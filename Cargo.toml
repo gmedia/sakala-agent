@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "apps/sakala-agent",
+    "crates/sakala-agent-core",
+    "crates/sakala-agent-protocol",
+    "crates/sakala-agent-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["PT Media Sarana Data (GMEDIA)"]
+license = "Apache-2.0"
+repository = "https://github.com/gmedia/sakala-agent"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"
+wiremock = "0.6"
+sakala-agent-core = { path = "crates/sakala-agent-core" }
+sakala-agent-protocol = { path = "crates/sakala-agent-protocol" }
+sakala-agent-runtime = { path = "crates/sakala-agent-runtime" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

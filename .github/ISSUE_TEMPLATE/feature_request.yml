@@ -1,0 +1,46 @@
+name: Feature Request
+description: Usulkan kemampuan agent/runtime baru.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Masalah yang diselesaikan
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Protocol / Payload
+        - Dashboard Client
+        - Command Lifecycle
+        - Runtime Executor
+        - Docker Direction
+        - Caddy Direction
+        - Logs / Observability
+        - Security
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: mvp_scope
+    attributes:
+      label: Scope minimum
+      description: Definisikan versi terkecil yang dapat diuji dengan aman.
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Dampak keamanan dan boundary
+      placeholder: Jelaskan akses host, token, socket, command input, atau risiko log.
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Di luar scope

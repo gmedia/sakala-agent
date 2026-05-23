@@ -1,0 +1,25 @@
+[package]
+name = "sakala-agent-core"
+description = "Agent orchestration, dashboard communication, and workers for Sakala."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+sakala-agent-protocol.workspace = true
+sakala-agent-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

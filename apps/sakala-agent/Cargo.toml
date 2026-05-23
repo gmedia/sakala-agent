@@ -1,0 +1,40 @@
+[package]
+name = "sakala-agent"
+description = "Runtime executor binary for Sakala compute nodes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sakala-agent-core.workspace = true
+sakala-agent-runtime.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "config_test"
+path = "../../tests/config_test.rs"
+
+[[test]]
+name = "command_lifecycle_test"
+path = "../../tests/command_lifecycle_test.rs"
+
+[[test]]
+name = "log_redaction_test"
+path = "../../tests/log_redaction_test.rs"
+
+[dev-dependencies]
+sakala-agent-core.workspace = true
+sakala-agent-protocol.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true

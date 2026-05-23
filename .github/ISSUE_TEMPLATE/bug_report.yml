@@ -1,0 +1,62 @@
+name: Bug Report
+description: Laporkan bug pada Sakala Agent atau protocol runtime.
+title: "fix: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Ringkasan bug
+      placeholder: Contoh: Connected mode tidak mengirim X-Agent-Id pada heartbeat.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Protocol / Payload
+        - Dashboard Client
+        - Command Lifecycle
+        - Heartbeat / Poller
+        - Runtime Executor
+        - Logs / Redaction
+        - Configuration
+        - Documentation
+        - CI / Build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Langkah reproduksi
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Perilaku yang diharapkan
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Perilaku yang terjadi
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs teredaksi
+      description: Hapus token atau secret sebelum mengirim output.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Checklist keamanan
+      options:
+        - label: Saya tidak menyertakan token, secret, atau credential nyata.
+          required: true
+        - label: Ini bukan laporan kerentanan yang harus dilaporkan privat.
+          required: true

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Diskusi umum Sakala Agent
+    url: https://github.com/gmedia/sakala-agent/discussions
+    about: Gunakan Discussions untuk ide atau pertanyaan yang belum menjadi issue.
+  - name: Security reporting
+    url: https://github.com/gmedia/sakala-agent/security
+    about: Jangan laporkan potensi kerentanan melalui issue publik.

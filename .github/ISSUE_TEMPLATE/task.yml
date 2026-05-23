@@ -1,0 +1,50 @@
+name: Task
+description: Definisikan pekerjaan terukur pada Sakala Agent.
+title: "task: "
+labels: [task]
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: Tujuan
+    validations:
+      required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Boundary utama
+      options:
+        - apps/sakala-agent
+        - sakala-agent-protocol
+        - sakala-agent-core
+        - sakala-agent-runtime
+        - Docs / CI
+        - Cross-crate contract
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test plan
+      placeholder: cargo test --workspace --all-features
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Boundary checks
+      options:
+        - label: Task tidak menambahkan akses runtime privileged tanpa review keamanan.
+          required: true
+        - label: Task tidak memasukkan secret atau token aktual.
+          required: true

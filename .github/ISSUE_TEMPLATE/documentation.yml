@@ -1,0 +1,44 @@
+name: Documentation
+description: Usulkan pembaruan dokumentasi Sakala Agent.
+title: "docs: "
+labels: [documentation]
+body:
+  - type: dropdown
+    id: document
+    attributes:
+      label: Dokumen
+      options:
+        - README
+        - ARCHITECTURE
+        - AGENTS / CONTRIBUTING
+        - SECURITY
+        - Configuration
+        - Dashboard API
+        - Command Lifecycle
+        - Runtime / Docker / Caddy
+        - Logging
+        - Development
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Masalah dokumentasi
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: Perubahan yang diusulkan
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: Command dan boundary keamanan dijelaskan bila relevan.
+          required: true
+        - label: Contoh tidak memuat secret atau token nyata.
+          required: true
