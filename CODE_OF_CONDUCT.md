@@ -19,6 +19,6 @@ Komunitas Sakala berkomitmen menyediakan lingkungan kolaborasi yang terbuka, pro
 
 ## Penegakan
 
-Perilaku yang melanggar dapat dilaporkan secara privat kepada maintainer PT Media Sarana Data / GMEDIA. Maintainer dapat menghapus konten, menolak kontribusi, atau membatasi partisipasi berdasarkan tingkat pelanggaran.
+Perilaku yang melanggar dapat dilaporkan secara privat kepada maintainer Sakala. Maintainer dapat menghapus konten, menolak kontribusi, atau membatasi partisipasi berdasarkan tingkat pelanggaran.
 
 Dokumen ini berlaku pada repository, issue tracker, pull request, serta kanal kolaborasi resmi Sakala.

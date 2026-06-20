@@ -1,6 +1,8 @@
 # Sakala Agent
 
-**Sakala Agent** adalah runtime executor untuk platform deployment **Sakala** dari **PT Media Sarana Data / GMEDIA**. Agent dirancang berjalan pada compute/runtime node, mengambil command dari dashboard, menjalankan operasi runtime, lalu melaporkan status, event, log, dan heartbeat.
+**Sakala Agent** adalah runtime executor untuk **Sakala**, project deployment open-source yang didukung **PT Media Sarana Data / GMEDIA** sebagai founding sponsor dan infrastructure supporter. Agent dirancang berjalan pada compute/runtime node, mengambil command dari dashboard, menjalankan operasi runtime, lalu melaporkan status, event, log, dan heartbeat.
+
+GMEDIA menyediakan dukungan awal berupa domain, infrastruktur, ruang eksperimen, dan dukungan teknis. Dukungan ini tidak mengubah prinsip Sakala sebagai project open-source dengan roadmap, dokumentasi, issue, dan kontribusi yang dikembangkan secara terbuka.
 
 Foundation ini sengaja aman dan minimal: executor aktif adalah `NoopRuntimeExecutor`. Belum ada akses Docker, Railpack, Caddy, atau Docker socket.
 

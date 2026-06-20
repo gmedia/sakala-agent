@@ -4,7 +4,9 @@ Sakala Agent nantinya menjalankan operasi privileged pada runtime node. Foundati
 
 ## Reporting Vulnerabilities
 
-Jangan membuka issue publik untuk kerentanan yang dapat dieksploitasi. Laporkan secara privat kepada maintainer PT Media Sarana Data / GMEDIA melalui kanal security repository ketika tersedia, dengan langkah reproduksi dan dampak tanpa membagikan secret nyata.
+Jangan membuka issue publik untuk kerentanan yang dapat dieksploitasi. Laporkan secara privat kepada maintainer Sakala melalui kanal security repository ketika tersedia, dengan langkah reproduksi dan dampak tanpa membagikan secret nyata.
+
+Pada fase MVP, GMEDIA dapat membantu triage keamanan sebagai founding sponsor dan infrastructure supporter.
 
 ## Docker Socket Boundary
 
