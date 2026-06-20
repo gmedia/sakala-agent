@@ -6,10 +6,13 @@ Dokumen ini berlaku bagi AI agents, Codex CLI, automation tools, dan contributor
 
 - Project: **Sakala Agent**
 - Product: **Sakala**
-- Organization: **PT Media Sarana Data / GMEDIA**
+- Project stewardship: **Sakala Maintainers**
+- Founding sponsor: **PT Media Sarana Data / GMEDIA**
 - License: **Apache License 2.0**
 - Documentation language: **Bahasa Indonesia**
 - Rust identifiers and API field names: **English**
+
+Do not frame Sakala as a closed GMEDIA-owned product. Use this framing instead: Sakala is an open-source project maintained by Sakala maintainers and supported by GMEDIA as founding sponsor.
 
 ## Architecture Rules
 
