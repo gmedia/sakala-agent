@@ -40,7 +40,7 @@ Jika dependency digunakan oleh beberapa crate, pusatkan version requirement di `
 
 ## Menambah Perilaku Runtime
 
-1. Perbarui protocol hanya bila contract dashboard berubah.
+1. Perbarui protocol hanya bila kontrak agent API berubah.
 2. Tambahkan atau perluas trait/runtime implementation.
 3. Pastikan core tetap mengurus lifecycle/reporting, bukan detail host.
 4. Tambahkan test untuk safety dan failure path.

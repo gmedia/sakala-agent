@@ -4,11 +4,11 @@ use sakala_agent_runtime::RuntimeExecutor;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
-use crate::{AgentConfig, commands::CommandHandler, dashboard::DashboardClient};
+use crate::{AgentConfig, api::ApiClient, commands::CommandHandler};
 
 pub async fn run(
     config: AgentConfig,
-    client: Option<DashboardClient>,
+    client: Option<ApiClient>,
     runtime: Arc<dyn RuntimeExecutor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -26,13 +26,13 @@ pub async fn run(
                         }
                     }
                 }
-                Err(error) => warn!(%error, "failed to poll dashboard commands"),
+                Err(error) => warn!(%error, "failed to poll control-plane commands"),
             }
         } else {
             info!(
                 agent_id = %config.agent_id,
                 runtime_network = %config.runtime_network,
-                "local command poll tick; dashboard request skipped"
+                "local command poll tick; control-plane request skipped"
             );
         }
 

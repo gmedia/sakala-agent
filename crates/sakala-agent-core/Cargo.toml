@@ -1,6 +1,6 @@
 [package]
 name = "sakala-agent-core"
-description = "Agent orchestration, dashboard communication, and workers for Sakala."
+description = "Agent orchestration, control-plane API communication, and workers for Sakala."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

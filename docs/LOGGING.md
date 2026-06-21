@@ -14,7 +14,7 @@ Nilai dapat memakai filter tracing yang lebih spesifik untuk debugging lokal.
 
 ## Redaction
 
-Sebelum deployment log dikirim ke dashboard, core meredaksi value setelah key berikut:
+Sebelum deployment log dikirim ke `sakala-api`, core meredaksi value setelah key berikut:
 
 ```txt
 TOKEN=

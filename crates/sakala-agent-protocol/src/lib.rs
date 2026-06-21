@@ -1,4 +1,4 @@
-//! Shared protocol types between the Sakala dashboard and runtime agent.
+//! Shared protocol types between the Sakala control plane and runtime agent.
 
 pub mod commands;
 pub mod deployments;

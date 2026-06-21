@@ -1,6 +1,6 @@
 # Command Lifecycle
 
-Dashboard adalah pemilik record command dan authorization. Agent hanya mengerjakan command yang diberikan melalui agent API.
+`sakala-api` adalah pemilik record command dan authorization. Agent hanya mengerjakan command yang diberikan melalui agent API.
 
 ## Status
 
@@ -11,7 +11,7 @@ Pending -> Cancelled
 Pending -> Expired
 ```
 
-Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Endpoint dashboard belum diimplementasikan di repository dashboard pada tahap ini.
+Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Endpoint agent belum diimplementasikan di `sakala-api` pada tahap ini.
 
 ## Flow Connected Mode
 

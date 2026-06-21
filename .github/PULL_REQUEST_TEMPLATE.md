@@ -16,7 +16,7 @@ Jelaskan perubahan utama pada pull request ini.
 ## Area yang Terdampak
 
 - [ ] Protocol / API contract
-- [ ] Core workers / dashboard client
+- [ ] Core workers / API client
 - [ ] Runtime executor
 - [ ] Configuration / telemetry
 - [ ] Logs / redaction

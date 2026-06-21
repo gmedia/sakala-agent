@@ -16,7 +16,7 @@ body:
       label: Area
       options:
         - Protocol / Payload
-        - Dashboard Client
+        - API Client
         - Command Lifecycle
         - Heartbeat / Poller
         - Runtime Executor

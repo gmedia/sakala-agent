@@ -5,16 +5,16 @@ use sakala_agent_runtime::RuntimeExecutor;
 use serde_json::json;
 use time::OffsetDateTime;
 
-use crate::{CoreError, dashboard::DashboardClient, logs::reporter::report_logs};
+use crate::{CoreError, api::ApiClient, logs::reporter::report_logs};
 
 pub struct CommandHandler {
-    client: DashboardClient,
+    client: ApiClient,
     runtime: Arc<dyn RuntimeExecutor>,
 }
 
 impl CommandHandler {
     #[must_use]
-    pub fn new(client: DashboardClient, runtime: Arc<dyn RuntimeExecutor>) -> Self {
+    pub fn new(client: ApiClient, runtime: Arc<dyn RuntimeExecutor>) -> Self {
         Self { client, runtime }
     }
 

@@ -4,11 +4,11 @@ Dokumen ini melengkapi [../SECURITY.md](../SECURITY.md) dengan catatan implement
 
 ## Privilege Boundary
 
-Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh runtime node. Hak tersebut tidak boleh mengalir ke dashboard atau aplikasi user.
+Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh runtime node. Hak tersebut tidak boleh mengalir ke API, console, atau aplikasi user.
 
 ## Foundation Guarantees
 
-- Default `local` mode tidak menghubungi dashboard.
+- Default `local` mode tidak menghubungi control plane.
 - Connected mode memerlukan token non-placeholder.
 - Request connected membawa bearer token dan `X-Agent-Id`.
 - Executor aktif adalah noop.
@@ -17,7 +17,7 @@ Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh r
 
 ## Sebelum Mengaktifkan Runtime Nyata
 
-- Tambahkan autentikasi/lease/idempotency tests dengan dashboard API.
+- Tambahkan autentikasi/lease/idempotency tests dengan agent API.
 - Tentukan pembatasan filesystem, network, container resource, dan route ownership.
 - Review redaction untuk format secret tambahan.
 - Dokumentasikan recovery jika command berhenti di tengah eksekusi.

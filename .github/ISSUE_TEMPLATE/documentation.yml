@@ -13,7 +13,7 @@ body:
         - AGENTS / CONTRIBUTING
         - SECURITY
         - Configuration
-        - Dashboard API
+        - Agent API
         - Command Lifecycle
         - Runtime / Docker / Caddy
         - Logging

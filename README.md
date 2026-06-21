@@ -1,6 +1,6 @@
 # Sakala Agent
 
-**Sakala Agent** adalah runtime executor untuk **Sakala**, project deployment open-source yang didukung **PT Media Sarana Data / GMEDIA** sebagai founding sponsor dan infrastructure supporter. Agent dirancang berjalan pada compute/runtime node, mengambil command dari dashboard, menjalankan operasi runtime, lalu melaporkan status, event, log, dan heartbeat.
+**Sakala Agent** adalah runtime executor untuk **Sakala**, project deployment open-source yang didukung **PT Media Sarana Data / GMEDIA** sebagai founding sponsor dan infrastructure supporter. Agent dirancang berjalan pada compute/runtime node, mengambil command dari `sakala-api`, menjalankan operasi runtime, lalu melaporkan status, event, log, dan heartbeat kembali ke API.
 
 GMEDIA menyediakan dukungan awal berupa domain, infrastruktur, ruang eksperimen, dan dukungan teknis. Dukungan ini tidak mengubah prinsip Sakala sebagai project open-source dengan roadmap, dokumentasi, issue, dan kontribusi yang dikembangkan secara terbuka.
 
@@ -9,18 +9,19 @@ Foundation ini sengaja aman dan minimal: executor aktif adalah `NoopRuntimeExecu
 ## Posisi Repository
 
 ```txt
-sakala-dashboard  Laravel control plane dan agent API
-sakala-agent      Rust runtime executor pada node
-sakala-infra      Local runtime playground dengan Caddy/network referensi
+sakala-console  SvelteKit frontend pada app.sakala.dev
+sakala-api      Laravel control plane dan agent API
+sakala-agent    Rust runtime executor pada node
+sakala-infra    Local runtime playground dengan Caddy/network referensi
 ```
 
-Dashboard membuat command. Agent melakukan polling outbound ke dashboard. Agent tidak menyediakan command server inbound.
+Sakala API membuat command. Agent melakukan polling outbound ke API. Agent tidak menyediakan command server inbound.
 
 ## Workspace Layout
 
 ```txt
 apps/sakala-agent/              Binary, config, telemetry, shutdown
-crates/sakala-agent-protocol/   Tipe payload dashboard-agent
+crates/sakala-agent-protocol/   Tipe payload control-plane-agent
 crates/sakala-agent-core/       HTTP client, workers, lifecycle, redaction
 crates/sakala-agent-runtime/    Trait executor dan executor noop
 ```
@@ -31,7 +32,7 @@ crates/sakala-agent-runtime/    Trait executor dan executor noop
 cargo run -p sakala-agent
 ```
 
-Default mode adalah `local`. Agent menulis heartbeat tick dan polling tick ke log JSON tanpa membuat request dashboard. Hentikan dengan `Ctrl+C`.
+Default mode adalah `local`. Agent menulis heartbeat tick dan polling tick ke log JSON tanpa membuat request control plane. Hentikan dengan `Ctrl+C`.
 
 `.env.example` merupakan referensi variable. Binary membaca environment atau CLI flag dan sengaja tidak menambahkan loader file dotenv pada foundation ini.
 
@@ -53,10 +54,10 @@ Mode ini digunakan untuk pengembangan foundation dan aman dijalankan tanpa token
 SAKALA_AGENT_MODE=connected
 SAKALA_AGENT_ID=node-01
 SAKALA_AGENT_TOKEN=replace-with-real-agent-token
-SAKALA_DASHBOARD_URL=http://localhost:8000
+SAKALA_API_URL=http://localhost:8000
 ```
 
-Connected mode mengaktifkan `DashboardClient`. Token placeholder `change-me` ditolak. Dashboard endpoint harus tersedia sebelum mode ini digunakan.
+Connected mode mengaktifkan `ApiClient`. Token placeholder `change-me` ditolak. Endpoint `sakala-api` harus tersedia sebelum mode ini digunakan.
 
 ## Command Types
 

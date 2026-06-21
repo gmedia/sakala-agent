@@ -7,7 +7,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_AGENT_MODE` | `local` | `local` atau `connected`. |
 | `SAKALA_AGENT_ID` | `local-agent-01` | Identitas node yang dikirim sebagai `X-Agent-Id`. |
 | `SAKALA_AGENT_TOKEN` | tidak ada | Bearer token; wajib dan bukan `change-me` pada connected mode. |
-| `SAKALA_DASHBOARD_URL` | `http://localhost:8000` | Base URL control plane. |
+| `SAKALA_API_URL` | `http://localhost:8000` | Base URL `sakala-api` control plane. |
 | `SAKALA_POLL_INTERVAL_SECONDS` | `3` | Interval polling command, harus lebih besar dari nol. |
 | `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. |
 | `SAKALA_RUNTIME_NETWORK` | `sakala-runtime` | Nama network referensi dari `sakala-infra`. |
@@ -20,7 +20,7 @@ cp examples/env/local.env.example .env
 cargo run -p sakala-agent
 ```
 
-File `.env` tidak dimuat otomatis oleh binary. Export variable menggunakan shell/environment runner yang dipilih, atau jalankan dengan default local mode tanpa file. Tidak ada dashboard request pada mode ini.
+File `.env` tidak dimuat otomatis oleh binary. Export variable menggunakan shell/environment runner yang dipilih, atau jalankan dengan default local mode tanpa file. Tidak ada control-plane request pada mode ini.
 
 ## Connected Mode
 
@@ -28,7 +28,7 @@ File `.env` tidak dimuat otomatis oleh binary. Export variable menggunakan shell
 SAKALA_AGENT_MODE=connected \
 SAKALA_AGENT_ID=node-01 \
 SAKALA_AGENT_TOKEN='<issued-agent-token>' \
-SAKALA_DASHBOARD_URL=http://localhost:8000 \
+SAKALA_API_URL=http://localhost:8000 \
 cargo run -p sakala-agent
 ```
 

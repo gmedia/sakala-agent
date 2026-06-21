@@ -2,7 +2,7 @@ use sakala_agent_core::commands::lifecycle::can_transition;
 use sakala_agent_protocol::{CommandStatus, CommandType};
 
 #[test]
-fn command_types_use_dashboard_json_names() {
+fn command_types_use_control_plane_json_names() {
     let json = serde_json::to_string(&CommandType::DeployProject).expect("type should serialize");
     let restored: CommandType = serde_json::from_str("\"RefreshRoute\"").expect("valid type");
 
@@ -11,7 +11,7 @@ fn command_types_use_dashboard_json_names() {
 }
 
 #[test]
-fn command_statuses_use_dashboard_json_names_and_valid_lifecycle() {
+fn command_statuses_use_control_plane_json_names_and_valid_lifecycle() {
     let status: CommandStatus = serde_json::from_str("\"Claimed\"").expect("valid status");
 
     assert_eq!(status, CommandStatus::Claimed);

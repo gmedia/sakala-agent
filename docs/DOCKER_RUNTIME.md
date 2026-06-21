@@ -17,7 +17,7 @@ Executor Docker nantinya dapat menangani:
 - Tetapkan payload command tervalidasi dan ownership project/node.
 - Hindari raw shell execution berdasarkan input user.
 - Definisikan allowlist mount/network/port.
-- Jangan pernah memasang Docker socket ke dashboard, Caddy, atau aplikasi user.
+- Jangan pernah memasang Docker socket ke API, console, Caddy, atau aplikasi user.
 - Tambahkan tests dan dokumentasi threat boundary.
 
 Foundation ini tidak boleh dipahami sebagai runtime yang aman untuk menjalankan workload user.

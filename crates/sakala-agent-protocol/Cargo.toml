@@ -1,6 +1,6 @@
 [package]
 name = "sakala-agent-protocol"
-description = "Dashboard-to-agent protocol types for Sakala."
+description = "Control-plane-to-agent protocol types for Sakala."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

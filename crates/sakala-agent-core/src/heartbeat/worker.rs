@@ -3,11 +3,11 @@ use time::OffsetDateTime;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
-use crate::{AgentConfig, dashboard::DashboardClient};
+use crate::{AgentConfig, api::ApiClient};
 
 pub async fn run(
     config: AgentConfig,
-    client: Option<DashboardClient>,
+    client: Option<ApiClient>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -15,7 +15,7 @@ pub async fn run(
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
-                warn!(%error, "failed to send dashboard heartbeat");
+                warn!(%error, "failed to send control-plane heartbeat");
             }
         } else {
             info!(

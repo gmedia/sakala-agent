@@ -1,6 +1,6 @@
 # Contributing to Sakala Agent
 
-Sakala Agent adalah komponen runtime privileged. Kontribusi harus kecil, dapat diuji, dan mempertahankan boundary keamanan antara dashboard, agent, dan host runtime.
+Sakala Agent adalah komponen runtime privileged. Kontribusi harus kecil, dapat diuji, dan mempertahankan boundary keamanan antara control plane, agent, dan host runtime.
 
 Sakala adalah project open-source yang didukung GMEDIA sebagai founding sponsor dan infrastructure supporter. Hindari wording seperti "Sakala by GMEDIA" atau "produk GMEDIA"; gunakan framing bahwa GMEDIA mendukung fase awal tanpa mengubah prinsip open-source project.
 
@@ -53,7 +53,7 @@ Contoh:
 
 ```txt
 chore(agent): initialize Rust workspace foundation
-feat(core): poll dashboard commands
+feat(core): poll control-plane commands
 test(logs): cover secret redaction formats
 docs(api): document command completion endpoint
 ```
