@@ -1,6 +1,6 @@
-# Dashboard Agent API
+# Sakala Agent API
 
-Dokumen ini mendefinisikan endpoint yang diharapkan oleh connected mode agent. Dashboard tetap menjadi control plane dan harus mengautentikasi serta mengotorisasi setiap request agent.
+Dokumen ini mendefinisikan endpoint `sakala-api` yang diharapkan oleh connected mode agent. Sakala API adalah control plane dan harus mengautentikasi serta mengotorisasi setiap request agent.
 
 ## Authentication Headers
 
@@ -9,7 +9,7 @@ Authorization: Bearer <agent-token>
 X-Agent-Id: <agent-id>
 ```
 
-Token harus diterbitkan secara aman, disimpan hashed oleh dashboard, dan tidak muncul dalam logs.
+Token harus diterbitkan secara aman, disimpan hashed oleh `sakala-api`, dan tidak muncul dalam logs.
 
 ## Endpoints
 
@@ -29,4 +29,4 @@ Lihat `examples/commands/deploy-project.json`. Protocol saat ini memakai `type` 
 
 ## Error/Retry Direction
 
-Foundation client memakai HTTP status failure sebagai error request dan melanjutkan worker loop. Policy retry, backoff per endpoint, idempotency key, lease expiry, dan command locking harus disepakati bersama dashboard sebelum connected mode dipakai untuk operasi runtime nyata.
+Foundation client memakai HTTP status failure sebagai error request dan melanjutkan worker loop. Policy retry, backoff per endpoint, idempotency key, lease expiry, dan command locking harus disepakati dengan kontrak `sakala-api` sebelum connected mode dipakai untuk operasi runtime nyata.

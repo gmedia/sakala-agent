@@ -15,8 +15,8 @@ struct Cli {
     #[arg(long, env = "SAKALA_AGENT_TOKEN", hide_env_values = true)]
     agent_token: Option<String>,
 
-    #[arg(long, env = "SAKALA_DASHBOARD_URL")]
-    dashboard_url: Option<String>,
+    #[arg(long, env = "SAKALA_API_URL")]
+    api_url: Option<String>,
 
     #[arg(long, env = "SAKALA_POLL_INTERVAL_SECONDS")]
     poll_interval_seconds: Option<String>,
@@ -38,7 +38,7 @@ pub fn load() -> Result<AgentConfig, sakala_agent_core::CoreError> {
     insert(&mut values, "SAKALA_AGENT_MODE", cli.mode);
     insert(&mut values, "SAKALA_AGENT_ID", cli.agent_id);
     insert(&mut values, "SAKALA_AGENT_TOKEN", cli.agent_token);
-    insert(&mut values, "SAKALA_DASHBOARD_URL", cli.dashboard_url);
+    insert(&mut values, "SAKALA_API_URL", cli.api_url);
     insert(
         &mut values,
         "SAKALA_POLL_INTERVAL_SECONDS",

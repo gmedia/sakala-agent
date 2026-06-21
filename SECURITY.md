@@ -10,7 +10,7 @@ Pada fase MVP, GMEDIA dapat membantu triage keamanan sebagai founding sponsor da
 
 ## Docker Socket Boundary
 
-- Dashboard tidak boleh mengakses Docker socket.
+- `sakala-api` dan `sakala-console` tidak boleh mengakses Docker socket.
 - Caddy atau aplikasi user tidak boleh menerima Docker socket.
 - Foundation agent tidak memakai Docker client crate atau Docker socket.
 - Akses Docker agent di masa depan harus dibatasi, terdokumentasi, dan direview sebagai perubahan berisiko tinggi.
@@ -20,7 +20,7 @@ Pada fase MVP, GMEDIA dapat membantu triage keamanan sebagai founding sponsor da
 - Agent melakukan autentikasi menggunakan bearer token dan `X-Agent-Id`.
 - Jangan commit token aktual ke `.env`, contoh, test fixture, atau log.
 - Connected mode menolak placeholder `change-me`.
-- Dashboard harus menyimpan token agent dalam bentuk hash dan mendukung rotasi pada implementasi API.
+- `sakala-api` harus menyimpan token agent dalam bentuk hash dan mendukung rotasi.
 
 ## Logs dan Secrets
 

@@ -1,4 +1,4 @@
 pub mod client;
 pub mod endpoints;
 
-pub use client::DashboardClient;
+pub use client::ApiClient;

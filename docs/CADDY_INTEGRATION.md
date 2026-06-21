@@ -14,7 +14,7 @@ Arah production:
 
 ## Peran Agent Mendatang
 
-Agent nantinya dapat mengatur route aplikasi setelah container siap, lalu melaporkan event route ke dashboard. Mekanisme penulisan config, validasi, reload, rollback, dan concurrency belum ditetapkan.
+Agent nantinya dapat mengatur route aplikasi setelah container siap, lalu melaporkan event route ke `sakala-api`. Mekanisme penulisan config, validasi, reload, rollback, dan concurrency belum ditetapkan.
 
 ## Boundary Keamanan
 

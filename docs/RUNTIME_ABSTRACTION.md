@@ -23,4 +23,4 @@ Boundary ini memungkinkan:
 
 ## Future Implementation
 
-Docker, Railpack, Caddy, health checks, sleep/wake, dan log streaming harus diterapkan di crate runtime melalui trait ini. Jangan meletakkan command shell atau Docker access di dashboard client/core worker.
+Docker, Railpack, Caddy, health checks, sleep/wake, dan log streaming harus diterapkan di crate runtime melalui trait ini. Jangan meletakkan command shell atau Docker access di API client/core worker.

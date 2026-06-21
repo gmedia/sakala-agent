@@ -3,7 +3,7 @@ use time::OffsetDateTime;
 
 use crate::{NodeInfo, NodeStatus};
 
-/// Periodic presence report sent by an agent to the dashboard.
+/// Periodic presence report sent by an agent to the control plane.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HeartbeatPayload {
     pub status: NodeStatus,

@@ -8,7 +8,7 @@ fn config_defaults_to_safe_local_mode() {
 
     assert_eq!(config.mode, AgentMode::Local);
     assert_eq!(config.agent_id, "local-agent-01");
-    assert_eq!(config.dashboard_url, "http://localhost:8000");
+    assert_eq!(config.api_url, "http://localhost:8000");
     assert_eq!(config.poll_interval_seconds, 3);
     assert_eq!(config.heartbeat_interval_seconds, 10);
     assert_eq!(config.runtime_network, "sakala-runtime");

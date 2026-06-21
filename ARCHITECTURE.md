@@ -1,16 +1,17 @@
 # Sakala Agent Architecture
 
-Sakala Agent adalah data-plane executor untuk Sakala. Ia menjalankan operasi runtime pada node berdasarkan command yang dibuat oleh dashboard. Foundation ini menyediakan boundary dan perilaku dummy yang dapat diuji sebelum akses host benar-benar dibangun.
+Sakala Agent adalah data-plane executor untuk Sakala. Ia menjalankan operasi runtime pada node berdasarkan command yang dibuat oleh `sakala-api`. Foundation ini menyediakan boundary dan perilaku dummy yang dapat diuji sebelum akses host benar-benar dibangun.
 
 ## Boundary Sistem
 
 ```txt
 User / Browser
     |
-Sakala Dashboard (control plane)
-    | creates commands, stores state, authorizes users
+Sakala Console (presentation layer)
+    |
     v
-Agent API
+Sakala API (control plane / Agent API)
+    | creates commands, stores state, authorizes requests
     ^
     | outbound polling and reports
 Sakala Agent (runtime executor)
@@ -18,11 +19,12 @@ Sakala Agent (runtime executor)
 Future: Docker / Railpack / Caddy on runtime node
 ```
 
-- `sakala-dashboard` memegang policy, user access, metadata, dan command records.
+- `sakala-console` menampilkan state dan mengirim intent user melalui API.
+- `sakala-api` memegang policy, user access, metadata, dan command records.
 - `sakala-agent` memproses command privileged pada node runtime.
 - `sakala-infra` menjadi referensi local network dan edge routing.
-- Dashboard tidak mengakses Docker socket secara langsung.
-- Agent tidak membuka HTTP server untuk menerima command dashboard.
+- API dan console tidak mengakses Docker socket secara langsung.
+- Agent tidak membuka HTTP server untuk menerima command dari control plane.
 
 ## Workspace Crates
 
@@ -32,7 +34,7 @@ Binary process. Ia memuat config dari environment/CLI, menginisialisasi tracing 
 
 ### `sakala-agent-protocol`
 
-Kontrak serialisasi yang nantinya harus sinkron dengan API dashboard:
+Kontrak serialisasi yang harus sinkron dengan agent API pada `sakala-api`:
 
 - command type dan status;
 - heartbeat dan node info;
@@ -43,7 +45,7 @@ Kontrak serialisasi yang nantinya harus sinkron dengan API dashboard:
 
 Orkestrasi application-independent:
 
-- `DashboardClient` outbound dengan bearer token dan `X-Agent-Id`;
+- `ApiClient` outbound dengan bearer token dan `X-Agent-Id`;
 - heartbeat worker;
 - polling worker dan lifecycle handler;
 - redaksi log;
@@ -56,7 +58,7 @@ Boundary operasi host melalui `RuntimeExecutor`. `NoopRuntimeExecutor` saat ini 
 ## Polling Model
 
 ```txt
-Dashboard creates Pending command
+Sakala API creates Pending command
 Agent GET /api/agent/v1/commands
 Agent POST .../{id}/claim
 Agent runs RuntimeExecutor
@@ -69,7 +71,7 @@ Model outbound polling menjaga node tidak perlu membuka endpoint command publik 
 
 ## Modes
 
-`local` adalah default aman: worker aktif, tetapi tidak menghubungi dashboard. `connected` membuat request API dan mewajibkan token non-placeholder.
+`local` adalah default aman: worker aktif, tetapi tidak menghubungi control plane. `connected` membuat request ke `sakala-api` dan mewajibkan token non-placeholder.
 
 ## Future Extraction Path
 

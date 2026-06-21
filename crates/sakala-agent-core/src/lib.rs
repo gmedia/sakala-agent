@@ -1,8 +1,8 @@
-//! Core workers and dashboard integration for the Sakala agent.
+//! Core workers and control-plane API integration for the Sakala agent.
 
+pub mod api;
 pub mod commands;
 pub mod config;
-pub mod dashboard;
 pub mod error;
 pub mod heartbeat;
 pub mod logs;

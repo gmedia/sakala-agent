@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Operation requested by the dashboard for execution on a runtime node.
+/// Operation requested by the control plane for execution on a runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CommandType {
@@ -15,7 +15,7 @@ pub enum CommandType {
     RefreshRoute,
 }
 
-/// State owned by the dashboard while an agent processes a command.
+/// State owned by the control plane while an agent processes a command.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum CommandStatus {
@@ -28,7 +28,7 @@ pub enum CommandStatus {
     Expired,
 }
 
-/// Command record returned by the dashboard polling endpoint.
+/// Command record returned by the control-plane polling endpoint.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AgentCommand {
     pub id: Uuid,

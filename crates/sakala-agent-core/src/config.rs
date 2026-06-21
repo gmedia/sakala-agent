@@ -37,7 +37,7 @@ pub struct AgentConfig {
     pub mode: AgentMode,
     pub agent_id: String,
     pub agent_token: Option<String>,
-    pub dashboard_url: String,
+    pub api_url: String,
     pub poll_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
     pub runtime_network: String,
@@ -72,7 +72,7 @@ impl AgentConfig {
             mode,
             agent_id: get(values, "SAKALA_AGENT_ID", "local-agent-01"),
             agent_token,
-            dashboard_url: get(values, "SAKALA_DASHBOARD_URL", "http://localhost:8000"),
+            api_url: get(values, "SAKALA_API_URL", "http://localhost:8000"),
             poll_interval_seconds: positive_number(values, "SAKALA_POLL_INTERVAL_SECONDS", 3)?,
             heartbeat_interval_seconds: positive_number(
                 values,

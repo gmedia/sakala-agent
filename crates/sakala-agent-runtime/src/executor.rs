@@ -3,7 +3,7 @@ use sakala_agent_protocol::{AgentCommand, DeploymentEvent, DeploymentLog};
 
 use crate::RuntimeError;
 
-/// Output that the core worker reports back to the dashboard.
+/// Output that the core worker reports back to the control plane.
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionOutcome {
     pub events: Vec<DeploymentEvent>,

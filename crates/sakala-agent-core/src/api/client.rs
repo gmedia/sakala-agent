@@ -8,16 +8,16 @@ use crate::{AgentConfig, CoreError};
 
 use super::endpoints;
 
-/// Authenticated outbound client for the dashboard agent API.
+/// Authenticated outbound client for the Sakala control-plane agent API.
 #[derive(Clone, Debug)]
-pub struct DashboardClient {
+pub struct ApiClient {
     http: Client,
     base_url: String,
     agent_id: String,
     token: String,
 }
 
-impl DashboardClient {
+impl ApiClient {
     pub fn from_config(config: &AgentConfig) -> Result<Self, CoreError> {
         let token = config.agent_token.clone().ok_or_else(|| {
             CoreError::InvalidConfiguration("connected mode requires SAKALA_AGENT_TOKEN".to_owned())
@@ -25,7 +25,7 @@ impl DashboardClient {
 
         Ok(Self {
             http: Client::new(),
-            base_url: config.dashboard_url.trim_end_matches('/').to_owned(),
+            base_url: config.api_url.trim_end_matches('/').to_owned(),
             agent_id: config.agent_id.clone(),
             token,
         })
