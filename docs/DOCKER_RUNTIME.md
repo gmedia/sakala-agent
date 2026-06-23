@@ -8,6 +8,7 @@
 validate command
 -> init repository dan fetch immutable commit SHA
 -> pilih Dockerfile atau Railpack
+-> enforce build deadline
 -> docker buildx build --load
 -> docker run candidate pada sakala-runtime
 -> basic Docker health/running check
@@ -16,6 +17,8 @@ validate command
 -> ambil startup logs
 -> hapus container deployment sebelumnya
 ```
+
+Startup agent juga menjalankan scan orphan secara detection-only. Detail guard Phase 9 ada di [Runtime hardening](RUNTIME_HARDENING.md).
 
 Image ditag berdasarkan project, commit, dan deployment. Container diberi ownership labels agar cleanup tidak menyentuh workload di luar Sakala.
 

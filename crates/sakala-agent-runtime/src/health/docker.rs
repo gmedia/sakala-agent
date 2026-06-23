@@ -44,7 +44,7 @@ impl HealthChecker for DockerHealthChecker {
             }
 
             if status == "unhealthy" || attempt == self.attempts {
-                return Err(RuntimeError::Execution(format!(
+                return Err(RuntimeError::Health(format!(
                     "container {container} failed its basic health check with status {status:?}"
                 )));
             }
@@ -52,7 +52,7 @@ impl HealthChecker for DockerHealthChecker {
             sleep(self.interval).await;
         }
 
-        Err(RuntimeError::Execution(format!(
+        Err(RuntimeError::Health(format!(
             "container {container} did not become healthy"
         )))
     }

@@ -18,10 +18,7 @@ pub async fn run_checked(
     let sink = ReporterOutputSink::new(reporter, phase);
     let output = runner.run(command, &sink).await?;
     if !output.success {
-        return Err(RuntimeError::Execution(format!(
-            "{phase} exited with status {:?}",
-            output.code
-        )));
+        return Err(RuntimeError::failed_operation(phase, output.code));
     }
     Ok(output)
 }

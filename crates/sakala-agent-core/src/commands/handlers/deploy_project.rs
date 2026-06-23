@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sakala_agent_protocol::AgentCommand;
 
 use crate::ports::{
@@ -7,7 +9,7 @@ use crate::ports::{
 pub async fn handle(
     command: &AgentCommand,
     runtime: &dyn RuntimeExecutor,
-    reporter: &dyn RuntimeReporter,
+    reporter: Arc<dyn RuntimeReporter>,
 ) -> Result<CommandOutput, RuntimeExecutionError> {
     let project_id = command.project_id.ok_or_else(|| {
         RuntimeExecutionError::invalid_command("DeployProject requires project_id")

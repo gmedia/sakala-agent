@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use sakala_agent_core::{
     commands::CommandDispatcher,
-    ports::{CommandOutput, RuntimeExecutionError, RuntimeReporter},
+    ports::{CommandOutput, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter},
 };
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog,
@@ -24,11 +24,11 @@ use uuid::Uuid;
 async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let config = runtime_config(&temp);
     let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
 
-    let output = dispatch(executor, &deploy_command("auto"), &reporter)
+    let output = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
         .await
         .expect("Dockerfile deployment should complete");
 
@@ -75,7 +75,7 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
 async fn control_plane_resource_request_is_applied_and_reported() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
     let mut command = deploy_command("auto");
     command.payload["resources"] = json!({
@@ -84,7 +84,7 @@ async fn control_plane_resource_request_is_applied_and_reported() {
         "pids_limit": 200
     });
 
-    let output = dispatch(executor, &command, &reporter)
+    let output = dispatch(executor, &command, Arc::clone(&reporter))
         .await
         .expect("resource request within node ceilings should complete");
 
@@ -106,12 +106,12 @@ async fn control_plane_resource_request_is_applied_and_reported() {
 async fn resource_request_above_node_maximum_fails_before_process_execution() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
     let mut command = deploy_command("auto");
     command.payload["resources"] = json!({ "memory_mb": 1024 });
 
-    let error = dispatch(executor, &command, &reporter)
+    let error = dispatch(executor, &command, Arc::clone(&reporter))
         .await
         .expect_err("resource request above node maximum should fail");
 
@@ -120,13 +120,43 @@ async fn resource_request_above_node_maximum_fails_before_process_execution() {
 }
 
 #[tokio::test]
+async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(60)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.build_timeout = Duration::from_millis(30);
+    let workspace = config.workspace_root.join(
+        Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b")
+            .expect("command UUID")
+            .to_string(),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect_err("slow build must exceed its deadline");
+
+    assert_eq!(error.code(), "runtime_timeout");
+    assert!(!workspace.exists());
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
 async fn auto_builder_falls_back_to_railpack_when_dockerfile_is_absent() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(false));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    dispatch(executor, &deploy_command("auto"), &reporter)
+    dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
         .await
         .expect("Railpack fallback should complete");
 
@@ -147,10 +177,10 @@ async fn auto_builder_falls_back_to_railpack_when_dockerfile_is_absent() {
 async fn project_preview_uses_railpack_info_without_preparing_or_building() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(false));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    let output = dispatch(executor, &inspect_command(), &reporter)
+    let output = dispatch(executor, &inspect_command(), Arc::clone(&reporter))
         .await
         .expect("project inspection should complete");
 
@@ -176,12 +206,12 @@ async fn project_preview_uses_railpack_info_without_preparing_or_building() {
 async fn executor_rejects_non_github_repository_before_starting_a_process() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let reporter = RecordingReporter::default();
+    let reporter = Arc::new(RecordingReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
     let mut command = deploy_command("auto");
     command.payload["repository_url"] = json!("https://git.example.internal/project.git");
 
-    let error = dispatch(executor, &command, &reporter)
+    let error = dispatch(executor, &command, Arc::clone(&reporter))
         .await
         .expect_err("unsupported repository host must be rejected");
 
@@ -193,10 +223,10 @@ async fn executor_rejects_non_github_repository_before_starting_a_process() {
 async fn activated_route_is_not_cleaned_up_when_ready_reporting_fails() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let reporter = FailingReadyReporter::default();
+    let reporter = Arc::new(FailingReadyReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    let error = dispatch(executor, &deploy_command("auto"), &reporter)
+    let error = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
         .await
         .expect_err("ready report should fail");
 
@@ -215,11 +245,96 @@ async fn activated_route_is_not_cleaned_up_when_ready_reporting_fails() {
     }));
 }
 
-async fn dispatch(
+#[tokio::test]
+async fn node_capacity_rejects_a_new_project_but_allows_replacement() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let existing_project = "ff66ed4a-6303-4be6-8ef4-63c28b112680";
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "{existing_project}\n11111111-1111-4111-8111-111111111111\n"
+    )));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 2;
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+    dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect("redeploying an existing project must retain a replacement slot");
+
+    let mut new_project = deploy_command("auto");
+    new_project.project_id =
+        Some(Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("project UUID"));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    let error = dispatch(executor, &new_project, Arc::clone(&reporter))
+        .await
+        .expect_err("new project must respect node capacity");
+
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+}
+
+#[tokio::test]
+async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "deadbeef\tExited (1) 2 minutes ago\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\nmissing\tUp 10 minutes\t\t\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = sakala_agent_core::ports::RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation scan should complete");
+
+    assert_eq!(report.inspected_containers, 2);
+    assert_eq!(report.orphans.len(), 2);
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|orphan| orphan.reason.contains("not running"))
+    );
+}
+
+#[tokio::test]
+async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let runtime: Arc<dyn RuntimeExecutor> = executor.clone();
+
+    CommandDispatcher::new(runtime)
+        .dispatch(&deploy_command("auto"), reporter)
+        .await
+        .expect("deployment should start a log follower");
+    tokio::task::yield_now().await;
+    executor
+        .shutdown()
+        .await
+        .expect("runtime shutdown should stop log followers");
+
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "logs")
+            && command.args.iter().any(|argument| argument == "--follow")
+            && command.timeout_disabled
+    }));
+}
+
+async fn dispatch<R>(
     executor: DockerRuntimeExecutor,
     command: &AgentCommand,
-    reporter: &dyn RuntimeReporter,
-) -> Result<CommandOutput, RuntimeExecutionError> {
+    reporter: Arc<R>,
+) -> Result<CommandOutput, RuntimeExecutionError>
+where
+    R: RuntimeReporter + 'static,
+{
     CommandDispatcher::new(Arc::new(executor))
         .dispatch(command, reporter)
         .await
@@ -274,6 +389,8 @@ fn inspect_command() -> AgentCommand {
 struct FakeRunner {
     dockerfile: bool,
     commands: Mutex<Vec<CommandSpec>>,
+    docker_ps_stdout: String,
+    build_delay: Option<Duration>,
 }
 
 impl FakeRunner {
@@ -281,7 +398,19 @@ impl FakeRunner {
         Self {
             dockerfile,
             commands: Mutex::new(Vec::new()),
+            docker_ps_stdout: String::new(),
+            build_delay: None,
         }
+    }
+
+    fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
+        self.docker_ps_stdout = stdout.into();
+        self
+    }
+
+    fn with_build_delay(mut self, delay: Duration) -> Self {
+        self.build_delay = Some(delay);
+        self
     }
 }
 
@@ -296,6 +425,13 @@ impl ProcessRunner for FakeRunner {
             .lock()
             .expect("command lock")
             .push(spec.clone());
+
+        if spec.program == "docker"
+            && spec.args.iter().any(|argument| argument == "buildx")
+            && let Some(delay) = self.build_delay
+        {
+            tokio::time::sleep(delay).await;
+        }
 
         if spec.program == "git" && spec.args.iter().any(|argument| argument == "init") {
             let source = spec.args.last().expect("git init target");
@@ -334,8 +470,10 @@ impl ProcessRunner for FakeRunner {
             .expect("fake Railpack info should be written");
         }
 
-        let stdout = if spec.program == "docker"
-            && spec.args.iter().any(|argument| argument == "inspect")
+        let stdout = if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "ps")
+        {
+            self.docker_ps_stdout.as_str()
+        } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
             "running\n"
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "logs") {

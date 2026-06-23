@@ -4,7 +4,7 @@ use anyhow::Context;
 use sakala_agent_core::{AgentMode, api::ApiClient, heartbeat, ports::RuntimeExecutor, scheduler};
 use sakala_agent_runtime::{DockerRuntimeExecutor, NoopRuntimeExecutor};
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{AppConfig, RuntimeDriver};
 
@@ -26,6 +26,24 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
         RuntimeDriver::Docker => Arc::new(DockerRuntimeExecutor::new(config.docker_runtime)),
     };
+    match runtime.reconcile().await {
+        Ok(report) => {
+            info!(
+                inspected_containers = report.inspected_containers,
+                orphaned_containers = report.orphans.len(),
+                "runtime reconciliation scan completed"
+            );
+            for orphan in report.orphans {
+                warn!(
+                    container_id = %orphan.container_id,
+                    project_id = ?orphan.project_id,
+                    reason = %orphan.reason,
+                    "orphaned Sakala container detected; automatic deletion is disabled"
+                );
+            }
+        }
+        Err(error) => warn!(%error, "runtime reconciliation scan failed"),
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
@@ -36,7 +54,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let poller_task = tokio::spawn(scheduler::poller::run(
         config.agent,
         client,
-        runtime,
+        Arc::clone(&runtime),
         shutdown_rx,
     ));
 
@@ -52,6 +70,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .await
         .context("heartbeat worker task failed")?;
     poller_task.await.context("command poller task failed")?;
+    runtime
+        .shutdown()
+        .await
+        .context("failed to shut down runtime background tasks")?;
     info!("Sakala agent shutdown complete");
 
     Ok(())

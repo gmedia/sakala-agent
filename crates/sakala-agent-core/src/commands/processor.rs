@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use sakala_agent_protocol::{
     AgentCommand, CompleteCommandPayload, DeploymentEvent, DeploymentEventLevel,
@@ -14,14 +15,20 @@ use crate::{
 pub struct CommandProcessor {
     client: ApiClient,
     dispatcher: CommandDispatcher,
+    command_timeout: Duration,
 }
 
 impl CommandProcessor {
     #[must_use]
-    pub fn new(client: ApiClient, runtime: Arc<dyn RuntimeExecutor>) -> Self {
+    pub fn new(
+        client: ApiClient,
+        runtime: Arc<dyn RuntimeExecutor>,
+        command_timeout: Duration,
+    ) -> Self {
         Self {
             client,
             dispatcher: CommandDispatcher::new(runtime),
+            command_timeout,
         }
     }
 
@@ -40,9 +47,24 @@ impl CommandProcessor {
             )
             .await?;
 
-        let reporter = ApiRuntimeReporter::new(self.client.clone(), command.id);
+        let reporter = Arc::new(ApiRuntimeReporter::new(self.client.clone(), command.id));
 
-        match self.dispatcher.dispatch(command, &reporter).await {
+        let execution = tokio::time::timeout(
+            self.command_timeout,
+            self.dispatcher.dispatch(command, reporter),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(crate::ports::RuntimeExecutionError::new(
+                "runtime_timeout",
+                format!(
+                    "command execution exceeded its {}s timeout",
+                    self.command_timeout.as_secs()
+                ),
+            ))
+        });
+
+        match execution {
             Ok(output) => {
                 self.client
                     .complete(

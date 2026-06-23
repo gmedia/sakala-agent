@@ -6,7 +6,7 @@ use std::sync::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
-    RuntimeExecutor, RuntimeReporter,
+    RuntimeExecutor, RuntimeReconciliationReport, RuntimeReporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -36,12 +36,14 @@ pub struct DockerRuntimeExecutor {
     containers: Arc<dyn ContainerEngine>,
     health: Arc<dyn HealthChecker>,
     routes: Arc<dyn RouteManager>,
+    build_timeout: std::time::Duration,
 }
 
 impl DockerRuntimeExecutor {
     #[must_use]
     pub fn new(config: DockerRuntimeConfig) -> Self {
-        Self::with_runner(config, Arc::new(TokioProcessRunner))
+        let runner = Arc::new(TokioProcessRunner::new(config.command_timeout));
+        Self::with_runner(config, runner)
     }
 
     #[must_use]
@@ -64,6 +66,7 @@ impl DockerRuntimeExecutor {
                 Arc::clone(&runner),
                 config.runtime_network,
                 config.resource_safety,
+                config.max_active_containers,
             )),
             Arc::new(DockerHealthChecker::new(
                 Arc::clone(&runner),
@@ -71,6 +74,7 @@ impl DockerRuntimeExecutor {
                 config.health_interval,
             )),
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
+            config.build_timeout,
         )
     }
 
@@ -82,6 +86,7 @@ impl DockerRuntimeExecutor {
         containers: Arc<dyn ContainerEngine>,
         health: Arc<dyn HealthChecker>,
         routes: Arc<dyn RouteManager>,
+        build_timeout: std::time::Duration,
     ) -> Self {
         Self {
             workspace,
@@ -90,14 +95,16 @@ impl DockerRuntimeExecutor {
             containers,
             health,
             routes,
+            build_timeout,
         }
     }
 
     async fn run_inspection(
         &self,
         request: InspectProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
+        let reporter = reporter.as_ref();
         let source = inspection_source(&request.payload)?;
 
         emit_event(
@@ -136,7 +143,7 @@ impl DockerRuntimeExecutor {
     async fn run_deployment(
         &self,
         request: DeployProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let project_id = request.project_id;
         let deployment_id = request.deployment_id;
@@ -144,9 +151,10 @@ impl DockerRuntimeExecutor {
         validate_payload(&payload)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload)?;
+        self.containers.ensure_capacity(project_id).await?;
 
         emit_event(
-            reporter,
+            reporter.as_ref(),
             "deployment.resources.resolved",
             "Runtime resource request passed node safety checks.",
             json!({
@@ -157,7 +165,7 @@ impl DockerRuntimeExecutor {
         .await?;
 
         emit_event(
-            reporter,
+            reporter.as_ref(),
             "deployment.checkout.started",
             "Cloning repository at the requested commit.",
             json!({ "commit_sha": payload.commit_sha }),
@@ -165,7 +173,7 @@ impl DockerRuntimeExecutor {
         .await?;
         let workspace = self
             .workspace
-            .checkout(request.command_id, &source, reporter)
+            .checkout(request.command_id, &source, reporter.as_ref())
             .await?;
         let image = image_name(project_id, deployment_id, &payload.commit_sha);
         let container = container_name(project_id, deployment_id);
@@ -181,7 +189,7 @@ impl DockerRuntimeExecutor {
                 &container,
                 applied_resources,
                 &route_activated,
-                reporter,
+                Arc::clone(&reporter),
             )
             .await;
 
@@ -219,30 +227,36 @@ impl DockerRuntimeExecutor {
         container: &str,
         applied_resources: AppliedRuntimeResources,
         route_activated: &AtomicBool,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
+        let reporter_ref = reporter.as_ref();
         emit_event(
-            reporter,
+            reporter_ref,
             "deployment.build.started",
             "Preparing application image.",
             json!({ "requested_builder": payload.builder }),
         )
         .await?;
-        let build = self
-            .builder
-            .build(
+        let build = tokio::time::timeout(
+            self.build_timeout,
+            self.builder.build(
                 &BuildRequest {
                     workspace: workspace.root().to_owned(),
                     source: workspace.source().to_owned(),
                     image: image.to_owned(),
                     requested: payload.builder,
                 },
-                reporter,
-            )
-            .await?;
+                reporter_ref,
+            ),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout {
+            operation: "deployment-build".to_owned(),
+            seconds: self.build_timeout.as_secs(),
+        })??;
 
         emit_event(
-            reporter,
+            reporter_ref,
             "deployment.container.started",
             "Starting candidate application container.",
             json!({ "container": container, "image": image }),
@@ -259,7 +273,7 @@ impl DockerRuntimeExecutor {
                     environment: payload.environment.clone(),
                     resources: applied_resources,
                 },
-                reporter,
+                reporter_ref,
             )
             .await?;
         self.health.wait_until_ready(container).await?;
@@ -271,14 +285,14 @@ impl DockerRuntimeExecutor {
                     upstream: container.to_owned(),
                     port: payload.container_port,
                 },
-                reporter,
+                reporter_ref,
             )
             .await?;
         route_activated.store(true, Ordering::Release);
 
         if let Err(error) = self
             .containers
-            .report_startup_logs(container, reporter)
+            .report_startup_logs(container, reporter_ref)
             .await
         {
             let _ = reporter
@@ -289,7 +303,7 @@ impl DockerRuntimeExecutor {
         }
         if let Err(error) = self
             .containers
-            .cleanup_previous(project_id, container, reporter)
+            .cleanup_previous(project_id, container, reporter_ref)
             .await
         {
             let _ = reporter
@@ -300,7 +314,7 @@ impl DockerRuntimeExecutor {
         }
 
         emit_event(
-            reporter,
+            reporter_ref,
             "deployment.runtime.ready",
             "Application container and route are ready.",
             json!({
@@ -311,16 +325,27 @@ impl DockerRuntimeExecutor {
                 "resources": applied_resources,
             }),
         )
-        .await
+        .await?;
+        self.containers.start_log_follower(container, reporter);
+        Ok(())
     }
 }
 
 #[async_trait]
 impl RuntimeExecutor for DockerRuntimeExecutor {
+    async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
+        self.containers.detect_orphans().await.map_err(Into::into)
+    }
+
+    async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {
+        self.containers.shutdown().await;
+        Ok(())
+    }
+
     async fn inspect_project(
         &self,
         request: InspectProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         self.run_inspection(request, reporter)
             .await
@@ -330,7 +355,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     async fn deploy_project(
         &self,
         request: DeployProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         self.run_deployment(request, reporter)
             .await

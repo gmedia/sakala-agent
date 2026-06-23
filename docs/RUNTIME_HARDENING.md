@@ -1,0 +1,60 @@
+# Runtime Hardening v1
+
+Phase 9 menambah guard untuk pilot terbatas tanpa menganggap Docker host sebagai sandbox multi-tenant yang sempurna.
+
+## Ownership Policy
+
+```txt
+sakala-api
+  plan dan entitlement
+  max project per user/workspace
+  allowed active deployment
+  admin stop/suspend decision
+  requested resource profile
+
+sakala-agent
+  enforce command resource profile
+  hard maximum dan capacity guard node
+  process/build deadline
+  detect actual orphaned container
+  report requested/applied resource dan failure code
+```
+
+Agent tidak mengetahui plan berbayar, membership, atau kuota workspace. Jika user memperoleh resource lebih besar, API menghitung profile baru dan mengirim command redeploy. Replacement container memakai profile baru; route hanya berpindah setelah health check berhasil.
+
+## Timeout dan Cancellation
+
+- `SAKALA_BUILD_TIMEOUT_SECONDS` membatasi keseluruhan builder operation.
+- `SAKALA_COMMAND_TIMEOUT_SECONDS` membatasi lifecycle runtime setelah command diklaim.
+- Setiap subprocess juga memakai deadline command sebagai fallback.
+- Child dijalankan sebagai process-group leader pada Unix. Timeout, reporting error, task cancellation, atau shutdown menjatuhkan seluruh process group.
+- Failure dikirim dengan `runtime_timeout`; build, container, health, routing, capacity, dan filesystem memiliki code terpisah.
+
+Build timeout harus lebih pendek daripada command timeout agar runtime sempat menjalankan cleanup dan mengirim failure status.
+
+## Runtime Log Lifecycle
+
+Setelah candidate sehat, route aktif, dan startup log terkirim, runtime memulai follower `docker logs --follow --tail 0`. Follower berjalan sebagai task milik `DockerContainerEngine`, sehingga bukan task yang terlepas dari lifecycle agent. Saat shutdown, seluruh task follower dibatalkan dan process group subprocess dihentikan sebelum binary keluar.
+
+Follower memakai reporter deployment yang sama dan seluruh baris tetap melewati redaction core. Kegagalan reporting menghentikan follower dengan warning operator; retry/cursor belum diterapkan sampai API memiliki kontrak resume yang eksplisit.
+
+## Capacity Guard
+
+`SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard guard node. Deployment project baru ditolak ketika jumlah container managed yang aktif mencapai batas. Redeploy project yang sudah aktif tetap diizinkan karena candidate akan menggantikan container sebelumnya.
+
+Guard ini bukan aggregate scheduler dan belum menghitung total memory/CPU reservation. Penempatan lintas node tetap pekerjaan control plane setelah MVP.
+
+Perubahan resource user dilakukan melalui redeploy dengan payload resource baru. Agent tidak memakai `docker update` untuk mengubah container aktif secara diam-diam karena deployment harus tetap memiliki desired state, applied state, image, health check, dan route cutover yang dapat diaudit.
+
+## Orphan Detection
+
+Saat startup, Docker executor memindai container dengan label `dev.sakala.managed=true`. Container ditandai orphan bila:
+
+- identity label project/deployment hilang atau invalid; atau
+- status container `Created`, `Exited`, atau `Dead`.
+
+Phase 9 hanya melaporkan warning. Auto-removal sengaja tidak dilakukan karena agent belum memiliki desired-state snapshot dari API; menghapus berdasarkan observasi host saja berisiko menghapus workload yang masih dibutuhkan.
+
+## Isolation Decision
+
+Docker rootful pada node khusus masih dapat dipakai untuk pilot dengan repository terkontrol. Untuk workload publik tidak tepercaya, target berikutnya adalah isolated/rootless builder terpisah dari runtime daemon. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.

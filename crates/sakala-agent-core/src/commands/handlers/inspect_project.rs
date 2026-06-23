@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use sakala_agent_protocol::AgentCommand;
 
 use crate::ports::{
@@ -7,7 +9,7 @@ use crate::ports::{
 pub async fn handle(
     command: &AgentCommand,
     runtime: &dyn RuntimeExecutor,
-    reporter: &dyn RuntimeReporter,
+    reporter: Arc<dyn RuntimeReporter>,
 ) -> Result<CommandOutput, RuntimeExecutionError> {
     let payload = command.inspect_payload().map_err(|error| {
         RuntimeExecutionError::invalid_command(format!(

@@ -14,9 +14,9 @@ pub async fn run(
 ) {
     let handler = client
         .as_ref()
-        .map(|client| CommandProcessor::new(client.clone(), runtime));
+        .map(|client| CommandProcessor::new(client.clone(), runtime, config.command_timeout()));
 
-    loop {
+    'polling: loop {
         if let (Some(client), Some(handler)) = (&client, &handler) {
             match client.poll_commands().await {
                 Ok(commands) => {
@@ -30,8 +30,18 @@ pub async fn run(
                             continue;
                         }
 
-                        if let Err(error) = handler.process(&command).await {
-                            warn!(command_id = %command.id, %error, "command execution failed");
+                        tokio::select! {
+                            result = handler.process(&command) => {
+                                if let Err(error) = result {
+                                    warn!(command_id = %command.id, %error, "command execution failed");
+                                }
+                            }
+                            result = shutdown.changed() => {
+                                if result.is_err() || *shutdown.borrow() {
+                                    info!(command_id = %command.id, "cancelling in-flight command during shutdown");
+                                    break 'polling;
+                                }
+                            }
                         }
                     }
                 }

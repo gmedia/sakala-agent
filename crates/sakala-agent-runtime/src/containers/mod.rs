@@ -1,10 +1,11 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
+use sakala_agent_core::ports::RuntimeReconciliationReport;
 
 mod docker;
 pub(crate) mod limits;
@@ -30,6 +31,10 @@ pub trait ContainerEngine: Send + Sync {
         requested: RuntimeResourceLimits,
     ) -> Result<AppliedRuntimeResources, RuntimeError>;
 
+    async fn ensure_capacity(&self, project_id: Uuid) -> Result<(), RuntimeError>;
+
+    async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
+
     async fn start(
         &self,
         request: &RunContainerRequest,
@@ -42,6 +47,8 @@ pub trait ContainerEngine: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
+    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>);
+
     async fn cleanup_previous(
         &self,
         project_id: Uuid,
@@ -50,6 +57,8 @@ pub trait ContainerEngine: Send + Sync {
     ) -> Result<(), RuntimeError>;
 
     async fn cleanup_candidate(&self, container: &str, image: &str);
+
+    async fn shutdown(&self);
 }
 
 #[must_use]
