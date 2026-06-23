@@ -4,7 +4,7 @@
 
 GMEDIA menyediakan dukungan awal berupa domain, infrastruktur, ruang eksperimen, dan dukungan teknis. Dukungan ini tidak mengubah prinsip Sakala sebagai project open-source dengan roadmap, dokumentasi, issue, dan kontribusi yang dikembangkan secara terbuka.
 
-Foundation ini sengaja aman dan minimal: executor aktif adalah `NoopRuntimeExecutor`. Belum ada akses Docker, Railpack, Caddy, atau Docker socket.
+Default tetap aman: executor aktif adalah `NoopRuntimeExecutor`. Phase 8 menambahkan executor Docker opt-in untuk deployment repository GitHub publik melalui Dockerfile atau fallback Railpack, lalu mendaftarkan route Caddy. Executor nyata tidak aktif tanpa `SAKALA_RUNTIME_DRIVER=docker`.
 
 ## Posisi Repository
 
@@ -22,8 +22,8 @@ Sakala API membuat command. Agent melakukan polling outbound ke API. Agent tidak
 ```txt
 apps/sakala-agent/              Binary, config, telemetry, shutdown
 crates/sakala-agent-protocol/   Tipe payload control-plane-agent
-crates/sakala-agent-core/       HTTP client, workers, lifecycle, redaction
-crates/sakala-agent-runtime/    Trait executor dan executor noop
+crates/sakala-agent-core/       HTTP client, workers, lifecycle, ports, redaction
+crates/sakala-agent-runtime/    Implementasi noop, inspection, Docker, Railpack, Caddy
 ```
 
 ## Quickstart
@@ -59,12 +59,28 @@ SAKALA_API_URL=http://localhost:8000
 
 Connected mode mengaktifkan `ApiClient`. Token placeholder `change-me` ditolak. Endpoint `sakala-api` harus tersedia sebelum mode ini digunakan.
 
+### Docker Runtime (Opt-in)
+
+```dotenv
+SAKALA_AGENT_MODE=connected
+SAKALA_RUNTIME_DRIVER=docker
+SAKALA_RUNTIME_NETWORK=sakala-runtime
+SAKALA_RUNTIME_WORKSPACE=/var/lib/sakala/builds
+SAKALA_CADDY_SITES_DIR=/absolute/path/to/sakala-infra/caddy/sites
+SAKALA_CADDY_CONTAINER=sakala-caddy
+SAKALA_RAILPACK_FRONTEND=ghcr.io/railwayapp/railpack-frontend:v0.23.0
+```
+
+Host harus menyediakan Git, Docker Buildx, Railpack CLI dengan versi yang sesuai frontend, Caddy dari `sakala-infra`, serta permission runtime yang telah direview. Lihat [Docker runtime](docs/DOCKER_RUNTIME.md) dan [strategi Railpack](docs/RAILPACK_STRATEGY.md).
+
+Create-project preview memakai command `InspectProject`: agent menjalankan scanner ringan dan `railpack info`, kemudian mengembalikan metadata tanpa menjalankan `railpack prepare`, build image, container, atau routing. Deployment baru berjalan setelah command `DeployProject` dibuat.
+
 ## Command Types
 
 Protocol awal mendukung:
 
 ```txt
-DeployProject RestartProject StopProject SleepProject
+InspectProject DeployProject RestartProject StopProject SleepProject
 WakeProject HealthCheck RefreshRoute
 ```
 

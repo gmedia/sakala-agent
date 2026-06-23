@@ -5,6 +5,7 @@
 - Rust stable toolchain dengan `rustfmt` dan `clippy`.
 - Cargo.
 - `cargo-audit` bila menjalankan audit lokal.
+- Git, Docker Buildx, dan Railpack hanya untuk integration test runtime opt-in.
 
 Toolchain komponen dideklarasikan di `rust-toolchain.toml`.
 
@@ -45,3 +46,5 @@ Jika dependency digunakan oleh beberapa crate, pusatkan version requirement di `
 3. Pastikan core tetap mengurus lifecycle/reporting, bukan detail host.
 4. Tambahkan test untuk safety dan failure path.
 5. Perbarui dokumentasi security/runtime/API.
+
+Runtime tests di crate `sakala-agent-runtime` memakai fake `ProcessRunner`; jangan membuat unit test bergantung pada daemon Docker contributor.

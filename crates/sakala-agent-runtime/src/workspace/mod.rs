@@ -1,0 +1,52 @@
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use uuid::Uuid;
+
+use crate::{RuntimeError, RuntimeReporter};
+
+mod git;
+
+pub use git::GitWorkspaceManager;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositorySource {
+    pub repository_url: String,
+    pub commit_sha: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeploymentWorkspace {
+    root: PathBuf,
+    source: PathBuf,
+}
+
+impl DeploymentWorkspace {
+    #[must_use]
+    pub fn new(root: PathBuf) -> Self {
+        let source = root.join("source");
+        Self { root, source }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+}
+
+#[async_trait]
+pub trait WorkspaceManager: Send + Sync {
+    async fn checkout(
+        &self,
+        command_id: Uuid,
+        source: &RepositorySource,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<DeploymentWorkspace, RuntimeError>;
+
+    async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;
+}

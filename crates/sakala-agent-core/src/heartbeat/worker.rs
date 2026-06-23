@@ -45,7 +45,7 @@ fn payload(config: &AgentConfig) -> HeartbeatPayload {
         node: NodeInfo {
             hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
             runtime_network: config.runtime_network.clone(),
-            capabilities: vec!["noop-runtime".to_owned()],
+            capabilities: config.capabilities.clone(),
         },
         metadata: json!({ "version": env!("CARGO_PKG_VERSION") }),
         sent_at: OffsetDateTime::now_utc(),

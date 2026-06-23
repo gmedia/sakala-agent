@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use sakala_agent_protocol::CommandStatus;
-use sakala_agent_runtime::RuntimeExecutor;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
-use crate::{AgentConfig, api::ApiClient, commands::CommandHandler};
+use crate::{AgentConfig, api::ApiClient, commands::CommandProcessor, ports::RuntimeExecutor};
 
 pub async fn run(
     config: AgentConfig,
@@ -15,7 +14,7 @@ pub async fn run(
 ) {
     let handler = client
         .as_ref()
-        .map(|client| CommandHandler::new(client.clone(), runtime));
+        .map(|client| CommandProcessor::new(client.clone(), runtime));
 
     loop {
         if let (Some(client), Some(handler)) = (&client, &handler) {
@@ -31,7 +30,7 @@ pub async fn run(
                             continue;
                         }
 
-                        if let Err(error) = handler.handle(&command).await {
+                        if let Err(error) = handler.process(&command).await {
                             warn!(command_id = %command.id, %error, "command execution failed");
                         }
                     }

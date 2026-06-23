@@ -2,12 +2,21 @@
 
 pub mod commands;
 pub mod deployments;
+pub mod events;
 pub mod heartbeat;
+pub mod inspections;
 pub mod logs;
 pub mod node;
+pub mod status;
 
-pub use commands::{AgentCommand, CommandStatus, CommandType};
-pub use deployments::{DeploymentEvent, DeploymentEventLevel};
+pub use commands::{AgentCommand, CommandType, CompleteCommandPayload};
+pub use deployments::{
+    AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
+    RuntimeResourceLimits,
+};
+pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::HeartbeatPayload;
+pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
-pub use node::{NodeInfo, NodeStatus};
+pub use node::NodeInfo;
+pub use status::{CommandStatus, NodeStatus};

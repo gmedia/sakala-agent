@@ -9,5 +9,5 @@ pub enum CoreError {
     Api(#[from] reqwest::Error),
 
     #[error("runtime execution failed: {0}")]
-    Runtime(#[from] sakala_agent_runtime::RuntimeError),
+    Runtime(#[from] crate::ports::RuntimeExecutionError),
 }

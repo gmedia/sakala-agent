@@ -1,9 +1,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sakala_agent_core::{api::ApiClient, commands::CommandHandler};
+use sakala_agent_core::{
+    api::ApiClient,
+    commands::CommandProcessor,
+    ports::{
+        CommandOutput, DeployProjectRequest, RuntimeExecutionError, RuntimeExecutor,
+        RuntimeReporter,
+    },
+};
 use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
-use sakala_agent_runtime::{ExecutionOutcome, NoopRuntimeExecutor, RuntimeError, RuntimeExecutor};
+use sakala_agent_runtime::NoopRuntimeExecutor;
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -29,8 +36,8 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     assert_eq!(commands[0].status, CommandStatus::Pending);
 
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
-    CommandHandler::new(client, runtime)
-        .handle(&commands[0])
+    CommandProcessor::new(client, runtime)
+        .process(&commands[0])
         .await
         .expect("noop command lifecycle should complete");
 }
@@ -47,7 +54,7 @@ async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
         .and(header("x-agent-id", "runtime-01"))
         .and(body_json(json!({
             "error_code": "runtime_execution_failed",
-            "error_message": "runtime executor failed: simulated runtime failure"
+            "error_message": "simulated runtime failure"
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -60,8 +67,8 @@ async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
         .expect("test client should be valid");
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(FailingRuntimeExecutor);
 
-    let error = CommandHandler::new(client, runtime)
-        .handle(&command)
+    let error = CommandProcessor::new(client, runtime)
+        .process(&command)
         .await
         .expect_err("runtime failure should propagate after being reported");
 
@@ -109,7 +116,7 @@ async fn mount_lifecycle_mocks(server: &MockServer) {
         )))
         .and(header("authorization", "Bearer test-agent-token"))
         .and(header("x-agent-id", "runtime-01"))
-        .and(body_json(json!({})))
+        .and(body_json(json!({ "result": null })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(server)
@@ -152,8 +159,12 @@ fn command_fixture() -> serde_json::Value {
         "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
         "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
         "payload": {
-            "repository_url": "https://example.invalid/student/demo-app.git",
-            "runtime_network": "sakala-runtime"
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.run.sakala.localhost",
+            "container_port": 3000,
+            "builder": "auto",
+            "environment": {}
         }
     })
 }
@@ -162,9 +173,14 @@ struct FailingRuntimeExecutor;
 
 #[async_trait]
 impl RuntimeExecutor for FailingRuntimeExecutor {
-    async fn execute(&self, _command: &AgentCommand) -> Result<ExecutionOutcome, RuntimeError> {
-        Err(RuntimeError::Execution(
-            "simulated runtime failure".to_owned(),
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        _reporter: &dyn RuntimeReporter,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::new(
+            "runtime_execution_failed",
+            "simulated runtime failure",
         ))
     }
 }

@@ -1,6 +1,7 @@
 use sakala_agent_core::commands::lifecycle::can_transition;
 use sakala_agent_protocol::{
-    CommandStatus, CommandType, DeploymentEvent, DeploymentLog, HeartbeatPayload,
+    CommandStatus, CommandType, DeployProjectPayload, DeploymentBuilder, DeploymentEvent,
+    DeploymentLog, HeartbeatPayload, InspectProjectPayload,
 };
 use serde_json::json;
 
@@ -11,6 +12,40 @@ fn command_types_use_control_plane_json_names() {
 
     assert_eq!(json, "\"DeployProject\"");
     assert_eq!(restored, CommandType::RefreshRoute);
+
+    let inspect = serde_json::to_string(&CommandType::InspectProject)
+        .expect("inspection type should serialize");
+    assert_eq!(inspect, "\"InspectProject\"");
+}
+
+#[test]
+fn inspect_payload_is_separate_from_deployment_configuration() {
+    let payload: InspectProjectPayload = serde_json::from_value(json!({
+        "repository_url": "https://github.com/gmedia/example-app.git",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567"
+    }))
+    .expect("inspect payload should deserialize");
+
+    assert_eq!(
+        payload.repository_url,
+        "https://github.com/gmedia/example-app.git"
+    );
+    assert_eq!(payload.commit_sha.len(), 40);
+}
+
+#[test]
+fn deploy_payload_defaults_to_auto_builder_and_port_3000() {
+    let payload: DeployProjectPayload = serde_json::from_value(json!({
+        "repository_url": "https://github.com/gmedia/example-app.git",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "domain": "demo.run.sakala.localhost"
+    }))
+    .expect("deploy payload should deserialize");
+
+    assert_eq!(payload.builder, DeploymentBuilder::Auto);
+    assert_eq!(payload.container_port, 3000);
+    assert!(payload.environment.is_empty());
+    assert_eq!(payload.resources.memory_mb, None);
 }
 
 #[test]
