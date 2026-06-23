@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use sakala_agent_protocol::CommandStatus;
 use sakala_agent_runtime::RuntimeExecutor;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
@@ -21,6 +22,15 @@ pub async fn run(
             match client.poll_commands().await {
                 Ok(commands) => {
                     for command in commands {
+                        if command.status != CommandStatus::Pending {
+                            warn!(
+                                command_id = %command.id,
+                                status = ?command.status,
+                                "skipping command that is not pending"
+                            );
+                            continue;
+                        }
+
                         if let Err(error) = handler.handle(&command).await {
                             warn!(command_id = %command.id, %error, "command execution failed");
                         }

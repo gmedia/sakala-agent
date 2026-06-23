@@ -1,6 +1,8 @@
-use reqwest::{Client, Method, RequestBuilder};
+use std::time::Duration;
+
+use reqwest::{Client, Method, RequestBuilder, Url, header::ACCEPT};
 use sakala_agent_protocol::{AgentCommand, DeploymentEvent, DeploymentLog, HeartbeatPayload};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -9,7 +11,7 @@ use crate::{AgentConfig, CoreError};
 use super::endpoints;
 
 /// Authenticated outbound client for the Sakala control-plane agent API.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ApiClient {
     http: Client,
     base_url: String,
@@ -23,10 +25,43 @@ impl ApiClient {
             CoreError::InvalidConfiguration("connected mode requires SAKALA_AGENT_TOKEN".to_owned())
         })?;
 
+        Self::new(&config.api_url, &config.agent_id, token)
+    }
+
+    pub fn new(
+        base_url: impl AsRef<str>,
+        agent_id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, CoreError> {
+        let base_url = base_url.as_ref().trim_end_matches('/').to_owned();
+        let parsed_url = Url::parse(&base_url).map_err(|error| {
+            CoreError::InvalidConfiguration(format!("SAKALA_API_URL is invalid: {error}"))
+        })?;
+
+        if !matches!(parsed_url.scheme(), "http" | "https") {
+            return Err(CoreError::InvalidConfiguration(
+                "SAKALA_API_URL must use http or https".to_owned(),
+            ));
+        }
+
+        let agent_id = agent_id.into();
+        let token = token.into();
+
+        if agent_id.trim().is_empty() || token.trim().is_empty() {
+            return Err(CoreError::InvalidConfiguration(
+                "agent id and token must not be empty".to_owned(),
+            ));
+        }
+
+        let http = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(concat!("sakala-agent/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
         Ok(Self {
-            http: Client::new(),
-            base_url: config.api_url.trim_end_matches('/').to_owned(),
-            agent_id: config.agent_id.clone(),
+            http,
+            base_url,
+            agent_id,
             token,
         })
     }
@@ -38,7 +73,9 @@ impl ApiClient {
             .await?
             .error_for_status()?;
 
-        Ok(response.json().await?)
+        let envelope = response.json::<ApiEnvelope<Vec<AgentCommand>>>().await?;
+
+        Ok(envelope.data)
     }
 
     pub async fn heartbeat(&self, payload: &HeartbeatPayload) -> Result<(), CoreError> {
@@ -75,7 +112,10 @@ impl ApiClient {
     pub async fn fail(&self, command_id: Uuid, error: &str) -> Result<(), CoreError> {
         self.post(
             &endpoints::command_action(command_id, "fail"),
-            &json!({ "error": error }),
+            &FailCommandPayload {
+                error_code: "runtime_execution_failed",
+                error_message: error,
+            },
         )
         .await
     }
@@ -85,6 +125,7 @@ impl ApiClient {
             .request(method, format!("{}{endpoint}", self.base_url))
             .bearer_auth(&self.token)
             .header("X-Agent-Id", &self.agent_id)
+            .header(ACCEPT, "application/json")
     }
 
     async fn post<T: Serialize + ?Sized>(
@@ -100,4 +141,15 @@ impl ApiClient {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiEnvelope<T> {
+    data: T,
+}
+
+#[derive(Debug, Serialize)]
+struct FailCommandPayload<'a> {
+    error_code: &'static str,
+    error_message: &'a str,
 }

@@ -24,7 +24,7 @@ impl CommandHandler {
             .event(
                 command.id,
                 &DeploymentEvent {
-                    command_id: command.id,
+                    event_type: "command.claimed".to_owned(),
                     level: DeploymentEventLevel::Info,
                     message: "Agent claimed command.".to_owned(),
                     metadata: json!({}),
@@ -38,7 +38,7 @@ impl CommandHandler {
                 for event in outcome.events {
                     self.client.event(command.id, &event).await?;
                 }
-                report_logs(&self.client, outcome.logs).await?;
+                report_logs(&self.client, command.id, outcome.logs).await?;
                 self.client.complete(command.id).await
             }
             Err(error) => {

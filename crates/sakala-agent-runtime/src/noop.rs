@@ -25,16 +25,15 @@ impl RuntimeExecutor for NoopRuntimeExecutor {
 
         Ok(ExecutionOutcome {
             events: vec![DeploymentEvent {
-                command_id: command.id,
+                event_type: "runtime.noop.completed".to_owned(),
                 level: DeploymentEventLevel::Info,
                 message: "Noop runtime completed command without host changes.".to_owned(),
                 metadata: json!({ "executor": "noop" }),
                 occurred_at: now,
             }],
             logs: vec![DeploymentLog {
-                command_id: command.id,
                 stream: LogStream::System,
-                line: "Foundation mode: no Docker, Caddy, or Railpack operation executed."
+                message: "Foundation mode: no Docker, Caddy, or Railpack operation executed."
                     .to_owned(),
                 recorded_at: now,
             }],

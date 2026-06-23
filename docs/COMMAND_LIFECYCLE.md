@@ -11,7 +11,7 @@ Pending -> Cancelled
 Pending -> Expired
 ```
 
-Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Endpoint agent belum diimplementasikan di `sakala-api` pada tahap ini.
+Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Connected agent hanya memproses command berstatus `Pending`; status lain yang tidak sengaja dikembalikan API dilewati dan dicatat sebagai warning. Endpoint agent belum diimplementasikan di `sakala-api` pada tahap ini.
 
 ## Flow Connected Mode
 
@@ -23,6 +23,8 @@ Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan he
 5. Agent mengirim events/logs yang sudah direduksi dari secret.
 6. Agent menandai complete atau fail.
 ```
+
+Polling response memakai envelope `{ "data": [...] }`. Request lifecycle selalu membawa bearer token dan `X-Agent-Id`. Event/log memakai command UUID dari URL, sedangkan sequence dan relasi persistence dimiliki `sakala-api`.
 
 ## Foundation Executor
 

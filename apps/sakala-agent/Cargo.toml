@@ -32,7 +32,16 @@ path = "../../tests/command_lifecycle_test.rs"
 name = "log_redaction_test"
 path = "../../tests/log_redaction_test.rs"
 
+[[test]]
+name = "connected_heartbeat_test"
+path = "../../tests/connected_heartbeat_test.rs"
+
+[[test]]
+name = "connected_command_lifecycle_test"
+path = "../../tests/connected_command_lifecycle_test.rs"
+
 [dev-dependencies]
+async-trait.workspace = true
 sakala-agent-core.workspace = true
 sakala-agent-protocol.workspace = true
 serde_json.workspace = true
