@@ -1,4 +1,7 @@
-pub mod handler;
+mod dispatcher;
+mod handlers;
 pub mod lifecycle;
+mod processor;
 
-pub use handler::CommandHandler;
+pub use dispatcher::CommandDispatcher;
+pub use processor::CommandProcessor;

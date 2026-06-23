@@ -6,6 +6,8 @@ pub mod config;
 pub mod error;
 pub mod heartbeat;
 pub mod logs;
+pub mod ports;
+mod reporting;
 pub mod scheduler;
 pub mod support;
 

@@ -1,24 +1,54 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use time::OffsetDateTime;
+use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DeploymentEventLevel {
-    Info,
-    Warning,
-    Error,
+pub enum DeploymentBuilder {
+    #[default]
+    Auto,
+    Dockerfile,
+    Railpack,
 }
 
-/// Lifecycle event reported while a command is executing.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct DeploymentEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub level: DeploymentEventLevel,
-    pub message: String,
+/// Product-level resource request resolved by the control plane.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeResourceLimits {
+    pub memory_mb: Option<u64>,
+    pub cpu_millis: Option<u32>,
+    pub pids_limit: Option<u32>,
+}
+
+/// Concrete resource limits enforced by the runtime node.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppliedRuntimeResources {
+    pub memory_mb: u64,
+    pub cpu_millis: u32,
+    pub pids_limit: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeployProjectResult {
+    pub requested_resources: RuntimeResourceLimits,
+    pub applied_resources: AppliedRuntimeResources,
+}
+
+/// Immutable input required to deploy one HTTP application.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeployProjectPayload {
+    pub repository_url: String,
+    pub commit_sha: String,
+    pub domain: String,
+    #[serde(default = "default_container_port")]
+    pub container_port: u16,
     #[serde(default)]
-    pub metadata: Value,
-    #[serde(with = "time::serde::rfc3339")]
-    pub occurred_at: OffsetDateTime,
+    pub builder: DeploymentBuilder,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default)]
+    pub resources: RuntimeResourceLimits,
+}
+
+const fn default_container_port() -> u16 {
+    3000
 }

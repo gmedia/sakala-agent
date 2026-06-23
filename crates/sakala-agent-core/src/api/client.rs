@@ -1,7 +1,9 @@
 use std::time::Duration;
 
 use reqwest::{Client, Method, RequestBuilder, Url, header::ACCEPT};
-use sakala_agent_protocol::{AgentCommand, DeploymentEvent, DeploymentLog, HeartbeatPayload};
+use sakala_agent_protocol::{
+    AgentCommand, CompleteCommandPayload, DeploymentEvent, DeploymentLog, HeartbeatPayload,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
@@ -101,20 +103,26 @@ impl ApiClient {
             .await
     }
 
-    pub async fn complete(&self, command_id: Uuid) -> Result<(), CoreError> {
-        self.post(
-            &endpoints::command_action(command_id, "complete"),
-            &json!({}),
-        )
-        .await
+    pub async fn complete(
+        &self,
+        command_id: Uuid,
+        payload: &CompleteCommandPayload,
+    ) -> Result<(), CoreError> {
+        self.post(&endpoints::command_action(command_id, "complete"), payload)
+            .await
     }
 
-    pub async fn fail(&self, command_id: Uuid, error: &str) -> Result<(), CoreError> {
+    pub async fn fail(
+        &self,
+        command_id: Uuid,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<(), CoreError> {
         self.post(
             &endpoints::command_action(command_id, "fail"),
             &FailCommandPayload {
-                error_code: "runtime_execution_failed",
-                error_message: error,
+                error_code,
+                error_message,
             },
         )
         .await
@@ -150,6 +158,6 @@ struct ApiEnvelope<T> {
 
 #[derive(Debug, Serialize)]
 struct FailCommandPayload<'a> {
-    error_code: &'static str,
+    error_code: &'a str,
     error_message: &'a str,
 }

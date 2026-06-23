@@ -1,6 +1,6 @@
 # Security Policy
 
-Sakala Agent nantinya menjalankan operasi privileged pada runtime node. Foundation saat ini tidak mengakses runtime host, tetapi boundary keamanan berikut wajib dipertahankan.
+Sakala Agent dapat menjalankan operasi privileged pada runtime node ketika executor Docker diaktifkan eksplisit. Default tetap noop.
 
 ## Reporting Vulnerabilities
 
@@ -12,8 +12,9 @@ Pada fase MVP, GMEDIA dapat membantu triage keamanan sebagai founding sponsor da
 
 - `sakala-api` dan `sakala-console` tidak boleh mengakses Docker socket.
 - Caddy atau aplikasi user tidak boleh menerima Docker socket.
-- Foundation agent tidak memakai Docker client crate atau Docker socket.
-- Akses Docker agent di masa depan harus dibatasi, terdokumentasi, dan direview sebagai perubahan berisiko tinggi.
+- Agent mengakses daemon hanya melalui Docker CLI pada runtime node khusus.
+- Aplikasi user, Caddy, API, dan console tidak menerima Docker socket.
+- Runtime access harus dianggap setara host privilege dan tidak cocok untuk workload tidak tepercaya tanpa hardening lanjutan.
 
 ## Agent Tokens
 
@@ -34,8 +35,8 @@ Redaksi dasar ini bukan jaminan semua format secret tertutup. Runtime implementa
 
 ## Command Safety
 
-Command berasal dari control plane dan tetap harus divalidasi agent sebelum operasi host. Implementasi runtime mendatang wajib mempertimbangkan idempotensi, route ownership, resource boundaries, path traversal, command injection, dan isolasi workload.
+Command berasal dari control plane dan tetap divalidasi agent. Executor membatasi repository host, mewajibkan immutable SHA, memvalidasi hostname/env key, memakai structured process arguments, ownership labels, atomic route write, dan resource limits awal. API menentukan policy resource; agent menolak nilai nol atau request di atas hard maximum node dan melaporkan requested/applied limits.
 
 ## Scope Saat Ini
 
-Foundation ini belum menyediakan production hardening, mTLS, token rotation, container isolation, Caddy reload, image verification, atau sandbox runtime.
+MVP belum menyediakan production-grade sandbox, mTLS, token rotation, image signature verification, build timeout, egress policy, rootless daemon, atau isolation per tenant.

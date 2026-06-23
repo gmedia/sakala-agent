@@ -1327,9 +1327,9 @@ name = "sakala-agent-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "reqwest",
  "sakala-agent-protocol",
- "sakala-agent-runtime",
  "serde",
  "serde_json",
  "thiserror",
@@ -1354,11 +1354,17 @@ name = "sakala-agent-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "sakala-agent-core",
  "sakala-agent-protocol",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "time",
+ "tokio",
  "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]

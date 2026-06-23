@@ -1,26 +1,15 @@
-# Caddy Integration Direction
+# Caddy Integration
 
-`sakala-infra` saat ini menyediakan Caddy lokal dan pola domain:
-
-```txt
-*.run.sakala.localhost
-```
-
-Arah production:
+Agent menulis satu file `<project-id>.Caddyfile` pada `SAKALA_CADDY_SITES_DIR`. Domain hanya diterima bila cocok dengan `*.run.sakala.localhost` atau `*.run.sakala.dev`; upstream selalu candidate container terkelola dan port tervalidasi.
 
 ```txt
-*.run.sakala.dev
+write temporary file
+-> atomic rename
+-> docker exec caddy validate
+-> docker exec caddy reload
+-> restore route lama bila reload gagal
 ```
 
-## Peran Agent Mendatang
+Contract `sakala-infra` memasang folder route read-only ke `/etc/caddy/sites`, mengimport `*.Caddyfile`, dan membatasi Admin API ke loopback container. Port admin tidak dipublish. Docker socket tidak pernah diberikan ke Caddy.
 
-Agent nantinya dapat mengatur route aplikasi setelah container siap, lalu melaporkan event route ke `sakala-api`. Mekanisme penulisan config, validasi, reload, rollback, dan concurrency belum ditetapkan.
-
-## Boundary Keamanan
-
-- Jangan memberi Caddy akses Docker socket untuk discovery otomatis.
-- Jangan mengaktifkan route sebelum upstream tervalidasi.
-- Jangan membuat asumsi TLS production dari config lokal.
-- Route harus terkait dengan command/project yang sah dari control plane.
-
-`crates/sakala-agent-runtime/src/caddy.rs` tetap skeleton sampai desain tersebut siap.
+TLS production, concurrent per-project lease, dan distributed route storage belum termasuk MVP.

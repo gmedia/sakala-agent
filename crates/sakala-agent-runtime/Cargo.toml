@@ -10,11 +10,19 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+sakala-agent-core = { version = "0.1.0", path = "../sakala-agent-core" }
 sakala-agent-protocol.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+url = "2.5.8"
+uuid.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -41,7 +41,7 @@ pub struct AgentConfig {
     pub poll_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
     pub runtime_network: String,
-    pub log_level: String,
+    pub capabilities: Vec<String>,
 }
 
 impl AgentConfig {
@@ -80,7 +80,7 @@ impl AgentConfig {
                 10,
             )?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
-            log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
+            capabilities: vec!["noop-runtime".to_owned()],
         })
     }
 
