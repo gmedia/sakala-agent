@@ -11,7 +11,6 @@ pub enum NodeStatus {
 /// Runtime-node details sent with agent heartbeat messages.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct NodeInfo {
-    pub agent_id: String,
     pub hostname: String,
     pub runtime_network: String,
     pub capabilities: Vec<String>,

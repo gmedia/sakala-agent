@@ -1,4 +1,5 @@
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus};
+use serde_json::json;
 use time::OffsetDateTime;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
@@ -42,11 +43,11 @@ fn payload(config: &AgentConfig) -> HeartbeatPayload {
     HeartbeatPayload {
         status: NodeStatus::Ready,
         node: NodeInfo {
-            agent_id: config.agent_id.clone(),
             hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
             runtime_network: config.runtime_network.clone(),
             capabilities: vec!["noop-runtime".to_owned()],
         },
+        metadata: json!({ "version": env!("CARGO_PKG_VERSION") }),
         sent_at: OffsetDateTime::now_utc(),
     }
 }
