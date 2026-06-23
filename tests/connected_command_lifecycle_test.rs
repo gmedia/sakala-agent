@@ -12,6 +12,7 @@ use sakala_agent_core::{
 use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
 use sakala_agent_runtime::NoopRuntimeExecutor;
 use serde_json::json;
+use tokio::time::sleep;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, body_partial_json, header, method, path},
@@ -36,7 +37,7 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     assert_eq!(commands[0].status, CommandStatus::Pending);
 
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
-    CommandProcessor::new(client, runtime)
+    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(30))
         .process(&commands[0])
         .await
         .expect("noop command lifecycle should complete");
@@ -67,12 +68,45 @@ async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
         .expect("test client should be valid");
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(FailingRuntimeExecutor);
 
-    let error = CommandProcessor::new(client, runtime)
+    let error = CommandProcessor::new(client, runtime, std::time::Duration::from_secs(30))
         .process(&command)
         .await
         .expect_err("runtime failure should propagate after being reported");
 
     assert!(error.to_string().contains("simulated runtime failure"));
+}
+
+#[tokio::test]
+async fn connected_agent_reports_command_timeout_with_stable_failure_status() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/fail")))
+        .and(body_json(json!({
+            "error_code": "runtime_timeout",
+            "error_message": "command execution exceeded its 1s timeout"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let command: AgentCommand = serde_json::from_value(command_fixture()).expect("valid command");
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+
+    let error = CommandProcessor::new(
+        client,
+        Arc::new(SlowRuntimeExecutor),
+        std::time::Duration::from_secs(1),
+    )
+    .process(&command)
+    .await
+    .expect_err("slow runtime must time out");
+
+    assert!(error.to_string().contains("exceeded its 1s timeout"));
 }
 
 async fn mount_lifecycle_mocks(server: &MockServer) {
@@ -171,12 +205,26 @@ fn command_fixture() -> serde_json::Value {
 
 struct FailingRuntimeExecutor;
 
+struct SlowRuntimeExecutor;
+
+#[async_trait]
+impl RuntimeExecutor for SlowRuntimeExecutor {
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        sleep(std::time::Duration::from_secs(60)).await;
+        Ok(CommandOutput::empty())
+    }
+}
+
 #[async_trait]
 impl RuntimeExecutor for FailingRuntimeExecutor {
     async fn deploy_project(
         &self,
         _request: DeployProjectRequest,
-        _reporter: &dyn RuntimeReporter,
+        _reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         Err(RuntimeExecutionError::new(
             "runtime_execution_failed",

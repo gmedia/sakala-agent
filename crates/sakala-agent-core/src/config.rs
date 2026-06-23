@@ -40,6 +40,7 @@ pub struct AgentConfig {
     pub api_url: String,
     pub poll_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
+    pub command_timeout_seconds: u64,
     pub runtime_network: String,
     pub capabilities: Vec<String>,
 }
@@ -79,6 +80,11 @@ impl AgentConfig {
                 "SAKALA_HEARTBEAT_INTERVAL_SECONDS",
                 10,
             )?,
+            command_timeout_seconds: positive_number(
+                values,
+                "SAKALA_COMMAND_TIMEOUT_SECONDS",
+                900,
+            )?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
             capabilities: vec!["noop-runtime".to_owned()],
         })
@@ -92,6 +98,11 @@ impl AgentConfig {
     #[must_use]
     pub fn heartbeat_interval(&self) -> Duration {
         Duration::from_secs(self.heartbeat_interval_seconds)
+    }
+
+    #[must_use]
+    pub fn command_timeout(&self) -> Duration {
+        Duration::from_secs(self.command_timeout_seconds)
     }
 }
 

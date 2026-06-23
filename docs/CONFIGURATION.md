@@ -10,12 +10,15 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_API_URL` | `http://localhost:8000` | Base URL `sakala-api` control plane. |
 | `SAKALA_POLL_INTERVAL_SECONDS` | `3` | Interval polling command, harus lebih besar dari nol. |
 | `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. |
+| `SAKALA_COMMAND_TIMEOUT_SECONDS` | `900` | Deadline seluruh lifecycle eksekusi command setelah claim. |
 | `SAKALA_RUNTIME_NETWORK` | `sakala-runtime` | Nama network referensi dari `sakala-infra`. |
 | `SAKALA_RUNTIME_DRIVER` | `noop` | `noop` atau executor opt-in `docker`. |
 | `SAKALA_RUNTIME_WORKSPACE` | `/var/lib/sakala/builds` | Root workspace checkout/build sementara. |
 | `SAKALA_CADDY_SITES_DIR` | `/var/lib/sakala/caddy/sites` | Folder route host yang dimount ke Caddy. |
 | `SAKALA_CADDY_CONTAINER` | `sakala-caddy` | Container Caddy yang divalidasi dan direload. |
 | `SAKALA_RAILPACK_FRONTEND` | `ghcr.io/railwayapp/railpack-frontend:v0.23.0` | BuildKit frontend; pin sesuai Railpack CLI. |
+| `SAKALA_BUILD_TIMEOUT_SECONDS` | `600` | Deadline build image; harus lebih pendek dari command timeout. |
+| `SAKALA_MAX_ACTIVE_CONTAINERS` | `20` | Guard kapasitas workload aktif pada node, bukan kuota plan/user. Redeploy project aktif tetap memperoleh replacement slot. |
 | `SAKALA_DEFAULT_CONTAINER_MEMORY_MB` | `256` | Fallback memory bila command tidak menentukan nilai. |
 | `SAKALA_MAX_CONTAINER_MEMORY_MB` | `512` | Hard ceiling memory yang diizinkan node. |
 | `SAKALA_DEFAULT_CONTAINER_CPU_MILLIS` | `500` | Fallback CPU; `500` berarti `0.5` vCPU. |
@@ -50,5 +53,9 @@ Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang tela
 ## Resource Policy Boundary
 
 `sakala-api` menentukan policy resource berdasarkan project, workspace, atau plan lalu mengirim `resources` pada command deployment. Agent tidak memiliki logic plan. Konfigurasi `DEFAULT` hanya dipakai ketika field command kosong, sedangkan konfigurasi `MAX` melindungi kapasitas node. Request nol atau melebihi maximum ditolak secara eksplisit dan tidak di-clamp diam-diam.
+
+Kuota jumlah project per user/workspace dan jumlah deployment yang diizinkan plan tetap milik `sakala-api`. `SAKALA_MAX_ACTIVE_CONTAINERS` hanya mencegah runtime node menerima workload baru setelah kapasitas lokal tercapai. Nilai ini tidak boleh dipakai untuk menyimpulkan entitlement user.
+
+Perubahan memory/CPU/PID dilakukan dengan command redeploy yang membawa resource profile baru. Agent membuat candidate container baru, memverifikasinya, mengalihkan route, lalu membersihkan container sebelumnya. Phase 9 sengaja tidak memakai `docker update` agar requested state, applied state, image, dan deployment history tetap konsisten.
 
 `SAKALA_RUNTIME_NETWORK` tetap konfigurasi node karena merupakan detail topologi host, bukan product-level resource policy.

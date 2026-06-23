@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -19,6 +20,8 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
+    pub timeout: Option<Duration>,
+    pub timeout_disabled: bool,
 }
 
 impl CommandSpec {
@@ -28,6 +31,8 @@ impl CommandSpec {
             args: Vec::new(),
             current_dir: None,
             environment: BTreeMap::new(),
+            timeout: None,
+            timeout_disabled: false,
         }
     }
 
@@ -38,6 +43,18 @@ impl CommandSpec {
 
     pub fn current_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.current_dir = Some(path.as_ref().to_owned());
+        self
+    }
+
+    #[must_use]
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    #[must_use]
+    pub fn without_timeout(mut self) -> Self {
+        self.timeout_disabled = true;
         self
     }
 }
@@ -80,8 +97,23 @@ pub trait ProcessRunner: Send + Sync {
     ) -> Result<ProcessOutput, RuntimeError>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TokioProcessRunner;
+#[derive(Clone, Copy, Debug)]
+pub struct TokioProcessRunner {
+    default_timeout: Duration,
+}
+
+impl TokioProcessRunner {
+    #[must_use]
+    pub fn new(default_timeout: Duration) -> Self {
+        Self { default_timeout }
+    }
+}
+
+impl Default for TokioProcessRunner {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(120))
+    }
+}
 
 #[async_trait]
 impl ProcessRunner for TokioProcessRunner {
@@ -103,9 +135,13 @@ impl ProcessRunner for TokioProcessRunner {
             command.current_dir(current_dir);
         }
 
+        #[cfg(unix)]
+        command.process_group(0);
+
         let mut child = command.spawn().map_err(|error| {
             RuntimeError::Dependency(format!("could not start {}: {error}", spec.program))
         })?;
+        let mut process_group = ProcessGroupGuard::new(child.id());
         let stdout = child.stdout.take().ok_or_else(|| {
             RuntimeError::Dependency(format!("could not capture {} stdout", spec.program))
         })?;
@@ -118,9 +154,27 @@ impl ProcessRunner for TokioProcessRunner {
         let mut stderr_done = false;
         let mut captured_stdout = String::new();
         let mut captured_stderr = String::new();
+        let timeout =
+            (!spec.timeout_disabled).then(|| spec.timeout.unwrap_or(self.default_timeout));
+        let deadline = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep(timeout).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(deadline);
 
         while !stdout_done || !stderr_done {
             tokio::select! {
+                () = &mut deadline => {
+                    process_group.kill();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(RuntimeError::Timeout {
+                        operation: spec.program.clone(),
+                        seconds: timeout.map_or(0, |timeout| timeout.as_secs()),
+                    });
+                }
                 line = stdout.next_line(), if !stdout_done => {
                     match line.map_err(RuntimeError::Filesystem)? {
                         Some(line) => {
@@ -142,9 +196,21 @@ impl ProcessRunner for TokioProcessRunner {
             }
         }
 
-        let status = child.wait().await.map_err(|error| {
-            RuntimeError::Dependency(format!("could not wait for {}: {error}", spec.program))
-        })?;
+        let status = tokio::select! {
+            () = &mut deadline => {
+                process_group.kill();
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(RuntimeError::Timeout {
+                    operation: spec.program.clone(),
+                    seconds: timeout.map_or(0, |timeout| timeout.as_secs()),
+                });
+            }
+            status = child.wait() => status.map_err(|error| {
+                RuntimeError::Dependency(format!("could not wait for {}: {error}", spec.program))
+            })?,
+        };
+        process_group.disarm();
 
         Ok(ProcessOutput {
             success: status.success(),
@@ -152,6 +218,42 @@ impl ProcessRunner for TokioProcessRunner {
             stdout: captured_stdout,
             stderr: captured_stderr,
         })
+    }
+}
+
+struct ProcessGroupGuard {
+    pid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pid }
+    }
+
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take().and_then(|pid| i32::try_from(pid).ok()) {
+            // The child is its own process-group leader, so this also terminates descendants.
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+
+        #[cfg(not(unix))]
+        {
+            self.pid = None;
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 

@@ -17,3 +17,13 @@ fn non_sensitive_output_is_preserved() {
 
     assert_eq!(redact_line(line), line);
 }
+
+#[test]
+fn structured_and_bearer_secrets_are_redacted_case_insensitively() {
+    let line = r#"authorization: Bearer abc123 {"access_token":"secret-value"} Api_Key='key-value' ghp_example"#;
+
+    assert_eq!(
+        redact_line(line),
+        r#"authorization: [REDACTED] {"access_token":"[REDACTED]"} Api_Key='[REDACTED]' [REDACTED]"#
+    );
+}

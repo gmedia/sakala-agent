@@ -2,5 +2,5 @@ mod runtime;
 
 pub use runtime::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
-    RuntimeExecutor, RuntimeReporter,
+    RuntimeExecutor, RuntimeOrphan, RuntimeReconciliationReport, RuntimeReporter,
 };

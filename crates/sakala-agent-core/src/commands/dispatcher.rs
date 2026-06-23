@@ -20,7 +20,7 @@ impl CommandDispatcher {
     pub async fn dispatch(
         &self,
         command: &AgentCommand,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         match command.command_type {
             CommandType::InspectProject => {

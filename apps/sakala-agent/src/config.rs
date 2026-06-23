@@ -63,6 +63,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_HEARTBEAT_INTERVAL_SECONDS")]
     heartbeat_interval_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_COMMAND_TIMEOUT_SECONDS")]
+    command_timeout_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_RUNTIME_NETWORK")]
     runtime_network: Option<String>,
 
@@ -80,6 +83,12 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_RAILPACK_FRONTEND")]
     railpack_frontend: Option<String>,
+
+    #[arg(long, env = "SAKALA_BUILD_TIMEOUT_SECONDS")]
+    build_timeout_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_MAX_ACTIVE_CONTAINERS")]
+    max_active_containers: Option<String>,
 
     #[arg(long, env = "SAKALA_DEFAULT_CONTAINER_MEMORY_MB")]
     default_container_memory_mb: Option<String>,
@@ -121,6 +130,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_HEARTBEAT_INTERVAL_SECONDS",
         cli.heartbeat_interval_seconds,
     );
+    insert(
+        &mut values,
+        "SAKALA_COMMAND_TIMEOUT_SECONDS",
+        cli.command_timeout_seconds,
+    );
     insert(&mut values, "SAKALA_RUNTIME_NETWORK", cli.runtime_network);
     insert(&mut values, "SAKALA_RUNTIME_DRIVER", cli.runtime_driver);
     insert(
@@ -134,6 +148,16 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_RAILPACK_FRONTEND",
         cli.railpack_frontend,
+    );
+    insert(
+        &mut values,
+        "SAKALA_BUILD_TIMEOUT_SECONDS",
+        cli.build_timeout_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_MAX_ACTIVE_CONTAINERS",
+        cli.max_active_containers,
     );
     insert(
         &mut values,
@@ -175,6 +199,13 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     let mut agent = AgentConfig::from_values(values)?;
     agent.capabilities = capabilities(runtime_driver);
     let resource_safety = resource_safety(values)?;
+    let build_timeout_seconds = positive_u64(values, "SAKALA_BUILD_TIMEOUT_SECONDS", 600)?;
+    if build_timeout_seconds >= agent.command_timeout_seconds {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "SAKALA_BUILD_TIMEOUT_SECONDS ({build_timeout_seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({})",
+            agent.command_timeout_seconds
+        )));
+    }
 
     Ok(AppConfig {
         docker_runtime: DockerRuntimeConfig {
@@ -194,6 +225,9 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 "ghcr.io/railwayapp/railpack-frontend:v0.23.0",
             ),
             resource_safety,
+            build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
+            command_timeout: agent.command_timeout(),
+            max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             ..DockerRuntimeConfig::default()
         },
         agent,
@@ -360,5 +394,19 @@ mod tests {
 
         let error = from_values(&values).expect_err("invalid safety config should fail");
         assert!(error.to_string().contains("cannot exceed node maximum"));
+    }
+
+    #[test]
+    fn rejects_build_timeout_that_cannot_leave_time_for_cleanup() {
+        let values = HashMap::from([
+            ("SAKALA_BUILD_TIMEOUT_SECONDS".to_owned(), "900".to_owned()),
+            (
+                "SAKALA_COMMAND_TIMEOUT_SECONDS".to_owned(),
+                "900".to_owned(),
+            ),
+        ]);
+
+        let error = from_values(&values).expect_err("build deadline must precede command deadline");
+        assert!(error.to_string().contains("must be shorter"));
     }
 }

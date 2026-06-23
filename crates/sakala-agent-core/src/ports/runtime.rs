@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     DeployProjectPayload, DeploymentEvent, DeploymentLog, InspectProjectPayload,
@@ -23,6 +25,19 @@ pub struct DeployProjectRequest {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CommandOutput {
     pub result: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeOrphan {
+    pub container_id: String,
+    pub project_id: Option<Uuid>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeReconciliationReport {
+    pub inspected_containers: usize,
+    pub orphans: Vec<RuntimeOrphan>,
 }
 
 impl CommandOutput {
@@ -82,10 +97,18 @@ pub trait RuntimeReporter: Send + Sync {
 
 #[async_trait]
 pub trait RuntimeExecutor: Send + Sync {
+    async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
+        Ok(RuntimeReconciliationReport::default())
+    }
+
+    async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {
+        Ok(())
+    }
+
     async fn inspect_project(
         &self,
         _request: InspectProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         let _ = reporter;
         Err(RuntimeExecutionError::unsupported_command(
@@ -96,7 +119,7 @@ pub trait RuntimeExecutor: Send + Sync {
     async fn deploy_project(
         &self,
         _request: DeployProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         let _ = reporter;
         Err(RuntimeExecutionError::unsupported_command(

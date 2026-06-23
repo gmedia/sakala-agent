@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
@@ -17,17 +19,17 @@ impl RuntimeExecutor for NoopRuntimeExecutor {
     async fn inspect_project(
         &self,
         request: InspectProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
-        execute_noop(request.command_id, "InspectProject", reporter).await
+        execute_noop(request.command_id, "InspectProject", reporter.as_ref()).await
     }
 
     async fn deploy_project(
         &self,
         request: DeployProjectRequest,
-        reporter: &dyn RuntimeReporter,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
-        execute_noop(request.command_id, "DeployProject", reporter).await
+        execute_noop(request.command_id, "DeployProject", reporter.as_ref()).await
     }
 }
 
