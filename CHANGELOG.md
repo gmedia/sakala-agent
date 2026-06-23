@@ -6,6 +6,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Added
 
+- Dokumentasi matriks operating mode, ownership command melalui atomic claim, dan batas topologi Caddy container/host.
 - Docker runtime executor untuk checkout immutable GitHub commit, Buildx image build, candidate container, health check, Caddy route activation, dan cleanup deployment lama.
 - Dockerfile-first builder selection dengan Railpack fallback melalui version-pinned BuildKit frontend.
 - Command `InspectProject` untuk preview repository melalui `railpack info`, scanner metadata ringan, dan typed completion result.

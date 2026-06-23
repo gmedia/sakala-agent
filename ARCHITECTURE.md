@@ -121,6 +121,8 @@ Model outbound polling menjaga node tidak perlu membuka endpoint command publik 
 
 `local` adalah default aman: worker aktif, tetapi tidak menghubungi control plane. `connected` membuat request ke `sakala-api` dan mewajibkan token non-placeholder.
 
+Mode tersebut independen dari runtime driver. `connected + noop` menguji kontrak API dan lifecycle command tanpa perubahan host, sedangkan `connected + docker` menjalankan runtime nyata. Lihat [docs/OPERATING_MODES.md](docs/OPERATING_MODES.md).
+
 ## Future Extraction Path
 
 Implementasi baru ditambahkan di belakang port yang relevan, misalnya host-process Caddy reloader, remote image builder, atau container engine lain. Crate baru tidak perlu dibuat sebelum satu module memiliki lifecycle, dependency, atau ownership release yang benar-benar independen.

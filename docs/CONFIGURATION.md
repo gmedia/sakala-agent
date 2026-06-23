@@ -27,6 +27,8 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_MAX_CONTAINER_PIDS_LIMIT` | `256` | Hard ceiling jumlah process pada node. |
 | `SAKALA_LOG_LEVEL` | `info` | Filter `tracing-subscriber`, misalnya `debug` atau `sakala_agent=debug`. |
 
+`SAKALA_AGENT_MODE` dan `SAKALA_RUNTIME_DRIVER` tidak mewakili hal yang sama. Mode menentukan koneksi control plane, sedangkan driver menentukan efek command pada runtime node. Lihat [Operating Modes](OPERATING_MODES.md) untuk matriks lengkap.
+
 ## Local Mode
 
 ```bash
@@ -49,6 +51,8 @@ cargo run -p sakala-agent
 Jangan menyimpan token issued pada repository atau command history yang dibagikan.
 
 Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
+
+Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
 
 ## Resource Policy Boundary
 

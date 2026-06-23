@@ -60,6 +60,25 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
 
 `sakala-api` menentukan `resources` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Semua field boleh `null` atau tidak dikirim agar agent memakai fallback node, tetapi nilai nol atau nilai di atas hard maximum node akan menggagalkan command. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
+## Polling and Claim Semantics
+
+Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.
+
+Claim harus dilakukan atomik di `sakala-api`, misalnya melalui conditional update atau transaction yang memastikan status masih `Pending`. Hanya satu agent boleh menerima claim sukses. Bila claim mendapat conflict karena command sudah diklaim, dibatalkan, kedaluwarsa, atau tidak lagi eligible, agent harus melewati command tersebut tanpa menjalankannya.
+
+Command yang sudah `Claimed`, `Running`, `Succeeded`, `Failed`, `Cancelled`, atau `Expired` tidak boleh dikembalikan lagi sebagai pekerjaan pending. Polling berikutnya hanya mengembalikan pekerjaan baru atau pekerjaan yang secara eksplisit dikembalikan ke antrean oleh policy lease/recovery API.
+
+```txt
+Pending in database
+-> returned by poll when eligible
+-> atomic claim succeeds for one agent
+-> execute and report
+-> complete or fail
+-> no longer returned by normal polling
+```
+
+Agent tidak menyediakan HTTP server. Semua endpoint dalam dokumen ini dimiliki oleh `sakala-api`; agent bertindak sebagai HTTP client outbound.
+
 ### Project Inspection Command
 
 Create-project preview menggunakan command terpisah agar tidak menjalankan pipeline deployment:
@@ -184,4 +203,4 @@ Command tanpa output mengirim `null`:
 
 ## Error/Retry Direction
 
-Client memakai timeout 10 detik, memperlakukan HTTP status failure sebagai request error, dan melanjutkan worker loop pada tick berikutnya. Build output dikirim per baris selama subprocess berjalan. Policy retry, backoff per endpoint, idempotency key, lease expiry, dan command locking harus disepakati dengan kontrak `sakala-api` sebelum connected mode dipakai pada node pilot.
+Client memakai timeout 10 detik, memperlakukan HTTP status failure sebagai request error, dan melanjutkan worker loop pada tick berikutnya. Build output dikirim per baris selama subprocess berjalan. Atomic claim merupakan requirement MVP. Policy retry, backoff per endpoint, idempotency key, lease expiry, dan recovery command yang terputus harus disepakati dengan kontrak `sakala-api` sebelum connected Docker mode dipakai pada node pilot.
