@@ -38,6 +38,8 @@ Default mode adalah `local`. Agent menulis heartbeat tick dan polling tick ke lo
 
 ## Mode
 
+Mode koneksi dan runtime driver merupakan dua konfigurasi terpisah. Ringkasan kombinasi `local/connected` dengan `noop/docker` tersedia di [docs/OPERATING_MODES.md](docs/OPERATING_MODES.md).
+
 ### Local
 
 ```dotenv
@@ -71,7 +73,7 @@ SAKALA_CADDY_CONTAINER=sakala-caddy
 SAKALA_RAILPACK_FRONTEND=ghcr.io/railwayapp/railpack-frontend:v0.23.0
 ```
 
-Host harus menyediakan Git, Docker Buildx, Railpack CLI dengan versi yang sesuai frontend, Caddy dari `sakala-infra`, serta permission runtime yang telah direview. Lihat [Docker runtime](docs/DOCKER_RUNTIME.md), [runtime hardening](docs/RUNTIME_HARDENING.md), dan [strategi Railpack](docs/RAILPACK_STRATEGY.md).
+Host harus menyediakan Git, Docker Buildx, Railpack CLI dengan versi yang sesuai frontend, Caddy container dari `sakala-infra`, serta permission runtime yang telah direview. Caddy binary yang terpasang langsung pada host belum digunakan oleh adapter MVP. Lihat [operating modes](docs/OPERATING_MODES.md), [Docker runtime](docs/DOCKER_RUNTIME.md), [runtime hardening](docs/RUNTIME_HARDENING.md), dan [strategi Railpack](docs/RAILPACK_STRATEGY.md).
 
 Create-project preview memakai command `InspectProject`: agent menjalankan scanner ringan dan `railpack info`, kemudian mengembalikan metadata tanpa menjalankan `railpack prepare`, build image, container, atau routing. Deployment baru berjalan setelah command `DeployProject` dibuat.
 
