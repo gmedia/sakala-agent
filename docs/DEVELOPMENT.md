@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Rust stable toolchain dengan `rustfmt` dan `clippy`.
+- Rust 1.88 atau lebih baru dengan `rustfmt` dan `clippy`.
 - Cargo.
 - `cargo-audit` bila menjalankan audit lokal.
 - Git, Docker Buildx, dan Railpack hanya untuk integration test runtime opt-in.
