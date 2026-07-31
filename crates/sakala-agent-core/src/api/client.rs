@@ -56,6 +56,10 @@ impl ApiClient {
         }
 
         let http = Client::builder()
+            // Agent requests carry a machine credential. The control plane URL is an
+            // explicit runtime setting, so do not leak that traffic through ambient
+            // HTTP proxy environment variables.
+            .no_proxy()
             .timeout(Duration::from_secs(10))
             .user_agent(concat!("sakala-agent/", env!("CARGO_PKG_VERSION")))
             .build()?;

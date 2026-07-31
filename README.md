@@ -34,6 +34,12 @@ cargo run -p sakala-agent
 
 Default mode adalah `local`. Agent menulis heartbeat tick dan polling tick ke log JSON tanpa membuat request control plane. Hentikan dengan `Ctrl+C`.
 
+## Deployment Runtime Node
+
+Untuk node MVP, Sakala Agent dijalankan sebagai binary Rust melalui service host seperti `systemd`, bukan sebagai container aplikasi. Agent perlu mengakses capability runtime node yang eksplisit, seperti Docker daemon, Git, workspace build, dan adapter routing. Menaruh agent di dalam container akan membutuhkan mount Docker socket serta filesystem host dan memperluas boundary privilege secara tidak perlu.
+
+Repository deployment akan menangani instalasi binary, service `systemd`, permission runtime, environment, dan integrasi Caddy pada node. Sakala Agent tidak membawa konfigurasi deployment host tersebut.
+
 `.env.example` merupakan referensi variable. Binary membaca environment atau CLI flag dan sengaja tidak menambahkan loader file dotenv pada foundation ini.
 
 ## Mode
