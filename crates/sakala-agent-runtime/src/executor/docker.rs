@@ -372,7 +372,7 @@ fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> 
     }
     if !valid_domain(&payload.domain) {
         return Err(RuntimeError::InvalidCommand(
-            "domain must be a valid *.run.sakala.localhost or *.run.sakala.dev hostname".to_owned(),
+            "domain must be a valid *.run.sakala.localhost, *.run.staging.sakala.dev, or *.run.sakala.dev hostname".to_owned(),
         ));
     }
     for (key, value) in &payload.environment {
@@ -438,8 +438,9 @@ fn validate_repository_source(repository_url: &str, commit_sha: &str) -> Result<
 }
 
 fn valid_domain(domain: &str) -> bool {
-    let allowed_suffix =
-        domain.ends_with(".run.sakala.localhost") || domain.ends_with(".run.sakala.dev");
+    let allowed_suffix = domain.ends_with(".run.sakala.localhost")
+        || domain.ends_with(".run.staging.sakala.dev")
+        || domain.ends_with(".run.sakala.dev");
     allowed_suffix
         && domain.len() <= 253
         && domain.split('.').all(|label| {
@@ -484,5 +485,21 @@ fn system_log(message: String) -> DeploymentLog {
         stream: LogStream::System,
         message,
         recorded_at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_domain;
+
+    #[test]
+    fn accepts_staging_runtime_domains() {
+        assert!(valid_domain("portfolio.run.staging.sakala.dev"));
+    }
+
+    #[test]
+    fn rejects_domains_outside_runtime_zones() {
+        assert!(!valid_domain("portfolio.staging.sakala.dev"));
+        assert!(!valid_domain("portfolio.run.example.test"));
     }
 }

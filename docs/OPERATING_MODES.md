@@ -102,7 +102,7 @@ internet/client
 -> application container melalui sakala-runtime
 ```
 
-Host Caddy memakai konfigurasi statis untuk meneruskan domain `*.run.sakala.dev` ke port loopback `sakala-caddy`. Header `Host` harus dipertahankan agar route per-project tetap dipilih oleh Caddy container. Agent hanya mengelola dan me-reload router container; TLS dan policy edge luar tetap menjadi tanggung jawab operator. Port container Caddy sebaiknya bind ke loopback, bukan seluruh interface publik.
+Host Caddy memakai konfigurasi statis untuk meneruskan domain `*.run.staging.sakala.dev` atau `*.run.sakala.dev` ke port loopback `sakala-caddy`. Header `Host` harus dipertahankan agar route per-project tetap dipilih oleh Caddy container. Agent hanya mengelola dan me-reload router container; TLS dan policy edge luar tetap menjadi tanggung jawab operator. Port container Caddy sebaiknya bind ke loopback, bukan seluruh interface publik.
 
 Topologi host Caddy membutuhkan implementasi utuh yang berbeda:
 

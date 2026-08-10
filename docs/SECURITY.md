@@ -14,7 +14,7 @@ Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh r
 - Executor default tetap noop dan Docker hanya aktif melalui `SAKALA_RUNTIME_DRIVER=docker`.
 - Docker diakses oleh proses agent pada runtime node; socket tidak pernah dipasang ke API, console, Caddy, atau container aplikasi user.
 - MVP menerima repository publik GitHub tanpa credential dan immutable commit SHA lengkap.
-- Domain command dibatasi ke `*.run.sakala.localhost` dan `*.run.sakala.dev`.
+- Domain command dibatasi ke `*.run.sakala.localhost`, `*.run.staging.sakala.dev`, dan `*.run.sakala.dev`.
 - Container memakai resource limits dari command API yang telah diverifikasi terhadap hard maximum node, `no-new-privileges`, dan drop seluruh Linux capabilities.
 - Runtime environment ditulis sementara dengan mode `0600`, tidak dimasukkan ke command arguments, lalu dihapus setelah container dibuat.
 - Deployment logs melewati redactor case-insensitive untuk env-style, JSON, authorization header, bearer token, dan prefix token GitHub umum.
