@@ -23,6 +23,36 @@ Token harus diterbitkan secara aman, disimpan hashed oleh `sakala-api`, dan tida
 | `POST` | `/api/agent/v1/commands/{command}/fail` | Tandai eksekusi gagal. |
 | `POST` | `/api/agent/v1/heartbeat` | Laporkan keberadaan/status node. |
 
+### Arti `{command}`
+
+`{command}` adalah **UUID field `id` milik satu `AgentCommand`** yang diterima
+agent dari `GET /api/agent/v1/commands`. Ini bukan nilai `type`, bukan
+`project_id`, dan bukan `deployment_id`.
+
+Misalnya hasil polling mengandung:
+
+```json
+{
+  "id": "b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+  "type": "DeployProject",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993"
+}
+```
+
+Maka agent memakai ID command itu untuk seluruh lifecycle command yang sama:
+
+```text
+POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/claim
+POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/events
+POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/logs
+POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/complete
+```
+
+`type` menjelaskan **pekerjaan apa** yang harus dilakukan, misalnya
+`InspectProject` atau `DeployProject`. Sedangkan `id` command adalah identitas
+rekam pekerjaan tersebut untuk claim, event, log, dan status akhirnya.
+
 ## Command Response Shape
 
 Endpoint polling wajib memakai envelope Laravel API Resource:
