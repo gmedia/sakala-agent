@@ -44,6 +44,36 @@ async fn claim_conflict_skips_runtime_execution_and_terminal_reporting() {
 }
 
 #[tokio::test]
+async fn private_repository_credential_fixture_matches_agent_contract() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/repository-credential"
+        )))
+        .and(header("authorization", "Bearer test-agent-token"))
+        .and(header("x-agent-id", "runtime-01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "username": "x-access-token",
+            "token": "ghs_ephemeral_fixture_token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let command_id: AgentCommand = serde_json::from_value(command_fixture())
+        .expect("command fixture should match the protocol");
+    let credential = client
+        .repository_credential(command_id.id)
+        .await
+        .expect("credential fixture should deserialize");
+
+    assert_eq!(credential.username, "x-access-token");
+    assert!(!format!("{credential:?}").contains("ghs_ephemeral_fixture_token"));
+}
+
+#[tokio::test]
 async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     let server = MockServer::start().await;
     mount_lifecycle_mocks(&server).await;
