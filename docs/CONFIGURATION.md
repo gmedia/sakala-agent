@@ -12,6 +12,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. |
 | `SAKALA_COMMAND_TIMEOUT_SECONDS` | `900` | Hard maximum node untuk deadline seluruh lifecycle command setelah claim; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_MAX_CONCURRENT_COMMANDS` | `4` | Batas global command aktif. Command pada project yang sama tetap diproses satu per satu; command yang belum mendapat slot tetap pending di control plane. |
+| `SAKALA_SHUTDOWN_GRACE_SECONDS` | `30` | Waktu maksimum untuk command aktif menyelesaikan cancellation dan cleanup sebelum agent membatalkan task yang tersisa. |
 | `SAKALA_MAX_CONCURRENT_BUILDS` | `1` | Batas build image Docker/Railpack aktif pada node agar build tidak saling menghabiskan CPU, memori, dan I/O. |
 | `SAKALA_RUNTIME_NETWORK` | `sakala-runtime` | Nama network referensi dari `sakala-infra`. |
 | `SAKALA_RUNTIME_DRIVER` | `noop` | `noop` atau executor opt-in `docker`. |

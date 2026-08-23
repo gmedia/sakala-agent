@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sakala_agent_protocol::{AgentCommand, CommandType};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     commands::handlers::{deploy_project, inspect_project},
@@ -39,6 +40,7 @@ impl CommandDispatcher {
         &self,
         command: &AgentCommand,
         reporter: Arc<dyn RuntimeReporter>,
+        cancellation: CancellationToken,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         match command.command_type {
             CommandType::InspectProject => {
@@ -47,6 +49,7 @@ impl CommandDispatcher {
                     self.runtime.as_ref(),
                     self.repository_credentials.as_ref(),
                     reporter,
+                    cancellation,
                 )
                 .await
             }
@@ -56,6 +59,7 @@ impl CommandDispatcher {
                     self.runtime.as_ref(),
                     self.repository_credentials.as_ref(),
                     reporter,
+                    cancellation,
                 )
                 .await
             }

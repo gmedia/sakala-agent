@@ -13,6 +13,7 @@ use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
 use sakala_agent_runtime::NoopRuntimeExecutor;
 use serde_json::json;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, body_partial_json, header, method, path},
@@ -38,7 +39,7 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
 
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
     CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
-        .process(&commands[0])
+        .process(&commands[0], CancellationToken::new())
         .await
         .expect("noop command lifecycle should complete");
 }
@@ -69,7 +70,7 @@ async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(FailingRuntimeExecutor);
 
     let error = CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
-        .process(&command)
+        .process(&command, CancellationToken::new())
         .await
         .expect_err("runtime failure should propagate after being reported");
 
@@ -104,7 +105,7 @@ async fn connected_agent_reports_command_timeout_with_stable_failure_status() {
         Arc::new(SlowRuntimeExecutor),
         std::time::Duration::from_secs(1),
     )
-    .process(&command)
+    .process(&command, CancellationToken::new())
     .await
     .expect_err("slow runtime must time out");
 

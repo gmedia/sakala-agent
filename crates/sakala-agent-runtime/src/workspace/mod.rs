@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
@@ -59,6 +60,7 @@ pub trait WorkspaceManager: Send + Sync {
         command_id: Uuid,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
+        cancellation: CancellationToken,
     ) -> Result<DeploymentWorkspace, RuntimeError>;
 
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;

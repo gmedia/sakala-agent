@@ -24,6 +24,7 @@ use sakala_agent_runtime::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -131,6 +132,7 @@ async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_argum
                 username: "x-access-token".to_owned(),
                 token: SecretString::new("ghs_installation_token"),
             }),
+            cancellation: CancellationToken::new(),
         },
         reporter,
     )
@@ -230,6 +232,47 @@ async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts()
 }
 
 #[tokio::test]
+async fn cancelled_deployment_cleans_workspace_and_candidate_artifacts() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(60)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let workspace = config.workspace_root.join(
+        Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b")
+            .expect("command UUID")
+            .to_string(),
+    );
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let cancellation = CancellationToken::new();
+    let command = deploy_command("auto");
+    let task_executor = Arc::clone(&executor);
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        CommandDispatcher::new(task_executor)
+            .dispatch(&command, reporter, task_cancellation)
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancellation.cancel();
+    let error = task
+        .await
+        .expect("deployment task should join")
+        .expect_err("cancelled deployment should fail");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert!(!workspace.exists());
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
 async fn node_limits_concurrent_image_builds() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_millis(50)));
@@ -246,8 +289,16 @@ async fn node_limits_concurrent_image_builds() {
     let first_dispatcher = CommandDispatcher::new(executor.clone());
     let second_dispatcher = CommandDispatcher::new(executor);
     let (first_result, second_result) = tokio::join!(
-        first_dispatcher.dispatch(&first, Arc::new(RecordingReporter::default())),
-        second_dispatcher.dispatch(&second, Arc::new(RecordingReporter::default()))
+        first_dispatcher.dispatch(
+            &first,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        ),
+        second_dispatcher.dispatch(
+            &second,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        )
     );
 
     first_result.expect("first deployment should complete");
@@ -498,7 +549,7 @@ async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
     let runtime: Arc<dyn RuntimeExecutor> = executor.clone();
 
     CommandDispatcher::new(runtime)
-        .dispatch(&deploy_command("auto"), reporter)
+        .dispatch(&deploy_command("auto"), reporter, CancellationToken::new())
         .await
         .expect("deployment should start a log follower");
     tokio::task::yield_now().await;
@@ -528,7 +579,7 @@ where
     R: RuntimeReporter + 'static,
 {
     CommandDispatcher::new(Arc::new(executor))
-        .dispatch(command, reporter)
+        .dispatch(command, reporter, CancellationToken::new())
         .await
 }
 

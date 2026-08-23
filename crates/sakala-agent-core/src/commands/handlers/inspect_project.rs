@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sakala_agent_protocol::AgentCommand;
+use tokio_util::sync::CancellationToken;
 
 use crate::ports::{
     CommandOutput, InspectProjectRequest, RepositoryCredentialProvider, RuntimeExecutionError,
@@ -12,6 +13,7 @@ pub async fn handle(
     runtime: &dyn RuntimeExecutor,
     repository_credentials: &dyn RepositoryCredentialProvider,
     reporter: Arc<dyn RuntimeReporter>,
+    cancellation: CancellationToken,
 ) -> Result<CommandOutput, RuntimeExecutionError> {
     let payload = command.inspect_payload().map_err(|error| {
         RuntimeExecutionError::invalid_command(format!(
@@ -28,6 +30,7 @@ pub async fn handle(
                 command_id: command.id,
                 payload,
                 repository_credential,
+                cancellation,
             },
             reporter,
         )

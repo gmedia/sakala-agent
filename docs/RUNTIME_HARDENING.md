@@ -28,7 +28,8 @@ Agent tidak mengetahui plan berbayar, membership, atau kuota workspace. Jika use
 - `SAKALA_COMMAND_TIMEOUT_SECONDS` membatasi lifecycle runtime setelah command diklaim.
 - Setiap subprocess juga memakai deadline command sebagai fallback.
 - Child dijalankan sebagai process-group leader pada Unix. Timeout, reporting error, task cancellation, atau shutdown menjatuhkan seluruh process group.
-- Failure dikirim dengan `runtime_timeout`; build, container, health, routing, capacity, dan filesystem memiliki code terpisah.
+- Shutdown lebih dulu membatalkan token semua command aktif, memberi waktu `SAKALA_SHUTDOWN_GRACE_SECONDS` agar candidate/workspace dibersihkan dan failure kritis dikirim, lalu hanya meng-abort task yang masih tersisa.
+- Cancellation dikirim sebagai `runtime_cancelled`; timeout tetap memakai `runtime_timeout`. Build, container, health, routing, capacity, dan filesystem memiliki code terpisah.
 
 Build timeout harus lebih pendek daripada command timeout agar runtime sempat menjalankan cleanup dan mengirim failure status.
 

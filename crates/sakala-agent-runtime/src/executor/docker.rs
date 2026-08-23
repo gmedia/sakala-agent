@@ -145,14 +145,19 @@ impl DockerRuntimeExecutor {
         .await?;
         let workspace = self
             .workspace
-            .checkout(request.command_id, &source, reporter)
+            .checkout(
+                request.command_id,
+                &source,
+                reporter,
+                request.cancellation.clone(),
+            )
             .await?;
         let inspection_source = source.without_credential();
         drop(source);
-        let result = self
-            .inspector
-            .inspect(&workspace, &inspection_source, reporter)
-            .await;
+        let result = tokio::select! {
+            result = self.inspector.inspect(&workspace, &inspection_source, reporter) => result,
+            () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        };
         let cleanup = self.workspace.cleanup(&workspace).await;
 
         let inspection = result?;
@@ -219,15 +224,20 @@ impl DockerRuntimeExecutor {
         .await?;
         let workspace = self
             .workspace
-            .checkout(request.command_id, &source, reporter.as_ref())
+            .checkout(
+                request.command_id,
+                &source,
+                reporter.as_ref(),
+                request.cancellation.clone(),
+            )
             .await?;
         drop(source);
         let image = image_name(project_id, deployment_id, &payload.commit_sha);
         let container = container_name(project_id, deployment_id);
         let route_activated = AtomicBool::new(false);
 
-        let result = self
-            .deploy_inner(
+        let result = tokio::select! {
+            result = self.deploy_inner(
                 project_id,
                 deployment_id,
                 &payload,
@@ -238,8 +248,9 @@ impl DockerRuntimeExecutor {
                 applied_timeouts,
                 &route_activated,
                 Arc::clone(&reporter),
-            )
-            .await;
+            ) => result,
+            () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        };
 
         if result.is_err() && !route_activated.load(Ordering::Acquire) {
             self.containers.cleanup_candidate(&container, &image).await;

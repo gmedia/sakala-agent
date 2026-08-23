@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sakala_agent_protocol::AgentCommand;
+use tokio_util::sync::CancellationToken;
 
 use crate::ports::{
     CommandOutput, DeployProjectRequest, RepositoryCredentialProvider, RuntimeExecutionError,
@@ -12,6 +13,7 @@ pub async fn handle(
     runtime: &dyn RuntimeExecutor,
     repository_credentials: &dyn RepositoryCredentialProvider,
     reporter: Arc<dyn RuntimeReporter>,
+    cancellation: CancellationToken,
 ) -> Result<CommandOutput, RuntimeExecutionError> {
     let project_id = command.project_id.ok_or_else(|| {
         RuntimeExecutionError::invalid_command("DeployProject requires project_id")
@@ -34,6 +36,7 @@ pub async fn handle(
                 deployment_id,
                 payload,
                 repository_credential,
+                cancellation,
             },
             reporter,
         )

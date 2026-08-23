@@ -42,6 +42,7 @@ pub struct AgentConfig {
     pub heartbeat_interval_seconds: u64,
     pub command_timeout_seconds: u64,
     pub max_concurrent_commands: usize,
+    pub shutdown_grace_seconds: u64,
     pub runtime_network: String,
     pub capabilities: Vec<String>,
 }
@@ -87,6 +88,7 @@ impl AgentConfig {
                 900,
             )?,
             max_concurrent_commands: positive_usize(values, "SAKALA_MAX_CONCURRENT_COMMANDS", 4)?,
+            shutdown_grace_seconds: positive_number(values, "SAKALA_SHUTDOWN_GRACE_SECONDS", 30)?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
             capabilities: vec!["noop-runtime".to_owned()],
         })
@@ -105,6 +107,11 @@ impl AgentConfig {
     #[must_use]
     pub fn command_timeout(&self) -> Duration {
         Duration::from_secs(self.command_timeout_seconds)
+    }
+
+    #[must_use]
+    pub fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(self.shutdown_grace_seconds)
     }
 }
 

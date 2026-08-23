@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -32,6 +33,7 @@ impl WorkspaceManager for GitWorkspaceManager {
         command_id: Uuid,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
+        cancellation: CancellationToken,
     ) -> Result<DeploymentWorkspace, RuntimeError> {
         let workspace = DeploymentWorkspace::new(self.root.join(command_id.to_string()));
         if fs::try_exists(workspace.root()).await? {
@@ -52,7 +54,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                     CommandSpec::new("git")
                         .arg("init")
                         .arg("--initial-branch=sakala")
-                        .arg(workspace.source().as_os_str()),
+                        .arg(workspace.source().as_os_str())
+                        .cancellation(cancellation.clone()),
                 ),
                 (
                     "git-remote",
@@ -62,7 +65,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                         .arg("remote")
                         .arg("add")
                         .arg("origin")
-                        .arg(&source.repository_url),
+                        .arg(&source.repository_url)
+                        .cancellation(cancellation.clone()),
                 ),
                 (
                     "git-checkout",
@@ -71,7 +75,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                         .arg(workspace.source().as_os_str())
                         .arg("checkout")
                         .arg("--detach")
-                        .arg("FETCH_HEAD"),
+                        .arg("FETCH_HEAD")
+                        .cancellation(cancellation.clone()),
                 ),
             ] {
                 run_checked(self.runner.as_ref(), &command, phase, reporter).await?;
@@ -83,7 +88,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                 .arg("fetch")
                 .arg("--depth=1")
                 .arg("origin")
-                .arg(&source.commit_sha);
+                .arg(&source.commit_sha)
+                .cancellation(cancellation.clone());
             if let (Some(credential), Some(askpass)) = (&source.credential, &askpass) {
                 fetch = fetch
                     .env("GIT_TERMINAL_PROMPT", "0")

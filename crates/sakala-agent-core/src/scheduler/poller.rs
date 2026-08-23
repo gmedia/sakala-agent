@@ -6,6 +6,7 @@ use std::{
 
 use sakala_agent_protocol::{AgentCommand, CommandStatus};
 use tokio::{sync::watch, task::JoinSet, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -45,10 +46,11 @@ pub async fn run(
                         let command_id = command.id;
                         let project_id = command.project_id;
                         let work_command = command.clone();
-                        if !executions.try_start(command, {
+                        let cancellation = CancellationToken::new();
+                        if !executions.try_start(command, cancellation.clone(), {
                             let handler = Arc::clone(handler);
                             async move {
-                                if let Err(error) = handler.process(&work_command).await {
+                                if let Err(error) = handler.process(&work_command, cancellation).await {
                                     warn!(command_id = %command_id, %error, "command execution failed");
                                 }
                             }
@@ -82,7 +84,7 @@ pub async fn run(
         }
     }
 
-    executions.cancel_and_wait().await;
+    executions.cancel_and_wait(config.shutdown_grace()).await;
     info!("command poller stopped");
 }
 
@@ -92,8 +94,14 @@ pub async fn run(
 struct CommandExecutions {
     limit: usize,
     active_projects: HashSet<Uuid>,
-    task_projects: HashMap<tokio::task::Id, Uuid>,
-    tasks: JoinSet<Option<Uuid>>,
+    task_metadata: HashMap<tokio::task::Id, TaskMetadata>,
+    tasks: JoinSet<(Uuid, Option<Uuid>)>,
+}
+
+struct TaskMetadata {
+    command_id: Uuid,
+    project_id: Option<Uuid>,
+    cancellation: CancellationToken,
 }
 
 impl CommandExecutions {
@@ -101,7 +109,7 @@ impl CommandExecutions {
         Self {
             limit,
             active_projects: HashSet::new(),
-            task_projects: HashMap::new(),
+            task_metadata: HashMap::new(),
             tasks: JoinSet::new(),
         }
     }
@@ -110,10 +118,16 @@ impl CommandExecutions {
         self.tasks.len()
     }
 
-    fn try_start<F>(&mut self, command: AgentCommand, work: F) -> bool
+    fn try_start<F>(
+        &mut self,
+        command: AgentCommand,
+        cancellation: CancellationToken,
+        work: F,
+    ) -> bool
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        let command_id = command.id;
         let project_id = command.project_id;
         if self.tasks.len() >= self.limit
             || project_id.is_some_and(|project_id| self.active_projects.contains(&project_id))
@@ -126,24 +140,33 @@ impl CommandExecutions {
         }
         let task = self.tasks.spawn(async move {
             work.await;
-            project_id
+            (command_id, project_id)
         });
-        if let Some(project_id) = project_id {
-            self.task_projects.insert(task.id(), project_id);
-        }
+        self.task_metadata.insert(
+            task.id(),
+            TaskMetadata {
+                command_id,
+                project_id,
+                cancellation,
+            },
+        );
         true
     }
 
     fn reap_completed(&mut self) {
         while let Some(result) = self.tasks.try_join_next() {
             match result {
-                Ok(Some(project_id)) => {
-                    self.active_projects.remove(&project_id);
-                    self.task_projects.retain(|_, id| *id != project_id);
+                Ok((command_id, project_id)) => {
+                    if let Some(project_id) = project_id {
+                        self.active_projects.remove(&project_id);
+                    }
+                    self.task_metadata
+                        .retain(|_, task| task.command_id != command_id);
                 }
-                Ok(None) => {}
                 Err(error) => {
-                    if let Some(project_id) = self.task_projects.remove(&error.id()) {
+                    if let Some(task) = self.task_metadata.remove(&error.id())
+                        && let Some(project_id) = task.project_id
+                    {
                         self.active_projects.remove(&project_id);
                     }
                     warn!(%error, "command task terminated unexpectedly");
@@ -152,17 +175,38 @@ impl CommandExecutions {
         }
     }
 
-    async fn cancel_and_wait(&mut self) {
+    async fn cancel_and_wait(&mut self, grace: std::time::Duration) {
+        for task in self.task_metadata.values() {
+            task.cancellation.cancel();
+        }
+        if tokio::time::timeout(grace, self.wait_for_tasks())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        warn!(
+            grace_seconds = grace.as_secs(),
+            "command cancellation grace period elapsed; aborting remaining tasks"
+        );
         self.tasks.abort_all();
+        self.wait_for_tasks().await;
+    }
+
+    async fn wait_for_tasks(&mut self) {
         while let Some(result) = self.tasks.join_next().await {
             match result {
-                Ok(Some(project_id)) => {
-                    self.active_projects.remove(&project_id);
-                    self.task_projects.retain(|_, id| *id != project_id);
+                Ok((command_id, project_id)) => {
+                    if let Some(project_id) = project_id {
+                        self.active_projects.remove(&project_id);
+                    }
+                    self.task_metadata
+                        .retain(|_, task| task.command_id != command_id);
                 }
-                Ok(None) => {}
                 Err(error) => {
-                    if let Some(project_id) = self.task_projects.remove(&error.id()) {
+                    if let Some(task) = self.task_metadata.remove(&error.id())
+                        && let Some(project_id) = task.project_id
+                    {
                         self.active_projects.remove(&project_id);
                     }
                     if !error.is_cancelled() {
@@ -186,6 +230,7 @@ mod tests {
 
     use sakala_agent_protocol::{CommandStatus, CommandType};
     use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use super::CommandExecutions;
@@ -213,14 +258,18 @@ mod tests {
 
         assert!(executions.try_start(
             command(Some(project_a)),
+            CancellationToken::new(),
             tracked(wait_a, Arc::clone(&active), Arc::clone(&maximum))
         ));
-        assert!(!executions.try_start(command(Some(project_a)), async {}));
+        assert!(
+            !executions.try_start(command(Some(project_a)), CancellationToken::new(), async {})
+        );
         assert!(executions.try_start(
             command(Some(project_b)),
+            CancellationToken::new(),
             tracked(wait_b, Arc::clone(&active), Arc::clone(&maximum))
         ));
-        assert!(!executions.try_start(command(None), async {}));
+        assert!(!executions.try_start(command(None), CancellationToken::new(), async {}));
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
@@ -229,7 +278,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         executions.reap_completed();
 
-        assert!(executions.try_start(command(Some(project_a)), async {}));
+        assert!(executions.try_start(command(Some(project_a)), CancellationToken::new(), async {}));
         assert_eq!(executions.len(), 1);
     }
 

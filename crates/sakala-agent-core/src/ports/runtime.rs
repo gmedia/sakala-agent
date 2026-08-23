@@ -6,24 +6,27 @@ use sakala_agent_protocol::{
 };
 use serde_json::Value;
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::RepositoryCredential;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct InspectProjectRequest {
     pub command_id: Uuid,
     pub payload: InspectProjectPayload,
     pub repository_credential: Option<RepositoryCredential>,
+    pub cancellation: CancellationToken,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DeployProjectRequest {
     pub command_id: Uuid,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub payload: DeployProjectPayload,
     pub repository_credential: Option<RepositoryCredential>,
+    pub cancellation: CancellationToken,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

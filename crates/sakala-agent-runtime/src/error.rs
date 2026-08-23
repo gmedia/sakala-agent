@@ -22,6 +22,8 @@ pub enum RuntimeError {
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
     Capacity(String),
+    #[error("runtime operation was cancelled")]
+    Cancelled,
     #[error("runtime operation {operation} exceeded its {seconds}s timeout")]
     Timeout { operation: String, seconds: u64 },
     #[error("runtime reporting failed: {0}")]
@@ -43,6 +45,7 @@ impl RuntimeError {
             Self::Health(_) => "runtime_health_check_failed",
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
+            Self::Cancelled => "runtime_cancelled",
             Self::Timeout { .. } => "runtime_timeout",
             Self::Reporting(_) => "runtime_reporting_failed",
             Self::Filesystem(_) => "runtime_filesystem_failed",

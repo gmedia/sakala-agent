@@ -12,10 +12,11 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::RuntimeError;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<OsString>,
@@ -24,6 +25,7 @@ pub struct CommandSpec {
     secret_environment: BTreeMap<String, SecretString>,
     pub timeout: Option<Duration>,
     pub timeout_disabled: bool,
+    pub cancellation: Option<CancellationToken>,
 }
 
 impl CommandSpec {
@@ -36,6 +38,7 @@ impl CommandSpec {
             secret_environment: BTreeMap::new(),
             timeout: None,
             timeout_disabled: false,
+            cancellation: None,
         }
     }
 
@@ -70,6 +73,12 @@ impl CommandSpec {
     #[must_use]
     pub fn without_timeout(mut self) -> Self {
         self.timeout_disabled = true;
+        self
+    }
+
+    #[must_use]
+    pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 }
@@ -175,6 +184,7 @@ impl ProcessRunner for TokioProcessRunner {
         let mut captured_stderr = String::new();
         let timeout =
             (!spec.timeout_disabled).then(|| spec.timeout.unwrap_or(self.default_timeout));
+        let cancellation = spec.cancellation.clone();
         let deadline = async {
             match timeout {
                 Some(timeout) => tokio::time::sleep(timeout).await,
@@ -185,6 +195,12 @@ impl ProcessRunner for TokioProcessRunner {
 
         while !stdout_done || !stderr_done {
             tokio::select! {
+                _ = cancelled(&cancellation) => {
+                    process_group.kill();
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    return Err(RuntimeError::Cancelled);
+                }
                 () = &mut deadline => {
                     process_group.kill();
                     let _ = child.kill().await;
@@ -216,6 +232,12 @@ impl ProcessRunner for TokioProcessRunner {
         }
 
         let status = tokio::select! {
+            _ = cancelled(&cancellation) => {
+                process_group.kill();
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(RuntimeError::Cancelled);
+            }
             () = &mut deadline => {
                 process_group.kill();
                 let _ = child.kill().await;
@@ -237,6 +259,13 @@ impl ProcessRunner for TokioProcessRunner {
             stdout: captured_stdout,
             stderr: captured_stderr,
         })
+    }
+}
+
+async fn cancelled(cancellation: &Option<CancellationToken>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
     }
 }
 

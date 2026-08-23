@@ -69,6 +69,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_MAX_CONCURRENT_COMMANDS")]
     max_concurrent_commands: Option<String>,
 
+    #[arg(long, env = "SAKALA_SHUTDOWN_GRACE_SECONDS")]
+    shutdown_grace_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_RUNTIME_NETWORK")]
     runtime_network: Option<String>,
 
@@ -148,6 +151,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_MAX_CONCURRENT_COMMANDS",
         cli.max_concurrent_commands,
+    );
+    insert(
+        &mut values,
+        "SAKALA_SHUTDOWN_GRACE_SECONDS",
+        cli.shutdown_grace_seconds,
     );
     insert(&mut values, "SAKALA_RUNTIME_NETWORK", cli.runtime_network);
     insert(&mut values, "SAKALA_RUNTIME_DRIVER", cli.runtime_driver);

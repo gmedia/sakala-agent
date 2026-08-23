@@ -7,6 +7,7 @@ use sakala_agent_protocol::{
 };
 use serde_json::json;
 use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     CoreError, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
@@ -37,7 +38,11 @@ impl CommandProcessor {
         }
     }
 
-    pub async fn process(&self, command: &AgentCommand) -> Result<(), CoreError> {
+    pub async fn process(
+        &self,
+        command: &AgentCommand,
+        cancellation: CancellationToken,
+    ) -> Result<(), CoreError> {
         self.client.claim(command.id).await?;
         self.client
             .event(
@@ -69,7 +74,7 @@ impl CommandProcessor {
 
         let execution = tokio::time::timeout(
             execution_timeout,
-            self.dispatcher.dispatch(command, reporter),
+            self.dispatcher.dispatch(command, reporter, cancellation),
         )
         .await
         .unwrap_or_else(|_| {
