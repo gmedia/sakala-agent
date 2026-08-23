@@ -153,13 +153,14 @@ impl ContainerEngine for DockerContainerEngine {
             let status = fields.get(1).copied().unwrap_or_default();
             let project_id = fields.get(2).and_then(|value| Uuid::parse_str(value).ok());
             let deployment_id = fields.get(3).and_then(|value| Uuid::parse_str(value).ok());
-            let reason = if project_id.is_none() || deployment_id.is_none() {
-                Some("managed container has incomplete Sakala identity labels")
-            } else if status.starts_with("Exited")
-                || status.starts_with("Dead")
-                || status.starts_with("Created")
-            {
-                Some("managed container is not running")
+            let reason = if project_id.is_none() {
+                Some("managed container has an unknown project identity")
+            } else if deployment_id.is_none() {
+                Some("managed container has incomplete deployment identity labels")
+            } else if status.starts_with("Created") {
+                Some("dangling candidate container was never started")
+            } else if status.starts_with("Exited") || status.starts_with("Dead") {
+                Some("stale stopped deployment container")
             } else {
                 None
             };
@@ -191,7 +192,7 @@ impl ContainerEngine for DockerContainerEngine {
                 report
                     .orphans
                     .iter()
-                    .filter(|orphan| orphan.reason == "managed container is not running")
+                    .filter(|orphan| orphan.reason == "stale stopped deployment container")
                     .count(),
             ),
             maximum_active_workloads: Some(self.max_active_containers as usize),

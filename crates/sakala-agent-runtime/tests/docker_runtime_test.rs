@@ -746,7 +746,7 @@ async fn deployment_refuses_build_when_workspace_disk_is_below_local_floor() {
 async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
-        "deadbeef\tExited (1) 2 minutes ago\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\nmissing\tUp 10 minutes\t\t\n",
+        "deadbeef\tExited (1) 2 minutes ago\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\ncandidate\tCreated\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\nmissing\tUp 10 minutes\t\t\n",
     ));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
 
@@ -754,13 +754,19 @@ async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
         .await
         .expect("reconciliation scan should complete");
 
-    assert_eq!(report.inspected_containers, 2);
-    assert_eq!(report.orphans.len(), 2);
+    assert_eq!(report.inspected_containers, 3);
+    assert_eq!(report.orphans.len(), 3);
     assert!(
         report
             .orphans
             .iter()
-            .any(|orphan| orphan.reason.contains("not running"))
+            .any(|orphan| orphan.reason == "stale stopped deployment container")
+    );
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|orphan| orphan.reason == "dangling candidate container was never started")
     );
 }
 
