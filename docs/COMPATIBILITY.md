@@ -7,7 +7,8 @@ Sakala Agent reports two independent values in every heartbeat:
 - `metadata.version`: semantic version of the Agent binary;
 - `metadata.protocol_version`: revision of the Agent/API wire contract.
 
-The current protocol revision is `3`. Revision 3 adds recovery metadata,
+The current protocol revision is `4`. Revision 4 adds authoritative node
+lifecycle bootstrap. Revision 3 adds recovery metadata,
 explicit safe actions on `ReconcileWorkload`, and approval-gated
 `CleanupRuntime`. Revision 2 added workload lifecycle commands
 (`RestartProject`, `StopProject`, `SleepProject`, `WakeProject`, `HealthCheck`,
@@ -24,8 +25,8 @@ types without an Agent handler fail explicitly with
 
 `DeployProject`, `InspectProject`, workload lifecycle, reconciliation, approved
 runtime cleanup, and node maintenance commands are supported by the current
-runtime. A control plane that only supports revision 1 or 2 must not assign
-revision-3 commands to the node.
+runtime. A control plane that only supports revision 1–3 must not admit a
+revision-4 connected node until it implements `GET /api/agent/v1/node-state`.
 
 ## Upgrade procedure
 
@@ -58,6 +59,14 @@ container agar Agent dapat membangun ulang log follower setelah restart.
 `approved: true`. API revision 2 tetap dapat memakai command lama, tetapi tidak
 boleh mengirim command revision 3 sebelum mendukung payload serta completion
 result yang didokumentasikan.
+
+### Protocol revision 3 → 4
+
+Revision 4 mewajibkan API menyediakan `GET /api/agent/v1/node-state` dengan
+desired state `active`, `draining`, `drained`, atau `maintenance`. Agent membaca
+state ini sebelum polling sehingga restart process tidak mengaktifkan kembali
+node yang masih di-drain. Connected Agent fail-closed bila endpoint belum ada
+atau tidak dapat dijangkau.
 
 The Agent repository owns binary behavior, protocol fixtures, and release
 notes. Host installation, service management, and rollout orchestration remain

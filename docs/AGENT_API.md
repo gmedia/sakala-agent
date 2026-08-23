@@ -16,6 +16,7 @@ Token harus diterbitkan secara aman, disimpan hashed oleh `sakala-api`, dan tida
 | Method | Endpoint | Tujuan |
 | --- | --- | --- |
 | `GET` | `/api/agent/v1/commands` | Poll command tersedia untuk node. |
+| `GET` | `/api/agent/v1/node-state` | Ambil desired lifecycle node sebelum scheduler mulai polling. |
 | `POST` | `/api/agent/v1/commands/{command}/claim` | Klaim command sebelum eksekusi. |
 | `POST` | `/api/agent/v1/commands/{command}/events` | Kirim lifecycle event. |
 | `POST` | `/api/agent/v1/commands/{command}/logs` | Kirim baris log teredaksi. |
@@ -126,6 +127,24 @@ refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
 `project_id: null`, `deployment_id: null`, dan payload `{}`. Saat draining atau
 drained, API hanya perlu menawarkan kedua command ini kepada node tersebut;
 command workload lain dibiarkan pending sampai node kembali active.
+
+Connected Agent wajib memanggil `GET /api/agent/v1/node-state` saat bootstrap,
+sebelum scheduler dapat mengambil atau mengklaim command. Respons menggunakan
+envelope berikut:
+
+```json
+{
+  "data": {
+    "desired_state": "drained"
+  }
+}
+```
+
+Nilai yang valid adalah `active`, `draining`, `drained`, dan `maintenance`.
+Control plane merupakan sumber kebenaran state ini: API harus menyimpan desired
+state secara atomik sebelum menawarkan `DrainNode`/`ResumeNode`. Bila bootstrap
+state gagal diambil, connected Agent berhenti secara fail-closed dan tidak
+mengklaim pekerjaan baru. Local mode selalu mulai sebagai `active`.
 
 Sebelum kembali `active`, `ResumeNode` menjalankan preflight dan mengambil
 snapshot kapasitas lokal. Completion result menyertakan
@@ -302,7 +321,7 @@ untuk aturan rollout dan command yang belum didukung.
   ],
   "metadata": {
     "version": "0.1.0",
-    "protocol_version": 3,
+    "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
     "uptime_seconds": 86400,

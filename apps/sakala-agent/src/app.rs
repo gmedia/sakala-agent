@@ -60,6 +60,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 cleaned_workspaces = report.cleaned_workspaces,
                 reattached_log_followers = report.reattached_log_followers,
                 recovered_execution_records = report.recovered_execution_records,
+                compatibility_issues = report.compatibility_issues.len(),
                 "runtime reconciliation scan completed"
             );
             for orphan in report.orphans {
@@ -94,8 +95,17 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
         Err(error) => warn!(%error, "startup workload health verification failed"),
     }
+    let desired_lifecycle = match &client {
+        Some(client) => client
+            .node_lifecycle()
+            .await
+            .context("failed to restore authoritative node lifecycle state")?
+            .desired_state
+            .into(),
+        None => sakala_agent_core::NodeLifecycleState::Active,
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let node_lifecycle = Arc::new(NodeLifecycle::new());
+    let node_lifecycle = Arc::new(NodeLifecycle::with_state(desired_lifecycle));
     let scheduler_metrics = Arc::new(scheduler::metrics::SchedulerMetrics::default());
 
     let runtime_health_task = tokio::spawn(sakala_agent_core::health::worker::run(

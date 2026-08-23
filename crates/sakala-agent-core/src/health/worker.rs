@@ -38,9 +38,11 @@ pub async fn run(
     }
 
     loop {
-        match runtime.health_snapshot().await {
-            Ok(snapshots) => observe(&mut known, snapshots),
-            Err(error) => warn!(%error, "runtime health snapshot failed"),
+        let probe_deadline = interval.clamp(Duration::from_secs(1), Duration::from_secs(10));
+        match tokio::time::timeout(probe_deadline, runtime.health_snapshot()).await {
+            Ok(Ok(snapshots)) => observe(&mut known, snapshots),
+            Ok(Err(error)) => warn!(%error, "runtime health snapshot failed"),
+            Err(_) => warn!(?probe_deadline, "runtime health snapshot timed out"),
         }
 
         tokio::select! {

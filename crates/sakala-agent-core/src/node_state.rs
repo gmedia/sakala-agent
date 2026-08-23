@@ -34,8 +34,13 @@ impl Default for NodeLifecycle {
 impl NodeLifecycle {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_state(NodeLifecycleState::Active)
+    }
+
+    #[must_use]
+    pub fn with_state(state: NodeLifecycleState) -> Self {
         Self {
-            state: AtomicU8::new(NodeLifecycleState::Active as u8),
+            state: AtomicU8::new(state as u8),
         }
     }
 
@@ -54,6 +59,17 @@ impl NodeLifecycle {
     }
 }
 
+impl From<sakala_agent_protocol::DesiredNodeLifecycleState> for NodeLifecycleState {
+    fn from(value: sakala_agent_protocol::DesiredNodeLifecycleState) -> Self {
+        match value {
+            sakala_agent_protocol::DesiredNodeLifecycleState::Active => Self::Active,
+            sakala_agent_protocol::DesiredNodeLifecycleState::Draining => Self::Draining,
+            sakala_agent_protocol::DesiredNodeLifecycleState::Drained => Self::Drained,
+            sakala_agent_protocol::DesiredNodeLifecycleState::Maintenance => Self::Maintenance,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{NodeLifecycle, NodeLifecycleState};
@@ -66,5 +82,12 @@ mod tests {
         assert!(!lifecycle.accepts_workload_commands());
         lifecycle.set(NodeLifecycleState::Active);
         assert!(lifecycle.accepts_workload_commands());
+    }
+
+    #[test]
+    fn bootstrap_state_is_applied_before_work_is_accepted() {
+        let lifecycle = NodeLifecycle::with_state(NodeLifecycleState::Drained);
+        assert_eq!(lifecycle.state(), NodeLifecycleState::Drained);
+        assert!(!lifecycle.accepts_workload_commands());
     }
 }

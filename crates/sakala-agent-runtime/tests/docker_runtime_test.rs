@@ -494,6 +494,45 @@ async fn node_limits_concurrent_image_builds() {
 }
 
 #[tokio::test]
+async fn build_permit_is_released_before_container_readiness() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_build_delay(Duration::from_millis(50))
+            .with_inspect_delay(Duration::from_millis(200)),
+    );
+    let mut config = runtime_config(&temp);
+    config.max_concurrent_builds = 1;
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner));
+    let first = deploy_command("auto");
+    let mut second = deploy_command("auto");
+    second.id = Uuid::new_v4();
+    second.project_id = Some(Uuid::new_v4());
+    second.deployment_id = Some(Uuid::new_v4());
+    second.payload["domain"] = json!("second.run.sakala.localhost");
+    let started = tokio::time::Instant::now();
+    let first_dispatcher = CommandDispatcher::new(executor.clone());
+    let second_dispatcher = CommandDispatcher::new(executor);
+
+    let (first_result, second_result) = tokio::join!(
+        first_dispatcher.dispatch(
+            &first,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        ),
+        second_dispatcher.dispatch(
+            &second,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        )
+    );
+
+    first_result.expect("first deployment should complete");
+    second_result.expect("second deployment should complete");
+    assert!(started.elapsed() < Duration::from_millis(425));
+}
+
+#[tokio::test]
 async fn requested_build_timeout_is_used_when_shorter_than_node_maximum() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(2)));
@@ -753,7 +792,7 @@ async fn successful_redeploy_removes_only_stopped_previous_containers() {
 }
 
 #[tokio::test]
-async fn successful_redeploy_never_removes_a_running_previous_container() {
+async fn successful_redeploy_stops_and_removes_a_running_previous_container() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(
         FakeRunner::new(true)
@@ -768,7 +807,19 @@ async fn successful_redeploy_never_removes_a_running_previous_container() {
         .expect("redeployment should complete");
 
     let commands = runner.commands.lock().expect("command lock");
-    assert!(!commands.iter().any(|command| {
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "stop")
+            && command
+                .args
+                .iter()
+                .any(|argument| argument == "previous-container")
+            && command.args.iter().any(|argument| argument == "--time")
+    }));
+    assert!(commands.iter().any(|command| {
         command.program == "docker"
             && command
                 .args
@@ -933,6 +984,64 @@ async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
     RuntimeExecutor::shutdown(&executor)
         .await
         .expect("recovered follower should stop during shutdown");
+}
+
+#[tokio::test]
+async fn legacy_container_metadata_is_reported_without_aborting_recovery() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "legacy\tUp 10 minutes\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(
+                "legacy\tUp 10 minutes\t\t\t\t\t\t\n",
+            ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::recover(
+        &executor,
+        Some(Arc::new(RecordingReporterFactory::default())),
+    )
+    .await
+    .expect("legacy metadata must not fail global recovery");
+
+    assert_eq!(report.workloads.len(), 1);
+    assert_eq!(report.compatibility_issues.len(), 1);
+    assert!(
+        report.compatibility_issues[0]
+            .reason
+            .contains("redeploy is required")
+    );
+    assert_eq!(report.reattached_log_followers, 0);
+}
+
+#[tokio::test]
+async fn exited_workload_does_not_keep_a_route_alive() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680")
+        .expect("project UUID should be valid");
+    let config = runtime_config(&temp);
+    fs::create_dir_all(&config.caddy_sites_dir).expect("route directory should be created");
+    fs::write(
+        config
+            .caddy_sites_dir
+            .join(format!("{project_id}.Caddyfile")),
+        format!("# Managed by sakala-agent for project {project_id}.\nexample.test:80 {{}}\n"),
+    )
+    .expect("managed route should be written");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "deadbeef\tExited (1) 2 minutes ago\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation should complete");
+
+    assert_eq!(report.stale_routes.len(), 1);
+    assert_eq!(report.stale_routes[0].project_id, project_id);
 }
 
 #[tokio::test]
@@ -1316,6 +1425,51 @@ async fn stop_removes_workload_container_but_not_its_image() {
                 .is_some_and(|argument| argument == "image")
             && command.args.get(1).is_some_and(|argument| argument == "rm")
     }));
+}
+
+#[tokio::test]
+async fn stop_missing_workload_removes_stale_owned_route_idempotently() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let request = lifecycle_request();
+    fs::create_dir_all(&config.caddy_sites_dir).expect("route directory should be created");
+    let route = config
+        .caddy_sites_dir
+        .join(format!("{}.Caddyfile", request.project_id));
+    fs::write(
+        &route,
+        format!(
+            "# Managed by sakala-agent for project {}.\nexample.test:80 {{}}\n",
+            request.project_id
+        ),
+    )
+    .expect("managed route should be written");
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    let output =
+        RuntimeExecutor::stop_project(&executor, request, Arc::new(RecordingReporter::default()))
+            .await
+            .expect("stop should be idempotent when the workload is absent");
+
+    assert_eq!(output.result["status"], "already_stopped");
+    assert!(!route.exists());
+}
+
+#[tokio::test]
+async fn sleep_missing_workload_reports_drift_instead_of_success() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let executor =
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), Arc::new(FakeRunner::new(true)));
+
+    let error = RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("sleep cannot retain an absent container");
+
+    assert_eq!(error.code(), "runtime_workload_not_found");
 }
 
 #[tokio::test]

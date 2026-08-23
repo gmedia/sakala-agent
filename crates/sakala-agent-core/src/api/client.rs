@@ -3,7 +3,7 @@ use std::time::Duration;
 use reqwest::{Client, Method, RequestBuilder, Url, header::ACCEPT};
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CompleteCommandPayload, DeploymentEvent, DeploymentLog,
-    HeartbeatPayload,
+    HeartbeatPayload, NodeLifecyclePayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -90,6 +90,19 @@ impl ApiClient {
 
     pub async fn heartbeat(&self, payload: &HeartbeatPayload) -> Result<(), CoreError> {
         self.post(endpoints::HEARTBEAT, payload).await
+    }
+
+    /// Fetches the authoritative lifecycle state before the scheduler can claim work.
+    pub async fn node_lifecycle(&self) -> Result<NodeLifecyclePayload, CoreError> {
+        let response = self
+            .request(Method::GET, endpoints::NODE_STATE)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response
+            .json::<ApiEnvelope<NodeLifecyclePayload>>()
+            .await?
+            .data)
     }
 
     pub async fn claim(&self, command_id: Uuid) -> Result<(), CoreError> {

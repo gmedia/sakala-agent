@@ -6,6 +6,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Added
 
+- Protocol revision 4 dengan bootstrap desired lifecycle node dari control plane sebelum scheduler mengklaim command.
 - Dokumentasi matriks operating mode, ownership command melalui atomic claim, dan batas topologi Caddy container/host.
 - Docker runtime executor untuk checkout immutable GitHub commit, Buildx image build, candidate container, health check, Caddy route activation, dan cleanup deployment lama.
 - Dockerfile-first builder selection dengan Railpack fallback melalui version-pinned BuildKit frontend.
@@ -28,6 +29,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Changed
 
+- Recovery menoleransi metadata container legacy per workload, stale route hanya mempertahankan workload running, dan semaphore build dilepas sebelum fase start/readiness.
+- Heartbeat meng-cache versi dependency dan membatasi durasi probe subprocess/runtime.
 - Refactor runtime crate dari flat modules menjadi executor, workspace, builders, containers, routing, health, logs, dan process boundaries dengan dependency injection.
 - Pisahkan protocol sebagai DTO-only, core sebagai command lifecycle/application ports, runtime sebagai adapter implementation, dan binary sebagai composition root.
 - Pisahkan Caddy file route transaction dari transport reload `docker exec`, sehingga lokasi proses Caddy dapat diganti tanpa mengubah deploy orchestration.
@@ -36,3 +39,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Update transitive `quinn-proto` dependency to `0.11.15` to address `RUSTSEC-2026-0185`.
 - Update transitive `h2` dependency to `0.4.16` to address `RUSTSEC-2026-0258`.
 - Container runtime menyimpan command identity dan bounded-log policy sebagai label agar execution bookkeeping dan follower dapat dipulihkan setelah Agent restart.
+
+### Fixed
+
+- Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.

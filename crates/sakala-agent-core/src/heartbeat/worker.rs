@@ -1,6 +1,7 @@
 use std::{
     path::Path,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
@@ -32,8 +33,11 @@ pub async fn run(
     context: HeartbeatRuntimeContext,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Dependency versions are immutable for the lifetime of this process and can
+    // be relatively expensive to obtain from Docker, so probe them only once.
+    let dependencies = runtime_dependency_versions().await;
     loop {
-        let payload = payload(&config, &context).await;
+        let payload = payload(&config, &context, &dependencies).await;
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -60,10 +64,13 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> HeartbeatPayload {
+async fn payload(
+    config: &AgentConfig,
+    context: &HeartbeatRuntimeContext,
+    dependencies: &serde_json::Value,
+) -> HeartbeatPayload {
     let resources = node_resources(&context.workspace_root).await;
     let workloads = workload_statistics(context.runtime.as_ref()).await;
-    let dependencies = runtime_dependency_versions().await;
     let reconciliation = context
         .reconciliation
         .read()
@@ -146,6 +153,12 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                     "project_id": image.project_id,
                     "deployment_id": image.deployment_id,
                 })).collect::<Vec<_>>(),
+                "compatibility_issues": reconciliation.compatibility_issues.iter().map(|issue| json!({
+                    "container_id": issue.container_id,
+                    "project_id": issue.project_id,
+                    "deployment_id": issue.deployment_id,
+                    "reason": issue.reason,
+                })).collect::<Vec<_>>(),
             },
             "runtime_dependencies": dependencies,
         }),
@@ -177,11 +190,15 @@ async fn runtime_dependency_versions() -> serde_json::Value {
 }
 
 async fn command_version(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = tokio::process::Command::new(program)
-        .args(arguments)
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        probe_timeout(),
+        tokio::process::Command::new(program)
+            .args(arguments)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -201,14 +218,18 @@ struct WorkloadStatistics {
 }
 
 async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
-    let capacity = runtime.capacity().await.ok();
+    let capacity = tokio::time::timeout(probe_timeout(), runtime.capacity())
+        .await
+        .ok()
+        .and_then(Result::ok);
     let active = capacity.as_ref().and_then(|value| value.active_workloads);
     let stopped = capacity.as_ref().and_then(|value| value.stopped_workloads);
     let active_builds = capacity.as_ref().and_then(|value| value.active_builds);
     let maximum_concurrent_builds = capacity
         .as_ref()
         .and_then(|value| value.maximum_concurrent_builds);
-    let Ok(snapshots) = runtime.health_snapshot().await else {
+    let Ok(Ok(snapshots)) = tokio::time::timeout(probe_timeout(), runtime.health_snapshot()).await
+    else {
         return WorkloadStatistics {
             active,
             stopped,
@@ -283,12 +304,15 @@ async fn node_resources(workspace_root: &Path) -> NodeResources {
 }
 
 async fn workspace_disk_resources(workspace_root: &Path) -> NodeResources {
-    let output = tokio::process::Command::new("df")
-        .arg("-Pk")
-        .arg(workspace_root)
-        .output()
-        .await;
-    let Ok(output) = output else {
+    let output = tokio::time::timeout(
+        probe_timeout(),
+        tokio::process::Command::new("df")
+            .arg("-Pk")
+            .arg(workspace_root)
+            .output(),
+    )
+    .await;
+    let Ok(Ok(output)) = output else {
         return NodeResources::default();
     };
     if !output.status.success() {
@@ -307,21 +331,36 @@ async fn workspace_disk_resources(workspace_root: &Path) -> NodeResources {
         .get(3)
         .and_then(|value| value.parse::<u64>().ok())
         .and_then(|value| value.checked_mul(1_024));
-    let workspace_used_bytes = tokio::process::Command::new("du")
-        .arg("-sk")
-        .arg(workspace_root)
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|output| output.split_whitespace().next()?.parse::<u64>().ok())
-        .and_then(|value| value.checked_mul(1_024));
+    let workspace_used_bytes = tokio::time::timeout(
+        probe_timeout(),
+        tokio::process::Command::new("du")
+            .arg("-sk")
+            .arg(workspace_root)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .filter(|output| output.status.success())
+    .and_then(|output| String::from_utf8(output.stdout).ok())
+    .and_then(|output| output.split_whitespace().next()?.parse::<u64>().ok())
+    .and_then(|value| value.checked_mul(1_024));
     NodeResources {
         disk_total_bytes,
         disk_available_bytes,
         workspace_used_bytes,
         ..NodeResources::default()
+    }
+}
+
+fn probe_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        Duration::from_millis(100)
+    }
+    #[cfg(not(test))]
+    {
+        Duration::from_secs(2)
     }
 }
 
@@ -389,7 +428,7 @@ mod tests {
             })),
             minimum_workspace_free_bytes: 0,
         };
-        let heartbeat = payload(&config, &context).await;
+        let heartbeat = payload(&config, &context, &serde_json::json!({})).await;
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));

@@ -2,6 +2,7 @@ use uuid::Uuid;
 
 pub const COMMANDS: &str = "/api/agent/v1/commands";
 pub const HEARTBEAT: &str = "/api/agent/v1/heartbeat";
+pub const NODE_STATE: &str = "/api/agent/v1/node-state";
 
 #[must_use]
 pub fn repository_credential(command_id: Uuid) -> String {

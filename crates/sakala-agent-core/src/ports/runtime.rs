@@ -84,6 +84,16 @@ pub struct RuntimeStaleImage {
     pub deployment_id: Option<Uuid>,
 }
 
+/// Managed runtime object created by an older Agent whose labels are not
+/// sufficient for current recovery/lifecycle behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeCompatibilityIssue {
+    pub container_id: String,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeWorkload {
     pub container_id: String,
@@ -136,6 +146,7 @@ pub struct RuntimeReconciliationReport {
     pub stale_images: Vec<RuntimeStaleImage>,
     pub reattached_log_followers: usize,
     pub recovered_execution_records: usize,
+    pub compatibility_issues: Vec<RuntimeCompatibilityIssue>,
 }
 
 /// Result of a local runtime dependency check performed before command polling.

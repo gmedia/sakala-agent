@@ -6,8 +6,8 @@ use std::sync::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
-    ReconcileWorkloadRequest, RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor,
-    RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
+    ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue, RuntimeExecutionError,
+    RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
     RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
@@ -333,7 +333,7 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
         let reporter_ref = reporter.as_ref();
-        let _build_permit = Arc::clone(&self.build_permits)
+        let build_permit = Arc::clone(&self.build_permits)
             .acquire_owned()
             .await
             .map_err(|_| {
@@ -365,6 +365,9 @@ impl DockerRuntimeExecutor {
             operation: "deployment-build".to_owned(),
             seconds: applied_timeouts.build.as_secs(),
         })??;
+        // Build concurrency protects builder capacity only; start/readiness and routing
+        // must not prevent another deployment from entering the build phase.
+        drop(build_permit);
 
         emit_event(
             reporter_ref,
@@ -513,9 +516,15 @@ impl DockerRuntimeExecutor {
             .workload(request.project_id, request.deployment_id)
             .await?
         else {
-            return Ok(CommandOutput::with_result(
-                json!({ "status": "already_stopped" }),
-            ));
+            if remove {
+                self.routes
+                    .deactivate(request.project_id, reporter.as_ref())
+                    .await?;
+                return Ok(CommandOutput::with_result(
+                    json!({ "status": "already_stopped" }),
+                ));
+            }
+            return Err(RuntimeError::WorkloadNotFound);
         };
         self.containers.stop(&workload, 10).await?;
         self.routes
@@ -689,6 +698,15 @@ async fn directory_check(name: &str, path: &std::path::Path, fatal: bool) -> Run
     }
 }
 
+fn routable_projects(report: &RuntimeReconciliationReport) -> std::collections::HashSet<Uuid> {
+    report
+        .workloads
+        .iter()
+        .filter(|workload| workload.status.to_ascii_lowercase().starts_with("up"))
+        .map(|workload| workload.project_id)
+        .collect()
+}
+
 #[async_trait]
 impl RuntimeExecutor for DockerRuntimeExecutor {
     async fn preflight(&self) -> Result<RuntimePreflightReport, RuntimeExecutionError> {
@@ -697,12 +715,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.containers.detect_orphans().await?;
-        let known_projects = report
-            .workloads
-            .iter()
-            .map(|workload| workload.project_id)
-            .chain(report.orphans.iter().filter_map(|orphan| orphan.project_id))
-            .collect();
+        let known_projects = routable_projects(&report);
         report.stale_routes = self.routes.discover_stale_routes(&known_projects).await?;
         report.stale_images = self
             .containers
@@ -721,14 +734,34 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.reconcile().await?;
         for discovered in report.workloads.clone() {
-            let Some(workload) = self
+            let workload = match self
                 .containers
                 .workload(discovered.project_id, discovered.deployment_id)
-                .await?
-            else {
-                continue;
+                .await
+            {
+                Ok(Some(workload)) => workload,
+                Ok(None) => continue,
+                Err(error) => {
+                    report.compatibility_issues.push(RuntimeCompatibilityIssue {
+                        container_id: discovered.container_id,
+                        project_id: discovered.project_id,
+                        deployment_id: discovered.deployment_id,
+                        reason: format!(
+                            "managed workload metadata is incompatible with this Agent: {error}; redeploy is required"
+                        ),
+                    });
+                    continue;
+                }
             };
             let Some(command_id) = workload.command_id else {
+                report.compatibility_issues.push(RuntimeCompatibilityIssue {
+                    container_id: discovered.container_id,
+                    project_id: discovered.project_id,
+                    deployment_id: discovered.deployment_id,
+                    reason:
+                        "managed workload predates recovery command-id labels; redeploy is required"
+                            .to_owned(),
+                });
                 continue;
             };
             report.recovered_execution_records += 1;
@@ -876,17 +909,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
                     let discovered = self.containers.detect_orphans().await?;
-                    let known_projects = discovered
-                        .workloads
-                        .iter()
-                        .map(|workload| workload.project_id)
-                        .chain(
-                            discovered
-                                .orphans
-                                .iter()
-                                .filter_map(|orphan| orphan.project_id),
-                        )
-                        .collect();
+                    let known_projects = routable_projects(&discovered);
                     cleaned_routes += self
                         .routes
                         .cleanup_stale_routes(&known_projects, reporter.as_ref())

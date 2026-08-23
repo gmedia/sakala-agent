@@ -69,16 +69,6 @@ impl WorkspaceManager for GitWorkspaceManager {
                         .arg(&source.repository_url)
                         .cancellation(cancellation.clone()),
                 ),
-                (
-                    "git-checkout",
-                    CommandSpec::new("git")
-                        .arg("-C")
-                        .arg(workspace.source().as_os_str())
-                        .arg("checkout")
-                        .arg("--detach")
-                        .arg("FETCH_HEAD")
-                        .cancellation(cancellation.clone()),
-                ),
             ] {
                 run_checked(self.runner.as_ref(), &command, phase, reporter).await?;
             }
@@ -99,6 +89,15 @@ impl WorkspaceManager for GitWorkspaceManager {
                     .secret_env("SAKALA_GIT_ASKPASS_TOKEN", credential.token.clone());
             }
             run_checked(self.runner.as_ref(), &fetch, "git-fetch", reporter).await?;
+
+            let checkout = CommandSpec::new("git")
+                .arg("-C")
+                .arg(workspace.source().as_os_str())
+                .arg("checkout")
+                .arg("--detach")
+                .arg("FETCH_HEAD")
+                .cancellation(cancellation.clone());
+            run_checked(self.runner.as_ref(), &checkout, "git-checkout", reporter).await?;
 
             Ok::<(), RuntimeError>(())
         }
@@ -237,7 +236,7 @@ mod tests {
 
     use crate::{
         CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, RuntimeError,
-        RuntimeReporter,
+        RuntimeReporter, TokioProcessRunner,
         workspace::{GitWorkspaceManager, RepositorySource, WorkspaceManager},
     };
 
@@ -295,6 +294,51 @@ mod tests {
 
         assert_eq!(workspace.root(), temp.path().join(command_id.to_string()));
         assert!(!workspace.root().join(".sakala-git-askpass").exists());
+    }
+
+    #[tokio::test]
+    async fn real_git_checkout_fetches_requested_commit_before_checkout() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let origin = temp.path().join("origin");
+        std::fs::create_dir_all(&origin).expect("origin should be created");
+        git(&origin, &["init", "--initial-branch=main"]);
+        git(&origin, &["config", "user.name", "Sakala Test"]);
+        git(
+            &origin,
+            &["config", "user.email", "sakala-test@example.invalid"],
+        );
+        std::fs::write(origin.join("README.md"), "fixture\n").expect("fixture should be written");
+        git(&origin, &["add", "README.md"]);
+        git(&origin, &["commit", "-m", "fixture"]);
+        let commit_sha = git_output(&origin, &["rev-parse", "HEAD"]);
+        let manager = GitWorkspaceManager::new(
+            temp.path().join("builds"),
+            Arc::new(TokioProcessRunner::new(Duration::from_secs(10))),
+        );
+
+        let workspace = manager
+            .checkout(
+                Uuid::new_v4(),
+                &RepositorySource {
+                    repository_url: origin.display().to_string(),
+                    commit_sha: commit_sha.clone(),
+                    credential: None,
+                },
+                &NoopReporter,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("real local repository checkout should succeed");
+
+        assert_eq!(
+            git_output(workspace.source(), &["rev-parse", "HEAD"]),
+            commit_sha
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.source().join("README.md"))
+                .expect("checked out fixture should be readable"),
+            "fixture\n"
+        );
     }
 
     #[tokio::test]
@@ -441,6 +485,32 @@ mod tests {
     }
 
     struct NoopReporter;
+
+    fn git(directory: &std::path::Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(arguments)
+            .output()
+            .expect("git should be installed for workspace tests");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(directory: &std::path::Path, arguments: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(directory)
+            .args(arguments)
+            .output()
+            .expect("git should be installed for workspace tests");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("git output should be UTF-8")
+            .trim()
+            .to_owned()
+    }
 
     #[async_trait]
     impl RuntimeReporter for NoopReporter {

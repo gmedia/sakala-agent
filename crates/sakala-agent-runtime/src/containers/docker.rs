@@ -523,11 +523,31 @@ impl ContainerEngine for DockerContainerEngine {
                 .arg("{{.State.Running}}\t{{.Name}}")
                 .arg(container_id);
             let inspected_name = self.runner.run(&inspect, &NullOutputSink).await?;
+            if !inspected_name.success {
+                return Err(RuntimeError::Container(format!(
+                    "docker-inspect-previous exited with status {:?}",
+                    inspected_name.code
+                )));
+            }
             let mut fields = inspected_name.stdout.trim().split('\t');
             let running = matches!(fields.next(), Some("true"));
             let name = fields.next().unwrap_or_default().trim_start_matches('/');
-            if running || name == current {
+            if name == current {
                 continue;
+            }
+            if running {
+                let stop = CommandSpec::new("docker")
+                    .arg("stop")
+                    .arg("--time")
+                    .arg("10")
+                    .arg(container_id);
+                run_checked(
+                    self.runner.as_ref(),
+                    &stop,
+                    "docker-stop-previous",
+                    reporter,
+                )
+                .await?;
             }
             let remove = CommandSpec::new("docker").arg("rm").arg(container_id);
             run_checked(

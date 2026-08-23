@@ -4,7 +4,7 @@
 ///
 /// This is intentionally independent from the crate semantic version so the
 /// control plane can reject an incompatible agent before assigning work.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 pub mod commands;
 pub mod deployments;
@@ -28,6 +28,6 @@ pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::HeartbeatPayload;
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
-pub use node::NodeInfo;
+pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};
 pub use repositories::RepositoryAccess;
 pub use status::{CommandStatus, NodeStatus};

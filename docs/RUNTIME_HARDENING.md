@@ -85,6 +85,18 @@ container/project/deployment/status/reason yang aman. Ini memberi operator
 verifikasi ringan segera setelah restart tanpa menunggu interval health worker;
 Agent tetap tidak menjalankan restart otomatis atau mutasi recovery.
 
+Probe heartbeat yang menjalankan subprocess memiliki deadline dua detik.
+Versi Git, Docker, Buildx, dan Railpack di-cache sekali saat worker heartbeat
+dimulai; probe kapasitas, health runtime, `df`, dan `du` juga dibatasi agar satu
+command host yang macet tidak menahan heartbeat maupun shutdown tanpa batas.
+
+Container yang dibuat oleh Agent revision lama mungkin belum memiliki label
+domain, port, command ID, atau batas log yang dibutuhkan recovery modern. Agent
+tetap menginventaris container tersebut dan melaporkan `compatibility_issues`
+di heartbeat tanpa menggagalkan recovery workload lain. Container itu tidak
+dipasangi log follower baru; operator harus melakukan redeploy untuk menulis
+label canonical lengkap.
+
 Sebelum checkout deployment baru, Agent juga membaca free space filesystem
 workspace dengan `df -Pk`. Bila jumlahnya di bawah
 `SAKALA_MIN_WORKSPACE_FREE_MB`, command gagal dengan

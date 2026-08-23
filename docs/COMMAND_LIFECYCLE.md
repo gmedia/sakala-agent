@@ -45,8 +45,8 @@ dapat drift dari deployment aktif.
 | Command | Perilaku | Idempotensi |
 | --- | --- | --- |
 | `RestartProject` | Restart container aktif dengan graceful Docker stop timeout, tunggu readiness, lalu tulis dan validasi ulang route. | Workload yang sudah stopped menghasilkan `runtime_workload_not_running`; tidak membuat deployment baru. |
-| `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan. | Bila container/rute sudah tidak ada, command berhasil tanpa mutasi tambahan. |
-| `SleepProject` | Hapus route dan stop container, tetapi tidak menghapus container maupun image. | Container yang sudah stopped tetap sukses; artifact dipertahankan untuk wake. |
+| `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan. | Bila container sudah tidak ada, route owned Agent tetap dinonaktifkan dan command sukses idempoten. |
+| `SleepProject` | Hapus route dan stop container, tetapi tidak menghapus container maupun image. | Container yang sudah stopped tetap sukses; container yang hilang menghasilkan drift/error karena tidak ada artifact untuk di-wake. |
 | `WakeProject` | Start kembali container hasil sleep, tunggu readiness, lalu restore route dari label domain/port. | Container yang sudah running hanya merevalidasi readiness dan route. |
 | `HealthCheck` | Menginspeksi container managed dan mengembalikan state running, ready, status Docker, serta reason aman. | Read-only. |
 | `RefreshRoute` | Menolak container yang tidak ready; kemudian membangun ulang route deterministik dari label domain/port dan menjalankan validate/reload Caddy. | Menulis konten route yang sama secara atomik; aman diulang. |
@@ -61,6 +61,11 @@ tidak membutuhkan checkout atau build. Agent tidak membuat kebijakan retry/resta
 otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane.
 `CleanupRuntime` menolak payload tanpa approval eksplisit, sementara penghapusan
 route memverifikasi marker ownership Sakala sebelum menyentuh file.
+
+State drain tidak hanya disimpan di memory process. Saat connected Agent
+bootstrap, desired lifecycle dipulihkan dari control plane sebelum polling
+command dimulai. Karena itu restart binary tidak boleh mengaktifkan node yang
+masih `draining`, `drained`, atau `maintenance`.
 
 `DrainNode` dan `ResumeNode` tidak memerlukan `project_id` atau `deployment_id`.
 

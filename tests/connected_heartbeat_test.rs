@@ -1,5 +1,5 @@
 use sakala_agent_core::api::ApiClient;
-use sakala_agent_protocol::HeartbeatPayload;
+use sakala_agent_protocol::{DesiredNodeLifecycleState, HeartbeatPayload};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -16,7 +16,7 @@ async fn connected_heartbeat_uses_the_agent_contract() {
         "capabilities": ["noop-runtime"],
         "metadata": {
             "version": "0.1.0",
-            "protocol_version": 3,
+            "protocol_version": 4,
             "runtime_driver": "docker",
             "lifecycle_state": "active",
             "uptime_seconds": 86400,
@@ -45,7 +45,7 @@ async fn connected_heartbeat_uses_the_agent_contract() {
             "capabilities": ["noop-runtime"],
             "metadata": {
                 "version": "0.1.0",
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "runtime_driver": "docker",
                 "lifecycle_state": "active",
                 "uptime_seconds": 86400,
@@ -72,4 +72,28 @@ async fn connected_heartbeat_uses_the_agent_contract() {
         .heartbeat(&payload)
         .await
         .expect("heartbeat request should succeed");
+}
+
+#[tokio::test]
+async fn connected_bootstrap_reads_authoritative_node_lifecycle() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/node-state"))
+        .and(header("authorization", "Bearer test-agent-token"))
+        .and(header("x-agent-id", "runtime-01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "desired_state": "drained" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+
+    let state = client
+        .node_lifecycle()
+        .await
+        .expect("desired lifecycle should be readable");
+
+    assert_eq!(state.desired_state, DesiredNodeLifecycleState::Drained);
 }
