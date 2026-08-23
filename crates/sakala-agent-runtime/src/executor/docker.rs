@@ -269,7 +269,13 @@ impl DockerRuntimeExecutor {
         };
 
         if result.is_err() && !route_activated.load(Ordering::Acquire) {
-            self.containers.cleanup_candidate(&container, &image).await;
+            if let Err(error) = self.containers.cleanup_candidate(&container, &image).await {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "candidate cleanup warning for {container}: {error}"
+                    )))
+                    .await;
+            }
         }
         if let Err(error) = self.workspace.cleanup(&workspace).await {
             let _ = reporter

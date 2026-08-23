@@ -514,19 +514,40 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(())
     }
 
-    async fn cleanup_candidate(&self, container: &str, image: &str) {
-        for command in [
-            CommandSpec::new("docker")
-                .arg("rm")
-                .arg("--force")
-                .arg(container),
-            CommandSpec::new("docker")
-                .arg("image")
-                .arg("rm")
-                .arg("--force")
-                .arg(image),
+    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError> {
+        let mut failures = Vec::new();
+        for (artifact, command) in [
+            (
+                "candidate container",
+                CommandSpec::new("docker")
+                    .arg("rm")
+                    .arg("--force")
+                    .arg(container),
+            ),
+            (
+                "candidate image",
+                CommandSpec::new("docker")
+                    .arg("image")
+                    .arg("rm")
+                    .arg("--force")
+                    .arg(image),
+            ),
         ] {
-            let _ = self.runner.run(&command, &NullOutputSink).await;
+            match self.runner.run(&command, &NullOutputSink).await {
+                Ok(output) if output.success => {}
+                Ok(output) => {
+                    failures.push(format!("{artifact} exited with status {:?}", output.code))
+                }
+                Err(error) => failures.push(format!("{artifact}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Container(format!(
+                "candidate cleanup incomplete: {}",
+                failures.join("; ")
+            )))
         }
     }
 

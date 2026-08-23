@@ -96,7 +96,10 @@ pub trait ContainerEngine: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    async fn cleanup_candidate(&self, container: &str, image: &str);
+    /// Attempts every candidate cleanup action. A failure is returned only
+    /// after all owned artifacts have been attempted, so callers can report
+    /// partial cleanup without replacing the primary deployment error.
+    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
 
     async fn shutdown(&self);
 }
