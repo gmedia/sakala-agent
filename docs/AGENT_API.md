@@ -158,6 +158,15 @@ Respons conflict harus menyertakan state command yang aman untuk ditampilkan
 payload deployment atau credential. Retry command polling tidak memberi izin
 untuk menjalankan ulang command yang tidak berhasil di-claim.
 
+Bentuk respons `409` yang ditetapkan adalah:
+
+```json
+{
+  "status": "Succeeded",
+  "terminal_at": "2026-08-23T10:00:00Z"
+}
+```
+
 Command yang sudah `Claimed`, `Running`, `Succeeded`, `Failed`, `Cancelled`, atau `Expired` tidak boleh dikembalikan lagi sebagai pekerjaan pending. Polling berikutnya hanya mengembalikan pekerjaan baru atau pekerjaan yang secara eksplisit dikembalikan ke antrean oleh policy lease/recovery API.
 
 ```txt
