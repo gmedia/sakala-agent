@@ -12,6 +12,18 @@ pub enum RuntimeError {
     Dependency(String),
     #[error("runtime repository operation failed: {0}")]
     Repository(String),
+    #[error("repository was not found")]
+    RepositoryNotFound,
+    #[error("repository access was denied")]
+    RepositoryAccessDenied,
+    #[error("repository authentication failed")]
+    RepositoryAuthFailed,
+    #[error("repository credential has expired or is no longer valid")]
+    RepositoryCredentialExpired,
+    #[error("requested repository commit was not found")]
+    RepositoryCommitNotFound,
+    #[error("repository checkout failed")]
+    RepositoryCheckoutFailed,
     #[error("runtime operation failed: {0}")]
     Execution(String),
     #[error("runtime build failed: {0}")]
@@ -42,6 +54,12 @@ impl RuntimeError {
             Self::InvalidCommand(_) => "invalid_runtime_command",
             Self::Dependency(_) => "runtime_dependency_failed",
             Self::Repository(_) => "runtime_repository_failed",
+            Self::RepositoryNotFound => "repository_not_found",
+            Self::RepositoryAccessDenied => "repository_access_denied",
+            Self::RepositoryAuthFailed => "repository_auth_failed",
+            Self::RepositoryCredentialExpired => "repository_credential_expired",
+            Self::RepositoryCommitNotFound => "repository_commit_not_found",
+            Self::RepositoryCheckoutFailed => "repository_checkout_failed",
             Self::Execution(_) => "runtime_execution_failed",
             Self::Build(_) => "runtime_build_failed",
             Self::Container(_) => "runtime_container_failed",
@@ -70,6 +88,44 @@ impl RuntimeError {
             Self::Execution(summary)
         }
     }
+
+    #[must_use]
+    pub fn failed_process(phase: &str, status: Option<i32>, stderr: &str) -> Self {
+        if phase.starts_with("git-") {
+            return Self::classify_repository_failure(stderr);
+        }
+        Self::failed_operation(phase, status)
+    }
+
+    fn classify_repository_failure(stderr: &str) -> Self {
+        let detail = stderr.to_ascii_lowercase();
+        if detail.contains("repository not found") {
+            Self::RepositoryNotFound
+        } else if detail.contains("authentication failed")
+            || detail.contains("http basic: access denied")
+            || detail.contains("invalid username or token")
+        {
+            Self::RepositoryAuthFailed
+        } else if detail.contains("expired")
+            || detail.contains("token has been revoked")
+            || detail.contains("token is not valid")
+        {
+            Self::RepositoryCredentialExpired
+        } else if detail.contains("permission denied")
+            || detail.contains("could not read from remote repository")
+            || detail.contains("access denied")
+        {
+            Self::RepositoryAccessDenied
+        } else if detail.contains("couldn't find remote ref")
+            || detail.contains("not our ref")
+            || detail.contains("reference is not a tree")
+            || detail.contains("unknown revision")
+        {
+            Self::RepositoryCommitNotFound
+        } else {
+            Self::RepositoryCheckoutFailed
+        }
+    }
 }
 
 impl From<RuntimeError> for RuntimeExecutionError {
@@ -81,5 +137,31 @@ impl From<RuntimeError> for RuntimeExecutionError {
 impl From<RuntimeExecutionError> for RuntimeError {
     fn from(error: RuntimeExecutionError) -> Self {
         Self::Reporting(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeError;
+
+    #[test]
+    fn git_stderr_is_classified_without_becoming_the_reported_message() {
+        for (stderr, code) in [
+            ("remote: Repository not found.", "repository_not_found"),
+            ("fatal: Authentication failed", "repository_auth_failed"),
+            ("fatal: token has expired", "repository_credential_expired"),
+            (
+                "fatal: Could not read from remote repository.",
+                "repository_access_denied",
+            ),
+            (
+                "fatal: couldn't find remote ref deadbeef",
+                "repository_commit_not_found",
+            ),
+        ] {
+            let error = RuntimeError::failed_process("git-fetch", Some(128), stderr);
+            assert_eq!(error.code(), code);
+            assert!(!error.to_string().contains(stderr));
+        }
     }
 }

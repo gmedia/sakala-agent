@@ -463,7 +463,7 @@ async fn executor_rejects_non_github_repository_before_starting_a_process() {
 }
 
 #[tokio::test]
-async fn git_checkout_failure_uses_a_repository_error_code() {
+async fn git_checkout_failure_uses_a_specific_repository_error_code() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FailingGitRunner);
     let reporter = Arc::new(RecordingReporter::default());
@@ -473,7 +473,7 @@ async fn git_checkout_failure_uses_a_repository_error_code() {
         .await
         .expect_err("failed fetch should stop deployment");
 
-    assert_eq!(error.code(), "runtime_repository_failed");
+    assert_eq!(error.code(), "repository_checkout_failed");
 }
 
 #[tokio::test]
