@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, ports::RuntimeExecutor,
+    scheduler::metrics::SchedulerMetrics,
 };
 
 pub async fn run(
@@ -17,6 +18,7 @@ pub async fn run(
     runtime_driver: String,
     workspace_root: std::path::PathBuf,
     runtime: Arc<dyn RuntimeExecutor>,
+    scheduler_metrics: Arc<SchedulerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -26,6 +28,7 @@ pub async fn run(
             &runtime_driver,
             &workspace_root,
             runtime.as_ref(),
+            scheduler_metrics.as_ref(),
         )
         .await;
 
@@ -60,6 +63,7 @@ async fn payload(
     runtime_driver: &str,
     workspace_root: &Path,
     runtime: &dyn RuntimeExecutor,
+    scheduler_metrics: &SchedulerMetrics,
 ) -> HeartbeatPayload {
     let resources = node_resources(workspace_root).await;
     let workloads = workload_statistics(runtime).await;
@@ -96,6 +100,12 @@ async fn payload(
                 "starting": workloads.starting,
                 "unhealthy": workloads.unhealthy,
                 "stopped": workloads.stopped,
+            },
+            "execution": {
+                "active_commands": scheduler_metrics.active_commands(),
+                "queued_local_commands": scheduler_metrics.queued_local_commands(),
+                "active_builds": workloads.active_builds,
+                "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },
             "runtime_dependencies": dependencies,
         }),
@@ -137,16 +147,24 @@ struct WorkloadStatistics {
     stopped: Option<usize>,
     starting: Option<usize>,
     unhealthy: Option<usize>,
+    active_builds: Option<usize>,
+    maximum_concurrent_builds: Option<usize>,
 }
 
 async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
     let capacity = runtime.capacity().await.ok();
     let active = capacity.as_ref().and_then(|value| value.active_workloads);
     let stopped = capacity.as_ref().and_then(|value| value.stopped_workloads);
+    let active_builds = capacity.as_ref().and_then(|value| value.active_builds);
+    let maximum_concurrent_builds = capacity
+        .as_ref()
+        .and_then(|value| value.maximum_concurrent_builds);
     let Ok(snapshots) = runtime.health_snapshot().await else {
         return WorkloadStatistics {
             active,
             stopped,
+            active_builds,
+            maximum_concurrent_builds,
             ..WorkloadStatistics::default()
         };
     };
@@ -174,6 +192,8 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
     WorkloadStatistics {
         active,
         stopped,
+        active_builds,
+        maximum_concurrent_builds,
         starting: Some(starting),
         unhealthy: Some(unhealthy),
     }
@@ -277,7 +297,10 @@ mod tests {
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
 
-    use crate::{AgentConfig, NodeLifecycleState, ports::RuntimeExecutor};
+    use crate::{
+        AgentConfig, NodeLifecycleState, ports::RuntimeExecutor,
+        scheduler::metrics::SchedulerMetrics,
+    };
 
     use super::{parse_meminfo, payload, workspace_disk_resources};
 
@@ -290,12 +313,14 @@ mod tests {
     async fn heartbeat_identifies_the_wire_contract_revision() {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
+        let scheduler_metrics = SchedulerMetrics::default();
         let heartbeat = payload(
             &config,
             NodeLifecycleState::Active,
             "noop",
             std::path::Path::new("/tmp"),
             &EmptyRuntime,
+            &scheduler_metrics,
         )
         .await;
 

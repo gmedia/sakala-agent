@@ -78,6 +78,8 @@ pub struct RuntimeCapacity {
     pub active_workloads: Option<usize>,
     pub stopped_workloads: Option<usize>,
     pub maximum_active_workloads: Option<usize>,
+    pub active_builds: Option<usize>,
+    pub maximum_concurrent_builds: Option<usize>,
 }
 
 impl RuntimeCapacity {
@@ -291,6 +293,8 @@ mod tests {
                 active_workloads: Some(4),
                 stopped_workloads: None,
                 maximum_active_workloads: Some(2),
+                active_builds: None,
+                maximum_concurrent_builds: None,
             }
             .available_workload_slots(),
             Some(0)

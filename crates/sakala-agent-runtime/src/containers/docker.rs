@@ -195,6 +195,8 @@ impl ContainerEngine for DockerContainerEngine {
                     .count(),
             ),
             maximum_active_workloads: Some(self.max_active_containers as usize),
+            active_builds: None,
+            maximum_concurrent_builds: None,
         })
     }
 

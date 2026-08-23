@@ -41,6 +41,7 @@ pub struct DockerRuntimeExecutor {
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
     build_permits: Arc<Semaphore>,
+    max_concurrent_builds: usize,
     workspace_gc_max_age: std::time::Duration,
     min_workspace_free_bytes: u64,
     preflight: DockerPreflight,
@@ -135,6 +136,7 @@ impl DockerRuntimeExecutor {
             routes,
             timeout_safety,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            max_concurrent_builds,
             workspace_gc_max_age,
             min_workspace_free_bytes,
             preflight,
@@ -685,7 +687,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     }
 
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeExecutionError> {
-        self.containers.capacity().await.map_err(Into::into)
+        let mut capacity = self.containers.capacity().await?;
+        capacity.active_builds = Some(
+            self.max_concurrent_builds
+                .saturating_sub(self.build_permits.available_permits()),
+        );
+        capacity.maximum_concurrent_builds = Some(self.max_concurrent_builds);
+        Ok(capacity.into())
     }
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {

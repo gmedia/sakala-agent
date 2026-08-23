@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, commands::CommandProcessor,
-    ports::RuntimeExecutor,
+    ports::RuntimeExecutor, scheduler::metrics::SchedulerMetrics,
 };
 
 pub async fn run(
@@ -20,6 +20,7 @@ pub async fn run(
     client: Option<ApiClient>,
     runtime: Arc<dyn RuntimeExecutor>,
     node_lifecycle: Arc<NodeLifecycle>,
+    metrics: Arc<SchedulerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let handler = client.as_ref().map(|client| {
@@ -30,7 +31,7 @@ pub async fn run(
             Arc::clone(&node_lifecycle),
         ))
     });
-    let mut executions = CommandExecutions::new(config.max_concurrent_commands);
+    let mut executions = CommandExecutions::new(config.max_concurrent_commands, metrics);
 
     'polling: loop {
         executions.reap_completed();
@@ -119,6 +120,7 @@ struct CommandExecutions {
     active_heavy: usize,
     active_lightweight: usize,
     active_projects: HashSet<Uuid>,
+    metrics: Arc<SchedulerMetrics>,
     task_metadata: HashMap<tokio::task::Id, TaskMetadata>,
     tasks: JoinSet<(Uuid, Option<Uuid>)>,
 }
@@ -131,13 +133,14 @@ struct TaskMetadata {
 }
 
 impl CommandExecutions {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, metrics: Arc<SchedulerMetrics>) -> Self {
         Self {
             heavy_limit: limit,
             lightweight_limit: 1,
             active_heavy: 0,
             active_lightweight: 0,
             active_projects: HashSet::new(),
+            metrics,
             task_metadata: HashMap::new(),
             tasks: JoinSet::new(),
         }
@@ -174,6 +177,7 @@ impl CommandExecutions {
         } else {
             self.active_heavy += 1;
         }
+        self.metrics.command_started();
         let task = self.tasks.spawn(async move {
             work.await;
             (command_id, project_id)
@@ -231,6 +235,7 @@ impl CommandExecutions {
         } else {
             self.active_heavy = self.active_heavy.saturating_sub(1);
         }
+        self.metrics.command_finished();
     }
 
     async fn cancel_and_wait(&mut self, grace: std::time::Duration) {
@@ -298,6 +303,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::CommandExecutions;
+    use crate::scheduler::metrics::SchedulerMetrics;
 
     fn command(project_id: Option<Uuid>) -> sakala_agent_protocol::AgentCommand {
         command_with_type(project_id, CommandType::DeployProject)
@@ -319,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn lightweight_work_uses_a_slot_separate_from_heavy_build_work() {
-        let mut executions = CommandExecutions::new(1);
+        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
         let (release_build, wait_build) = oneshot::channel();
         let (release_health, wait_health) = oneshot::channel();
 
@@ -351,7 +357,7 @@ mod tests {
     async fn bounds_global_work_and_serializes_each_project() {
         let project_a = Uuid::new_v4();
         let project_b = Uuid::new_v4();
-        let mut executions = CommandExecutions::new(2);
+        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let (release_a, wait_a) = oneshot::channel();
@@ -385,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_cancels_multiple_in_flight_commands() {
-        let mut executions = CommandExecutions::new(2);
+        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
         let first_cancellation = CancellationToken::new();
         let second_cancellation = CancellationToken::new();
 
@@ -409,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn failed_task_releases_its_project_and_capacity() {
         let project_id = Uuid::new_v4();
-        let mut executions = CommandExecutions::new(1);
+        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
 
         assert!(
             executions.try_start(command(Some(project_id)), CancellationToken::new(), async {

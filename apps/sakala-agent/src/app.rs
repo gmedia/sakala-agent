@@ -84,6 +84,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let node_lifecycle = Arc::new(NodeLifecycle::new());
+    let scheduler_metrics = Arc::new(scheduler::metrics::SchedulerMetrics::default());
 
     let runtime_health_task = tokio::spawn(sakala_agent_core::health::worker::run(
         Arc::clone(&runtime),
@@ -98,6 +99,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.runtime_driver.to_string(),
         workspace_root,
         Arc::clone(&runtime),
+        Arc::clone(&scheduler_metrics),
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(
@@ -105,6 +107,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         client,
         Arc::clone(&runtime),
         node_lifecycle,
+        scheduler_metrics,
         shutdown_rx,
     ));
 

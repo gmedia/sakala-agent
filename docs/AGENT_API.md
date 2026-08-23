@@ -295,6 +295,12 @@ untuk aturan rollout dan command yang belum didukung.
       "docker": "27.3.1",
       "buildx": "github.com/docker/buildx v0.17.1",
       "railpack": "railpack 0.23.0"
+    },
+    "execution": {
+      "active_commands": 1,
+      "queued_local_commands": 0,
+      "active_builds": 1,
+      "maximum_concurrent_builds": 2
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"
