@@ -59,6 +59,16 @@ tidak membutuhkan checkout atau build. Agent tidak membuat kebijakan retry/resta
 otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane.
 
 `DrainNode` dan `ResumeNode` tidak memerlukan `project_id` atau `deployment_id`.
+
+## Kelas scheduler
+
+`DeployProject` dan lifecycle yang melakukan mutasi workload memakai pool
+heavy yang dibatasi `SAKALA_MAX_CONCURRENT_COMMANDS`. `InspectProject`,
+`HealthCheck`, `RefreshRoute`, `DrainNode`, dan `ResumeNode` memakai satu slot
+lightweight terpisah. Dengan begitu build panjang tidak memblokir health check
+atau maintenance read-only pada project lain. Semua command untuk project yang
+sama tetap serial; command yang tidak memperoleh slot tetap `Pending` di
+control plane untuk poll berikutnya.
 Keduanya tetap boleh diproses ketika node sedang draining/drained agar operator
 selalu memiliki jalur untuk melanjutkan service tanpa mematikan workload.
 

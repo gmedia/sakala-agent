@@ -114,7 +114,10 @@ pub async fn run(
 /// start remain pending in the control plane and will be considered again on a
 /// later poll. A project may own at most one active command at a time.
 struct CommandExecutions {
-    limit: usize,
+    heavy_limit: usize,
+    lightweight_limit: usize,
+    active_heavy: usize,
+    active_lightweight: usize,
     active_projects: HashSet<Uuid>,
     task_metadata: HashMap<tokio::task::Id, TaskMetadata>,
     tasks: JoinSet<(Uuid, Option<Uuid>)>,
@@ -124,12 +127,16 @@ struct TaskMetadata {
     command_id: Uuid,
     project_id: Option<Uuid>,
     cancellation: CancellationToken,
+    lightweight: bool,
 }
 
 impl CommandExecutions {
     fn new(limit: usize) -> Self {
         Self {
-            limit,
+            heavy_limit: limit,
+            lightweight_limit: 1,
+            active_heavy: 0,
+            active_lightweight: 0,
             active_projects: HashSet::new(),
             task_metadata: HashMap::new(),
             tasks: JoinSet::new(),
@@ -151,7 +158,9 @@ impl CommandExecutions {
     {
         let command_id = command.id;
         let project_id = command.project_id;
-        if self.tasks.len() >= self.limit
+        let lightweight = is_lightweight(command.command_type);
+        if (lightweight && self.active_lightweight >= self.lightweight_limit)
+            || (!lightweight && self.active_heavy >= self.heavy_limit)
             || project_id.is_some_and(|project_id| self.active_projects.contains(&project_id))
         {
             return false;
@@ -159,6 +168,11 @@ impl CommandExecutions {
 
         if let Some(project_id) = project_id {
             self.active_projects.insert(project_id);
+        }
+        if lightweight {
+            self.active_lightweight += 1;
+        } else {
+            self.active_heavy += 1;
         }
         let task = self.tasks.spawn(async move {
             work.await;
@@ -170,6 +184,7 @@ impl CommandExecutions {
                 command_id,
                 project_id,
                 cancellation,
+                lightweight,
             },
         );
         true
@@ -182,18 +197,39 @@ impl CommandExecutions {
                     if let Some(project_id) = project_id {
                         self.active_projects.remove(&project_id);
                     }
-                    self.task_metadata
-                        .retain(|_, task| task.command_id != command_id);
+                    self.release_task(command_id);
                 }
                 Err(error) => {
-                    if let Some(task) = self.task_metadata.remove(&error.id())
-                        && let Some(project_id) = task.project_id
-                    {
-                        self.active_projects.remove(&project_id);
+                    if let Some(task) = self.task_metadata.remove(&error.id()) {
+                        self.release_metadata(task);
                     }
                     warn!(%error, "command task terminated unexpectedly");
                 }
             }
+        }
+    }
+
+    fn release_task(&mut self, command_id: Uuid) {
+        let task_ids = self
+            .task_metadata
+            .iter()
+            .filter_map(|(id, task)| (task.command_id == command_id).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in task_ids {
+            if let Some(task) = self.task_metadata.remove(&id) {
+                self.release_metadata(task);
+            }
+        }
+    }
+
+    fn release_metadata(&mut self, task: TaskMetadata) {
+        if let Some(project_id) = task.project_id {
+            self.active_projects.remove(&project_id);
+        }
+        if task.lightweight {
+            self.active_lightweight = self.active_lightweight.saturating_sub(1);
+        } else {
+            self.active_heavy = self.active_heavy.saturating_sub(1);
         }
     }
 
@@ -219,17 +255,12 @@ impl CommandExecutions {
         while let Some(result) = self.tasks.join_next().await {
             match result {
                 Ok((command_id, project_id)) => {
-                    if let Some(project_id) = project_id {
-                        self.active_projects.remove(&project_id);
-                    }
-                    self.task_metadata
-                        .retain(|_, task| task.command_id != command_id);
+                    let _ = project_id;
+                    self.release_task(command_id);
                 }
                 Err(error) => {
-                    if let Some(task) = self.task_metadata.remove(&error.id())
-                        && let Some(project_id) = task.project_id
-                    {
-                        self.active_projects.remove(&project_id);
+                    if let Some(task) = self.task_metadata.remove(&error.id()) {
+                        self.release_metadata(task);
                     }
                     if !error.is_cancelled() {
                         warn!(%error, "command task terminated unexpectedly during shutdown");
@@ -238,6 +269,17 @@ impl CommandExecutions {
             }
         }
     }
+}
+
+fn is_lightweight(command_type: CommandType) -> bool {
+    matches!(
+        command_type,
+        CommandType::InspectProject
+            | CommandType::HealthCheck
+            | CommandType::RefreshRoute
+            | CommandType::DrainNode
+            | CommandType::ResumeNode
+    )
 }
 
 #[cfg(test)]
@@ -258,14 +300,51 @@ mod tests {
     use super::CommandExecutions;
 
     fn command(project_id: Option<Uuid>) -> sakala_agent_protocol::AgentCommand {
+        command_with_type(project_id, CommandType::DeployProject)
+    }
+
+    fn command_with_type(
+        project_id: Option<Uuid>,
+        command_type: CommandType,
+    ) -> sakala_agent_protocol::AgentCommand {
         sakala_agent_protocol::AgentCommand {
             id: Uuid::new_v4(),
-            command_type: CommandType::DeployProject,
+            command_type,
             status: CommandStatus::Pending,
             project_id,
             deployment_id: None,
             payload: serde_json::Value::Null,
         }
+    }
+
+    #[tokio::test]
+    async fn lightweight_work_uses_a_slot_separate_from_heavy_build_work() {
+        let mut executions = CommandExecutions::new(1);
+        let (release_build, wait_build) = oneshot::channel();
+        let (release_health, wait_health) = oneshot::channel();
+
+        assert!(executions.try_start(
+            command(Some(Uuid::new_v4())),
+            CancellationToken::new(),
+            async move {
+                let _ = wait_build.await;
+            }
+        ));
+        assert!(executions.try_start(
+            command_with_type(Some(Uuid::new_v4()), CommandType::HealthCheck),
+            CancellationToken::new(),
+            async move {
+                let _ = wait_health.await;
+            }
+        ));
+        assert_eq!(executions.len(), 2);
+        release_build.send(()).expect("build should still run");
+        release_health
+            .send(())
+            .expect("health check should still run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        executions.reap_completed();
+        assert_eq!(executions.len(), 0);
     }
 
     #[tokio::test]
