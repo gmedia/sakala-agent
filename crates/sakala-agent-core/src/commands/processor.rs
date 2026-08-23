@@ -68,7 +68,13 @@ impl CommandProcessor {
             command_type = ?command.command_type,
             "processing control-plane command"
         );
-        self.client.claim(command.id).await?;
+        if let Err(error) = self.client.claim(command.id).await {
+            if matches!(error, CoreError::CommandNotClaimable) {
+                info!(command_id = %command.id, "command claim conflicted; skipping execution");
+                return Ok(());
+            }
+            return Err(error);
+        }
         self.client
             .event(
                 command.id,

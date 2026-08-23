@@ -92,8 +92,19 @@ impl ApiClient {
     }
 
     pub async fn claim(&self, command_id: Uuid) -> Result<(), CoreError> {
-        self.post(&endpoints::command_action(command_id, "claim"), &json!({}))
-            .await
+        let response = self
+            .request(
+                Method::POST,
+                &endpoints::command_action(command_id, "claim"),
+            )
+            .json(&json!({}))
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Err(CoreError::CommandNotClaimable);
+        }
+        response.error_for_status()?;
+        Ok(())
     }
 
     pub async fn event(
