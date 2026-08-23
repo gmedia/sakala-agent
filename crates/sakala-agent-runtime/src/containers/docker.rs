@@ -492,16 +492,16 @@ impl ContainerEngine for DockerContainerEngine {
             let inspect = CommandSpec::new("docker")
                 .arg("inspect")
                 .arg("--format")
-                .arg("{{.Name}}")
+                .arg("{{.State.Running}}\t{{.Name}}")
                 .arg(container_id);
             let inspected_name = self.runner.run(&inspect, &NullOutputSink).await?;
-            if inspected_name.stdout.trim().trim_start_matches('/') == current {
+            let mut fields = inspected_name.stdout.trim().split('\t');
+            let running = matches!(fields.next(), Some("true"));
+            let name = fields.next().unwrap_or_default().trim_start_matches('/');
+            if running || name == current {
                 continue;
             }
-            let remove = CommandSpec::new("docker")
-                .arg("rm")
-                .arg("--force")
-                .arg(container_id);
+            let remove = CommandSpec::new("docker").arg("rm").arg(container_id);
             run_checked(
                 self.runner.as_ref(),
                 &remove,

@@ -656,6 +656,65 @@ async fn node_capacity_rejects_a_new_project_but_allows_replacement() {
 }
 
 #[tokio::test]
+async fn successful_redeploy_removes_only_stopped_previous_containers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("previous-container\n")
+            .with_previous_container_inspection("false\t/old-deployment\n"),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(executor, &deploy_command("auto"), reporter)
+        .await
+        .expect("redeployment should complete");
+
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+            && command
+                .args
+                .iter()
+                .any(|argument| argument == "previous-container")
+            && !command.args.iter().any(|argument| argument == "--force")
+    }));
+}
+
+#[tokio::test]
+async fn successful_redeploy_never_removes_a_running_previous_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("previous-container\n")
+            .with_previous_container_inspection("true\t/old-deployment\n"),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(executor, &deploy_command("auto"), reporter)
+        .await
+        .expect("redeployment should complete");
+
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(!commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+            && command
+                .args
+                .iter()
+                .any(|argument| argument == "previous-container")
+    }));
+}
+
+#[tokio::test]
 async fn deployment_refuses_build_when_workspace_disk_is_below_local_floor() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_df(
@@ -1012,6 +1071,7 @@ struct FakeRunner {
     df_stdout: String,
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
+    previous_container_inspection: Option<String>,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
 }
@@ -1076,6 +1136,7 @@ impl FakeRunner {
             df_stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1000 9999000 1% /\n".to_owned(),
             build_delay: None,
             inspect_delay: None,
+            previous_container_inspection: None,
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
         }
@@ -1098,6 +1159,11 @@ impl FakeRunner {
 
     fn with_inspect_delay(mut self, delay: Duration) -> Self {
         self.inspect_delay = Some(delay);
+        self
+    }
+
+    fn with_previous_container_inspection(mut self, stdout: impl Into<String>) -> Self {
+        self.previous_container_inspection = Some(stdout.into());
         self
     }
 }
@@ -1171,6 +1237,15 @@ impl ProcessRunner for FakeRunner {
         let stdout = if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "ps")
         {
             self.docker_ps_stdout.as_str()
+        } else if spec.program == "docker"
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument == "{{.State.Running}}\t{{.Name}}")
+        {
+            self.previous_container_inspection
+                .as_deref()
+                .unwrap_or("true\t/running\n")
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
             "running\n"
