@@ -236,6 +236,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
 
     Ok(AppConfig {
         docker_runtime: DockerRuntimeConfig {
+            agent_id: agent.agent_id.clone(),
             workspace_root: get(values, "SAKALA_RUNTIME_WORKSPACE", "/var/lib/sakala/builds")
                 .into(),
             runtime_network: agent.runtime_network.clone(),

@@ -52,6 +52,7 @@ impl DockerRuntimeExecutor {
 
     #[must_use]
     pub fn with_runner(config: DockerRuntimeConfig, runner: Arc<dyn ProcessRunner>) -> Self {
+        let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
@@ -72,6 +73,7 @@ impl DockerRuntimeExecutor {
                 config.runtime_network,
                 config.resource_safety,
                 config.max_active_containers,
+                agent_id,
             )),
             Arc::new(DockerHealthChecker::new(
                 Arc::clone(&runner),

@@ -24,12 +24,15 @@ use crate::{
 };
 
 const MANAGED_LABEL: &str = "dev.sakala.managed=true";
+const AGENT_ID_LABEL: &str = "dev.sakala.agent-id";
+const WORKLOAD_KIND_LABEL: &str = "dev.sakala.workload-kind=web";
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
     runtime_network: String,
     resource_safety: ResourceSafetyConfig,
     max_active_containers: u32,
+    agent_id: String,
     log_followers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -40,12 +43,14 @@ impl DockerContainerEngine {
         runtime_network: String,
         resource_safety: ResourceSafetyConfig,
         max_active_containers: u32,
+        agent_id: String,
     ) -> Self {
         Self {
             runner,
             runtime_network,
             resource_safety,
             max_active_containers,
+            agent_id,
             log_followers: Mutex::new(Vec::new()),
         }
     }
@@ -201,7 +206,11 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(format!(
                 "dev.sakala.deployment-id={}",
                 request.deployment_id
-            ));
+            ))
+            .arg("--label")
+            .arg(WORKLOAD_KIND_LABEL)
+            .arg("--label")
+            .arg(format!("{AGENT_ID_LABEL}={}", self.agent_id));
         if let Some(env_file) = &env_file {
             command = command.arg("--env-file").arg(env_file.as_os_str());
         }

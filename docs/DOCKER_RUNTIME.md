@@ -20,7 +20,13 @@ validate command
 
 Startup agent juga menjalankan scan orphan secara detection-only. Detail guard Phase 9 ada di [Runtime hardening](RUNTIME_HARDENING.md).
 
-Image ditag berdasarkan project, commit, dan deployment. Container diberi ownership labels agar cleanup tidak menyentuh workload di luar Sakala.
+Image ditag berdasarkan project, commit, dan deployment. Container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
+
+- `dev.sakala.managed=true`
+- `dev.sakala.project-id=<uuid>`
+- `dev.sakala.deployment-id=<uuid>`
+- `dev.sakala.workload-kind=web`
+- `dev.sakala.agent-id=<agent-id>`
 
 ## Batas Keamanan MVP
 

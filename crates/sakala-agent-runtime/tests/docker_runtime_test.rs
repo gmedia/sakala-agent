@@ -62,6 +62,16 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
     assert!(run.args.iter().any(|argument| argument == "0.5"));
     assert!(run.args.iter().any(|argument| argument == "128"));
     assert!(
+        run.args
+            .iter()
+            .any(|argument| argument == "dev.sakala.workload-kind=web")
+    );
+    assert!(
+        run.args
+            .iter()
+            .any(|argument| argument == "dev.sakala.agent-id=local-agent-01")
+    );
+    assert!(
         config
             .caddy_sites_dir
             .join("ff66ed4a-6303-4be6-8ef4-63c28b112680.Caddyfile")

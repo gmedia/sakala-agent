@@ -79,6 +79,7 @@ fn resolve_timeout(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DockerRuntimeConfig {
+    pub agent_id: String,
     pub workspace_root: PathBuf,
     pub runtime_network: String,
     pub caddy_sites_dir: PathBuf,
@@ -95,6 +96,7 @@ pub struct DockerRuntimeConfig {
 impl Default for DockerRuntimeConfig {
     fn default() -> Self {
         Self {
+            agent_id: "local-agent-01".to_owned(),
             workspace_root: PathBuf::from("/var/lib/sakala/builds"),
             runtime_network: "sakala-runtime".to_owned(),
             caddy_sites_dir: PathBuf::from("/var/lib/sakala/caddy/sites"),
