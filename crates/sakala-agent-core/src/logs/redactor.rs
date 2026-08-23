@@ -10,7 +10,7 @@ const SENSITIVE_KEYS: [&str; 10] = [
     "refresh_token",
     "client_secret",
 ];
-const TOKEN_PREFIXES: [&str; 3] = ["ghp_", "gho_", "github_pat_"];
+const TOKEN_PREFIXES: [&str; 4] = ["ghp_", "gho_", "ghs_", "github_pat_"];
 const REDACTED: &str = "[REDACTED]";
 
 #[must_use]
@@ -147,6 +147,14 @@ mod tests {
         assert_eq!(
             redact_line("remote rejected github_pat_example123"),
             "remote rejected [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redacts_github_app_installation_tokens() {
+        assert_eq!(
+            redact_line("fetch failed with ghs_installation_token"),
+            "fetch failed with [REDACTED]"
         );
     }
 }

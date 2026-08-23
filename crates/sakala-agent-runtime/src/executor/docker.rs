@@ -107,7 +107,7 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let reporter = reporter.as_ref();
-        let source = inspection_source(&request.payload)?;
+        let source = inspection_source(&request.payload, request.repository_credential)?;
 
         emit_event(
             reporter,
@@ -120,7 +120,12 @@ impl DockerRuntimeExecutor {
             .workspace
             .checkout(request.command_id, &source, reporter)
             .await?;
-        let result = self.inspector.inspect(&workspace, &source, reporter).await;
+        let inspection_source = source.without_credential();
+        drop(source);
+        let result = self
+            .inspector
+            .inspect(&workspace, &inspection_source, reporter)
+            .await;
         let cleanup = self.workspace.cleanup(&workspace).await;
 
         let inspection = result?;
@@ -153,7 +158,7 @@ impl DockerRuntimeExecutor {
         validate_payload(&payload)?;
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
-        let source = deployment_source(&payload)?;
+        let source = deployment_source(&payload, request.repository_credential)?;
         self.containers.ensure_capacity(project_id).await?;
 
         emit_event(
@@ -189,6 +194,7 @@ impl DockerRuntimeExecutor {
             .workspace
             .checkout(request.command_id, &source, reporter.as_ref())
             .await?;
+        drop(source);
         let image = image_name(project_id, deployment_id, &payload.commit_sha);
         let container = container_name(project_id, deployment_id);
         let route_activated = AtomicBool::new(false);
@@ -408,19 +414,27 @@ fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> 
     Ok(())
 }
 
-fn inspection_source(payload: &InspectProjectPayload) -> Result<RepositorySource, RuntimeError> {
+fn inspection_source(
+    payload: &InspectProjectPayload,
+    credential: Option<sakala_agent_core::ports::RepositoryCredential>,
+) -> Result<RepositorySource, RuntimeError> {
     validate_repository_source(&payload.repository_url, &payload.commit_sha)?;
     Ok(RepositorySource {
         repository_url: payload.repository_url.clone(),
         commit_sha: payload.commit_sha.clone(),
+        credential,
     })
 }
 
-fn deployment_source(payload: &DeployProjectPayload) -> Result<RepositorySource, RuntimeError> {
+fn deployment_source(
+    payload: &DeployProjectPayload,
+    credential: Option<sakala_agent_core::ports::RepositoryCredential>,
+) -> Result<RepositorySource, RuntimeError> {
     validate_repository_source(&payload.repository_url, &payload.commit_sha)?;
     Ok(RepositorySource {
         repository_url: payload.repository_url.clone(),
         commit_sha: payload.commit_sha.clone(),
+        credential,
     })
 }
 
@@ -436,7 +450,7 @@ fn validate_repository_source(repository_url: &str, commit_sha: &str) -> Result<
         || repository.fragment().is_some()
     {
         return Err(RuntimeError::InvalidCommand(
-            "MVP repository URL must be a credential-free public https://github.com URL".to_owned(),
+            "repository URL must be a credential-free https://github.com URL".to_owned(),
         ));
     }
     let path_segments = repository

@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sakala_agent_core::ports::SecretString;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -20,6 +21,7 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
+    secret_environment: BTreeMap<String, SecretString>,
     pub timeout: Option<Duration>,
     pub timeout_disabled: bool,
 }
@@ -31,6 +33,7 @@ impl CommandSpec {
             args: Vec::new(),
             current_dir: None,
             environment: BTreeMap::new(),
+            secret_environment: BTreeMap::new(),
             timeout: None,
             timeout_disabled: false,
         }
@@ -43,6 +46,18 @@ impl CommandSpec {
 
     pub fn current_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.current_dir = Some(path.as_ref().to_owned());
+        self
+    }
+
+    #[must_use]
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.environment.insert(key.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn secret_env(mut self, key: impl Into<String>, value: SecretString) -> Self {
+        self.secret_environment.insert(key.into(), value);
         self
     }
 
@@ -130,6 +145,10 @@ impl ProcessRunner for TokioProcessRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        for (key, value) in &spec.secret_environment {
+            command.env(key, value.expose());
+        }
 
         if let Some(current_dir) = &spec.current_dir {
             command.current_dir(current_dir);

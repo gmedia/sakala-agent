@@ -7,7 +7,10 @@ use std::{
 use async_trait::async_trait;
 use sakala_agent_core::{
     commands::CommandDispatcher,
-    ports::{CommandOutput, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter},
+    ports::{
+        CommandOutput, DeployProjectRequest, RepositoryCredential, RuntimeExecutionError,
+        RuntimeExecutor, RuntimeReporter, SecretString,
+    },
 };
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog,
@@ -69,6 +72,49 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
             .iter()
             .any(|event| event.event_type == "deployment.runtime.ready")
     );
+}
+
+#[tokio::test]
+async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_arguments() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = deploy_command("auto");
+    command.payload["repository_access"] = json!("temporary_credential");
+    let payload = command
+        .deploy_payload()
+        .expect("deployment payload should be valid");
+
+    RuntimeExecutor::deploy_project(
+        &executor,
+        DeployProjectRequest {
+            command_id: command.id,
+            project_id: command.project_id.expect("project id"),
+            deployment_id: command.deployment_id.expect("deployment id"),
+            payload,
+            repository_credential: Some(RepositoryCredential {
+                username: "x-access-token".to_owned(),
+                token: SecretString::new("ghs_installation_token"),
+            }),
+        },
+        reporter,
+    )
+    .await
+    .expect("temporary credential should authorize checkout");
+
+    let commands = runner.commands.lock().expect("command lock");
+    let remote = commands
+        .iter()
+        .find(|command| command.program == "git" && command.args.iter().any(|arg| arg == "remote"))
+        .expect("git remote should be configured");
+    assert!(
+        remote
+            .args
+            .iter()
+            .any(|argument| argument == "https://github.com/gmedia/example-app.git")
+    );
+    assert!(!format!("{commands:?}").contains("ghs_installation_token"));
 }
 
 #[tokio::test]
@@ -297,7 +343,11 @@ async fn executor_rejects_non_github_repository_before_starting_a_process() {
         .await
         .expect_err("unsupported repository host must be rejected");
 
-    assert!(error.to_string().contains("public https://github.com"));
+    assert!(
+        error
+            .to_string()
+            .contains("credential-free https://github.com")
+    );
     assert!(runner.commands.lock().expect("command lock").is_empty());
 }
 

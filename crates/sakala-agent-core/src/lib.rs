@@ -8,6 +8,7 @@ pub mod heartbeat;
 pub mod logs;
 pub mod ports;
 mod reporting;
+pub mod repositories;
 pub mod scheduler;
 pub mod support;
 

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
+use sakala_agent_core::ports::RepositoryCredential;
 
 mod git;
 
@@ -13,6 +14,7 @@ pub use git::GitWorkspaceManager;
 pub struct RepositorySource {
     pub repository_url: String,
     pub commit_sha: String,
+    pub credential: Option<RepositoryCredential>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +38,17 @@ impl DeploymentWorkspace {
     #[must_use]
     pub fn source(&self) -> &Path {
         &self.source
+    }
+}
+
+impl RepositorySource {
+    #[must_use]
+    pub fn without_credential(&self) -> Self {
+        Self {
+            repository_url: self.repository_url.clone(),
+            commit_sha: self.commit_sha.clone(),
+            credential: None,
+        }
     }
 }
 

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::RepositoryAccess;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeploymentBuilder {
@@ -54,6 +56,8 @@ pub struct DeployProjectResult {
 pub struct DeployProjectPayload {
     pub repository_url: String,
     pub commit_sha: String,
+    #[serde(default)]
+    pub repository_access: RepositoryAccess,
     pub domain: String,
     #[serde(default = "default_container_port")]
     pub container_port: u16,

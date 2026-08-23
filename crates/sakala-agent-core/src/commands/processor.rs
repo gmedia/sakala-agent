@@ -10,7 +10,7 @@ use time::OffsetDateTime;
 
 use crate::{
     CoreError, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
-    reporting::ApiRuntimeReporter,
+    reporting::ApiRuntimeReporter, repositories::ApiRepositoryCredentialProvider,
 };
 
 pub struct CommandProcessor {
@@ -26,9 +26,13 @@ impl CommandProcessor {
         runtime: Arc<dyn RuntimeExecutor>,
         command_timeout: Duration,
     ) -> Self {
+        let repository_credentials = Arc::new(ApiRepositoryCredentialProvider::new(client.clone()));
         Self {
             client,
-            dispatcher: CommandDispatcher::new(runtime),
+            dispatcher: CommandDispatcher::with_repository_credentials(
+                runtime,
+                repository_credentials,
+            ),
             command_timeout,
         }
     }

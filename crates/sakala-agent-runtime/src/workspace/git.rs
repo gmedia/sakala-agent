@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use tokio::fs;
@@ -36,6 +39,11 @@ impl WorkspaceManager for GitWorkspaceManager {
         }
         fs::create_dir_all(workspace.root()).await?;
 
+        let askpass = match &source.credential {
+            Some(_) => Some(write_askpass(workspace.root()).await?),
+            None => None,
+        };
+
         let checkout_result = async {
             for (phase, command) in [
                 (
@@ -56,16 +64,6 @@ impl WorkspaceManager for GitWorkspaceManager {
                         .arg(&source.repository_url),
                 ),
                 (
-                    "git-fetch",
-                    CommandSpec::new("git")
-                        .arg("-C")
-                        .arg(workspace.source().as_os_str())
-                        .arg("fetch")
-                        .arg("--depth=1")
-                        .arg("origin")
-                        .arg(&source.commit_sha),
-                ),
-                (
                     "git-checkout",
                     CommandSpec::new("git")
                         .arg("-C")
@@ -78,9 +76,29 @@ impl WorkspaceManager for GitWorkspaceManager {
                 run_checked(self.runner.as_ref(), &command, phase, reporter).await?;
             }
 
+            let mut fetch = CommandSpec::new("git")
+                .arg("-C")
+                .arg(workspace.source().as_os_str())
+                .arg("fetch")
+                .arg("--depth=1")
+                .arg("origin")
+                .arg(&source.commit_sha);
+            if let (Some(credential), Some(askpass)) = (&source.credential, &askpass) {
+                fetch = fetch
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_ASKPASS", askpass.display().to_string())
+                    .env("SAKALA_GIT_ASKPASS_USERNAME", &credential.username)
+                    .secret_env("SAKALA_GIT_ASKPASS_TOKEN", credential.token.clone());
+            }
+            run_checked(self.runner.as_ref(), &fetch, "git-fetch", reporter).await?;
+
             Ok::<(), RuntimeError>(())
         }
         .await;
+
+        if let Some(askpass) = askpass {
+            fs::remove_file(&askpass).await?;
+        }
 
         if let Err(error) = checkout_result {
             let _ = self.cleanup(&workspace).await;
@@ -97,4 +115,18 @@ impl WorkspaceManager for GitWorkspaceManager {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' \"$SAKALA_GIT_ASKPASS_USERNAME\" ;;\n  *) printf '%s\\n' \"$SAKALA_GIT_ASKPASS_TOKEN\" ;;\nesac\n";
+
+async fn write_askpass(root: &Path) -> Result<PathBuf, RuntimeError> {
+    let path = root.join(".sakala-git-askpass");
+    fs::write(&path, ASKPASS_SCRIPT).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(path)
 }

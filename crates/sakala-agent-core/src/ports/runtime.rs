@@ -8,10 +8,13 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::RepositoryCredential;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InspectProjectRequest {
     pub command_id: Uuid,
     pub payload: InspectProjectPayload,
+    pub repository_credential: Option<RepositoryCredential>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -20,6 +23,7 @@ pub struct DeployProjectRequest {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub payload: DeployProjectPayload,
+    pub repository_credential: Option<RepositoryCredential>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

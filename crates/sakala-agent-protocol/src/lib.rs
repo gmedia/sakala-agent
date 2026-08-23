@@ -7,6 +7,7 @@ pub mod heartbeat;
 pub mod inspections;
 pub mod logs;
 pub mod node;
+pub mod repositories;
 pub mod status;
 
 pub use commands::{AgentCommand, CommandType, CompleteCommandPayload};
@@ -19,4 +20,5 @@ pub use heartbeat::HeartbeatPayload;
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::NodeInfo;
+pub use repositories::RepositoryAccess;
 pub use status::{CommandStatus, NodeStatus};

@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{AgentConfig, CoreError};
+use crate::{
+    AgentConfig, CoreError,
+    ports::{RepositoryCredential, SecretString},
+};
 
 use super::endpoints;
 
@@ -132,6 +135,28 @@ impl ApiClient {
         .await
     }
 
+    pub async fn repository_credential(
+        &self,
+        command_id: Uuid,
+    ) -> Result<RepositoryCredential, CoreError> {
+        let response = self
+            .request(Method::POST, &endpoints::repository_credential(command_id))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?;
+        let payload = response.json::<RepositoryCredentialLeasePayload>().await?;
+        if payload.username.trim().is_empty() || payload.token.trim().is_empty() {
+            return Err(CoreError::InvalidConfiguration(
+                "repository credential lease is missing username or token".to_owned(),
+            ));
+        }
+        Ok(RepositoryCredential {
+            username: payload.username,
+            token: SecretString::new(payload.token),
+        })
+    }
+
     fn request(&self, method: Method, endpoint: &str) -> RequestBuilder {
         self.http
             .request(method, format!("{}{endpoint}", self.base_url))
@@ -164,4 +189,10 @@ struct ApiEnvelope<T> {
 struct FailCommandPayload<'a> {
     error_code: &'a str,
     error_message: &'a str,
+}
+
+#[derive(Deserialize)]
+struct RepositoryCredentialLeasePayload {
+    username: String,
+    token: String,
 }
