@@ -5,9 +5,10 @@ use std::sync::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
-    CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeCapacity,
-    RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck,
-    RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter, WorkloadLifecycleRequest,
+    CommandOutput, DeployProjectRequest, InspectProjectRequest, ReconcileWorkloadRequest,
+    RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot,
+    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
+    WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -720,6 +721,38 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
         self.containers.health_snapshot().await.map_err(Into::into)
+    }
+
+    async fn reconcile_workload(
+        &self,
+        request: ReconcileWorkloadRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled.into());
+        }
+        let workload = self
+            .containers
+            .workload(request.project_id, request.deployment_id)
+            .await?;
+        let actual_state = match &workload {
+            None => "missing",
+            Some(workload) if workload.status.to_ascii_lowercase().starts_with("up") => "running",
+            Some(_) => "stopped",
+        };
+        let desired_state = match request.desired_state {
+            sakala_agent_protocol::DesiredWorkloadState::Running => "running",
+            sakala_agent_protocol::DesiredWorkloadState::Stopped => "stopped",
+            sakala_agent_protocol::DesiredWorkloadState::Missing => "missing",
+        };
+        Ok(CommandOutput::with_result(json!({
+            "desired_state": desired_state,
+            "actual_state": actual_state,
+            "in_sync": desired_state == actual_state,
+            "drift_reason": (desired_state != actual_state).then_some("workload_state_mismatch"),
+            "container_id": workload.map(|workload| workload.container_id),
+        }))
+        .into())
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

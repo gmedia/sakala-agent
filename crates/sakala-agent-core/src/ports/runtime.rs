@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
-    DeployProjectPayload, DeploymentEvent, DeploymentLog, InspectProjectPayload,
+    DeployProjectPayload, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
+    InspectProjectPayload,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -35,6 +36,14 @@ pub struct WorkloadLifecycleRequest {
     pub command_id: Uuid,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReconcileWorkloadRequest {
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub desired_state: DesiredWorkloadState,
     pub cancellation: CancellationToken,
 }
 
@@ -288,6 +297,16 @@ pub trait RuntimeExecutor: Send + Sync {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support route refresh",
+        ))
+    }
+
+    async fn reconcile_workload(
+        &self,
+        _request: ReconcileWorkloadRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support workload reconciliation",
         ))
     }
 }

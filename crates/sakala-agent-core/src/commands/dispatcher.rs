@@ -9,8 +9,9 @@ use crate::{
     NodeLifecycle, NodeLifecycleState,
     commands::handlers::{deploy_project, inspect_project},
     ports::{
-        CommandOutput, RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor,
-        RuntimeReporter, UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
+        CommandOutput, ReconcileWorkloadRequest, RepositoryCredentialProvider,
+        RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
+        UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
     },
 };
 
@@ -110,6 +111,25 @@ impl CommandDispatcher {
             CommandType::RefreshRoute => {
                 self.runtime
                     .refresh_route(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::ReconcileWorkload => {
+                let lifecycle = lifecycle_request(command, cancellation)?;
+                let payload = command.reconcile_workload_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "ReconcileWorkload payload is invalid: {error}"
+                    ))
+                })?;
+                self.runtime
+                    .reconcile_workload(
+                        ReconcileWorkloadRequest {
+                            project_id: lifecycle.project_id,
+                            deployment_id: lifecycle.deployment_id,
+                            desired_state: payload.desired_state,
+                            cancellation: lifecycle.cancellation,
+                        },
+                        reporter,
+                    )
                     .await
             }
             CommandType::DrainNode => {

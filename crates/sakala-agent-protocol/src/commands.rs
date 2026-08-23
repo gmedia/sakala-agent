@@ -4,6 +4,19 @@ use uuid::Uuid;
 
 use crate::{CommandStatus, DeployProjectPayload, InspectProjectPayload};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesiredWorkloadState {
+    Running,
+    Stopped,
+    Missing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReconcileWorkloadPayload {
+    pub desired_state: DesiredWorkloadState,
+}
+
 /// Operation requested by the control plane for execution on a runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -16,6 +29,7 @@ pub enum CommandType {
     WakeProject,
     HealthCheck,
     RefreshRoute,
+    ReconcileWorkload,
     DrainNode,
     ResumeNode,
 }
@@ -39,6 +53,12 @@ impl AgentCommand {
     }
 
     pub fn inspect_payload(&self) -> Result<InspectProjectPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn reconcile_workload_payload(
+        &self,
+    ) -> Result<ReconcileWorkloadPayload, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
     }
 }

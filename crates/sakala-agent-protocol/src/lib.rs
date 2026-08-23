@@ -16,7 +16,10 @@ pub mod node;
 pub mod repositories;
 pub mod status;
 
-pub use commands::{AgentCommand, CommandType, CompleteCommandPayload};
+pub use commands::{
+    AgentCommand, CommandType, CompleteCommandPayload, DesiredWorkloadState,
+    ReconcileWorkloadPayload,
+};
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
     LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,

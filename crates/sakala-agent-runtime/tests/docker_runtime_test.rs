@@ -11,13 +11,13 @@ use async_trait::async_trait;
 use sakala_agent_core::{
     commands::CommandDispatcher,
     ports::{
-        CommandOutput, DeployProjectRequest, InspectProjectRequest, RepositoryCredential,
-        RuntimeExecutionError, RuntimeExecutor, RuntimeReporter, SecretString,
-        WorkloadLifecycleRequest,
+        CommandOutput, DeployProjectRequest, InspectProjectRequest, ReconcileWorkloadRequest,
+        RepositoryCredential, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
+        SecretString, WorkloadLifecycleRequest,
     },
 };
 use sakala_agent_protocol::{
-    AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog,
+    AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -816,6 +816,41 @@ async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
     );
     assert!(prune.args.iter().any(|argument| argument == "until=3600s"));
     assert!(!prune.args.iter().any(|argument| argument == "-a"));
+}
+
+#[tokio::test]
+async fn reconciliation_reports_drift_without_mutating_the_workload() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("workload\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id: "ff66ed4a-6303-4be6-8ef4-63c28b112680"
+                .parse()
+                .expect("project id"),
+            deployment_id: "4f1f21ef-730d-42d5-a46d-d965353cb993"
+                .parse()
+                .expect("deployment id"),
+            desired_state: DesiredWorkloadState::Stopped,
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("reconciliation should report drift");
+
+    assert_eq!(output.result["desired_state"], "stopped");
+    assert_eq!(output.result["actual_state"], "running");
+    assert_eq!(output.result["in_sync"], false);
+    assert!(runner.commands.lock().expect("command lock").iter().all(|command| {
+        !(command.program == "docker"
+            && matches!(command.args.first().map(|value| value.to_string_lossy()), Some(ref action) if action == "start" || action == "stop" || action == "rm"))
+    }));
 }
 
 #[tokio::test]
