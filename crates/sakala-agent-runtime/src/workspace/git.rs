@@ -256,6 +256,27 @@ mod tests {
         assert!(unrelated.exists());
     }
 
+    #[tokio::test]
+    async fn workspace_gc_never_follows_uuid_named_symlinks() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let target = temp.path().join("outside-workspace");
+        let symlink = temp.path().join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&target)
+            .await
+            .expect("target directory should be created");
+        std::os::unix::fs::symlink(&target, &symlink).expect("workspace symlink should be created");
+        let manager = GitWorkspaceManager::new(temp.path().to_owned(), Arc::new(UnusedRunner));
+
+        let cleaned = manager
+            .cleanup_stale(Duration::ZERO)
+            .await
+            .expect("workspace GC should complete");
+
+        assert_eq!(cleaned, 0);
+        assert!(symlink.exists());
+        assert!(target.exists());
+    }
+
     struct UnusedRunner;
 
     #[async_trait]
