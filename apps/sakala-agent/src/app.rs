@@ -100,13 +100,15 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
         config.agent.clone(),
         client.clone(),
-        Arc::clone(&node_lifecycle),
-        config.runtime_driver.to_string(),
-        workspace_root,
-        Arc::clone(&runtime),
-        Arc::clone(&scheduler_metrics),
-        Arc::clone(&reconciliation),
-        minimum_workspace_free_bytes,
+        heartbeat::worker::HeartbeatRuntimeContext {
+            node_lifecycle: Arc::clone(&node_lifecycle),
+            runtime_driver: config.runtime_driver.to_string(),
+            workspace_root,
+            runtime: Arc::clone(&runtime),
+            scheduler_metrics: Arc::clone(&scheduler_metrics),
+            reconciliation: Arc::clone(&reconciliation),
+            minimum_workspace_free_bytes,
+        },
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(

@@ -274,14 +274,15 @@ impl DockerRuntimeExecutor {
             () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
         };
 
-        if result.is_err() && !route_activated.load(Ordering::Acquire) {
-            if let Err(error) = self.containers.cleanup_candidate(&container, &image).await {
-                let _ = reporter
-                    .log(system_log(format!(
-                        "candidate cleanup warning for {container}: {error}"
-                    )))
-                    .await;
-            }
+        if result.is_err()
+            && !route_activated.load(Ordering::Acquire)
+            && let Err(error) = self.containers.cleanup_candidate(&container, &image).await
+        {
+            let _ = reporter
+                .log(system_log(format!(
+                    "candidate cleanup warning for {container}: {error}"
+                )))
+                .await;
         }
         if let Err(error) = self.workspace.cleanup(&workspace).await {
             let _ = reporter
@@ -716,7 +717,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 .saturating_sub(self.build_permits.available_permits()),
         );
         capacity.maximum_concurrent_builds = Some(self.max_concurrent_builds);
-        Ok(capacity.into())
+        Ok(capacity)
     }
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
@@ -751,8 +752,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             "in_sync": desired_state == actual_state,
             "drift_reason": (desired_state != actual_state).then_some("workload_state_mismatch"),
             "container_id": workload.map(|workload| workload.container_id),
-        }))
-        .into())
+        })))
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

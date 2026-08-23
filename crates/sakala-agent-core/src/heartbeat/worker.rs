@@ -16,30 +16,24 @@ use crate::{
     scheduler::metrics::SchedulerMetrics,
 };
 
+pub struct HeartbeatRuntimeContext {
+    pub node_lifecycle: Arc<NodeLifecycle>,
+    pub runtime_driver: String,
+    pub workspace_root: std::path::PathBuf,
+    pub runtime: Arc<dyn RuntimeExecutor>,
+    pub scheduler_metrics: Arc<SchedulerMetrics>,
+    pub reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
+    pub minimum_workspace_free_bytes: u64,
+}
+
 pub async fn run(
     config: AgentConfig,
     client: Option<ApiClient>,
-    node_lifecycle: Arc<NodeLifecycle>,
-    runtime_driver: String,
-    workspace_root: std::path::PathBuf,
-    runtime: Arc<dyn RuntimeExecutor>,
-    scheduler_metrics: Arc<SchedulerMetrics>,
-    reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
-    minimum_workspace_free_bytes: u64,
+    context: HeartbeatRuntimeContext,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let payload = payload(
-            &config,
-            node_lifecycle.state(),
-            &runtime_driver,
-            &workspace_root,
-            runtime.as_ref(),
-            scheduler_metrics.as_ref(),
-            reconciliation.as_ref(),
-            minimum_workspace_free_bytes,
-        )
-        .await;
+        let payload = payload(&config, &context).await;
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -66,25 +60,17 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-async fn payload(
-    config: &AgentConfig,
-    lifecycle_state: NodeLifecycleState,
-    runtime_driver: &str,
-    workspace_root: &Path,
-    runtime: &dyn RuntimeExecutor,
-    scheduler_metrics: &SchedulerMetrics,
-    reconciliation: &RwLock<RuntimeReconciliationReport>,
-    minimum_workspace_free_bytes: u64,
-) -> HeartbeatPayload {
-    let resources = node_resources(workspace_root).await;
-    let workloads = workload_statistics(runtime).await;
+async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> HeartbeatPayload {
+    let resources = node_resources(&context.workspace_root).await;
+    let workloads = workload_statistics(context.runtime.as_ref()).await;
     let dependencies = runtime_dependency_versions().await;
-    let reconciliation = reconciliation
+    let reconciliation = context
+        .reconciliation
         .read()
         .map(|report| report.clone())
         .unwrap_or_default();
     HeartbeatPayload {
-        status: match lifecycle_state {
+        status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active => NodeStatus::Ready,
             NodeLifecycleState::Draining => NodeStatus::Draining,
             NodeLifecycleState::Drained => NodeStatus::Drained,
@@ -98,8 +84,8 @@ async fn payload(
         metadata: json!({
             "version": env!("CARGO_PKG_VERSION"),
             "protocol_version": PROTOCOL_VERSION,
-            "lifecycle_state": format!("{lifecycle_state:?}").to_ascii_lowercase(),
-            "runtime_driver": runtime_driver,
+            "lifecycle_state": format!("{:?}", context.node_lifecycle.state()).to_ascii_lowercase(),
+            "runtime_driver": context.runtime_driver,
             "uptime_seconds": resources.uptime_seconds,
             "resources": {
                 "cpu_total": resources.cpu_total,
@@ -111,8 +97,8 @@ async fn payload(
                 "workspace_used_bytes": resources.workspace_used_bytes,
             },
             "disk_pressure": {
-                "state": disk_pressure_state(resources.disk_available_bytes, minimum_workspace_free_bytes),
-                "minimum_workspace_free_bytes": minimum_workspace_free_bytes,
+                "state": disk_pressure_state(resources.disk_available_bytes, context.minimum_workspace_free_bytes),
+                "minimum_workspace_free_bytes": context.minimum_workspace_free_bytes,
                 "available_workspace_bytes": resources.disk_available_bytes,
             },
             "workloads": {
@@ -129,9 +115,9 @@ async fn payload(
                 })).collect::<Vec<_>>(),
             },
             "execution": {
-                "active_commands": scheduler_metrics.active_commands(),
-                "queued_local_commands": scheduler_metrics.queued_local_commands(),
-                "capacity_waiting_commands": scheduler_metrics.capacity_waiting_commands(),
+                "active_commands": context.scheduler_metrics.active_commands(),
+                "queued_local_commands": context.scheduler_metrics.queued_local_commands(),
+                "capacity_waiting_commands": context.scheduler_metrics.capacity_waiting_commands(),
                 "active_builds": workloads.active_builds,
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },
@@ -350,19 +336,26 @@ fn parse_meminfo(contents: &str) -> (Option<u64>, Option<u64>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::RwLock};
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Arc, RwLock},
+    };
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
     use uuid::Uuid;
 
     use crate::{
-        AgentConfig, NodeLifecycleState,
+        AgentConfig, NodeLifecycle,
         ports::RuntimeExecutor,
         ports::{RuntimeReconciliationReport, RuntimeStaleRoute},
         scheduler::metrics::SchedulerMetrics,
     };
 
-    use super::{disk_pressure_state, parse_meminfo, payload, workspace_disk_resources};
+    use super::{
+        HeartbeatRuntimeContext, disk_pressure_state, parse_meminfo, payload,
+        workspace_disk_resources,
+    };
 
     struct EmptyRuntime;
 
@@ -373,26 +366,23 @@ mod tests {
     async fn heartbeat_identifies_the_wire_contract_revision() {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
-        let scheduler_metrics = SchedulerMetrics::default();
         let stale_project = Uuid::new_v4();
-        let reconciliation = RwLock::new(RuntimeReconciliationReport {
-            stale_routes: vec![RuntimeStaleRoute {
-                path: "/var/lib/sakala/caddy/stale.Caddyfile".to_owned(),
-                project_id: stale_project,
-            }],
-            ..RuntimeReconciliationReport::default()
-        });
-        let heartbeat = payload(
-            &config,
-            NodeLifecycleState::Active,
-            "noop",
-            std::path::Path::new("/tmp"),
-            &EmptyRuntime,
-            &scheduler_metrics,
-            &reconciliation,
-            0,
-        )
-        .await;
+        let context = HeartbeatRuntimeContext {
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
+            runtime_driver: "noop".to_owned(),
+            workspace_root: PathBuf::from("/tmp"),
+            runtime: Arc::new(EmptyRuntime),
+            scheduler_metrics: Arc::new(SchedulerMetrics::default()),
+            reconciliation: Arc::new(RwLock::new(RuntimeReconciliationReport {
+                stale_routes: vec![RuntimeStaleRoute {
+                    path: "/var/lib/sakala/caddy/stale.Caddyfile".to_owned(),
+                    project_id: stale_project,
+                }],
+                ..RuntimeReconciliationReport::default()
+            })),
+            minimum_workspace_free_bytes: 0,
+        };
+        let heartbeat = payload(&config, &context).await;
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
