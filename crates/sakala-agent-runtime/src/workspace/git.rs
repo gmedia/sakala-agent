@@ -222,15 +222,23 @@ async fn write_askpass(root: &Path) -> Result<PathBuf, RuntimeError> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
+    use sakala_agent_core::ports::{RepositoryCredential, SecretString};
+    use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use crate::{
-        ProcessOutput, ProcessOutputSink, ProcessRunner, RuntimeError,
-        workspace::{GitWorkspaceManager, WorkspaceManager},
+        CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, RuntimeError,
+        RuntimeReporter,
+        workspace::{GitWorkspaceManager, RepositorySource, WorkspaceManager},
     };
 
     use super::{parse_available_disk_bytes, restrict_workspace_permissions, write_askpass};
@@ -266,6 +274,58 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[tokio::test]
+    async fn credential_artifacts_are_removed_after_successful_checkout() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let command_id = Uuid::new_v4();
+        let manager =
+            GitWorkspaceManager::new(temp.path().to_owned(), Arc::new(CheckoutRunner::default()));
+
+        let workspace = manager
+            .checkout(
+                command_id,
+                &private_source(),
+                &NoopReporter,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("checkout should succeed");
+
+        assert_eq!(workspace.root(), temp.path().join(command_id.to_string()));
+        assert!(!workspace.root().join(".sakala-git-askpass").exists());
+    }
+
+    #[tokio::test]
+    async fn credential_artifacts_are_removed_after_failed_or_cancelled_checkout() {
+        for cancellation in [false, true] {
+            let temp = TempDir::new().expect("temporary directory should be available");
+            let command_id = Uuid::new_v4();
+            let manager = GitWorkspaceManager::new(
+                temp.path().to_owned(),
+                Arc::new(CheckoutRunner {
+                    fail_fetch: !cancellation,
+                    ..Default::default()
+                }),
+            );
+            let cancellation_token = CancellationToken::new();
+            if cancellation {
+                cancellation_token.cancel();
+            }
+
+            let result = manager
+                .checkout(
+                    command_id,
+                    &private_source(),
+                    &NoopReporter,
+                    cancellation_token,
+                )
+                .await;
+
+            assert!(result.is_err());
+            assert!(!temp.path().join(command_id.to_string()).exists());
+        }
     }
 
     #[tokio::test]
@@ -332,6 +392,70 @@ mod tests {
             _sink: &dyn ProcessOutputSink,
         ) -> Result<ProcessOutput, RuntimeError> {
             unreachable!("workspace GC does not run subprocesses")
+        }
+    }
+
+    #[derive(Default)]
+    struct CheckoutRunner {
+        fail_fetch: bool,
+        commands: Mutex<Vec<CommandSpec>>,
+    }
+
+    #[async_trait]
+    impl ProcessRunner for CheckoutRunner {
+        async fn run(
+            &self,
+            spec: &CommandSpec,
+            _sink: &dyn ProcessOutputSink,
+        ) -> Result<ProcessOutput, RuntimeError> {
+            self.commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            if spec
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(RuntimeError::Cancelled);
+            }
+            let is_fetch = spec.args.iter().any(|argument| argument == "fetch");
+            Ok(ProcessOutput {
+                success: !(self.fail_fetch && is_fetch),
+                code: (!self.fail_fetch || !is_fetch).then_some(0),
+                stderr: "simulated checkout failure".to_owned(),
+                ..ProcessOutput::default()
+            })
+        }
+    }
+
+    fn private_source() -> RepositorySource {
+        RepositorySource {
+            repository_url: "https://github.com/gmedia/private-repository.git".to_owned(),
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            credential: Some(RepositoryCredential {
+                username: "x-access-token".to_owned(),
+                token: SecretString::new("test-token"),
+            }),
+        }
+    }
+
+    struct NoopReporter;
+
+    #[async_trait]
+    impl RuntimeReporter for NoopReporter {
+        async fn event(
+            &self,
+            _event: DeploymentEvent,
+        ) -> Result<(), sakala_agent_core::ports::RuntimeExecutionError> {
+            Ok(())
+        }
+
+        async fn log(
+            &self,
+            _log: DeploymentLog,
+        ) -> Result<(), sakala_agent_core::ports::RuntimeExecutionError> {
+            Ok(())
         }
     }
 }
