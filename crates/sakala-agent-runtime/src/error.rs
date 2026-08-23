@@ -157,7 +157,10 @@ mod tests {
     fn git_stderr_is_classified_without_becoming_the_reported_message() {
         for (stderr, code) in [
             ("remote: Repository not found.", "repository_not_found"),
-            ("fatal: Authentication failed", "repository_auth_failed"),
+            (
+                "fatal: Authentication failed for token ghs_invalid_credential",
+                "repository_auth_failed",
+            ),
             ("fatal: token has expired", "repository_credential_expired"),
             (
                 "fatal: Could not read from remote repository.",
@@ -171,6 +174,7 @@ mod tests {
             let error = RuntimeError::failed_process("git-fetch", Some(128), stderr);
             assert_eq!(error.code(), code);
             assert!(!error.to_string().contains(stderr));
+            assert!(!error.to_string().contains("ghs_invalid_credential"));
         }
     }
 }
