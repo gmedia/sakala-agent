@@ -136,6 +136,37 @@ izin untuk melewati safety limit node.
 
 ## Polling and Claim Semantics
 
+## Desired versus actual workload state
+
+Control plane tetap menjadi pemilik desired state. Untuk reconciliation,
+command lifecycle atau endpoint inventory yang akan ditambahkan API harus
+mengirim identity workload serta desired state minimal berikut:
+
+```json
+{
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "desired_state": "running"
+}
+```
+
+Agent melaporkan actual state secara read-only melalui reconciliation/heartbeat
+dengan bentuk berikut:
+
+```json
+{
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "actual_state": "missing",
+  "reason": "container_missing"
+}
+```
+
+Nilai `actual_state` yang diizinkan adalah `running`, `stopped`, `unhealthy`,
+atau `missing`. Bila desired dan actual berbeda, Agent melaporkan drift tetapi
+tidak melakukan restart, deploy, atau delete secara otomatis. Control plane
+memutuskan policy recovery dan bila perlu mengirim command lifecycle eksplisit.
+
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.
 
 Claim harus dilakukan atomik di `sakala-api`, misalnya melalui conditional update atau transaction yang memastikan status masih `Pending`. Hanya satu agent boleh menerima claim sukses. Bila claim mendapat conflict karena command sudah diklaim, dibatalkan, kedaluwarsa, atau tidak lagi eligible, agent harus melewati command tersebut tanpa menjalankannya.
