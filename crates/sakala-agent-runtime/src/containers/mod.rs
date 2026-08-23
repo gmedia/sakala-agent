@@ -101,6 +101,11 @@ pub trait ContainerEngine: Send + Sync {
     /// partial cleanup without replacing the primary deployment error.
     async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
 
+    /// Reclaims only dangling images explicitly labeled as Sakala-managed.
+    /// Docker itself refuses images referenced by any container.
+    async fn cleanup_stale_images(&self, max_age: std::time::Duration)
+    -> Result<u64, RuntimeError>;
+
     async fn shutdown(&self);
 }
 

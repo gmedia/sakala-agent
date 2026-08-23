@@ -551,6 +551,28 @@ impl ContainerEngine for DockerContainerEngine {
         }
     }
 
+    async fn cleanup_stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<u64, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("image")
+            .arg("prune")
+            .arg("--force")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--filter")
+            .arg(format!("until={}s", max_age.as_secs()));
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "Sakala image GC exited with status {:?}",
+                output.code
+            )));
+        }
+        parse_reclaimed_bytes(&output.stdout)
+    }
+
     async fn shutdown(&self) {
         let followers = {
             let mut followers = self.log_followers.lock().expect("log follower lock");
@@ -563,6 +585,38 @@ impl ContainerEngine for DockerContainerEngine {
             let _ = follower.await;
         }
     }
+}
+
+fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
+    let Some(value) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Total reclaimed space: "))
+    else {
+        return Ok(0);
+    };
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<u64>().map_err(|_| {
+        RuntimeError::Container(
+            "Docker image GC returned an invalid reclaimed-space value".to_owned(),
+        )
+    })?;
+    let multiplier = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "b" | "bytes" | "" => 1,
+        "kb" | "kib" => 1_024,
+        "mb" | "mib" => 1_024 * 1_024,
+        "gb" | "gib" => 1_024 * 1_024 * 1_024,
+        _ => {
+            return Err(RuntimeError::Container(
+                "Docker image GC returned an unknown reclaimed-space unit".to_owned(),
+            ));
+        }
+    };
+    number.checked_mul(multiplier).ok_or_else(|| {
+        RuntimeError::Container("Docker image GC reclaimed-space value overflowed".to_owned())
+    })
 }
 
 async fn run_container_command(

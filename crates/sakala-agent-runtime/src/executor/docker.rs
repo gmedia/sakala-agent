@@ -43,6 +43,7 @@ pub struct DockerRuntimeExecutor {
     build_permits: Arc<Semaphore>,
     max_concurrent_builds: usize,
     workspace_gc_max_age: std::time::Duration,
+    image_gc_max_age: std::time::Duration,
     min_workspace_free_bytes: u64,
     preflight: DockerPreflight,
 }
@@ -76,6 +77,7 @@ impl DockerRuntimeExecutor {
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let workspace_gc_max_age = config.workspace_gc_max_age;
+        let image_gc_max_age = config.image_gc_max_age;
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
@@ -107,6 +109,7 @@ impl DockerRuntimeExecutor {
             config.timeout_safety,
             max_concurrent_builds,
             workspace_gc_max_age,
+            image_gc_max_age,
             min_workspace_free_bytes,
             preflight,
         )
@@ -124,6 +127,7 @@ impl DockerRuntimeExecutor {
         timeout_safety: crate::TimeoutSafetyConfig,
         max_concurrent_builds: usize,
         workspace_gc_max_age: std::time::Duration,
+        image_gc_max_age: std::time::Duration,
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
     ) -> Self {
@@ -138,6 +142,7 @@ impl DockerRuntimeExecutor {
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             max_concurrent_builds,
             workspace_gc_max_age,
+            image_gc_max_age,
             min_workspace_free_bytes,
             preflight,
         }
@@ -695,6 +700,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         report.cleaned_workspaces = self
             .workspace
             .cleanup_stale(self.workspace_gc_max_age)
+            .await?;
+        report.reclaimed_image_bytes = self
+            .containers
+            .cleanup_stale_images(self.image_gc_max_age)
             .await?;
         Ok(report)
     }

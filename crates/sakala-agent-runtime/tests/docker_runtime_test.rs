@@ -783,6 +783,42 @@ async fn reconciliation_discovers_valid_managed_workloads() {
 }
 
 #[tokio::test]
+async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2MB\n"));
+    let mut config = runtime_config(&temp);
+    config.image_gc_max_age = Duration::from_secs(3_600);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation should complete");
+
+    assert_eq!(report.reclaimed_image_bytes, 2 * 1_024 * 1_024);
+    let commands = runner.commands.lock().expect("command lock");
+    let prune = commands
+        .iter()
+        .find(|command| {
+            command.program == "docker"
+                && command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "image")
+                && command.args.iter().any(|argument| argument == "prune")
+        })
+        .expect("Sakala-only image prune should run");
+    assert!(
+        prune
+            .args
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.managed=true")
+    );
+    assert!(prune.args.iter().any(|argument| argument == "until=3600s"));
+    assert!(!prune.args.iter().any(|argument| argument == "-a"));
+}
+
+#[tokio::test]
 async fn runtime_health_snapshot_only_checks_active_workloads_and_marks_unhealthy_state() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
@@ -1072,6 +1108,7 @@ struct FakeRunner {
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
+    image_prune_stdout: String,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
 }
@@ -1137,6 +1174,7 @@ impl FakeRunner {
             build_delay: None,
             inspect_delay: None,
             previous_container_inspection: None,
+            image_prune_stdout: String::new(),
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
         }
@@ -1164,6 +1202,11 @@ impl FakeRunner {
 
     fn with_previous_container_inspection(mut self, stdout: impl Into<String>) -> Self {
         self.previous_container_inspection = Some(stdout.into());
+        self
+    }
+
+    fn with_image_prune_output(mut self, stdout: impl Into<String>) -> Self {
+        self.image_prune_stdout = stdout.into();
         self
     }
 }
@@ -1249,6 +1292,14 @@ impl ProcessRunner for FakeRunner {
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
             "running\n"
+        } else if spec.program == "docker"
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+            && spec.args.iter().any(|argument| argument == "prune")
+        {
+            &self.image_prune_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "logs") {
             "application listening\n"
         } else if spec.program == "df" {

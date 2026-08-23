@@ -103,6 +103,7 @@ impl RuntimeCapacity {
 pub struct RuntimeReconciliationReport {
     pub inspected_containers: usize,
     pub cleaned_workspaces: usize,
+    pub reclaimed_image_bytes: u64,
     pub workloads: Vec<RuntimeWorkload>,
     pub orphans: Vec<RuntimeOrphan>,
     pub stale_routes: Vec<RuntimeStaleRoute>,

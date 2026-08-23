@@ -89,6 +89,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS")]
     workspace_gc_max_age_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS")]
+    image_gc_max_age_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
     runtime_health_interval_seconds: Option<String>,
 
@@ -182,6 +185,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
         cli.workspace_gc_max_age_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
+        cli.image_gc_max_age_seconds,
     );
     insert(
         &mut values,
@@ -287,6 +295,11 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 values,
                 "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
                 86_400,
+            )?),
+            image_gc_max_age: std::time::Duration::from_secs(positive_u64(
+                values,
+                "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
+                604_800,
             )?),
             min_workspace_free_bytes,
             runtime_network: agent.runtime_network.clone(),
