@@ -22,6 +22,28 @@ use wiremock::{
 const COMMAND_ID: &str = "b3c8cb55-3bc8-4725-a004-e69d9917d40b";
 
 #[tokio::test]
+async fn claim_conflict_skips_runtime_execution_and_terminal_reporting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/claim")))
+        .respond_with(ResponseTemplate::new(409))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let command: AgentCommand = serde_json::from_value(command_fixture())
+        .expect("command fixture should match the protocol");
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let runtime: Arc<dyn RuntimeExecutor> = Arc::new(FailingRuntimeExecutor);
+
+    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
+        .process(&command, CancellationToken::new())
+        .await
+        .expect("claim conflict must safely skip the command");
+}
+
+#[tokio::test]
 async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     let server = MockServer::start().await;
     mount_lifecycle_mocks(&server).await;
