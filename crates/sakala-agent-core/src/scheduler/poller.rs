@@ -383,6 +383,49 @@ mod tests {
         assert_eq!(executions.len(), 1);
     }
 
+    #[tokio::test]
+    async fn graceful_shutdown_cancels_multiple_in_flight_commands() {
+        let mut executions = CommandExecutions::new(2);
+        let first_cancellation = CancellationToken::new();
+        let second_cancellation = CancellationToken::new();
+
+        for cancellation in [first_cancellation.clone(), second_cancellation.clone()] {
+            let task_cancellation = cancellation.clone();
+            assert!(executions.try_start(
+                command(Some(Uuid::new_v4())),
+                cancellation,
+                async move { task_cancellation.cancelled().await }
+            ));
+        }
+
+        executions.cancel_and_wait(Duration::from_secs(1)).await;
+
+        assert!(first_cancellation.is_cancelled());
+        assert!(second_cancellation.is_cancelled());
+        assert_eq!(executions.len(), 0);
+        assert!(executions.active_projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_task_releases_its_project_and_capacity() {
+        let project_id = Uuid::new_v4();
+        let mut executions = CommandExecutions::new(1);
+
+        assert!(
+            executions.try_start(command(Some(project_id)), CancellationToken::new(), async {
+                panic!("simulated command task failure")
+            })
+        );
+
+        tokio::task::yield_now().await;
+        executions.reap_completed();
+
+        assert!(
+            executions.try_start(command(Some(project_id)), CancellationToken::new(), async {
+            })
+        );
+    }
+
     async fn tracked(
         release: oneshot::Receiver<()>,
         active: Arc<AtomicUsize>,
