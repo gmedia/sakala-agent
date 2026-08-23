@@ -19,6 +19,22 @@ pub struct RuntimeResourceLimits {
     pub pids_limit: Option<u32>,
 }
 
+/// Product-level phase deadlines resolved by the control plane.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeTimeoutLimits {
+    pub build_timeout_seconds: Option<u64>,
+    pub start_timeout_seconds: Option<u64>,
+    pub command_timeout_seconds: Option<u64>,
+}
+
+/// Product-level bounds for deployment logs sent to the control plane.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LogBounds {
+    pub max_line_length: Option<u64>,
+    pub max_batch_lines: Option<u64>,
+    pub max_total_bytes: Option<u64>,
+}
+
 /// Concrete resource limits enforced by the runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AppliedRuntimeResources {
@@ -47,6 +63,10 @@ pub struct DeployProjectPayload {
     pub environment: BTreeMap<String, String>,
     #[serde(default)]
     pub resources: RuntimeResourceLimits,
+    #[serde(default)]
+    pub timeouts: RuntimeTimeoutLimits,
+    #[serde(default)]
+    pub log_bounds: LogBounds,
 }
 
 const fn default_container_port() -> u16 {

@@ -79,6 +79,16 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
           "memory_mb": 256,
           "cpu_millis": 500,
           "pids_limit": 128
+        },
+        "timeouts": {
+          "build_timeout_seconds": 600,
+          "start_timeout_seconds": 120,
+          "command_timeout_seconds": 900
+        },
+        "log_bounds": {
+          "max_line_length": 4096,
+          "max_batch_lines": 500,
+          "max_total_bytes": 10485760
         }
       }
     }
@@ -88,7 +98,7 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
 
 `type` dan `status` memakai PascalCase. Identifier command, project, dan deployment memakai UUID. Lihat juga `examples/commands/deploy-project.json`.
 
-`sakala-api` menentukan `resources` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Semua field boleh `null` atau tidak dikirim agar agent memakai fallback node, tetapi nilai nol atau nilai di atas hard maximum node akan menggagalkan command. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
+`sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
 ## Polling and Claim Semantics
 

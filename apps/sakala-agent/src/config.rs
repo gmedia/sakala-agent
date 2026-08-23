@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, fmt, str::FromStr};
 
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError};
-use sakala_agent_runtime::{DockerRuntimeConfig, ResourceSafetyConfig};
+use sakala_agent_runtime::{DockerRuntimeConfig, ResourceSafetyConfig, TimeoutSafetyConfig};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
@@ -87,6 +87,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_BUILD_TIMEOUT_SECONDS")]
     build_timeout_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_START_TIMEOUT_SECONDS")]
+    start_timeout_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_MAX_ACTIVE_CONTAINERS")]
     max_active_containers: Option<String>,
 
@@ -156,6 +159,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
     );
     insert(
         &mut values,
+        "SAKALA_START_TIMEOUT_SECONDS",
+        cli.start_timeout_seconds,
+    );
+    insert(
+        &mut values,
         "SAKALA_MAX_ACTIVE_CONTAINERS",
         cli.max_active_containers,
     );
@@ -200,9 +208,12 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     agent.capabilities = capabilities(runtime_driver);
     let resource_safety = resource_safety(values)?;
     let build_timeout_seconds = positive_u64(values, "SAKALA_BUILD_TIMEOUT_SECONDS", 600)?;
-    if build_timeout_seconds >= agent.command_timeout_seconds {
+    let start_timeout_seconds = positive_u64(values, "SAKALA_START_TIMEOUT_SECONDS", 120)?;
+    if build_timeout_seconds >= agent.command_timeout_seconds
+        || start_timeout_seconds >= agent.command_timeout_seconds
+    {
         return Err(CoreError::InvalidConfiguration(format!(
-            "SAKALA_BUILD_TIMEOUT_SECONDS ({build_timeout_seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({})",
+            "SAKALA_BUILD_TIMEOUT_SECONDS ({build_timeout_seconds}) and SAKALA_START_TIMEOUT_SECONDS ({start_timeout_seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({})",
             agent.command_timeout_seconds
         )));
     }
@@ -225,8 +236,11 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 "ghcr.io/railwayapp/railpack-frontend:v0.23.0",
             ),
             resource_safety,
-            build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
-            command_timeout: agent.command_timeout(),
+            timeout_safety: TimeoutSafetyConfig {
+                max_build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
+                max_start_timeout: std::time::Duration::from_secs(start_timeout_seconds),
+                max_command_timeout: agent.command_timeout(),
+            },
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             ..DockerRuntimeConfig::default()
         },

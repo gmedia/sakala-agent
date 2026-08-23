@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sakala_agent_protocol::{
-    AgentCommand, CompleteCommandPayload, DeploymentEvent, DeploymentEventLevel,
+    AgentCommand, CommandType, CompleteCommandPayload, DeploymentEvent, DeploymentEventLevel,
+    LogBounds,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -47,10 +48,23 @@ impl CommandProcessor {
             )
             .await?;
 
-        let reporter = Arc::new(ApiRuntimeReporter::new(self.client.clone(), command.id));
+        let (execution_timeout, log_bounds) = match self.command_policy(command) {
+            Ok(policy) => policy,
+            Err(error) => {
+                self.client
+                    .fail(command.id, error.code(), &error.to_string())
+                    .await?;
+                return Err(error.into());
+            }
+        };
+        let reporter = Arc::new(ApiRuntimeReporter::new(
+            self.client.clone(),
+            command.id,
+            log_bounds,
+        ));
 
         let execution = tokio::time::timeout(
-            self.command_timeout,
+            execution_timeout,
             self.dispatcher.dispatch(command, reporter),
         )
         .await
@@ -59,7 +73,7 @@ impl CommandProcessor {
                 "runtime_timeout",
                 format!(
                     "command execution exceeded its {}s timeout",
-                    self.command_timeout.as_secs()
+                    execution_timeout.as_secs()
                 ),
             ))
         });
@@ -82,5 +96,32 @@ impl CommandProcessor {
                 Err(error.into())
             }
         }
+    }
+
+    fn command_policy(
+        &self,
+        command: &AgentCommand,
+    ) -> Result<(Duration, LogBounds), crate::ports::RuntimeExecutionError> {
+        if command.command_type != CommandType::DeployProject {
+            return Ok((self.command_timeout, LogBounds::default()));
+        }
+        let payload = command.deploy_payload().map_err(|error| {
+            crate::ports::RuntimeExecutionError::invalid_command(format!(
+                "invalid DeployProject payload: {error}"
+            ))
+        })?;
+        let requested = payload
+            .timeouts
+            .command_timeout_seconds
+            .unwrap_or(self.command_timeout.as_secs());
+        if requested == 0 || requested > self.command_timeout.as_secs() {
+            return Err(crate::ports::RuntimeExecutionError::invalid_command(
+                format!(
+                    "command_timeout_seconds ({requested}s) exceeds the node maximum of {}s",
+                    self.command_timeout.as_secs()
+                ),
+            ));
+        }
+        Ok((Duration::from_secs(requested), payload.log_bounds))
     }
 }

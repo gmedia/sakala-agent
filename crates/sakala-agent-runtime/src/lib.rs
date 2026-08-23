@@ -13,7 +13,7 @@ mod railpack;
 pub mod routing;
 pub mod workspace;
 
-pub use config::DockerRuntimeConfig;
+pub use config::{DockerRuntimeConfig, TimeoutSafetyConfig};
 pub use containers::ResourceSafetyConfig;
 pub use error::RuntimeError;
 pub use executor::{DockerRuntimeExecutor, NoopRuntimeExecutor};

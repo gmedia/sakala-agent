@@ -12,7 +12,7 @@ pub mod status;
 pub use commands::{AgentCommand, CommandType, CompleteCommandPayload};
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
-    RuntimeResourceLimits,
+    LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::HeartbeatPayload;
