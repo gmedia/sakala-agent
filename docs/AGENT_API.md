@@ -301,6 +301,13 @@ untuk aturan rollout dan command yang belum didukung.
       "queued_local_commands": 0,
       "active_builds": 1,
       "maximum_concurrent_builds": 2
+    },
+    "reconciliation": {
+      "inspected_containers": 2,
+      "cleaned_workspaces": 0,
+      "recovered_workloads": [],
+      "orphans": [],
+      "stale_routes": []
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"

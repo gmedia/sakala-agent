@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
 use sakala_agent_core::{
     AgentMode, NodeLifecycle,
     api::ApiClient,
     heartbeat,
-    ports::{RuntimeExecutor, RuntimePreflightReport},
+    ports::{RuntimeExecutor, RuntimePreflightReport, RuntimeReconciliationReport},
     scheduler,
 };
 use sakala_agent_runtime::{DockerRuntimeExecutor, NoopRuntimeExecutor};
@@ -29,6 +29,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         AgentMode::Connected => Some(ApiClient::from_config(&config.agent)?),
     };
     let workspace_root = config.docker_runtime.workspace_root.clone();
+    let reconciliation = Arc::new(RwLock::new(RuntimeReconciliationReport::default()));
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
         RuntimeDriver::Docker => Arc::new(DockerRuntimeExecutor::new(config.docker_runtime)),
@@ -43,6 +44,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     }
     match runtime.reconcile().await {
         Ok(report) => {
+            if let Ok(mut snapshot) = reconciliation.write() {
+                *snapshot = report.clone();
+            }
             info!(
                 inspected_containers = report.inspected_containers,
                 discovered_workloads = report.workloads.len(),
@@ -100,6 +104,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         workspace_root,
         Arc::clone(&runtime),
         Arc::clone(&scheduler_metrics),
+        Arc::clone(&reconciliation),
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(

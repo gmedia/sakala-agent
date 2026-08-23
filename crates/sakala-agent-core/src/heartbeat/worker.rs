@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::json;
@@ -7,7 +10,9 @@ use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
 use crate::{
-    AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, ports::RuntimeExecutor,
+    AgentConfig, NodeLifecycle, NodeLifecycleState,
+    api::ApiClient,
+    ports::{RuntimeExecutor, RuntimeReconciliationReport},
     scheduler::metrics::SchedulerMetrics,
 };
 
@@ -19,6 +24,7 @@ pub async fn run(
     workspace_root: std::path::PathBuf,
     runtime: Arc<dyn RuntimeExecutor>,
     scheduler_metrics: Arc<SchedulerMetrics>,
+    reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -29,6 +35,7 @@ pub async fn run(
             &workspace_root,
             runtime.as_ref(),
             scheduler_metrics.as_ref(),
+            reconciliation.as_ref(),
         )
         .await;
 
@@ -64,10 +71,15 @@ async fn payload(
     workspace_root: &Path,
     runtime: &dyn RuntimeExecutor,
     scheduler_metrics: &SchedulerMetrics,
+    reconciliation: &RwLock<RuntimeReconciliationReport>,
 ) -> HeartbeatPayload {
     let resources = node_resources(workspace_root).await;
     let workloads = workload_statistics(runtime).await;
     let dependencies = runtime_dependency_versions().await;
+    let reconciliation = reconciliation
+        .read()
+        .map(|report| report.clone())
+        .unwrap_or_default();
     HeartbeatPayload {
         status: match lifecycle_state {
             NodeLifecycleState::Active => NodeStatus::Ready,
@@ -106,6 +118,25 @@ async fn payload(
                 "queued_local_commands": scheduler_metrics.queued_local_commands(),
                 "active_builds": workloads.active_builds,
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
+            },
+            "reconciliation": {
+                "inspected_containers": reconciliation.inspected_containers,
+                "cleaned_workspaces": reconciliation.cleaned_workspaces,
+                "recovered_workloads": reconciliation.workloads.iter().map(|workload| json!({
+                    "container_id": workload.container_id,
+                    "project_id": workload.project_id,
+                    "deployment_id": workload.deployment_id,
+                    "status": workload.status,
+                })).collect::<Vec<_>>(),
+                "orphans": reconciliation.orphans.iter().map(|orphan| json!({
+                    "container_id": orphan.container_id,
+                    "project_id": orphan.project_id,
+                    "reason": orphan.reason,
+                })).collect::<Vec<_>>(),
+                "stale_routes": reconciliation.stale_routes.iter().map(|route| json!({
+                    "path": route.path,
+                    "project_id": route.project_id,
+                })).collect::<Vec<_>>(),
             },
             "runtime_dependencies": dependencies,
         }),
@@ -293,12 +324,15 @@ fn parse_meminfo(contents: &str) -> (Option<u64>, Option<u64>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::RwLock};
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
+    use uuid::Uuid;
 
     use crate::{
-        AgentConfig, NodeLifecycleState, ports::RuntimeExecutor,
+        AgentConfig, NodeLifecycleState,
+        ports::RuntimeExecutor,
+        ports::{RuntimeReconciliationReport, RuntimeStaleRoute},
         scheduler::metrics::SchedulerMetrics,
     };
 
@@ -314,6 +348,14 @@ mod tests {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
         let scheduler_metrics = SchedulerMetrics::default();
+        let stale_project = Uuid::new_v4();
+        let reconciliation = RwLock::new(RuntimeReconciliationReport {
+            stale_routes: vec![RuntimeStaleRoute {
+                path: "/var/lib/sakala/caddy/stale.Caddyfile".to_owned(),
+                project_id: stale_project,
+            }],
+            ..RuntimeReconciliationReport::default()
+        });
         let heartbeat = payload(
             &config,
             NodeLifecycleState::Active,
@@ -321,11 +363,16 @@ mod tests {
             std::path::Path::new("/tmp"),
             &EmptyRuntime,
             &scheduler_metrics,
+            &reconciliation,
         )
         .await;
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            heartbeat.metadata["reconciliation"]["stale_routes"][0]["project_id"],
+            stale_project.to_string()
+        );
     }
 
     #[test]
