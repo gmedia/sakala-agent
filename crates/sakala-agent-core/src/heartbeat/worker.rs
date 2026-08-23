@@ -6,7 +6,9 @@ use time::OffsetDateTime;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
-use crate::{AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient};
+use crate::{
+    AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, ports::RuntimeExecutor,
+};
 
 pub async fn run(
     config: AgentConfig,
@@ -14,6 +16,7 @@ pub async fn run(
     node_lifecycle: Arc<NodeLifecycle>,
     runtime_driver: String,
     workspace_root: std::path::PathBuf,
+    runtime: Arc<dyn RuntimeExecutor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -22,6 +25,7 @@ pub async fn run(
             node_lifecycle.state(),
             &runtime_driver,
             &workspace_root,
+            runtime.as_ref(),
         )
         .await;
 
@@ -55,8 +59,10 @@ async fn payload(
     lifecycle_state: NodeLifecycleState,
     runtime_driver: &str,
     workspace_root: &Path,
+    runtime: &dyn RuntimeExecutor,
 ) -> HeartbeatPayload {
     let resources = node_resources(workspace_root).await;
+    let workloads = workload_statistics(runtime).await;
     HeartbeatPayload {
         status: match lifecycle_state {
             NodeLifecycleState::Active => NodeStatus::Ready,
@@ -83,8 +89,60 @@ async fn payload(
                 "disk_total_bytes": resources.disk_total_bytes,
                 "disk_available_bytes": resources.disk_available_bytes,
             },
+            "workloads": {
+                "active": workloads.active,
+                "starting": workloads.starting,
+                "unhealthy": workloads.unhealthy,
+            },
         }),
         sent_at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkloadStatistics {
+    active: Option<usize>,
+    starting: Option<usize>,
+    unhealthy: Option<usize>,
+}
+
+async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
+    let active = runtime
+        .capacity()
+        .await
+        .ok()
+        .and_then(|value| value.active_workloads);
+    let Ok(snapshots) = runtime.health_snapshot().await else {
+        return WorkloadStatistics {
+            active,
+            ..WorkloadStatistics::default()
+        };
+    };
+    let starting = snapshots
+        .iter()
+        .filter(|snapshot| {
+            snapshot
+                .workload
+                .status
+                .to_ascii_lowercase()
+                .contains("starting")
+        })
+        .count();
+    let unhealthy = snapshots
+        .iter()
+        .filter(|snapshot| {
+            !snapshot.ready
+                && !snapshot
+                    .workload
+                    .status
+                    .to_ascii_lowercase()
+                    .contains("starting")
+        })
+        .count();
+    WorkloadStatistics {
+        active,
+        starting: Some(starting),
+        unhealthy: Some(unhealthy),
     }
 }
 
@@ -173,9 +231,14 @@ mod tests {
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
 
-    use crate::{AgentConfig, NodeLifecycleState};
+    use crate::{AgentConfig, NodeLifecycleState, ports::RuntimeExecutor};
 
     use super::{parse_meminfo, payload, workspace_disk_resources};
+
+    struct EmptyRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for EmptyRuntime {}
 
     #[tokio::test]
     async fn heartbeat_identifies_the_wire_contract_revision() {
@@ -186,6 +249,7 @@ mod tests {
             NodeLifecycleState::Active,
             "noop",
             std::path::Path::new("/tmp"),
+            &EmptyRuntime,
         )
         .await;
 

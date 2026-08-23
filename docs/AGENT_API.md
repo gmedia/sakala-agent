@@ -251,6 +251,11 @@ untuk aturan rollout dan command yang belum didukung.
       "memory_available_bytes": 4294967296,
       "disk_total_bytes": 107374182400,
       "disk_available_bytes": 53687091200
+    },
+    "workloads": {
+      "active": 2,
+      "starting": 0,
+      "unhealthy": 0
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"
