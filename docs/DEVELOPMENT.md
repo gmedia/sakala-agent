@@ -29,6 +29,13 @@ make audit
 
 CI menjalankan format check, clippy, test, dan build. Workflow security menjalankan `cargo audit`.
 
+## Release
+
+Release dipicu oleh tag semantic version `v*`. Workflow release memverifikasi
+`make check`, membangun binary Linux `x86_64` dengan Rust `1.88.0`, lalu
+menerbitkan binary dan `SHA256SUMS` sebagai GitHub Release assets. Isi
+`CHANGELOG.md` harus diperbarui sebelum tag dibuat.
+
 ## Menambah Dependency
 
 Gunakan `cargo add`:

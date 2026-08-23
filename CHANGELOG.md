@@ -14,6 +14,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Typed deployment resource request, node safety defaults/ceilings, dan requested/applied resource reporting.
 - Per-repository task tracking untuk connected agent, real runtime, dan hardening berikutnya.
 - Wiremock coverage for connected heartbeat and successful/failed command reporting lifecycles.
+- Private repository checkout dengan temporary credential in-memory, credential-free remote URL, dan `GIT_ASKPASS` owner-only.
+- Bounded scheduler untuk command lintas project serta batas build image Docker/Railpack.
+- Cancellation end-to-end sampai process group, cleanup candidate/workspace, dan graceful shutdown deadline.
+- Docker preflight, label workload canonical, heartbeat protocol revision, serta GC workspace UUID yang konservatif.
 - Cargo workspace dengan binary agent serta crate protocol, core, dan runtime.
 - Safe local mode dengan heartbeat/polling log dan graceful shutdown.
 - Control-plane API client skeleton untuk connected mode.
@@ -28,3 +32,4 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Align heartbeat, command polling, event, log, and failure payloads with the `sakala-api` resource and persistence conventions.
 - Integrasi connected mode diarahkan ke `sakala-api` melalui `SAKALA_API_URL` dan modul `api`.
 - Update transitive `quinn-proto` dependency to `0.11.15` to address `RUSTSEC-2026-0185`.
+- Update transitive `h2` dependency to `0.4.16` to address `RUSTSEC-2026-0258`.
