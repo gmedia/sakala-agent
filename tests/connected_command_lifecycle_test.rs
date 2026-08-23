@@ -37,7 +37,7 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     assert_eq!(commands[0].status, CommandStatus::Pending);
 
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
-    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(30))
+    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
         .process(&commands[0])
         .await
         .expect("noop command lifecycle should complete");
@@ -68,7 +68,7 @@ async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
         .expect("test client should be valid");
     let runtime: Arc<dyn RuntimeExecutor> = Arc::new(FailingRuntimeExecutor);
 
-    let error = CommandProcessor::new(client, runtime, std::time::Duration::from_secs(30))
+    let error = CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
         .process(&command)
         .await
         .expect_err("runtime failure should propagate after being reported");
@@ -93,7 +93,9 @@ async fn connected_agent_reports_command_timeout_with_stable_failure_status() {
         .mount(&server)
         .await;
 
-    let command: AgentCommand = serde_json::from_value(command_fixture()).expect("valid command");
+    let mut fixture = command_fixture();
+    fixture["payload"]["timeouts"]["command_timeout_seconds"] = json!(1);
+    let command: AgentCommand = serde_json::from_value(fixture).expect("valid command");
     let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
         .expect("test client should be valid");
 
@@ -198,7 +200,22 @@ fn command_fixture() -> serde_json::Value {
             "domain": "portfolio.run.sakala.localhost",
             "container_port": 3000,
             "builder": "auto",
-            "environment": {}
+            "environment": {},
+            "resources": {
+                "memory_mb": 256,
+                "cpu_millis": 500,
+                "pids_limit": 128
+            },
+            "timeouts": {
+                "build_timeout_seconds": 600,
+                "start_timeout_seconds": 120,
+                "command_timeout_seconds": 900
+            },
+            "log_bounds": {
+                "max_line_length": 4096,
+                "max_batch_lines": 500,
+                "max_total_bytes": 10485760
+            }
         }
     })
 }

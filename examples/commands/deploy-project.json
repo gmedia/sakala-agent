@@ -17,6 +17,16 @@
       "memory_mb": 256,
       "cpu_millis": 500,
       "pids_limit": 128
+    },
+    "timeouts": {
+      "build_timeout_seconds": 600,
+      "start_timeout_seconds": 120,
+      "command_timeout_seconds": 900
+    },
+    "log_bounds": {
+      "max_line_length": 4096,
+      "max_batch_lines": 500,
+      "max_total_bytes": 10485760
     }
   }
 }

@@ -36,13 +36,15 @@ pub struct DockerRuntimeExecutor {
     containers: Arc<dyn ContainerEngine>,
     health: Arc<dyn HealthChecker>,
     routes: Arc<dyn RouteManager>,
-    build_timeout: std::time::Duration,
+    timeout_safety: crate::TimeoutSafetyConfig,
 }
 
 impl DockerRuntimeExecutor {
     #[must_use]
     pub fn new(config: DockerRuntimeConfig) -> Self {
-        let runner = Arc::new(TokioProcessRunner::new(config.command_timeout));
+        let runner = Arc::new(TokioProcessRunner::new(
+            config.timeout_safety.max_command_timeout,
+        ));
         Self::with_runner(config, runner)
     }
 
@@ -74,7 +76,7 @@ impl DockerRuntimeExecutor {
                 config.health_interval,
             )),
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
-            config.build_timeout,
+            config.timeout_safety,
         )
     }
 
@@ -86,7 +88,7 @@ impl DockerRuntimeExecutor {
         containers: Arc<dyn ContainerEngine>,
         health: Arc<dyn HealthChecker>,
         routes: Arc<dyn RouteManager>,
-        build_timeout: std::time::Duration,
+        timeout_safety: crate::TimeoutSafetyConfig,
     ) -> Self {
         Self {
             workspace,
@@ -95,7 +97,7 @@ impl DockerRuntimeExecutor {
             containers,
             health,
             routes,
-            build_timeout,
+            timeout_safety,
         }
     }
 
@@ -149,6 +151,7 @@ impl DockerRuntimeExecutor {
         let deployment_id = request.deployment_id;
         let payload = request.payload;
         validate_payload(&payload)?;
+        let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload)?;
         self.containers.ensure_capacity(project_id).await?;
@@ -160,6 +163,17 @@ impl DockerRuntimeExecutor {
             json!({
                 "requested": payload.resources,
                 "applied": applied_resources,
+            }),
+        )
+        .await?;
+
+        emit_event(
+            reporter.as_ref(),
+            "deployment.timeouts.resolved",
+            "Runtime timeout request passed node safety checks.",
+            json!({
+                "build_timeout_seconds": applied_timeouts.build.as_secs(),
+                "start_timeout_seconds": applied_timeouts.start.as_secs(),
             }),
         )
         .await?;
@@ -188,6 +202,7 @@ impl DockerRuntimeExecutor {
                 &image,
                 &container,
                 applied_resources,
+                applied_timeouts,
                 &route_activated,
                 Arc::clone(&reporter),
             )
@@ -226,6 +241,7 @@ impl DockerRuntimeExecutor {
         image: &str,
         container: &str,
         applied_resources: AppliedRuntimeResources,
+        applied_timeouts: crate::config::AppliedRuntimeTimeouts,
         route_activated: &AtomicBool,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
@@ -238,7 +254,7 @@ impl DockerRuntimeExecutor {
         )
         .await?;
         let build = tokio::time::timeout(
-            self.build_timeout,
+            applied_timeouts.build,
             self.builder.build(
                 &BuildRequest {
                     workspace: workspace.root().to_owned(),
@@ -252,7 +268,7 @@ impl DockerRuntimeExecutor {
         .await
         .map_err(|_| RuntimeError::Timeout {
             operation: "deployment-build".to_owned(),
-            seconds: self.build_timeout.as_secs(),
+            seconds: applied_timeouts.build.as_secs(),
         })??;
 
         emit_event(
@@ -262,21 +278,28 @@ impl DockerRuntimeExecutor {
             json!({ "container": container, "image": image }),
         )
         .await?;
-        self.containers
-            .start(
-                &RunContainerRequest {
-                    project_id,
-                    deployment_id,
-                    name: container.to_owned(),
-                    image: image.to_owned(),
-                    workspace: workspace.root().to_owned(),
-                    environment: payload.environment.clone(),
-                    resources: applied_resources,
-                },
-                reporter_ref,
-            )
-            .await?;
-        self.health.wait_until_ready(container).await?;
+        tokio::time::timeout(applied_timeouts.start, async {
+            self.containers
+                .start(
+                    &RunContainerRequest {
+                        project_id,
+                        deployment_id,
+                        name: container.to_owned(),
+                        image: image.to_owned(),
+                        workspace: workspace.root().to_owned(),
+                        environment: payload.environment.clone(),
+                        resources: applied_resources,
+                    },
+                    reporter_ref,
+                )
+                .await?;
+            self.health.wait_until_ready(container).await
+        })
+        .await
+        .map_err(|_| RuntimeError::Timeout {
+            operation: "deployment-start".to_owned(),
+            seconds: applied_timeouts.start.as_secs(),
+        })??;
         self.routes
             .activate(
                 &RouteSpec {

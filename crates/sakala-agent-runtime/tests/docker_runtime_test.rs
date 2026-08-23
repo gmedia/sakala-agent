@@ -125,7 +125,7 @@ async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts()
     let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(60)));
     let reporter = Arc::new(RecordingReporter::default());
     let mut config = runtime_config(&temp);
-    config.build_timeout = Duration::from_millis(30);
+    config.timeout_safety.max_build_timeout = Duration::from_secs(1);
     let workspace = config.workspace_root.join(
         Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b")
             .expect("command UUID")
