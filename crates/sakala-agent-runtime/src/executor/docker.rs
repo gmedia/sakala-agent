@@ -14,6 +14,7 @@ use sakala_agent_protocol::{
 };
 use serde_json::json;
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 
@@ -37,6 +38,7 @@ pub struct DockerRuntimeExecutor {
     health: Arc<dyn HealthChecker>,
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
+    build_permits: Arc<Semaphore>,
 }
 
 impl DockerRuntimeExecutor {
@@ -50,6 +52,7 @@ impl DockerRuntimeExecutor {
 
     #[must_use]
     pub fn with_runner(config: DockerRuntimeConfig, runner: Arc<dyn ProcessRunner>) -> Self {
+        let max_concurrent_builds = config.max_concurrent_builds;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -77,9 +80,11 @@ impl DockerRuntimeExecutor {
             )),
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
             config.timeout_safety,
+            max_concurrent_builds,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn with_services(
         workspace: Arc<dyn WorkspaceManager>,
@@ -89,6 +94,7 @@ impl DockerRuntimeExecutor {
         health: Arc<dyn HealthChecker>,
         routes: Arc<dyn RouteManager>,
         timeout_safety: crate::TimeoutSafetyConfig,
+        max_concurrent_builds: usize,
     ) -> Self {
         Self {
             workspace,
@@ -98,6 +104,7 @@ impl DockerRuntimeExecutor {
             health,
             routes,
             timeout_safety,
+            build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
         }
     }
 
@@ -252,6 +259,12 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
         let reporter_ref = reporter.as_ref();
+        let _build_permit = Arc::clone(&self.build_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                RuntimeError::Execution("build concurrency scheduler is unavailable".to_owned())
+            })?;
         emit_event(
             reporter_ref,
             "deployment.build.started",

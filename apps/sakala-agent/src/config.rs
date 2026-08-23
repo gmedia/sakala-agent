@@ -66,6 +66,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_COMMAND_TIMEOUT_SECONDS")]
     command_timeout_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_MAX_CONCURRENT_COMMANDS")]
+    max_concurrent_commands: Option<String>,
+
     #[arg(long, env = "SAKALA_RUNTIME_NETWORK")]
     runtime_network: Option<String>,
 
@@ -89,6 +92,9 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_START_TIMEOUT_SECONDS")]
     start_timeout_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_MAX_CONCURRENT_BUILDS")]
+    max_concurrent_builds: Option<String>,
 
     #[arg(long, env = "SAKALA_MAX_ACTIVE_CONTAINERS")]
     max_active_containers: Option<String>,
@@ -138,6 +144,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_COMMAND_TIMEOUT_SECONDS",
         cli.command_timeout_seconds,
     );
+    insert(
+        &mut values,
+        "SAKALA_MAX_CONCURRENT_COMMANDS",
+        cli.max_concurrent_commands,
+    );
     insert(&mut values, "SAKALA_RUNTIME_NETWORK", cli.runtime_network);
     insert(&mut values, "SAKALA_RUNTIME_DRIVER", cli.runtime_driver);
     insert(
@@ -161,6 +172,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_START_TIMEOUT_SECONDS",
         cli.start_timeout_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_MAX_CONCURRENT_BUILDS",
+        cli.max_concurrent_builds,
     );
     insert(
         &mut values,
@@ -241,6 +257,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 max_start_timeout: std::time::Duration::from_secs(start_timeout_seconds),
                 max_command_timeout: agent.command_timeout(),
             },
+            max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             ..DockerRuntimeConfig::default()
         },
@@ -351,6 +368,26 @@ fn positive_u64(
     Ok(value)
 }
 
+fn positive_usize(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: usize,
+) -> Result<usize, CoreError> {
+    let value = values
+        .get(key)
+        .map_or_else(|| default.to_string(), Clone::clone)
+        .parse::<usize>()
+        .map_err(|_| CoreError::InvalidConfiguration(format!("{key} must be a number")))?;
+
+    if value == 0 {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+
+    Ok(value)
+}
+
 fn insert(values: &mut HashMap<String, String>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         values.insert(key.to_owned(), value);
@@ -370,6 +407,8 @@ mod tests {
         assert_eq!(config.docker_runtime.runtime_network, "sakala-runtime");
         assert_eq!(config.docker_runtime.resource_safety.default_memory_mb, 256);
         assert_eq!(config.docker_runtime.resource_safety.max_memory_mb, 512);
+        assert_eq!(config.agent.max_concurrent_commands, 4);
+        assert_eq!(config.docker_runtime.max_concurrent_builds, 1);
         assert_eq!(config.log_level, "info");
     }
 
@@ -422,5 +461,17 @@ mod tests {
 
         let error = from_values(&values).expect_err("build deadline must precede command deadline");
         assert!(error.to_string().contains("must be shorter"));
+    }
+
+    #[test]
+    fn accepts_independent_command_and_build_concurrency_limits() {
+        let values = HashMap::from([
+            ("SAKALA_MAX_CONCURRENT_COMMANDS".to_owned(), "6".to_owned()),
+            ("SAKALA_MAX_CONCURRENT_BUILDS".to_owned(), "2".to_owned()),
+        ]);
+
+        let config = from_values(&values).expect("concurrency limits should be valid");
+        assert_eq!(config.agent.max_concurrent_commands, 6);
+        assert_eq!(config.docker_runtime.max_concurrent_builds, 2);
     }
 }

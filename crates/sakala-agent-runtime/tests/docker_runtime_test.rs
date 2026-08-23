@@ -1,6 +1,9 @@
 use std::{
     fs,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -193,6 +196,32 @@ async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts()
                 .first()
                 .is_some_and(|argument| argument == "rm")
     }));
+}
+
+#[tokio::test]
+async fn node_limits_concurrent_image_builds() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_millis(50)));
+    let mut config = runtime_config(&temp);
+    config.max_concurrent_builds = 1;
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let first = deploy_command("auto");
+    let mut second = deploy_command("auto");
+    second.id = Uuid::new_v4();
+    second.project_id = Some(Uuid::new_v4());
+    second.deployment_id = Some(Uuid::new_v4());
+    second.payload["domain"] = json!("second.run.sakala.localhost");
+
+    let first_dispatcher = CommandDispatcher::new(executor.clone());
+    let second_dispatcher = CommandDispatcher::new(executor);
+    let (first_result, second_result) = tokio::join!(
+        first_dispatcher.dispatch(&first, Arc::new(RecordingReporter::default())),
+        second_dispatcher.dispatch(&second, Arc::new(RecordingReporter::default()))
+    );
+
+    first_result.expect("first deployment should complete");
+    second_result.expect("second deployment should complete");
+    assert_eq!(runner.max_concurrent_builds.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -524,6 +553,8 @@ struct FakeRunner {
     docker_ps_stdout: String,
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
+    active_builds: AtomicUsize,
+    max_concurrent_builds: AtomicUsize,
 }
 
 impl FakeRunner {
@@ -534,6 +565,8 @@ impl FakeRunner {
             docker_ps_stdout: String::new(),
             build_delay: None,
             inspect_delay: None,
+            active_builds: AtomicUsize::new(0),
+            max_concurrent_builds: AtomicUsize::new(0),
         }
     }
 
@@ -569,7 +602,11 @@ impl ProcessRunner for FakeRunner {
             && spec.args.iter().any(|argument| argument == "buildx")
             && let Some(delay) = self.build_delay
         {
+            let active = self.active_builds.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_concurrent_builds
+                .fetch_max(active, Ordering::SeqCst);
             tokio::time::sleep(delay).await;
+            self.active_builds.fetch_sub(1, Ordering::SeqCst);
         }
         if spec.program == "docker"
             && spec.args.iter().any(|argument| argument == "inspect")
