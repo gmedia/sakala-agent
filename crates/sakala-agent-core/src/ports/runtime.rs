@@ -76,6 +76,7 @@ pub struct RuntimeHealthSnapshot {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeCapacity {
     pub active_workloads: Option<usize>,
+    pub stopped_workloads: Option<usize>,
     pub maximum_active_workloads: Option<usize>,
 }
 
@@ -288,6 +289,7 @@ mod tests {
         assert_eq!(
             RuntimeCapacity {
                 active_workloads: Some(4),
+                stopped_workloads: None,
                 maximum_active_workloads: Some(2),
             }
             .available_workload_slots(),

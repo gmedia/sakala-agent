@@ -287,7 +287,8 @@ untuk aturan rollout dan command yang belum didukung.
     "workloads": {
       "active": 2,
       "starting": 0,
-      "unhealthy": 0
+      "unhealthy": 0,
+      "stopped": 1
     },
     "runtime_dependencies": {
       "git": "git version 2.47.0",

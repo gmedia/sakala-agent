@@ -95,6 +95,7 @@ async fn payload(
                 "active": workloads.active,
                 "starting": workloads.starting,
                 "unhealthy": workloads.unhealthy,
+                "stopped": workloads.stopped,
             },
             "runtime_dependencies": dependencies,
         }),
@@ -133,19 +134,19 @@ async fn command_version(program: &str, arguments: &[&str]) -> Option<String> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct WorkloadStatistics {
     active: Option<usize>,
+    stopped: Option<usize>,
     starting: Option<usize>,
     unhealthy: Option<usize>,
 }
 
 async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
-    let active = runtime
-        .capacity()
-        .await
-        .ok()
-        .and_then(|value| value.active_workloads);
+    let capacity = runtime.capacity().await.ok();
+    let active = capacity.as_ref().and_then(|value| value.active_workloads);
+    let stopped = capacity.as_ref().and_then(|value| value.stopped_workloads);
     let Ok(snapshots) = runtime.health_snapshot().await else {
         return WorkloadStatistics {
             active,
+            stopped,
             ..WorkloadStatistics::default()
         };
     };
@@ -172,6 +173,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         .count();
     WorkloadStatistics {
         active,
+        stopped,
         starting: Some(starting),
         unhealthy: Some(unhealthy),
     }

@@ -187,6 +187,13 @@ impl ContainerEngine for DockerContainerEngine {
         let report = self.detect_orphans().await?;
         Ok(RuntimeCapacity {
             active_workloads: Some(report.workloads.len()),
+            stopped_workloads: Some(
+                report
+                    .orphans
+                    .iter()
+                    .filter(|orphan| orphan.reason == "managed container is not running")
+                    .count(),
+            ),
             maximum_active_workloads: Some(self.max_active_containers as usize),
         })
     }
