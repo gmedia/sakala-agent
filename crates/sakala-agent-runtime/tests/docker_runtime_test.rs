@@ -789,6 +789,40 @@ async fn reconciliation_discovers_valid_managed_workloads() {
 }
 
 #[tokio::test]
+async fn agent_restart_recovers_healthy_workload_and_orphan_visibility() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\ncandidate\tCreated\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\n",
+    ));
+
+    let recovered = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let report = RuntimeExecutor::reconcile(&recovered)
+        .await
+        .expect("new agent process should reconcile existing runtime state");
+    let health = RuntimeExecutor::health_snapshot(&recovered)
+        .await
+        .expect("new agent process should recheck recovered workload health");
+
+    assert_eq!(report.workloads.len(), 1);
+    assert!(
+        report
+            .orphans
+            .iter()
+            .any(|orphan| orphan.container_id == "candidate")
+    );
+    assert_eq!(health.len(), 2);
+    assert!(
+        health
+            .iter()
+            .any(|snapshot| snapshot.workload.container_id == "healthy" && snapshot.ready)
+    );
+    assert!(!runner.commands.lock().expect("command lock").iter().any(|command| {
+        command.program == "docker"
+            && matches!(command.args.first().map(|value| value.to_string_lossy()), Some(ref action) if action == "run" || action == "rm" || action == "start")
+    }));
+}
+
+#[tokio::test]
 async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner =
