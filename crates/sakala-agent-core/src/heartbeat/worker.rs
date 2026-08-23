@@ -12,10 +12,11 @@ pub async fn run(
     config: AgentConfig,
     client: Option<ApiClient>,
     node_lifecycle: Arc<NodeLifecycle>,
+    runtime_driver: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let payload = payload(&config, node_lifecycle.state());
+        let payload = payload(&config, node_lifecycle.state(), &runtime_driver);
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -42,7 +43,12 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-fn payload(config: &AgentConfig, lifecycle_state: NodeLifecycleState) -> HeartbeatPayload {
+fn payload(
+    config: &AgentConfig,
+    lifecycle_state: NodeLifecycleState,
+    runtime_driver: &str,
+) -> HeartbeatPayload {
+    let resources = node_resources();
     HeartbeatPayload {
         status: match lifecycle_state {
             NodeLifecycleState::Active => NodeStatus::Ready,
@@ -59,9 +65,56 @@ fn payload(config: &AgentConfig, lifecycle_state: NodeLifecycleState) -> Heartbe
             "version": env!("CARGO_PKG_VERSION"),
             "protocol_version": PROTOCOL_VERSION,
             "lifecycle_state": format!("{lifecycle_state:?}").to_ascii_lowercase(),
+            "runtime_driver": runtime_driver,
+            "uptime_seconds": resources.uptime_seconds,
+            "resources": {
+                "cpu_total": resources.cpu_total,
+                "memory_total_bytes": resources.memory_total_bytes,
+                "memory_available_bytes": resources.memory_available_bytes,
+            },
         }),
         sent_at: OffsetDateTime::now_utc(),
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NodeResources {
+    uptime_seconds: Option<u64>,
+    cpu_total: Option<usize>,
+    memory_total_bytes: Option<u64>,
+    memory_available_bytes: Option<u64>,
+}
+
+fn node_resources() -> NodeResources {
+    let memory = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .map(|contents| parse_meminfo(&contents))
+        .unwrap_or_default();
+    NodeResources {
+        uptime_seconds: std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok())
+            .map(|seconds| seconds.max(0.0) as u64),
+        cpu_total: std::thread::available_parallelism().ok().map(usize::from),
+        memory_total_bytes: memory.0,
+        memory_available_bytes: memory.1,
+    }
+}
+
+fn parse_meminfo(contents: &str) -> (Option<u64>, Option<u64>) {
+    let mut total = None;
+    let mut available = None;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(key) = fields.next() else { continue };
+        let value = fields.next().and_then(|value| value.parse::<u64>().ok());
+        match key {
+            "MemTotal:" => total = value.and_then(|value| value.checked_mul(1_024)),
+            "MemAvailable:" => available = value.and_then(|value| value.checked_mul(1_024)),
+            _ => {}
+        }
+    }
+    (total, available)
 }
 
 #[cfg(test)]
@@ -72,15 +125,23 @@ mod tests {
 
     use crate::{AgentConfig, NodeLifecycleState};
 
-    use super::payload;
+    use super::{parse_meminfo, payload};
 
     #[test]
     fn heartbeat_identifies_the_wire_contract_revision() {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
-        let heartbeat = payload(&config, NodeLifecycleState::Active);
+        let heartbeat = payload(&config, NodeLifecycleState::Active, "noop");
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn parses_memory_values_without_exposing_host_specific_text() {
+        assert_eq!(
+            parse_meminfo("MemTotal:       1024 kB\nMemAvailable:    512 kB\n"),
+            (Some(1_048_576), Some(524_288))
+        );
     }
 }

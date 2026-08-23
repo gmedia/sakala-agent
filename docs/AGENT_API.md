@@ -206,7 +206,15 @@ untuk aturan rollout dan command yang belum didukung.
   ],
   "metadata": {
     "version": "0.1.0",
-    "protocol_version": 1
+    "protocol_version": 1,
+    "runtime_driver": "docker",
+    "lifecycle_state": "active",
+    "uptime_seconds": 86400,
+    "resources": {
+      "cpu_total": 4,
+      "memory_total_bytes": 8589934592,
+      "memory_available_bytes": 4294967296
+    }
   },
   "sent_at": "2026-06-23T08:00:00Z"
 }

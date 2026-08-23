@@ -94,6 +94,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.agent.clone(),
         client.clone(),
         Arc::clone(&node_lifecycle),
+        config.runtime_driver.to_string(),
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(
