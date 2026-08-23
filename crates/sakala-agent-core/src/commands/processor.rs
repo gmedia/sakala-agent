@@ -8,6 +8,7 @@ use sakala_agent_protocol::{
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 
 use crate::{
     CoreError, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
@@ -43,6 +44,14 @@ impl CommandProcessor {
         command: &AgentCommand,
         cancellation: CancellationToken,
     ) -> Result<(), CoreError> {
+        let started = std::time::Instant::now();
+        info!(
+            command_id = %command.id,
+            project_id = ?command.project_id,
+            deployment_id = ?command.deployment_id,
+            command_type = ?command.command_type,
+            "processing control-plane command"
+        );
         self.client.claim(command.id).await?;
         self.client
             .event(
@@ -96,12 +105,30 @@ impl CommandProcessor {
                             result: output.result,
                         },
                     )
-                    .await
+                    .await?;
+                info!(
+                    command_id = %command.id,
+                    project_id = ?command.project_id,
+                    deployment_id = ?command.deployment_id,
+                    command_type = ?command.command_type,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "control-plane command completed"
+                );
+                Ok(())
             }
             Err(error) => {
                 self.client
                     .fail(command.id, error.code(), &error.to_string())
                     .await?;
+                warn!(
+                    command_id = %command.id,
+                    project_id = ?command.project_id,
+                    deployment_id = ?command.deployment_id,
+                    command_type = ?command.command_type,
+                    error_code = error.code(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "control-plane command failed"
+                );
                 Err(error.into())
             }
         }
