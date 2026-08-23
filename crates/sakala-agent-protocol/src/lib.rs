@@ -1,5 +1,11 @@
 //! Shared protocol types between the Sakala control plane and runtime agent.
 
+/// Wire-contract revision implemented by this agent build.
+///
+/// This is intentionally independent from the crate semantic version so the
+/// control plane can reject an incompatible agent before assigning work.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub mod commands;
 pub mod deployments;
 pub mod events;

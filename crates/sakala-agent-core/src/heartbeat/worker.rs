@@ -1,4 +1,4 @@
-use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus};
+use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::{sync::watch, time::sleep};
@@ -47,7 +47,31 @@ fn payload(config: &AgentConfig) -> HeartbeatPayload {
             runtime_network: config.runtime_network.clone(),
             capabilities: config.capabilities.clone(),
         },
-        metadata: json!({ "version": env!("CARGO_PKG_VERSION") }),
+        metadata: json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "protocol_version": PROTOCOL_VERSION,
+        }),
         sent_at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use sakala_agent_protocol::PROTOCOL_VERSION;
+
+    use crate::AgentConfig;
+
+    use super::payload;
+
+    #[test]
+    fn heartbeat_identifies_the_wire_contract_revision() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(&config);
+
+        assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
     }
 }

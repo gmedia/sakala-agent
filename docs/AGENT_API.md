@@ -174,7 +174,8 @@ Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan 
     "caddy-file-routing"
   ],
   "metadata": {
-    "version": "0.1.0"
+    "version": "0.1.0",
+    "protocol_version": 1
   },
   "sent_at": "2026-06-23T08:00:00Z"
 }
