@@ -894,6 +894,47 @@ async fn reconciliation_reports_drift_without_mutating_the_workload() {
 }
 
 #[tokio::test]
+async fn reconciliation_reports_missing_workload_without_creating_one() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id: "ff66ed4a-6303-4be6-8ef4-63c28b112680"
+                .parse()
+                .expect("project id"),
+            deployment_id: "4f1f21ef-730d-42d5-a46d-d965353cb993"
+                .parse()
+                .expect("deployment id"),
+            desired_state: DesiredWorkloadState::Running,
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("missing workload should be reported");
+
+    assert_eq!(output.result["actual_state"], "missing");
+    assert_eq!(output.result["in_sync"], false);
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|command| {
+                command.program == "docker"
+                    && command
+                        .args
+                        .first()
+                        .is_some_and(|argument| argument == "run")
+            })
+    );
+}
+
+#[tokio::test]
 async fn runtime_health_snapshot_only_checks_active_workloads_and_marks_unhealthy_state() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
