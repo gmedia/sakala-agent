@@ -72,6 +72,16 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
             .iter()
             .any(|argument| argument == "dev.sakala.agent-id=local-agent-01")
     );
+    assert!(
+        run.args
+            .iter()
+            .any(|argument| argument == "dev.sakala.domain=portfolio.run.sakala.localhost")
+    );
+    assert!(
+        run.args
+            .iter()
+            .any(|argument| argument == "dev.sakala.port=3000")
+    );
     let build = commands
         .iter()
         .find(|command| {
