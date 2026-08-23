@@ -31,7 +31,8 @@ pub async fn run(
             Arc::clone(&node_lifecycle),
         ))
     });
-    let mut executions = CommandExecutions::new(config.max_concurrent_commands, metrics);
+    let mut executions =
+        CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));
 
     'polling: loop {
         executions.reap_completed();
@@ -41,6 +42,7 @@ pub async fn run(
         }
 
         if let (Some(client), Some(handler)) = (&client, &handler) {
+            metrics.begin_poll();
             match client.poll_commands().await {
                 Ok(commands) => {
                     for command in commands {
@@ -78,6 +80,7 @@ pub async fn run(
                                 }
                             }
                         }) {
+                            metrics.command_deferred();
                             debug!(
                                 command_id = %command_id,
                                 project_id = ?project_id,

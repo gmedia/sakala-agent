@@ -305,6 +305,7 @@ untuk aturan rollout dan command yang belum didukung.
     "execution": {
       "active_commands": 1,
       "queued_local_commands": 0,
+      "capacity_waiting_commands": 1,
       "active_builds": 1,
       "maximum_concurrent_builds": 2
     },

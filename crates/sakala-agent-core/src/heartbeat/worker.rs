@@ -131,6 +131,7 @@ async fn payload(
             "execution": {
                 "active_commands": scheduler_metrics.active_commands(),
                 "queued_local_commands": scheduler_metrics.queued_local_commands(),
+                "capacity_waiting_commands": scheduler_metrics.capacity_waiting_commands(),
                 "active_builds": workloads.active_builds,
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },

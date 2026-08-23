@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[derive(Default)]
 pub struct SchedulerMetrics {
     active_commands: AtomicUsize,
+    capacity_waiting_commands: AtomicUsize,
 }
 
 impl SchedulerMetrics {
@@ -20,6 +21,15 @@ impl SchedulerMetrics {
         self.active_commands.fetch_sub(1, Ordering::Relaxed);
     }
 
+    pub fn begin_poll(&self) {
+        self.capacity_waiting_commands.store(0, Ordering::Relaxed);
+    }
+
+    pub fn command_deferred(&self) {
+        self.capacity_waiting_commands
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn active_commands(&self) -> usize {
         self.active_commands.load(Ordering::Relaxed)
@@ -28,5 +38,10 @@ impl SchedulerMetrics {
     #[must_use]
     pub const fn queued_local_commands(&self) -> usize {
         0
+    }
+
+    #[must_use]
+    pub fn capacity_waiting_commands(&self) -> usize {
+        self.capacity_waiting_commands.load(Ordering::Relaxed)
     }
 }
