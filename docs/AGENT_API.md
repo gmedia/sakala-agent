@@ -140,6 +140,24 @@ Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya m
 
 Claim harus dilakukan atomik di `sakala-api`, misalnya melalui conditional update atau transaction yang memastikan status masih `Pending`. Hanya satu agent boleh menerima claim sukses. Bila claim mendapat conflict karena command sudah diklaim, dibatalkan, kedaluwarsa, atau tidak lagi eligible, agent harus melewati command tersebut tanpa menjalankannya.
 
+### Idempotensi terminal command
+
+`claim`, `complete`, dan `fail` wajib bersifat aman terhadap retry jaringan.
+API harus memakai transisi atomik dan tidak boleh mengubah terminal state:
+
+| Request | State saat ini | Respons yang diharapkan | Perilaku Agent |
+| --- | --- | --- | --- |
+| `claim` | bukan `Pending` | `409 Conflict` dengan state saat ini | Jangan eksekusi command. |
+| `complete` | sudah `Succeeded` dengan command yang sama | `204 No Content` | Anggap sukses idempoten. |
+| `fail` | sudah `Failed` dengan command yang sama | `204 No Content` | Anggap gagal yang sama telah tercatat. |
+| `complete` | `Failed`/`Cancelled`/`Expired` | `409 Conflict` | Jangan menimpa state terminal. |
+| `fail` | `Succeeded` | `409 Conflict` | Jangan menimpa state terminal. |
+
+Respons conflict harus menyertakan state command yang aman untuk ditampilkan
+(`status` dan, bila relevan, `terminal_at`), tetapi tidak boleh memantulkan
+payload deployment atau credential. Retry command polling tidak memberi izin
+untuk menjalankan ulang command yang tidak berhasil di-claim.
+
 Command yang sudah `Claimed`, `Running`, `Succeeded`, `Failed`, `Cancelled`, atau `Expired` tidak boleh dikembalikan lagi sebagai pekerjaan pending. Polling berikutnya hanya mengembalikan pekerjaan baru atau pekerjaan yang secara eksplisit dikembalikan ke antrean oleh policy lease/recovery API.
 
 ```txt
