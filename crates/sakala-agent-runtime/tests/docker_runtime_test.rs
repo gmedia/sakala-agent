@@ -150,6 +150,88 @@ async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts()
 }
 
 #[tokio::test]
+async fn requested_build_timeout_is_used_when_shorter_than_node_maximum() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(2)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.timeout_safety.max_build_timeout = Duration::from_secs(10);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    let mut command = deploy_command("auto");
+    command.payload["timeouts"] = json!({
+        "build_timeout_seconds": 1,
+        "start_timeout_seconds": 5,
+        "command_timeout_seconds": 10
+    });
+
+    let error = dispatch(executor, &command, reporter)
+        .await
+        .expect_err("requested build deadline must be enforced");
+
+    assert_eq!(error.code(), "runtime_timeout");
+    assert!(
+        error
+            .to_string()
+            .contains("deployment-build exceeded its 1s timeout")
+    );
+}
+
+#[tokio::test]
+async fn timeout_above_node_maximum_is_rejected_before_runtime_processes_start() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.timeout_safety.max_build_timeout = Duration::from_secs(10);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+    let mut command = deploy_command("auto");
+    command.payload["timeouts"] = json!({
+        "build_timeout_seconds": 11,
+        "start_timeout_seconds": 5,
+        "command_timeout_seconds": 20
+    });
+
+    let error = dispatch(executor, &command, reporter)
+        .await
+        .expect_err("timeout above node maximum must be rejected");
+
+    assert_eq!(error.code(), "invalid_runtime_command");
+    assert!(
+        error
+            .to_string()
+            .contains("build_timeout_seconds (11s) exceeds")
+    );
+    assert!(runner.commands.lock().expect("command lock").is_empty());
+}
+
+#[tokio::test]
+async fn requested_start_timeout_covers_health_readiness() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_inspect_delay(Duration::from_secs(2)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.timeout_safety.max_start_timeout = Duration::from_secs(10);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    let mut command = deploy_command("auto");
+    command.payload["timeouts"] = json!({
+        "build_timeout_seconds": 5,
+        "start_timeout_seconds": 1,
+        "command_timeout_seconds": 10
+    });
+
+    let error = dispatch(executor, &command, reporter)
+        .await
+        .expect_err("requested start deadline must cover health readiness");
+
+    assert_eq!(error.code(), "runtime_timeout");
+    assert!(
+        error
+            .to_string()
+            .contains("deployment-start exceeded its 1s timeout")
+    );
+}
+
+#[tokio::test]
 async fn auto_builder_falls_back_to_railpack_when_dockerfile_is_absent() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(false));
@@ -391,6 +473,7 @@ struct FakeRunner {
     commands: Mutex<Vec<CommandSpec>>,
     docker_ps_stdout: String,
     build_delay: Option<Duration>,
+    inspect_delay: Option<Duration>,
 }
 
 impl FakeRunner {
@@ -400,6 +483,7 @@ impl FakeRunner {
             commands: Mutex::new(Vec::new()),
             docker_ps_stdout: String::new(),
             build_delay: None,
+            inspect_delay: None,
         }
     }
 
@@ -410,6 +494,11 @@ impl FakeRunner {
 
     fn with_build_delay(mut self, delay: Duration) -> Self {
         self.build_delay = Some(delay);
+        self
+    }
+
+    fn with_inspect_delay(mut self, delay: Duration) -> Self {
+        self.inspect_delay = Some(delay);
         self
     }
 }
@@ -429,6 +518,12 @@ impl ProcessRunner for FakeRunner {
         if spec.program == "docker"
             && spec.args.iter().any(|argument| argument == "buildx")
             && let Some(delay) = self.build_delay
+        {
+            tokio::time::sleep(delay).await;
+        }
+        if spec.program == "docker"
+            && spec.args.iter().any(|argument| argument == "inspect")
+            && let Some(delay) = self.inspect_delay
         {
             tokio::time::sleep(delay).await;
         }
