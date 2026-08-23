@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use sakala_agent_core::ports::{RuntimeOrphan, RuntimeReconciliationReport};
+use sakala_agent_core::ports::{RuntimeOrphan, RuntimeReconciliationReport, RuntimeWorkload};
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use tokio::{
     fs::{self, OpenOptions},
@@ -164,6 +164,13 @@ impl ContainerEngine for DockerContainerEngine {
                     container_id,
                     project_id,
                     reason: reason.to_owned(),
+                });
+            } else if let (Some(project_id), Some(deployment_id)) = (project_id, deployment_id) {
+                report.workloads.push(RuntimeWorkload {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    status: status.to_owned(),
                 });
             }
         }

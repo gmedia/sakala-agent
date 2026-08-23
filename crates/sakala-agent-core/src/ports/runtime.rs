@@ -41,10 +41,19 @@ pub struct RuntimeOrphan {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeWorkload {
+    pub container_id: String,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeReconciliationReport {
     pub inspected_containers: usize,
     pub cleaned_workspaces: usize,
+    pub workloads: Vec<RuntimeWorkload>,
     pub orphans: Vec<RuntimeOrphan>,
 }
 

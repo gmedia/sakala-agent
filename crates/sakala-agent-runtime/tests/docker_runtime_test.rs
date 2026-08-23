@@ -552,6 +552,24 @@ async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
 }
 
 #[tokio::test]
+async fn reconciliation_discovers_valid_managed_workloads() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "running	Up 10 minutes	ff66ed4a-6303-4be6-8ef4-63c28b112680	4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation scan should complete");
+
+    assert!(report.orphans.is_empty());
+    assert_eq!(report.workloads.len(), 1);
+    assert_eq!(report.workloads[0].container_id, "running");
+    assert_eq!(report.workloads[0].status, "Up 10 minutes");
+}
+
+#[tokio::test]
 async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
