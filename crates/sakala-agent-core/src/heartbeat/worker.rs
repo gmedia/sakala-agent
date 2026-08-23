@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::json;
@@ -13,10 +13,17 @@ pub async fn run(
     client: Option<ApiClient>,
     node_lifecycle: Arc<NodeLifecycle>,
     runtime_driver: String,
+    workspace_root: std::path::PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let payload = payload(&config, node_lifecycle.state(), &runtime_driver);
+        let payload = payload(
+            &config,
+            node_lifecycle.state(),
+            &runtime_driver,
+            &workspace_root,
+        )
+        .await;
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -43,12 +50,13 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-fn payload(
+async fn payload(
     config: &AgentConfig,
     lifecycle_state: NodeLifecycleState,
     runtime_driver: &str,
+    workspace_root: &Path,
 ) -> HeartbeatPayload {
-    let resources = node_resources();
+    let resources = node_resources(workspace_root).await;
     HeartbeatPayload {
         status: match lifecycle_state {
             NodeLifecycleState::Active => NodeStatus::Ready,
@@ -69,23 +77,29 @@ fn payload(
             "uptime_seconds": resources.uptime_seconds,
             "resources": {
                 "cpu_total": resources.cpu_total,
+                "cpu_load_1m": resources.cpu_load_1m,
                 "memory_total_bytes": resources.memory_total_bytes,
                 "memory_available_bytes": resources.memory_available_bytes,
+                "disk_total_bytes": resources.disk_total_bytes,
+                "disk_available_bytes": resources.disk_available_bytes,
             },
         }),
         sent_at: OffsetDateTime::now_utc(),
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct NodeResources {
     uptime_seconds: Option<u64>,
     cpu_total: Option<usize>,
+    cpu_load_1m: Option<f64>,
     memory_total_bytes: Option<u64>,
     memory_available_bytes: Option<u64>,
+    disk_total_bytes: Option<u64>,
+    disk_available_bytes: Option<u64>,
 }
 
-fn node_resources() -> NodeResources {
+async fn node_resources(workspace_root: &Path) -> NodeResources {
     let memory = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .map(|contents| parse_meminfo(&contents))
@@ -96,8 +110,44 @@ fn node_resources() -> NodeResources {
             .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok())
             .map(|seconds| seconds.max(0.0) as u64),
         cpu_total: std::thread::available_parallelism().ok().map(usize::from),
+        cpu_load_1m: std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok()),
         memory_total_bytes: memory.0,
         memory_available_bytes: memory.1,
+        ..workspace_disk_resources(workspace_root).await
+    }
+}
+
+async fn workspace_disk_resources(workspace_root: &Path) -> NodeResources {
+    let output = tokio::process::Command::new("df")
+        .arg("-Pk")
+        .arg(workspace_root)
+        .output()
+        .await;
+    let Ok(output) = output else {
+        return NodeResources::default();
+    };
+    if !output.status.success() {
+        return NodeResources::default();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(line) = stdout.lines().filter(|line| !line.trim().is_empty()).nth(1) else {
+        return NodeResources::default();
+    };
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let disk_total_bytes = fields
+        .get(1)
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.checked_mul(1_024));
+    let disk_available_bytes = fields
+        .get(3)
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.checked_mul(1_024));
+    NodeResources {
+        disk_total_bytes,
+        disk_available_bytes,
+        ..NodeResources::default()
     }
 }
 
@@ -125,13 +175,19 @@ mod tests {
 
     use crate::{AgentConfig, NodeLifecycleState};
 
-    use super::{parse_meminfo, payload};
+    use super::{parse_meminfo, payload, workspace_disk_resources};
 
-    #[test]
-    fn heartbeat_identifies_the_wire_contract_revision() {
+    #[tokio::test]
+    async fn heartbeat_identifies_the_wire_contract_revision() {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
-        let heartbeat = payload(&config, NodeLifecycleState::Active, "noop");
+        let heartbeat = payload(
+            &config,
+            NodeLifecycleState::Active,
+            "noop",
+            std::path::Path::new("/tmp"),
+        )
+        .await;
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
@@ -143,5 +199,12 @@ mod tests {
             parse_meminfo("MemTotal:       1024 kB\nMemAvailable:    512 kB\n"),
             (Some(1_048_576), Some(524_288))
         );
+    }
+
+    #[tokio::test]
+    async fn reads_disk_capacity_for_an_existing_workspace() {
+        let resources = workspace_disk_resources(std::path::Path::new("/tmp")).await;
+        assert!(resources.disk_total_bytes.is_some());
+        assert!(resources.disk_available_bytes.is_some());
     }
 }

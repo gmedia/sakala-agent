@@ -28,6 +28,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         AgentMode::Local => None,
         AgentMode::Connected => Some(ApiClient::from_config(&config.agent)?),
     };
+    let workspace_root = config.docker_runtime.workspace_root.clone();
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
         RuntimeDriver::Docker => Arc::new(DockerRuntimeExecutor::new(config.docker_runtime)),
@@ -95,6 +96,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         client.clone(),
         Arc::clone(&node_lifecycle),
         config.runtime_driver.to_string(),
+        workspace_root,
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(
