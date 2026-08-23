@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -128,6 +129,36 @@ impl WorkspaceManager for GitWorkspaceManager {
             Err(error) => Err(error.into()),
         }
     }
+
+    async fn cleanup_stale(&self, minimum_age: Duration) -> Result<usize, RuntimeError> {
+        let mut entries = match fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let now = SystemTime::now();
+        let mut cleaned = 0;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            if Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err() {
+                continue;
+            }
+            let modified = entry.metadata().await?.modified()?;
+            let age = now.duration_since(modified).unwrap_or_default();
+            if age < minimum_age {
+                continue;
+            }
+
+            fs::remove_dir_all(entry.path()).await?;
+            cleaned += 1;
+        }
+
+        Ok(cleaned)
+    }
 }
 
 async fn restrict_workspace_permissions(root: &Path) -> Result<(), RuntimeError> {
@@ -156,9 +187,16 @@ async fn write_askpass(root: &Path) -> Result<PathBuf, RuntimeError> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
+    use async_trait::async_trait;
     use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use crate::{
+        ProcessOutput, ProcessOutputSink, ProcessRunner, RuntimeError,
+        workspace::{GitWorkspaceManager, WorkspaceManager},
+    };
 
     use super::{restrict_workspace_permissions, write_askpass};
 
@@ -193,5 +231,41 @@ mod tests {
                 & 0o777,
             0o700
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_gc_only_removes_stale_uuid_directories() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let stale = temp.path().join(Uuid::new_v4().to_string());
+        let unrelated = temp.path().join("keep-me");
+        tokio::fs::create_dir_all(&stale)
+            .await
+            .expect("stale workspace should be created");
+        tokio::fs::create_dir_all(&unrelated)
+            .await
+            .expect("unrelated directory should be created");
+        let manager = GitWorkspaceManager::new(temp.path().to_owned(), Arc::new(UnusedRunner));
+
+        let cleaned = manager
+            .cleanup_stale(Duration::ZERO)
+            .await
+            .expect("workspace GC should complete");
+
+        assert_eq!(cleaned, 1);
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+    }
+
+    struct UnusedRunner;
+
+    #[async_trait]
+    impl ProcessRunner for UnusedRunner {
+        async fn run(
+            &self,
+            _spec: &crate::CommandSpec,
+            _sink: &dyn ProcessOutputSink,
+        ) -> Result<ProcessOutput, RuntimeError> {
+            unreachable!("workspace GC does not run subprocesses")
+        }
     }
 }

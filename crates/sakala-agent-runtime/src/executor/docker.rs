@@ -40,6 +40,7 @@ pub struct DockerRuntimeExecutor {
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
     build_permits: Arc<Semaphore>,
+    workspace_gc_max_age: std::time::Duration,
     preflight: DockerPreflight,
 }
 
@@ -69,6 +70,7 @@ impl DockerRuntimeExecutor {
         };
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
+        let workspace_gc_max_age = config.workspace_gc_max_age;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -98,6 +100,7 @@ impl DockerRuntimeExecutor {
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
             config.timeout_safety,
             max_concurrent_builds,
+            workspace_gc_max_age,
             preflight,
         )
     }
@@ -113,6 +116,7 @@ impl DockerRuntimeExecutor {
         routes: Arc<dyn RouteManager>,
         timeout_safety: crate::TimeoutSafetyConfig,
         max_concurrent_builds: usize,
+        workspace_gc_max_age: std::time::Duration,
         preflight: DockerPreflight,
     ) -> Self {
         Self {
@@ -124,6 +128,7 @@ impl DockerRuntimeExecutor {
             routes,
             timeout_safety,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            workspace_gc_max_age,
             preflight,
         }
     }
@@ -486,7 +491,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     }
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
-        self.containers.detect_orphans().await.map_err(Into::into)
+        let mut report = self.containers.detect_orphans().await?;
+        report.cleaned_workspaces = self
+            .workspace
+            .cleanup_stale(self.workspace_gc_max_age)
+            .await?;
+        Ok(report)
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

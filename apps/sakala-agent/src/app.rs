@@ -45,6 +45,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             info!(
                 inspected_containers = report.inspected_containers,
                 orphaned_containers = report.orphans.len(),
+                cleaned_workspaces = report.cleaned_workspaces,
                 "runtime reconciliation scan completed"
             );
             for orphan in report.orphans {

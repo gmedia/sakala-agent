@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -64,4 +67,6 @@ pub trait WorkspaceManager: Send + Sync {
     ) -> Result<DeploymentWorkspace, RuntimeError>;
 
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;
+
+    async fn cleanup_stale(&self, minimum_age: Duration) -> Result<usize, RuntimeError>;
 }

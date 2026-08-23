@@ -44,6 +44,7 @@ pub struct RuntimeOrphan {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeReconciliationReport {
     pub inspected_containers: usize,
+    pub cleaned_workspaces: usize,
     pub orphans: Vec<RuntimeOrphan>,
 }
 

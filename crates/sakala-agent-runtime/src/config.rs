@@ -81,6 +81,7 @@ fn resolve_timeout(
 pub struct DockerRuntimeConfig {
     pub agent_id: String,
     pub workspace_root: PathBuf,
+    pub workspace_gc_max_age: Duration,
     pub runtime_network: String,
     pub caddy_sites_dir: PathBuf,
     pub caddy_container: String,
@@ -98,6 +99,7 @@ impl Default for DockerRuntimeConfig {
         Self {
             agent_id: "local-agent-01".to_owned(),
             workspace_root: PathBuf::from("/var/lib/sakala/builds"),
+            workspace_gc_max_age: Duration::from_secs(86_400),
             runtime_network: "sakala-runtime".to_owned(),
             caddy_sites_dir: PathBuf::from("/var/lib/sakala/caddy/sites"),
             caddy_container: "sakala-caddy".to_owned(),

@@ -56,6 +56,8 @@ Saat startup, Docker executor memindai container dengan label `dev.sakala.manage
 
 Phase 9 hanya melaporkan warning. Auto-removal sengaja tidak dilakukan karena agent belum memiliki desired-state snapshot dari API; menghapus berdasarkan observasi host saja berisiko menghapus workload yang masih dibutuhkan.
 
+Workspace checkout berbeda: saat startup, agent dapat menghapus direktori terbengkalai yang namanya tepat UUID command Sakala dan umurnya melewati `SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS`. GC tidak mengikuti symlink, tidak menyentuh nama lain, dan tidak dijalankan saat command aktif diproses.
+
 ## Isolation Decision
 
 Docker rootful pada node khusus masih dapat dipakai untuk pilot dengan repository terkontrol. Untuk workload publik tidak tepercaya, target berikutnya adalah isolated/rootless builder terpisah dari runtime daemon. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.

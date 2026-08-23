@@ -81,6 +81,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_RUNTIME_WORKSPACE")]
     runtime_workspace: Option<String>,
 
+    #[arg(long, env = "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS")]
+    workspace_gc_max_age_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_CADDY_SITES_DIR")]
     caddy_sites_dir: Option<String>,
 
@@ -163,6 +166,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_RUNTIME_WORKSPACE",
         cli.runtime_workspace,
+    );
+    insert(
+        &mut values,
+        "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
+        cli.workspace_gc_max_age_seconds,
     );
     insert(&mut values, "SAKALA_CADDY_SITES_DIR", cli.caddy_sites_dir);
     insert(&mut values, "SAKALA_CADDY_CONTAINER", cli.caddy_container);
@@ -247,6 +255,11 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             agent_id: agent.agent_id.clone(),
             workspace_root: get(values, "SAKALA_RUNTIME_WORKSPACE", "/var/lib/sakala/builds")
                 .into(),
+            workspace_gc_max_age: std::time::Duration::from_secs(positive_u64(
+                values,
+                "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
+                86_400,
+            )?),
             runtime_network: agent.runtime_network.clone(),
             caddy_sites_dir: get(
                 values,
