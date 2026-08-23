@@ -463,6 +463,20 @@ async fn executor_rejects_non_github_repository_before_starting_a_process() {
 }
 
 #[tokio::test]
+async fn git_checkout_failure_uses_a_repository_error_code() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FailingGitRunner);
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let error = dispatch(executor, &deploy_command("auto"), reporter)
+        .await
+        .expect_err("failed fetch should stop deployment");
+
+    assert_eq!(error.code(), "runtime_repository_failed");
+}
+
+#[tokio::test]
 async fn activated_route_is_not_cleaned_up_when_ready_reporting_fails() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
@@ -637,6 +651,24 @@ struct FakeRunner {
     inspect_delay: Option<Duration>,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
+}
+
+struct FailingGitRunner;
+
+#[async_trait]
+impl ProcessRunner for FailingGitRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        _sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        Ok(ProcessOutput {
+            success: spec.program != "git",
+            code: (spec.program != "git").then_some(0).or(Some(1)),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
 }
 
 impl FakeRunner {

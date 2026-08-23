@@ -10,6 +10,8 @@ pub enum RuntimeError {
     InvalidCommand(String),
     #[error("runtime dependency failed: {0}")]
     Dependency(String),
+    #[error("runtime repository operation failed: {0}")]
+    Repository(String),
     #[error("runtime operation failed: {0}")]
     Execution(String),
     #[error("runtime build failed: {0}")]
@@ -39,6 +41,7 @@ impl RuntimeError {
             Self::Configuration(_) => "invalid_runtime_configuration",
             Self::InvalidCommand(_) => "invalid_runtime_command",
             Self::Dependency(_) => "runtime_dependency_failed",
+            Self::Repository(_) => "runtime_repository_failed",
             Self::Execution(_) => "runtime_execution_failed",
             Self::Build(_) => "runtime_build_failed",
             Self::Container(_) => "runtime_container_failed",
@@ -55,7 +58,9 @@ impl RuntimeError {
     #[must_use]
     pub fn failed_operation(phase: &str, status: Option<i32>) -> Self {
         let summary = format!("{phase} exited with status {status:?}");
-        if phase.contains("build") || phase.starts_with("railpack-") {
+        if phase.starts_with("git-") {
+            Self::Repository(summary)
+        } else if phase.contains("build") || phase.starts_with("railpack-") {
             Self::Build(summary)
         } else if phase.starts_with("docker-") {
             Self::Container(summary)
