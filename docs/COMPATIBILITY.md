@@ -37,6 +37,17 @@ supports revision 1 must not assign revision-2 commands to the node.
 5. Install the new binary and validate its configuration.
 6. Start the Agent and confirm Docker preflight and heartbeat metadata.
 
+## Migration notes
+
+### Protocol revision 1 → 2
+
+Revision 2 introduces workload lifecycle and node maintenance commands. Before
+an API begins assigning those commands, deploy an Agent that reports
+`metadata.protocol_version: 2` and confirm it through its heartbeat. Operators
+can also check the installed binary with `sakala-agent --version`. The Agent
+continues to reject unknown command values; an older revision-1 API must not
+assign revision-2 commands.
+
 The Agent repository owns binary behavior, protocol fixtures, and release
 notes. Host installation, service management, and rollout orchestration remain
 the responsibility of the deployment/infrastructure repository.

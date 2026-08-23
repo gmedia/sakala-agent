@@ -44,7 +44,11 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "sakala-agent", about = "Sakala runtime-node executor")]
+#[command(
+    name = "sakala-agent",
+    about = "Sakala runtime-node executor",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[arg(long, env = "SAKALA_AGENT_MODE")]
     mode: Option<String>,
@@ -449,6 +453,14 @@ fn insert(values: &mut HashMap<String, String>, key: &str, value: Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exposes_the_binary_version_for_operator_compatibility_checks() {
+        let error = Cli::try_parse_from(["sakala-agent", "--version"])
+            .expect_err("version flag should stop normal command parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
 
     #[test]
     fn defaults_to_noop_runtime() {
