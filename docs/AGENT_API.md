@@ -290,6 +290,11 @@ untuk aturan rollout dan command yang belum didukung.
       "unhealthy": 0,
       "stopped": 1
     },
+    "disk_pressure": {
+      "state": "normal",
+      "minimum_workspace_free_bytes": 2147483648,
+      "available_workspace_bytes": 53687091200
+    },
     "runtime_dependencies": {
       "git": "git version 2.47.0",
       "docker": "27.3.1",

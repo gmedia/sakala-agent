@@ -25,6 +25,7 @@ pub async fn run(
     runtime: Arc<dyn RuntimeExecutor>,
     scheduler_metrics: Arc<SchedulerMetrics>,
     reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
+    minimum_workspace_free_bytes: u64,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -36,6 +37,7 @@ pub async fn run(
             runtime.as_ref(),
             scheduler_metrics.as_ref(),
             reconciliation.as_ref(),
+            minimum_workspace_free_bytes,
         )
         .await;
 
@@ -72,6 +74,7 @@ async fn payload(
     runtime: &dyn RuntimeExecutor,
     scheduler_metrics: &SchedulerMetrics,
     reconciliation: &RwLock<RuntimeReconciliationReport>,
+    minimum_workspace_free_bytes: u64,
 ) -> HeartbeatPayload {
     let resources = node_resources(workspace_root).await;
     let workloads = workload_statistics(runtime).await;
@@ -107,6 +110,11 @@ async fn payload(
                 "disk_available_bytes": resources.disk_available_bytes,
                 "workspace_used_bytes": resources.workspace_used_bytes,
             },
+            "disk_pressure": {
+                "state": disk_pressure_state(resources.disk_available_bytes, minimum_workspace_free_bytes),
+                "minimum_workspace_free_bytes": minimum_workspace_free_bytes,
+                "available_workspace_bytes": resources.disk_available_bytes,
+            },
             "workloads": {
                 "active": workloads.active,
                 "starting": workloads.starting,
@@ -141,6 +149,14 @@ async fn payload(
             "runtime_dependencies": dependencies,
         }),
         sent_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn disk_pressure_state(available_bytes: Option<u64>, minimum_free_bytes: u64) -> &'static str {
+    match available_bytes {
+        Some(available_bytes) if available_bytes < minimum_free_bytes => "critical",
+        Some(_) => "normal",
+        None => "unknown",
     }
 }
 
@@ -336,7 +352,7 @@ mod tests {
         scheduler::metrics::SchedulerMetrics,
     };
 
-    use super::{parse_meminfo, payload, workspace_disk_resources};
+    use super::{disk_pressure_state, parse_meminfo, payload, workspace_disk_resources};
 
     struct EmptyRuntime;
 
@@ -364,6 +380,7 @@ mod tests {
             &EmptyRuntime,
             &scheduler_metrics,
             &reconciliation,
+            0,
         )
         .await;
 
@@ -381,6 +398,13 @@ mod tests {
             parse_meminfo("MemTotal:       1024 kB\nMemAvailable:    512 kB\n"),
             (Some(1_048_576), Some(524_288))
         );
+    }
+
+    #[test]
+    fn classifies_workspace_disk_pressure_without_guessing_missing_capacity() {
+        assert_eq!(disk_pressure_state(Some(99), 100), "critical");
+        assert_eq!(disk_pressure_state(Some(100), 100), "normal");
+        assert_eq!(disk_pressure_state(None, 100), "unknown");
     }
 
     #[tokio::test]

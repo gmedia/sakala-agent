@@ -29,6 +29,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         AgentMode::Connected => Some(ApiClient::from_config(&config.agent)?),
     };
     let workspace_root = config.docker_runtime.workspace_root.clone();
+    let minimum_workspace_free_bytes = config.docker_runtime.min_workspace_free_bytes;
     let reconciliation = Arc::new(RwLock::new(RuntimeReconciliationReport::default()));
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
@@ -105,6 +106,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::clone(&runtime),
         Arc::clone(&scheduler_metrics),
         Arc::clone(&reconciliation),
+        minimum_workspace_free_bytes,
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(
