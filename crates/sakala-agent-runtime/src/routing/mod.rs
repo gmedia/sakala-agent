@@ -1,4 +1,7 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
+
+use sakala_agent_core::ports::RuntimeStaleRoute;
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
@@ -19,6 +22,15 @@ pub struct RouteSpec {
 
 #[async_trait]
 pub trait RouteManager: Send + Sync {
+    /// Finds route files owned by Sakala that no longer have a known managed
+    /// workload. Discovery is intentionally non-destructive.
+    async fn discover_stale_routes(
+        &self,
+        _known_projects: &HashSet<Uuid>,
+    ) -> Result<Vec<RuntimeStaleRoute>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
     async fn activate(
         &self,
         route: &RouteSpec,

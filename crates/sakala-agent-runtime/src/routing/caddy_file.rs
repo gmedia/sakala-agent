@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -11,6 +12,9 @@ use crate::{
     RuntimeError, RuntimeReporter,
     routing::{CaddyReloader, RouteManager, RouteSpec},
 };
+use sakala_agent_core::ports::RuntimeStaleRoute;
+
+const MANAGED_ROUTE_PREFIX: &str = "# Managed by sakala-agent for project ";
 
 pub struct CaddyFileRouteManager {
     sites_dir: PathBuf,
@@ -42,7 +46,7 @@ async fn write_route(sites_dir: &Path, route: &RouteSpec) -> Result<RouteSnapsho
         Err(error) => return Err(error.into()),
     };
     let content = format!(
-        "# Managed by sakala-agent for project {}.\n{}:80 {{\n\treverse_proxy {}:{}\n}}\n",
+        "{MANAGED_ROUTE_PREFIX}{}.\n{}:80 {{\n\treverse_proxy {}:{}\n}}\n",
         route.project_id, route.domain, route.upstream, route.port
     );
 
@@ -82,6 +86,45 @@ async fn remove_route(sites_dir: &Path, project_id: Uuid) -> Result<RouteSnapsho
 
 #[async_trait]
 impl RouteManager for CaddyFileRouteManager {
+    async fn discover_stale_routes(
+        &self,
+        known_projects: &HashSet<Uuid>,
+    ) -> Result<Vec<RuntimeStaleRoute>, RuntimeError> {
+        let mut entries = match fs::read_dir(&self.sites_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut stale_routes = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(project) = name.strip_suffix(".Caddyfile") else {
+                continue;
+            };
+            let Ok(project_id) = Uuid::parse_str(project) else {
+                continue;
+            };
+            let content = fs::read_to_string(&path).await?;
+            if !content.starts_with(&format!("{MANAGED_ROUTE_PREFIX}{project_id}."))
+                || known_projects.contains(&project_id)
+            {
+                continue;
+            }
+            stale_routes.push(RuntimeStaleRoute {
+                path: path.display().to_string(),
+                project_id,
+            });
+        }
+        Ok(stale_routes)
+    }
+
     async fn activate(
         &self,
         route: &RouteSpec,

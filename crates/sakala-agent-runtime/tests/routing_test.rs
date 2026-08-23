@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -63,6 +66,46 @@ async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails(
         "managed route\n"
     );
     assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workloads() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let active_project = Uuid::new_v4();
+    let stale_project = Uuid::new_v4();
+    let unmanaged_project = Uuid::new_v4();
+    let manager =
+        CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(FailingReloader::default()));
+
+    tokio::fs::write(
+        temp.path().join(format!("{active_project}.Caddyfile")),
+        format!("# Managed by sakala-agent for project {active_project}.\n"),
+    )
+    .await
+    .expect("active route should be written");
+    let stale_path = temp.path().join(format!("{stale_project}.Caddyfile"));
+    tokio::fs::write(
+        &stale_path,
+        format!("# Managed by sakala-agent for project {stale_project}.\n"),
+    )
+    .await
+    .expect("stale route should be written");
+    tokio::fs::write(
+        temp.path().join(format!("{unmanaged_project}.Caddyfile")),
+        "# owned by another system\n",
+    )
+    .await
+    .expect("unmanaged route should be written");
+
+    let stale = manager
+        .discover_stale_routes(&HashSet::from([active_project]))
+        .await
+        .expect("route discovery should succeed");
+
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].project_id, stale_project);
+    assert_eq!(stale[0].path, stale_path.display().to_string());
+    assert!(stale_path.exists(), "discovery must not delete route files");
 }
 
 fn route(project_id: Uuid) -> RouteSpec {

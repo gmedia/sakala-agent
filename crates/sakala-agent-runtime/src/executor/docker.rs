@@ -679,6 +679,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.containers.detect_orphans().await?;
+        let known_projects = report
+            .workloads
+            .iter()
+            .map(|workload| workload.project_id)
+            .chain(report.orphans.iter().filter_map(|orphan| orphan.project_id))
+            .collect();
+        report.stale_routes = self.routes.discover_stale_routes(&known_projects).await?;
         report.cleaned_workspaces = self
             .workspace
             .cleanup_stale(self.workspace_gc_max_age)

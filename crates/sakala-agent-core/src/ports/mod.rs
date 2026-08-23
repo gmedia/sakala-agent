@@ -10,5 +10,5 @@ pub use runtime::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeCapacity,
     RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeOrphan,
     RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
-    RuntimeWorkload, WorkloadLifecycleRequest,
+    RuntimeStaleRoute, RuntimeWorkload, WorkloadLifecycleRequest,
 };

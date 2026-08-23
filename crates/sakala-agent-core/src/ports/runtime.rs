@@ -50,6 +50,14 @@ pub struct RuntimeOrphan {
     pub reason: String,
 }
 
+/// A Sakala-owned route file that no longer maps to any discovered workload.
+/// This is a reconciliation finding, not authorization to delete the file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStaleRoute {
+    pub path: String,
+    pub project_id: Uuid,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeWorkload {
     pub container_id: String,
@@ -97,6 +105,7 @@ pub struct RuntimeReconciliationReport {
     pub cleaned_workspaces: usize,
     pub workloads: Vec<RuntimeWorkload>,
     pub orphans: Vec<RuntimeOrphan>,
+    pub stale_routes: Vec<RuntimeStaleRoute>,
 }
 
 /// Result of a local runtime dependency check performed before command polling.
