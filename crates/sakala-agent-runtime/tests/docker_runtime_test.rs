@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use sakala_agent_core::{
     commands::CommandDispatcher,
     ports::{
-        CommandOutput, DeployProjectRequest, RepositoryCredential, RuntimeExecutionError,
-        RuntimeExecutor, RuntimeReporter, SecretString, WorkloadLifecycleRequest,
+        CommandOutput, DeployProjectRequest, InspectProjectRequest, RepositoryCredential,
+        RuntimeExecutionError, RuntimeExecutor, RuntimeReporter, SecretString,
+        WorkloadLifecycleRequest,
     },
 };
 use sakala_agent_protocol::{
@@ -187,6 +188,40 @@ async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_argum
             .any(|argument| argument == "https://github.com/gmedia/example-app.git")
     );
     assert!(!format!("{commands:?}").contains("ghs_installation_token"));
+}
+
+#[tokio::test]
+async fn private_inspection_uses_the_same_ephemeral_credential_path() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let command = inspect_command();
+
+    let output = RuntimeExecutor::inspect_project(
+        &executor,
+        InspectProjectRequest {
+            command_id: command.id,
+            payload: command
+                .inspect_payload()
+                .expect("inspection payload should be valid"),
+            repository_credential: Some(RepositoryCredential {
+                username: "x-access-token".to_owned(),
+                token: SecretString::new("ghs_inspection_token"),
+            }),
+            cancellation: CancellationToken::new(),
+        },
+        reporter,
+    )
+    .await
+    .expect("temporary credential should authorize inspection");
+
+    assert_eq!(output.result["package_manager"], "pnpm");
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "railpack" && command.args.iter().any(|argument| argument == "info")
+    }));
+    assert!(!format!("{commands:?}").contains("ghs_inspection_token"));
 }
 
 #[tokio::test]
