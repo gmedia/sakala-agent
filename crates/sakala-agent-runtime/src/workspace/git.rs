@@ -38,6 +38,7 @@ impl WorkspaceManager for GitWorkspaceManager {
             fs::remove_dir_all(workspace.root()).await?;
         }
         fs::create_dir_all(workspace.root()).await?;
+        restrict_workspace_permissions(workspace.root()).await?;
 
         let askpass = match &source.credential {
             Some(_) => Some(write_askpass(workspace.root()).await?),
@@ -96,11 +97,17 @@ impl WorkspaceManager for GitWorkspaceManager {
         }
         .await;
 
-        if let Some(askpass) = askpass {
-            fs::remove_file(&askpass).await?;
-        }
+        let askpass_cleanup = match askpass {
+            Some(askpass) => fs::remove_file(&askpass).await.map_err(RuntimeError::from),
+            None => Ok(()),
+        };
 
         if let Err(error) = checkout_result {
+            let _ = self.cleanup(&workspace).await;
+            return Err(error);
+        }
+
+        if let Err(error) = askpass_cleanup {
             let _ = self.cleanup(&workspace).await;
             return Err(error);
         }
@@ -117,6 +124,16 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 }
 
+async fn restrict_workspace_permissions(root: &Path) -> Result<(), RuntimeError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
 const ASKPASS_SCRIPT: &str = "#!/bin/sh\ncase \"$1\" in\n  *Username*) printf '%s\\n' \"$SAKALA_GIT_ASKPASS_USERNAME\" ;;\n  *) printf '%s\\n' \"$SAKALA_GIT_ASKPASS_TOKEN\" ;;\nesac\n";
 
 async fn write_askpass(root: &Path) -> Result<PathBuf, RuntimeError> {
@@ -129,4 +146,46 @@ async fn write_askpass(root: &Path) -> Result<PathBuf, RuntimeError> {
         fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).await?;
     }
     Ok(path)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::{restrict_workspace_permissions, write_askpass};
+
+    #[tokio::test]
+    async fn temporary_checkout_files_are_owner_only() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let workspace = temp.path().join("workspace");
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace should be created");
+
+        restrict_workspace_permissions(&workspace)
+            .await
+            .expect("workspace permission should be restricted");
+        let askpass = write_askpass(&workspace)
+            .await
+            .expect("askpass script should be written");
+
+        assert_eq!(
+            std::fs::metadata(&workspace)
+                .expect("workspace metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(askpass)
+                .expect("askpass metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
 }
