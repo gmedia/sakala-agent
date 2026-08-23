@@ -30,6 +30,10 @@ name = "command_lifecycle_test"
 path = "../../tests/command_lifecycle_test.rs"
 
 [[test]]
+name = "deploy_payload_contract_test"
+path = "../../tests/deploy_payload_contract_test.rs"
+
+[[test]]
 name = "log_redaction_test"
 path = "../../tests/log_redaction_test.rs"
 
