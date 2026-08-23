@@ -7,7 +7,10 @@ Sakala Agent reports two independent values in every heartbeat:
 - `metadata.version`: semantic version of the Agent binary;
 - `metadata.protocol_version`: revision of the Agent/API wire contract.
 
-The current protocol revision is `1`. A control plane must only assign work to
+The current protocol revision is `2`. Revision 2 adds workload lifecycle
+commands (`RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
+`HealthCheck`, `RefreshRoute`) and node maintenance commands (`DrainNode`,
+`ResumeNode`) plus the corresponding node status values. A control plane must only assign work to
 an Agent revision it supports. Until the control plane enforces that admission
 check, operators must deploy compatible `sakala-api` and Agent releases as a
 pair and verify the heartbeat metadata before enabling a node.
@@ -18,10 +21,9 @@ Unknown protocol command values fail during deserialization. Known command
 types without an Agent handler fail explicitly with
 `unsupported_runtime_command`; they are never acknowledged as successful.
 
-`DeployProject` and `InspectProject` are supported by the current runtime.
-Lifecycle commands require the API-owned semantic and payload contract before
-they may be enabled. This prevents a newer control plane from silently asking
-an older node to perform an ambiguous workload operation.
+`DeployProject`, `InspectProject`, workload lifecycle, and node maintenance
+commands are supported by the current runtime. A control plane that only
+supports revision 1 must not assign revision-2 commands to the node.
 
 ## Upgrade procedure
 

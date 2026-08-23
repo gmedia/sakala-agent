@@ -133,6 +133,8 @@ impl CommandDispatcher {
                         "node cannot resume because runtime preflight has fatal failures",
                     ));
                 }
+                let capacity = self.runtime.capacity().await?;
+                let available_workload_slots = capacity.available_workload_slots();
                 self.node_lifecycle.set(NodeLifecycleState::Active);
                 reporter
                     .event(DeploymentEvent {
@@ -140,11 +142,22 @@ impl CommandDispatcher {
                         level: DeploymentEventLevel::Info,
                         message: "Node preflight passed and workload command processing resumed."
                             .to_owned(),
-                        metadata: json!({}),
+                        metadata: json!({
+                            "active_workloads": capacity.active_workloads,
+                            "maximum_active_workloads": capacity.maximum_active_workloads,
+                            "available_workload_slots": available_workload_slots,
+                        }),
                         occurred_at: OffsetDateTime::now_utc(),
                     })
                     .await?;
-                Ok(CommandOutput::with_result(json!({ "state": "active" })))
+                Ok(CommandOutput::with_result(json!({
+                    "state": "active",
+                    "capacity": {
+                        "active_workloads": capacity.active_workloads,
+                        "maximum_active_workloads": capacity.maximum_active_workloads,
+                        "available_workload_slots": available_workload_slots,
+                    },
+                })))
             }
         }
     }

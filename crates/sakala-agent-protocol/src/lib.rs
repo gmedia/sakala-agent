@@ -4,7 +4,7 @@
 ///
 /// This is intentionally independent from the crate semantic version so the
 /// control plane can reject an incompatible agent before assigning work.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub mod commands;
 pub mod deployments;

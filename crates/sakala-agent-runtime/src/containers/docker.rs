@@ -6,7 +6,8 @@ use std::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
-    RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport, RuntimeWorkload,
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
+    RuntimeWorkload,
 };
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use tokio::{
@@ -180,6 +181,14 @@ impl ContainerEngine for DockerContainerEngine {
         }
 
         Ok(report)
+    }
+
+    async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError> {
+        let report = self.detect_orphans().await?;
+        Ok(RuntimeCapacity {
+            active_workloads: Some(report.workloads.len()),
+            maximum_active_workloads: Some(self.max_active_containers as usize),
+        })
     }
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError> {

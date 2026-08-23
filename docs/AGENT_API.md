@@ -127,6 +127,13 @@ refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
 drained, API hanya perlu menawarkan kedua command ini kepada node tersebut;
 command workload lain dibiarkan pending sampai node kembali active.
 
+Sebelum kembali `active`, `ResumeNode` menjalankan preflight dan mengambil
+snapshot kapasitas lokal. Completion result menyertakan
+`capacity.active_workloads`, `maximum_active_workloads`, dan
+`available_workload_slots`; nilai `null` berarti driver tidak dapat menentukan
+nilai tersebut dengan aman. API harus memperlakukannya sebagai telemetry, bukan
+izin untuk melewati safety limit node.
+
 ## Polling and Claim Semantics
 
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.
@@ -206,7 +213,7 @@ untuk aturan rollout dan command yang belum didukung.
   ],
   "metadata": {
     "version": "0.1.0",
-    "protocol_version": 1,
+    "protocol_version": 2,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
     "uptime_seconds": 86400,

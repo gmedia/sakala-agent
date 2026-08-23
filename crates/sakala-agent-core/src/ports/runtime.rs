@@ -69,6 +69,25 @@ pub struct RuntimeHealthSnapshot {
     pub reason: Option<String>,
 }
 
+/// Kapasitas workload yang diketahui runtime lokal saat snapshot diambil.
+///
+/// Nilai `None` berarti driver tidak dapat menentukan kapasitas dengan aman;
+/// control plane tidak boleh menganggapnya sebagai kapasitas tanpa batas.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeCapacity {
+    pub active_workloads: Option<usize>,
+    pub maximum_active_workloads: Option<usize>,
+}
+
+impl RuntimeCapacity {
+    #[must_use]
+    pub fn available_workload_slots(&self) -> Option<usize> {
+        self.maximum_active_workloads
+            .zip(self.active_workloads)
+            .map(|(maximum, active)| maximum.saturating_sub(active))
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeReconciliationReport {
     pub inspected_containers: usize,
@@ -163,6 +182,11 @@ pub trait RuntimeExecutor: Send + Sync {
         Ok(RuntimeReconciliationReport::default())
     }
 
+    /// Mengambil kapasitas deployment lokal tanpa mengubah runtime.
+    async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeExecutionError> {
+        Ok(RuntimeCapacity::default())
+    }
+
     /// Mengambil kesehatan workload aktif tanpa melakukan mutasi runtime.
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
         Ok(Vec::new())
@@ -252,5 +276,22 @@ pub trait RuntimeExecutor: Send + Sync {
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support route refresh",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeCapacity;
+
+    #[test]
+    fn capacity_never_reports_negative_available_slots() {
+        assert_eq!(
+            RuntimeCapacity {
+                active_workloads: Some(4),
+                maximum_active_workloads: Some(2),
+            }
+            .available_workload_slots(),
+            Some(0)
+        );
     }
 }
