@@ -88,6 +88,27 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
 }
 
 #[tokio::test]
+async fn docker_preflight_checks_required_runtime_dependencies() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::preflight(&executor)
+        .await
+        .expect("fake runtime dependencies should be checked");
+
+    assert!(!report.has_fatal_failure());
+    assert_eq!(report.checks.len(), 7);
+    assert!(report.checks.iter().any(|check| check.name == "git"));
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "caddy-routing")
+    );
+}
+
+#[tokio::test]
 async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_arguments() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));

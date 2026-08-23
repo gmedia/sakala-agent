@@ -8,5 +8,6 @@ pub use repository::{
 
 pub use runtime::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
-    RuntimeExecutor, RuntimeOrphan, RuntimeReconciliationReport, RuntimeReporter,
+    RuntimeExecutor, RuntimeOrphan, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter,
 };

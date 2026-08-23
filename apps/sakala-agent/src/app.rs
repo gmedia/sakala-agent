@@ -1,7 +1,13 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use sakala_agent_core::{AgentMode, api::ApiClient, heartbeat, ports::RuntimeExecutor, scheduler};
+use sakala_agent_core::{
+    AgentMode,
+    api::ApiClient,
+    heartbeat,
+    ports::{RuntimeExecutor, RuntimePreflightReport},
+    scheduler,
+};
 use sakala_agent_runtime::{DockerRuntimeExecutor, NoopRuntimeExecutor};
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -26,6 +32,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
         RuntimeDriver::Docker => Arc::new(DockerRuntimeExecutor::new(config.docker_runtime)),
     };
+    let preflight = runtime
+        .preflight()
+        .await
+        .context("runtime preflight failed")?;
+    log_preflight(&preflight);
+    if preflight.has_fatal_failure() {
+        anyhow::bail!("runtime preflight found one or more fatal dependency failures");
+    }
     match runtime.reconcile().await {
         Ok(report) => {
             info!(
@@ -77,4 +91,16 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     info!("Sakala agent shutdown complete");
 
     Ok(())
+}
+
+fn log_preflight(report: &RuntimePreflightReport) {
+    for check in &report.checks {
+        if check.ready {
+            info!(check = %check.name, detail = %check.detail, "runtime preflight check passed");
+        } else if check.fatal {
+            warn!(check = %check.name, detail = %check.detail, "runtime preflight check failed");
+        } else {
+            warn!(check = %check.name, detail = %check.detail, "runtime preflight warning");
+        }
+    }
 }

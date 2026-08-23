@@ -20,6 +20,8 @@ validate command
 
 Startup agent juga menjalankan scan orphan secara detection-only. Detail guard Phase 9 ada di [Runtime hardening](RUNTIME_HARDENING.md).
 
+Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, serta direktori workspace dan route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator.
+
 Image ditag berdasarkan project, commit, dan deployment. Container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
 
 - `dev.sakala.managed=true`

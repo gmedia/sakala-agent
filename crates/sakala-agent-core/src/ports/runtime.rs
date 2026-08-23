@@ -44,6 +44,27 @@ pub struct RuntimeReconciliationReport {
     pub orphans: Vec<RuntimeOrphan>,
 }
 
+/// Result of a local runtime dependency check performed before command polling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePreflightCheck {
+    pub name: String,
+    pub fatal: bool,
+    pub ready: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimePreflightReport {
+    pub checks: Vec<RuntimePreflightCheck>,
+}
+
+impl RuntimePreflightReport {
+    #[must_use]
+    pub fn has_fatal_failure(&self) -> bool {
+        self.checks.iter().any(|check| check.fatal && !check.ready)
+    }
+}
+
 impl CommandOutput {
     #[must_use]
     pub fn empty() -> Self {
@@ -101,6 +122,10 @@ pub trait RuntimeReporter: Send + Sync {
 
 #[async_trait]
 pub trait RuntimeExecutor: Send + Sync {
+    async fn preflight(&self) -> Result<RuntimePreflightReport, RuntimeExecutionError> {
+        Ok(RuntimePreflightReport::default())
+    }
+
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         Ok(RuntimeReconciliationReport::default())
     }

@@ -6,7 +6,8 @@ use std::sync::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
-    RuntimeExecutor, RuntimeReconciliationReport, RuntimeReporter,
+    RuntimeExecutor, RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
+    RuntimeReporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -19,7 +20,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
+    CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
         ContainerEngine, DockerContainerEngine, RunContainerRequest, container_name, image_name,
@@ -39,6 +40,14 @@ pub struct DockerRuntimeExecutor {
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
     build_permits: Arc<Semaphore>,
+    preflight: DockerPreflight,
+}
+
+pub(crate) struct DockerPreflight {
+    runner: Arc<dyn ProcessRunner>,
+    workspace_root: std::path::PathBuf,
+    caddy_sites_dir: std::path::PathBuf,
+    caddy_container: String,
 }
 
 impl DockerRuntimeExecutor {
@@ -52,6 +61,12 @@ impl DockerRuntimeExecutor {
 
     #[must_use]
     pub fn with_runner(config: DockerRuntimeConfig, runner: Arc<dyn ProcessRunner>) -> Self {
+        let preflight = DockerPreflight {
+            runner: Arc::clone(&runner),
+            workspace_root: config.workspace_root.clone(),
+            caddy_sites_dir: config.caddy_sites_dir.clone(),
+            caddy_container: config.caddy_container.clone(),
+        };
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
@@ -83,12 +98,13 @@ impl DockerRuntimeExecutor {
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
             config.timeout_safety,
             max_concurrent_builds,
+            preflight,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     #[must_use]
-    pub fn with_services(
+    pub(crate) fn with_services(
         workspace: Arc<dyn WorkspaceManager>,
         inspector: Arc<dyn ProjectInspector>,
         builder: Arc<dyn ImageBuilder>,
@@ -97,6 +113,7 @@ impl DockerRuntimeExecutor {
         routes: Arc<dyn RouteManager>,
         timeout_safety: crate::TimeoutSafetyConfig,
         max_concurrent_builds: usize,
+        preflight: DockerPreflight,
     ) -> Self {
         Self {
             workspace,
@@ -107,6 +124,7 @@ impl DockerRuntimeExecutor {
             routes,
             timeout_safety,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            preflight,
         }
     }
 
@@ -375,8 +393,87 @@ impl DockerRuntimeExecutor {
     }
 }
 
+impl DockerPreflight {
+    async fn run(&self) -> Result<RuntimePreflightReport, RuntimeError> {
+        let mut checks = vec![
+            self.command_check("git", CommandSpec::new("git").arg("--version"))
+                .await,
+            self.command_check(
+                "docker",
+                CommandSpec::new("docker")
+                    .arg("version")
+                    .arg("--format")
+                    .arg("{{.Server.Version}}"),
+            )
+            .await,
+            self.command_check(
+                "docker-buildx",
+                CommandSpec::new("docker").arg("buildx").arg("version"),
+            )
+            .await,
+            self.command_check("railpack", CommandSpec::new("railpack").arg("--version"))
+                .await,
+            self.command_check(
+                "caddy-routing",
+                CommandSpec::new("docker")
+                    .arg("inspect")
+                    .arg(&self.caddy_container),
+            )
+            .await,
+        ];
+        checks.push(directory_check("workspace", &self.workspace_root, true).await);
+        checks.push(directory_check("caddy-sites", &self.caddy_sites_dir, true).await);
+
+        Ok(RuntimePreflightReport { checks })
+    }
+
+    async fn command_check(&self, name: &str, command: CommandSpec) -> RuntimePreflightCheck {
+        match self.runner.run(&command, &crate::NullOutputSink).await {
+            Ok(output) if output.success => RuntimePreflightCheck {
+                name: name.to_owned(),
+                fatal: true,
+                ready: true,
+                detail: output.stdout.trim().to_owned(),
+            },
+            Ok(output) => RuntimePreflightCheck {
+                name: name.to_owned(),
+                fatal: true,
+                ready: false,
+                detail: format!("command exited with status {:?}", output.code),
+            },
+            Err(error) => RuntimePreflightCheck {
+                name: name.to_owned(),
+                fatal: true,
+                ready: false,
+                detail: error.to_string(),
+            },
+        }
+    }
+}
+
+async fn directory_check(name: &str, path: &std::path::Path, fatal: bool) -> RuntimePreflightCheck {
+    match tokio::fs::create_dir_all(path).await {
+        Ok(()) => RuntimePreflightCheck {
+            name: name.to_owned(),
+            fatal,
+            ready: true,
+            detail: path.display().to_string(),
+        },
+        Err(error) => RuntimePreflightCheck {
+            name: name.to_owned(),
+            fatal,
+            ready: false,
+            detail: format!("{}: {error}", path.display()),
+        },
+    }
+}
+
 #[async_trait]
 impl RuntimeExecutor for DockerRuntimeExecutor {
+    async fn preflight(&self) -> Result<RuntimePreflightReport, RuntimeExecutionError> {
+        self.preflight.run().await.map_err(Into::into)
+    }
+
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         self.containers.detect_orphans().await.map_err(Into::into)
     }
