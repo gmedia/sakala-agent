@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -13,17 +12,17 @@ use tracing::{info, warn};
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
     api::ApiClient,
-    ports::{RuntimeExecutor, RuntimeReconciliationReport},
+    ports::{NodeTelemetry, RuntimeExecutor, RuntimeReconciliationReport},
     scheduler::metrics::SchedulerMetrics,
 };
 
 pub struct HeartbeatRuntimeContext {
     pub node_lifecycle: Arc<NodeLifecycle>,
     pub runtime_driver: String,
-    pub workspace_root: std::path::PathBuf,
     pub runtime: Arc<dyn RuntimeExecutor>,
     pub scheduler_metrics: Arc<SchedulerMetrics>,
     pub reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
+    pub startup_reconciliation_at: OffsetDateTime,
     pub minimum_workspace_free_bytes: u64,
 }
 
@@ -33,11 +32,8 @@ pub async fn run(
     context: HeartbeatRuntimeContext,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Dependency versions are immutable for the lifetime of this process and can
-    // be relatively expensive to obtain from Docker, so probe them only once.
-    let dependencies = runtime_dependency_versions().await;
     loop {
-        let payload = payload(&config, &context, &dependencies).await;
+        let payload = payload(&config, &context).await;
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -64,12 +60,12 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-async fn payload(
-    config: &AgentConfig,
-    context: &HeartbeatRuntimeContext,
-    dependencies: &serde_json::Value,
-) -> HeartbeatPayload {
-    let resources = node_resources(&context.workspace_root).await;
+async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> HeartbeatPayload {
+    let resources = tokio::time::timeout(probe_timeout(), context.runtime.node_telemetry())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_else(NodeTelemetry::default);
     let workloads = workload_statistics(context.runtime.as_ref()).await;
     let reconciliation = context
         .reconciliation
@@ -84,7 +80,10 @@ async fn payload(
             NodeLifecycleState::Maintenance => NodeStatus::Maintenance,
         },
         node: NodeInfo {
-            hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
+            hostname: resources
+                .hostname
+                .clone()
+                .unwrap_or_else(|| "unknown-host".to_owned()),
             runtime_network: config.runtime_network.clone(),
             capabilities: config.capabilities.clone(),
         },
@@ -128,7 +127,8 @@ async fn payload(
                 "active_builds": workloads.active_builds,
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },
-            "reconciliation": {
+            "startup_reconciliation": {
+                "captured_at": context.startup_reconciliation_at,
                 "inspected_containers": reconciliation.inspected_containers,
                 "cleaned_workspaces": reconciliation.cleaned_workspaces,
                 "reattached_log_followers": reconciliation.reattached_log_followers,
@@ -160,7 +160,7 @@ async fn payload(
                     "reason": issue.reason,
                 })).collect::<Vec<_>>(),
             },
-            "runtime_dependencies": dependencies,
+            "runtime_dependencies": resources.runtime_dependencies,
         }),
         sent_at: OffsetDateTime::now_utc(),
     }
@@ -172,38 +172,6 @@ fn disk_pressure_state(available_bytes: Option<u64>, minimum_free_bytes: u64) ->
         Some(_) => "normal",
         None => "unknown",
     }
-}
-
-async fn runtime_dependency_versions() -> serde_json::Value {
-    let (git, docker, buildx, railpack) = tokio::join!(
-        command_version("git", &["--version"]),
-        command_version("docker", &["version", "--format", "{{.Server.Version}}"]),
-        command_version("docker", &["buildx", "version"]),
-        command_version("railpack", &["--version"]),
-    );
-    json!({
-        "git": git,
-        "docker": docker,
-        "buildx": buildx,
-        "railpack": railpack,
-    })
-}
-
-async fn command_version(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = tokio::time::timeout(
-        probe_timeout(),
-        tokio::process::Command::new(program)
-            .args(arguments)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (!version.is_empty()).then_some(version)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -270,89 +238,6 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct NodeResources {
-    uptime_seconds: Option<u64>,
-    cpu_total: Option<usize>,
-    cpu_load_1m: Option<f64>,
-    memory_total_bytes: Option<u64>,
-    memory_available_bytes: Option<u64>,
-    disk_total_bytes: Option<u64>,
-    disk_available_bytes: Option<u64>,
-    workspace_used_bytes: Option<u64>,
-}
-
-async fn node_resources(workspace_root: &Path) -> NodeResources {
-    let memory = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .map(|contents| parse_meminfo(&contents))
-        .unwrap_or_default();
-    let disk = workspace_disk_resources(workspace_root).await;
-    NodeResources {
-        uptime_seconds: std::fs::read_to_string("/proc/uptime")
-            .ok()
-            .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok())
-            .map(|seconds| seconds.max(0.0) as u64),
-        cpu_total: std::thread::available_parallelism().ok().map(usize::from),
-        cpu_load_1m: std::fs::read_to_string("/proc/loadavg")
-            .ok()
-            .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok()),
-        memory_total_bytes: memory.0,
-        memory_available_bytes: memory.1,
-        ..disk
-    }
-}
-
-async fn workspace_disk_resources(workspace_root: &Path) -> NodeResources {
-    let output = tokio::time::timeout(
-        probe_timeout(),
-        tokio::process::Command::new("df")
-            .arg("-Pk")
-            .arg(workspace_root)
-            .output(),
-    )
-    .await;
-    let Ok(Ok(output)) = output else {
-        return NodeResources::default();
-    };
-    if !output.status.success() {
-        return NodeResources::default();
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = stdout.lines().filter(|line| !line.trim().is_empty()).nth(1) else {
-        return NodeResources::default();
-    };
-    let fields = line.split_whitespace().collect::<Vec<_>>();
-    let disk_total_bytes = fields
-        .get(1)
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|value| value.checked_mul(1_024));
-    let disk_available_bytes = fields
-        .get(3)
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(|value| value.checked_mul(1_024));
-    let workspace_used_bytes = tokio::time::timeout(
-        probe_timeout(),
-        tokio::process::Command::new("du")
-            .arg("-sk")
-            .arg(workspace_root)
-            .output(),
-    )
-    .await
-    .ok()
-    .and_then(Result::ok)
-    .filter(|output| output.status.success())
-    .and_then(|output| String::from_utf8(output.stdout).ok())
-    .and_then(|output| output.split_whitespace().next()?.parse::<u64>().ok())
-    .and_then(|value| value.checked_mul(1_024));
-    NodeResources {
-        disk_total_bytes,
-        disk_available_bytes,
-        workspace_used_bytes,
-        ..NodeResources::default()
-    }
-}
-
 fn probe_timeout() -> Duration {
     #[cfg(test)]
     {
@@ -364,31 +249,15 @@ fn probe_timeout() -> Duration {
     }
 }
 
-fn parse_meminfo(contents: &str) -> (Option<u64>, Option<u64>) {
-    let mut total = None;
-    let mut available = None;
-    for line in contents.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(key) = fields.next() else { continue };
-        let value = fields.next().and_then(|value| value.parse::<u64>().ok());
-        match key {
-            "MemTotal:" => total = value.and_then(|value| value.checked_mul(1_024)),
-            "MemAvailable:" => available = value.and_then(|value| value.checked_mul(1_024)),
-            _ => {}
-        }
-    }
-    (total, available)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
-        path::PathBuf,
         sync::{Arc, RwLock},
     };
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     use crate::{
@@ -398,10 +267,7 @@ mod tests {
         scheduler::metrics::SchedulerMetrics,
     };
 
-    use super::{
-        HeartbeatRuntimeContext, disk_pressure_state, parse_meminfo, payload,
-        workspace_disk_resources,
-    };
+    use super::{HeartbeatRuntimeContext, disk_pressure_state, payload};
 
     struct EmptyRuntime;
 
@@ -416,33 +282,26 @@ mod tests {
         let context = HeartbeatRuntimeContext {
             node_lifecycle: Arc::new(NodeLifecycle::new()),
             runtime_driver: "noop".to_owned(),
-            workspace_root: PathBuf::from("/tmp"),
             runtime: Arc::new(EmptyRuntime),
             scheduler_metrics: Arc::new(SchedulerMetrics::default()),
             reconciliation: Arc::new(RwLock::new(RuntimeReconciliationReport {
                 stale_routes: vec![RuntimeStaleRoute {
                     path: "/var/lib/sakala/caddy/stale.Caddyfile".to_owned(),
                     project_id: stale_project,
+                    deployment_id: None,
                 }],
                 ..RuntimeReconciliationReport::default()
             })),
+            startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
         };
-        let heartbeat = payload(&config, &context, &serde_json::json!({})).await;
+        let heartbeat = payload(&config, &context).await;
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
-            heartbeat.metadata["reconciliation"]["stale_routes"][0]["project_id"],
+            heartbeat.metadata["startup_reconciliation"]["stale_routes"][0]["project_id"],
             stale_project.to_string()
-        );
-    }
-
-    #[test]
-    fn parses_memory_values_without_exposing_host_specific_text() {
-        assert_eq!(
-            parse_meminfo("MemTotal:       1024 kB\nMemAvailable:    512 kB\n"),
-            (Some(1_048_576), Some(524_288))
         );
     }
 
@@ -451,12 +310,5 @@ mod tests {
         assert_eq!(disk_pressure_state(Some(99), 100), "critical");
         assert_eq!(disk_pressure_state(Some(100), 100), "normal");
         assert_eq!(disk_pressure_state(None, 100), "unknown");
-    }
-
-    #[tokio::test]
-    async fn reads_disk_capacity_for_an_existing_workspace() {
-        let resources = workspace_disk_resources(std::path::Path::new("/tmp")).await;
-        assert!(resources.disk_total_bytes.is_some());
-        assert!(resources.disk_available_bytes.is_some());
     }
 }

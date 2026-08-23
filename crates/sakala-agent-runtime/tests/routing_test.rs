@@ -11,7 +11,7 @@ use sakala_agent_core::ports::{RuntimeExecutionError, RuntimeReporter};
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
 use sakala_agent_runtime::{
     RuntimeError,
-    routing::{CaddyFileRouteManager, CaddyReloader, RouteManager, RouteSpec},
+    routing::{CaddyFileRouteManager, CaddyReloader, RouteIdentity, RouteManager, RouteSpec},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -48,7 +48,9 @@ async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails(
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
     let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
-    let managed_route = format!("# Managed by sakala-agent for project {project_id}.\n");
+    let deployment_id = Uuid::new_v4();
+    let managed_route =
+        format!("# Managed by sakala-agent for project {project_id} deployment {deployment_id}.\n");
     tokio::fs::write(&route_path, &managed_route)
         .await
         .expect("route should be written");
@@ -56,7 +58,13 @@ async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails(
     let manager = CaddyFileRouteManager::new(temp.path().to_owned(), reloader.clone());
 
     manager
-        .deactivate(project_id, &NoopReporter)
+        .deactivate(
+            RouteIdentity {
+                project_id,
+                deployment_id: Some(deployment_id),
+            },
+            &NoopReporter,
+        )
         .await
         .expect_err("reload failure should fail route deactivation");
 
@@ -80,12 +88,52 @@ async fn route_deactivation_refuses_file_not_owned_by_sakala() {
     let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
 
     let error = manager
-        .deactivate(project_id, &NoopReporter)
+        .deactivate(
+            RouteIdentity {
+                project_id,
+                deployment_id: Some(Uuid::new_v4()),
+            },
+            &NoopReporter,
+        )
         .await
         .expect_err("unmanaged route deletion must be rejected");
 
     assert!(error.to_string().contains("not owned by Sakala"));
     assert!(route_path.exists());
+}
+
+#[tokio::test]
+async fn stale_deployment_cannot_deactivate_the_current_project_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let current_deployment = Uuid::new_v4();
+    let stale_deployment = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let current_route = format!(
+        "# Managed by sakala-agent for project {project_id} deployment {current_deployment}.\nexample.test:80 {{}}\n"
+    );
+    tokio::fs::write(&route_path, &current_route)
+        .await
+        .expect("current route should be written");
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+
+    manager
+        .deactivate(
+            RouteIdentity {
+                project_id,
+                deployment_id: Some(stale_deployment),
+            },
+            &NoopReporter,
+        )
+        .await
+        .expect("stale deactivation should be a safe no-op");
+
+    assert_eq!(
+        tokio::fs::read_to_string(route_path)
+            .await
+            .expect("current route must remain readable"),
+        current_route
+    );
 }
 
 #[tokio::test]
@@ -118,7 +166,10 @@ async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workload
     .expect("unmanaged route should be written");
 
     let stale = manager
-        .discover_stale_routes(&HashSet::from([active_project]))
+        .discover_stale_routes(&HashSet::from([RouteIdentity {
+            project_id: active_project,
+            deployment_id: Some(Uuid::new_v4()),
+        }]))
         .await
         .expect("route discovery should succeed");
 
@@ -131,6 +182,7 @@ async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workload
 fn route(project_id: Uuid) -> RouteSpec {
     RouteSpec {
         project_id,
+        deployment_id: Uuid::new_v4(),
         domain: "portfolio.run.sakala.localhost".to_owned(),
         upstream: "sakala-app-project-deployment".to_owned(),
         port: 3000,

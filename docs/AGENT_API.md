@@ -359,7 +359,8 @@ untuk aturan rollout dan command yang belum didukung.
       "active_builds": 1,
       "maximum_concurrent_builds": 2
     },
-    "reconciliation": {
+    "startup_reconciliation": {
+      "captured_at": "2026-06-23T07:59:58Z",
       "inspected_containers": 2,
       "cleaned_workspaces": 0,
       "reattached_log_followers": 1,
@@ -373,6 +374,11 @@ untuk aturan rollout dan command yang belum didukung.
   "sent_at": "2026-06-23T08:00:00Z"
 }
 ```
+
+`startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
+bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
+eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
+hasil command reconciliation eksplisit.
 
 ## Event and Log Payloads
 

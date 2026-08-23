@@ -29,7 +29,6 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         AgentMode::Local => None,
         AgentMode::Connected => Some(ApiClient::from_config(&config.agent)?),
     };
-    let workspace_root = config.docker_runtime.workspace_root.clone();
     let minimum_workspace_free_bytes = config.docker_runtime.min_workspace_free_bytes;
     let reconciliation = Arc::new(RwLock::new(RuntimeReconciliationReport::default()));
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
@@ -48,6 +47,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::new(ApiRuntimeReporterFactory::new(client))
             as Arc<dyn sakala_agent_core::ports::RuntimeReporterFactory>
     });
+    let startup_reconciliation_at = time::OffsetDateTime::now_utc();
     match runtime.recover(reporter_factory).await {
         Ok(report) => {
             if let Ok(mut snapshot) = reconciliation.write() {
@@ -120,10 +120,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         heartbeat::worker::HeartbeatRuntimeContext {
             node_lifecycle: Arc::clone(&node_lifecycle),
             runtime_driver: config.runtime_driver.to_string(),
-            workspace_root,
             runtime: Arc::clone(&runtime),
             scheduler_metrics: Arc::clone(&scheduler_metrics),
             reconciliation: Arc::clone(&reconciliation),
+            startup_reconciliation_at,
             minimum_workspace_free_bytes,
         },
         shutdown_rx.clone(),

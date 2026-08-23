@@ -29,6 +29,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Changed
 
+- Route Caddy membawa deployment identity, host telemetry berpindah dari core ke runtime adapter, dan snapshot reconciliation heartbeat diberi nama serta timestamp startup yang eksplisit.
 - Recovery menoleransi metadata container legacy per workload, stale route hanya mempertahankan workload running, dan semaphore build dilepas sebelum fase start/readiness.
 - Heartbeat meng-cache versi dependency dan membatasi durasi probe subprocess/runtime.
 - Refactor runtime crate dari flat modules menjadi executor, workspace, builders, containers, routing, health, logs, dan process boundaries dengan dependency injection.
@@ -42,4 +43,5 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Fixed
 
+- Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.

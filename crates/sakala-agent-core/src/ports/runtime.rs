@@ -74,6 +74,7 @@ pub struct RuntimeOrphan {
 pub struct RuntimeStaleRoute {
     pub path: String,
     pub project_id: Uuid,
+    pub deployment_id: Option<Uuid>,
 }
 
 /// A dangling Sakala-managed image discovered before an approved/local GC pass.
@@ -124,6 +125,22 @@ pub struct RuntimeCapacity {
     pub maximum_active_workloads: Option<usize>,
     pub active_builds: Option<usize>,
     pub maximum_concurrent_builds: Option<usize>,
+}
+
+/// Host/runtime telemetry gathered by the injected runtime adapter.
+/// Core serializes this snapshot but never executes host commands directly.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NodeTelemetry {
+    pub hostname: Option<String>,
+    pub uptime_seconds: Option<u64>,
+    pub cpu_total: Option<usize>,
+    pub cpu_load_1m: Option<f64>,
+    pub memory_total_bytes: Option<u64>,
+    pub memory_available_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub disk_available_bytes: Option<u64>,
+    pub workspace_used_bytes: Option<u64>,
+    pub runtime_dependencies: Value,
 }
 
 impl RuntimeCapacity {
@@ -259,6 +276,10 @@ pub trait RuntimeExecutor: Send + Sync {
     /// Mengambil kesehatan workload aktif tanpa melakukan mutasi runtime.
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
         Ok(Vec::new())
+    }
+
+    async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {
+        Ok(NodeTelemetry::default())
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

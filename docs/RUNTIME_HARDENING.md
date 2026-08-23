@@ -62,7 +62,7 @@ Follower memakai reporter deployment yang sama dan seluruh baris tetap melewati 
 
 ## Capacity Guard
 
-`SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard guard node. Deployment project baru ditolak ketika jumlah container managed yang aktif mencapai batas. Redeploy project yang sudah aktif tetap diizinkan karena candidate akan menggantikan container sebelumnya.
+`SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard admission guard untuk project aktif pada steady state. Agent melakukan pemeriksaan awal dan pemeriksaan authoritative yang di-serialize tepat sebelum `docker run`, sehingga deployment project baru yang concurrent tidak dapat melewati batas. Redeploy project aktif mengizinkan satu candidate surge sementara untuk cutover sehat, lalu container lama dihentikan dan dihapus.
 
 Guard ini bukan aggregate scheduler dan belum menghitung total memory/CPU reservation. Penempatan lintas node tetap pekerjaan control plane setelah MVP.
 
@@ -85,10 +85,11 @@ container/project/deployment/status/reason yang aman. Ini memberi operator
 verifikasi ringan segera setelah restart tanpa menunggu interval health worker;
 Agent tetap tidak menjalankan restart otomatis atau mutasi recovery.
 
-Probe heartbeat yang menjalankan subprocess memiliki deadline dua detik.
-Versi Git, Docker, Buildx, dan Railpack di-cache sekali saat worker heartbeat
-dimulai; probe kapasitas, health runtime, `df`, dan `du` juga dibatasi agar satu
-command host yang macet tidak menahan heartbeat maupun shutdown tanpa batas.
+Probe host heartbeat dimiliki adapter runtime dan memakai `ProcessRunner` dengan
+deadline dua detik, process group termination, serta child reaping. Versi Git,
+Docker, Buildx, dan Railpack di-cache sekali; probe kapasitas, health runtime,
+`df`, dan `du` juga dibatasi agar satu command host yang macet tidak menahan
+heartbeat maupun shutdown tanpa batas. Core hanya memanggil port runtime.
 
 Container yang dibuat oleh Agent revision lama mungkin belum memiliki label
 domain, port, command ID, atau batas log yang dibutuhkan recovery modern. Agent

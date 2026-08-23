@@ -45,7 +45,7 @@ reconciliation hanya melaporkan kandidat; prune baru dijalankan oleh command
 
 ## Batas Keamanan MVP
 
-- Repository hanya `https://github.com` publik tanpa credential URL.
+- Repository memakai URL canonical `https://github.com` tanpa credential pada URL. Repository private memakai credential lease sementara melalui `GIT_ASKPASS` dan tidak menaruh token di arguments, remote URL, atau log.
 - Checkout harus memakai full 40-character commit SHA.
 - Tidak ada shell interpolation; executable dan arguments dikirim langsung ke process API.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
@@ -63,4 +63,4 @@ Resource request berbentuk `memory_mb`, `cpu_millis`, dan `pids_limit`. API adal
 
 ## Verifikasi
 
-Test default memakai fake process runner dan tidak menyentuh daemon. Integration test nyata perlu dijalankan secara opt-in pada node disposable setelah `sakala-api` menyediakan command contract Phase 6.
+Test default memakai fake process runner dan tidak menyentuh daemon. Integration test nyata perlu dijalankan secara opt-in pada node disposable dengan `sakala-api` yang mendukung protocol revision 4.

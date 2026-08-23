@@ -12,9 +12,16 @@ mod docker_exec;
 pub use caddy_file::CaddyFileRouteManager;
 pub use docker_exec::DockerExecCaddyReloader;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RouteIdentity {
+    pub project_id: Uuid,
+    pub deployment_id: Option<Uuid>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteSpec {
     pub project_id: Uuid,
+    pub deployment_id: Uuid,
     pub domain: String,
     pub upstream: String,
     pub port: u16,
@@ -26,7 +33,7 @@ pub trait RouteManager: Send + Sync {
     /// workload. Discovery is intentionally non-destructive.
     async fn discover_stale_routes(
         &self,
-        _known_projects: &HashSet<Uuid>,
+        _known_routes: &HashSet<RouteIdentity>,
     ) -> Result<Vec<RuntimeStaleRoute>, RuntimeError> {
         Ok(Vec::new())
     }
@@ -39,18 +46,18 @@ pub trait RouteManager: Send + Sync {
 
     async fn deactivate(
         &self,
-        project_id: Uuid,
+        identity: RouteIdentity,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<(), RuntimeError>;
+    ) -> Result<bool, RuntimeError>;
 
     /// Deletes only stale route files that pass the same Sakala ownership
     /// validation used by lifecycle deactivation.
     async fn cleanup_stale_routes(
         &self,
-        known_projects: &HashSet<Uuid>,
+        known_routes: &HashSet<RouteIdentity>,
         reporter: &dyn RuntimeReporter,
     ) -> Result<usize, RuntimeError> {
-        let _ = (known_projects, reporter);
+        let _ = (known_routes, reporter);
         Ok(0)
     }
 }

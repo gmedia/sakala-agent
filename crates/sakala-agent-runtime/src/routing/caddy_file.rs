@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     RuntimeError, RuntimeReporter,
-    routing::{CaddyReloader, RouteManager, RouteSpec},
+    routing::{CaddyReloader, RouteIdentity, RouteManager, RouteSpec},
 };
 use sakala_agent_core::ports::RuntimeStaleRoute;
 
@@ -19,6 +19,7 @@ const MANAGED_ROUTE_PREFIX: &str = "# Managed by sakala-agent for project ";
 pub struct CaddyFileRouteManager {
     sites_dir: PathBuf,
     reloader: Arc<dyn CaddyReloader>,
+    mutation_lock: tokio::sync::Mutex<()>,
 }
 
 impl CaddyFileRouteManager {
@@ -27,6 +28,7 @@ impl CaddyFileRouteManager {
         Self {
             sites_dir,
             reloader,
+            mutation_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -34,6 +36,7 @@ impl CaddyFileRouteManager {
 struct RouteSnapshot {
     path: PathBuf,
     previous: Option<Vec<u8>>,
+    changed: bool,
 }
 
 async fn write_route(sites_dir: &Path, route: &RouteSpec) -> Result<RouteSnapshot, RuntimeError> {
@@ -46,14 +49,18 @@ async fn write_route(sites_dir: &Path, route: &RouteSpec) -> Result<RouteSnapsho
         Err(error) => return Err(error.into()),
     };
     let content = format!(
-        "{MANAGED_ROUTE_PREFIX}{}.\n{}:80 {{\n\treverse_proxy {}:{}\n}}\n",
-        route.project_id, route.domain, route.upstream, route.port
+        "{MANAGED_ROUTE_PREFIX}{} deployment {}.\n{}:80 {{\n\treverse_proxy {}:{}\n}}\n",
+        route.project_id, route.deployment_id, route.domain, route.upstream, route.port
     );
 
     fs::write(&temporary, content).await?;
     fs::rename(&temporary, &path).await?;
 
-    Ok(RouteSnapshot { path, previous })
+    Ok(RouteSnapshot {
+        path,
+        previous,
+        changed: true,
+    })
 }
 
 impl RouteSnapshot {
@@ -71,7 +78,11 @@ impl RouteSnapshot {
     }
 }
 
-async fn remove_route(sites_dir: &Path, project_id: Uuid) -> Result<RouteSnapshot, RuntimeError> {
+async fn remove_route(
+    sites_dir: &Path,
+    identity: RouteIdentity,
+) -> Result<RouteSnapshot, RuntimeError> {
+    let project_id = identity.project_id;
     let path = sites_dir.join(format!("{project_id}.Caddyfile"));
     let previous = match fs::read(&path).await {
         Ok(content) => Some(content),
@@ -79,23 +90,42 @@ async fn remove_route(sites_dir: &Path, project_id: Uuid) -> Result<RouteSnapsho
         Err(error) => return Err(error.into()),
     };
     if let Some(content) = &previous {
-        let owned_prefix = format!("{MANAGED_ROUTE_PREFIX}{project_id}.");
-        if !content.starts_with(owned_prefix.as_bytes()) {
+        let legacy_prefix = format!("{MANAGED_ROUTE_PREFIX}{project_id}.");
+        let current_prefix = format!("{MANAGED_ROUTE_PREFIX}{project_id} deployment ");
+        if !content.starts_with(legacy_prefix.as_bytes())
+            && !content.starts_with(current_prefix.as_bytes())
+        {
             return Err(RuntimeError::Routing(format!(
                 "refusing to delete route {} because it is not owned by Sakala",
                 path.display()
             )));
         }
+        if let Some(deployment_id) = identity.deployment_id {
+            let expected =
+                format!("{MANAGED_ROUTE_PREFIX}{project_id} deployment {deployment_id}.");
+            if !content.starts_with(expected.as_bytes()) {
+                return Ok(RouteSnapshot {
+                    path,
+                    previous,
+                    changed: false,
+                });
+            }
+        }
         fs::remove_file(&path).await?;
     }
-    Ok(RouteSnapshot { path, previous })
+    let changed = previous.is_some();
+    Ok(RouteSnapshot {
+        path,
+        previous,
+        changed,
+    })
 }
 
 #[async_trait]
 impl RouteManager for CaddyFileRouteManager {
     async fn discover_stale_routes(
         &self,
-        known_projects: &HashSet<Uuid>,
+        known_routes: &HashSet<RouteIdentity>,
     ) -> Result<Vec<RuntimeStaleRoute>, RuntimeError> {
         let mut entries = match fs::read_dir(&self.sites_dir).await {
             Ok(entries) => entries,
@@ -119,14 +149,32 @@ impl RouteManager for CaddyFileRouteManager {
                 continue;
             };
             let content = fs::read_to_string(&path).await?;
-            if !content.starts_with(&format!("{MANAGED_ROUTE_PREFIX}{project_id}."))
-                || known_projects.contains(&project_id)
+            let owned_prefix = format!("{MANAGED_ROUTE_PREFIX}{project_id}");
+            if !content.starts_with(&owned_prefix) {
+                continue;
+            }
+            let deployment_id = content
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix(&format!("{owned_prefix} deployment ")))
+                .and_then(|value| value.strip_suffix('.'))
+                .and_then(|value| Uuid::parse_str(value).ok());
+            if deployment_id.is_some_and(|deployment_id| {
+                known_routes.contains(&RouteIdentity {
+                    project_id,
+                    deployment_id: Some(deployment_id),
+                })
+            }) || deployment_id.is_none()
+                && known_routes
+                    .iter()
+                    .any(|identity| identity.project_id == project_id)
             {
                 continue;
             }
             stale_routes.push(RuntimeStaleRoute {
                 path: path.display().to_string(),
                 project_id,
+                deployment_id,
             });
         }
         Ok(stale_routes)
@@ -137,6 +185,7 @@ impl RouteManager for CaddyFileRouteManager {
         route: &RouteSpec,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
         let snapshot = write_route(&self.sites_dir, route).await?;
         if let Err(error) = self.reloader.validate_and_reload(reporter).await {
             snapshot.restore().await?;
@@ -148,31 +197,42 @@ impl RouteManager for CaddyFileRouteManager {
 
     async fn deactivate(
         &self,
-        project_id: Uuid,
+        identity: RouteIdentity,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<(), RuntimeError> {
-        let snapshot = remove_route(&self.sites_dir, project_id).await?;
-        if snapshot.previous.is_none() {
-            return Ok(());
+    ) -> Result<bool, RuntimeError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let snapshot = remove_route(&self.sites_dir, identity).await?;
+        if !snapshot.changed {
+            return Ok(false);
         }
         if let Err(error) = self.reloader.validate_and_reload(reporter).await {
             snapshot.restore().await?;
             self.reloader.reload_after_rollback().await;
             return Err(error);
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn cleanup_stale_routes(
         &self,
-        known_projects: &HashSet<Uuid>,
+        known_routes: &HashSet<RouteIdentity>,
         reporter: &dyn RuntimeReporter,
     ) -> Result<usize, RuntimeError> {
-        let stale = self.discover_stale_routes(known_projects).await?;
+        let stale = self.discover_stale_routes(known_routes).await?;
         let mut cleaned = 0;
         for route in stale {
-            self.deactivate(route.project_id, reporter).await?;
-            cleaned += 1;
+            if self
+                .deactivate(
+                    RouteIdentity {
+                        project_id: route.project_id,
+                        deployment_id: route.deployment_id,
+                    },
+                    reporter,
+                )
+                .await?
+            {
+                cleaned += 1;
+            }
         }
         Ok(cleaned)
     }

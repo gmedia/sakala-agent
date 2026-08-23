@@ -6,9 +6,10 @@ use std::sync::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
-    ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue, RuntimeExecutionError,
-    RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
-    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
+    NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
+    RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck,
+    RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory,
+    WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -17,7 +18,7 @@ use sakala_agent_protocol::{
 };
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use url::Url;
 use uuid::Uuid;
 
@@ -30,7 +31,10 @@ use crate::{
     },
     health::{DockerHealthChecker, HealthChecker},
     inspections::{ProjectInspector, RailpackProjectInspector},
-    routing::{CaddyFileRouteManager, DockerExecCaddyReloader, RouteManager, RouteSpec},
+    routing::{
+        CaddyFileRouteManager, DockerExecCaddyReloader, RouteIdentity, RouteManager, RouteSpec,
+    },
+    telemetry::NodeTelemetryCollector,
     workspace::{DeploymentWorkspace, GitWorkspaceManager, RepositorySource, WorkspaceManager},
 };
 
@@ -43,11 +47,13 @@ pub struct DockerRuntimeExecutor {
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
     build_permits: Arc<Semaphore>,
+    container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
     workspace_gc_max_age: std::time::Duration,
     image_gc_max_age: std::time::Duration,
     min_workspace_free_bytes: u64,
     preflight: DockerPreflight,
+    telemetry: NodeTelemetryCollector,
 }
 
 pub(crate) struct DockerPreflight {
@@ -133,6 +139,10 @@ impl DockerRuntimeExecutor {
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
     ) -> Self {
+        let telemetry = NodeTelemetryCollector::new(
+            Arc::clone(&preflight.runner),
+            preflight.workspace_root.clone(),
+        );
         Self {
             workspace,
             inspector,
@@ -142,11 +152,13 @@ impl DockerRuntimeExecutor {
             routes,
             timeout_safety,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
+            container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
             workspace_gc_max_age,
             image_gc_max_age,
             min_workspace_free_bytes,
             preflight,
+            telemetry,
         }
     }
 
@@ -377,6 +389,10 @@ impl DockerRuntimeExecutor {
         )
         .await?;
         tokio::time::timeout(applied_timeouts.start, async {
+            // The early capacity check is only a fast-fail optimization. This
+            // serialized re-check is authoritative and closes concurrent admission races.
+            let admission = self.container_admission.lock().await;
+            self.containers.ensure_capacity(project_id).await?;
             self.containers
                 .start(
                     &RunContainerRequest {
@@ -395,6 +411,7 @@ impl DockerRuntimeExecutor {
                     reporter_ref,
                 )
                 .await?;
+            drop(admission);
             self.health.wait_until_ready(container).await
         })
         .await
@@ -406,6 +423,7 @@ impl DockerRuntimeExecutor {
             .activate(
                 &RouteSpec {
                     project_id,
+                    deployment_id,
                     domain: payload.domain.clone(),
                     upstream: container.to_owned(),
                     port: payload.container_port,
@@ -475,6 +493,7 @@ impl DockerRuntimeExecutor {
             .activate(
                 &RouteSpec {
                     project_id: workload.project_id,
+                    deployment_id: workload.deployment_id,
                     domain: workload.domain.clone(),
                     upstream: container_name(workload.project_id, workload.deployment_id),
                     port: workload.port,
@@ -518,7 +537,13 @@ impl DockerRuntimeExecutor {
         else {
             if remove {
                 self.routes
-                    .deactivate(request.project_id, reporter.as_ref())
+                    .deactivate(
+                        RouteIdentity {
+                            project_id: request.project_id,
+                            deployment_id: Some(request.deployment_id),
+                        },
+                        reporter.as_ref(),
+                    )
                     .await?;
                 return Ok(CommandOutput::with_result(
                     json!({ "status": "already_stopped" }),
@@ -528,7 +553,13 @@ impl DockerRuntimeExecutor {
         };
         self.containers.stop(&workload, 10).await?;
         self.routes
-            .deactivate(workload.project_id, reporter.as_ref())
+            .deactivate(
+                RouteIdentity {
+                    project_id: workload.project_id,
+                    deployment_id: Some(workload.deployment_id),
+                },
+                reporter.as_ref(),
+            )
             .await?;
         if remove {
             self.containers.remove(&workload).await?;
@@ -698,12 +729,17 @@ async fn directory_check(name: &str, path: &std::path::Path, fatal: bool) -> Run
     }
 }
 
-fn routable_projects(report: &RuntimeReconciliationReport) -> std::collections::HashSet<Uuid> {
+fn routable_routes(
+    report: &RuntimeReconciliationReport,
+) -> std::collections::HashSet<RouteIdentity> {
     report
         .workloads
         .iter()
         .filter(|workload| workload.status.to_ascii_lowercase().starts_with("up"))
-        .map(|workload| workload.project_id)
+        .map(|workload| RouteIdentity {
+            project_id: workload.project_id,
+            deployment_id: Some(workload.deployment_id),
+        })
         .collect()
 }
 
@@ -715,8 +751,8 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.containers.detect_orphans().await?;
-        let known_projects = routable_projects(&report);
-        report.stale_routes = self.routes.discover_stale_routes(&known_projects).await?;
+        let known_routes = routable_routes(&report);
+        report.stale_routes = self.routes.discover_stale_routes(&known_routes).await?;
         report.stale_images = self
             .containers
             .detect_stale_images(self.image_gc_max_age)
@@ -794,6 +830,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
         self.containers.health_snapshot().await.map_err(Into::into)
+    }
+
+    async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {
+        Ok(self.telemetry.snapshot().await)
     }
 
     async fn reconcile_workload(
@@ -909,10 +949,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
                     let discovered = self.containers.detect_orphans().await?;
-                    let known_projects = routable_projects(&discovered);
+                    let known_routes = routable_routes(&discovered);
                     cleaned_routes += self
                         .routes
-                        .cleanup_stale_routes(&known_projects, reporter.as_ref())
+                        .cleanup_stale_routes(&known_routes, reporter.as_ref())
                         .await?;
                 }
             }

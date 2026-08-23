@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     sync::{
         Arc, Mutex,
@@ -144,6 +145,40 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
             .checks
             .iter()
             .any(|check| check.name == "workspace-disk")
+    );
+}
+
+#[tokio::test]
+async fn runtime_owns_bounded_host_telemetry_and_caches_dependency_versions() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let first = RuntimeExecutor::node_telemetry(&executor)
+        .await
+        .expect("telemetry snapshot should be available");
+    RuntimeExecutor::node_telemetry(&executor)
+        .await
+        .expect("second telemetry snapshot should be available");
+
+    assert!(first.disk_total_bytes.is_some());
+    let commands = runner.commands.lock().expect("command lock");
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.program == "git"
+                && command.args.iter().any(|arg| arg == "--version"))
+            .count(),
+        1
+    );
+    assert!(
+        commands
+            .iter()
+            .filter(|command| matches!(
+                command.program.as_str(),
+                "git" | "docker" | "railpack" | "df" | "du"
+            ))
+            .all(|command| command.timeout == Some(Duration::from_secs(2)))
     );
 }
 
@@ -491,6 +526,48 @@ async fn node_limits_concurrent_image_builds() {
     first_result.expect("first deployment should complete");
     second_result.expect("second deployment should complete");
     assert_eq!(runner.max_concurrent_builds.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_new_projects_cannot_exceed_container_admission_limit() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(AdmissionRunner::new());
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 1;
+    config.max_concurrent_builds = 2;
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let first = deploy_command("auto");
+    let mut second = deploy_command("auto");
+    second.id = Uuid::new_v4();
+    second.project_id = Some(Uuid::new_v4());
+    second.deployment_id = Some(Uuid::new_v4());
+    second.payload["domain"] = json!("second.run.sakala.localhost");
+    let first_dispatcher = CommandDispatcher::new(executor.clone());
+    let second_dispatcher = CommandDispatcher::new(executor);
+
+    let (first_result, second_result) = tokio::join!(
+        first_dispatcher.dispatch(
+            &first,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        ),
+        second_dispatcher.dispatch(
+            &second,
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new()
+        )
+    );
+
+    assert_eq!(
+        usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()),
+        1
+    );
+    let failure = first_result
+        .err()
+        .or_else(|| second_result.err())
+        .expect("one deployment must fail");
+    assert_eq!(failure.code(), "runtime_capacity_exceeded");
+    assert_eq!(runner.active.lock().expect("capacity lock").len(), 1);
 }
 
 #[tokio::test]
@@ -1090,6 +1167,29 @@ async fn approved_image_cleanup_prunes_only_retained_sakala_dangling_images() {
 }
 
 #[tokio::test]
+async fn successful_image_prune_is_not_failed_by_cosmetic_telemetry_format() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: unknown\n"));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let output = RuntimeExecutor::cleanup_runtime(
+        &executor,
+        CleanupRuntimeRequest {
+            command_id: Uuid::new_v4(),
+            approved: true,
+            targets: vec![RuntimeCleanupTarget::StaleImages],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("successful prune must not fail on cosmetic output parsing");
+
+    assert_eq!(output.result["reclaimed_image_bytes"], 0);
+}
+
+#[tokio::test]
 async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
@@ -1253,7 +1353,7 @@ async fn reconciliation_restores_known_route_only_when_explicitly_instructed() {
         fs::read_to_string(route_path)
             .expect("route should be readable")
             .starts_with(&format!(
-                "# Managed by sakala-agent for project {project_id}."
+                "# Managed by sakala-agent for project {project_id} deployment {deployment_id}."
             ))
     );
 }
@@ -1439,8 +1539,8 @@ async fn stop_missing_workload_removes_stale_owned_route_idempotently() {
     fs::write(
         &route,
         format!(
-            "# Managed by sakala-agent for project {}.\nexample.test:80 {{}}\n",
-            request.project_id
+            "# Managed by sakala-agent for project {} deployment {}.\nexample.test:80 {{}}\n",
+            request.project_id, request.deployment_id
         ),
     )
     .expect("managed route should be written");
@@ -1453,6 +1553,38 @@ async fn stop_missing_workload_removes_stale_owned_route_idempotently() {
 
     assert_eq!(output.result["status"], "already_stopped");
     assert!(!route.exists());
+}
+
+#[tokio::test]
+async fn stale_stop_command_cannot_remove_a_newer_deployment_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let stale_request = lifecycle_request();
+    let current_deployment = Uuid::new_v4();
+    fs::create_dir_all(&config.caddy_sites_dir).expect("route directory should be created");
+    let route = config
+        .caddy_sites_dir
+        .join(format!("{}.Caddyfile", stale_request.project_id));
+    let current_route = format!(
+        "# Managed by sakala-agent for project {} deployment {current_deployment}.\nexample.test:80 {{}}\n",
+        stale_request.project_id
+    );
+    fs::write(&route, &current_route).expect("current route should be written");
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    let output = RuntimeExecutor::stop_project(
+        &executor,
+        stale_request,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stale stop should remain idempotent");
+
+    assert_eq!(output.result["status"], "already_stopped");
+    assert_eq!(
+        fs::read_to_string(route).expect("current route must remain"),
+        current_route
+    );
 }
 
 #[tokio::test]
@@ -1812,6 +1944,73 @@ struct FakeRunner {
     follow_delay: Option<Duration>,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
+}
+
+struct AdmissionRunner {
+    inner: FakeRunner,
+    active: Mutex<HashSet<String>>,
+}
+
+impl AdmissionRunner {
+    fn new() -> Self {
+        Self {
+            inner: FakeRunner::new(true).with_build_delay(Duration::from_millis(25)),
+            active: Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for AdmissionRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        let capacity_probe = spec.program == "docker"
+            && spec.args.first().is_some_and(|argument| argument == "ps")
+            && !spec.args.iter().any(|argument| argument == "--all")
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("dev.sakala.project-id"));
+        if capacity_probe {
+            self.inner
+                .commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            let stdout = self
+                .active
+                .lock()
+                .expect("capacity lock")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            });
+        }
+
+        let output = self.inner.run(spec, sink).await?;
+        if output.success
+            && spec.program == "docker"
+            && spec.args.first().is_some_and(|argument| argument == "run")
+            && let Some(project) = spec.args.iter().find_map(|argument| {
+                argument
+                    .to_string_lossy()
+                    .strip_prefix("dev.sakala.project-id=")
+                    .map(str::to_owned)
+            })
+        {
+            self.active.lock().expect("capacity lock").insert(project);
+        }
+        Ok(output)
+    }
 }
 
 struct FailingGitRunner;

@@ -11,6 +11,7 @@ pub mod logs;
 pub mod process;
 mod railpack;
 pub mod routing;
+mod telemetry;
 pub mod workspace;
 
 pub use config::{DockerRuntimeConfig, TimeoutSafetyConfig};

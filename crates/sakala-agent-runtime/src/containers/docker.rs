@@ -677,7 +677,13 @@ impl ContainerEngine for DockerContainerEngine {
                 output.code
             )));
         }
-        parse_reclaimed_bytes(&output.stdout)
+        match parse_reclaimed_bytes(&output.stdout) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                tracing::warn!(%error, "Docker image prune succeeded but reclaimed-space telemetry was not parseable");
+                Ok(0)
+            }
+        }
     }
 
     async fn shutdown(&self) {
@@ -709,9 +715,9 @@ fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
     };
     let value = value.trim();
     let split = value
-        .find(|character: char| !character.is_ascii_digit())
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
         .unwrap_or(value.len());
-    let number = value[..split].parse::<u64>().map_err(|_| {
+    let number = value[..split].parse::<f64>().map_err(|_| {
         RuntimeError::Container(
             "Docker image GC returned an invalid reclaimed-space value".to_owned(),
         )
@@ -727,9 +733,13 @@ fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
             ));
         }
     };
-    number.checked_mul(multiplier).ok_or_else(|| {
-        RuntimeError::Container("Docker image GC reclaimed-space value overflowed".to_owned())
-    })
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes.is_sign_negative() || bytes > u64::MAX as f64 {
+        return Err(RuntimeError::Container(
+            "Docker image GC reclaimed-space value overflowed".to_owned(),
+        ));
+    }
+    Ok(bytes.round() as u64)
 }
 
 async fn run_container_command(
@@ -765,4 +775,25 @@ fn health_state(status: &str) -> (bool, Option<String>) {
     }
 
     (false, Some(format!("container is not running: {status}")))
+}
+
+#[cfg(test)]
+mod reclaimed_space_tests {
+    use super::parse_reclaimed_bytes;
+
+    #[test]
+    fn parses_decimal_and_compact_docker_sizes() {
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 16.43 MB\n").expect("decimal MB"),
+            (16.43_f64 * 1_048_576_f64).round() as u64
+        );
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 1.84kB\n").expect("compact kB"),
+            (1.84_f64 * 1_024_f64).round() as u64
+        );
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 0B\n").expect("zero bytes"),
+            0
+        );
+    }
 }

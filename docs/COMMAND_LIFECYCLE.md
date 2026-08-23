@@ -11,7 +11,7 @@ Pending -> Cancelled
 Pending -> Expired
 ```
 
-Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Connected agent hanya memproses command berstatus `Pending`; status lain yang tidak sengaja dikembalikan API dilewati dan dicatat sebagai warning. Endpoint agent belum diimplementasikan di `sakala-api` pada tahap ini.
+Foundation mendefinisikan mapping status tersebut melalui `CommandStatus` dan helper transisi pada core. Connected agent hanya memproses command berstatus `Pending`; status lain yang tidak sengaja dikembalikan API dilewati dan dicatat sebagai warning. Protocol revision 4 juga mewajibkan bootstrap `GET /api/agent/v1/node-state` sebelum polling dimulai.
 
 ## Flow Connected Mode
 
@@ -32,7 +32,7 @@ Polling response memakai envelope `{ "data": [...] }`. Request lifecycle selalu 
 
 `InspectProject` melakukan checkout immutable, menjalankan `railpack info`, memindai metadata repository, lalu mengembalikan `ProjectInspection` melalui completion result. Ia tidak membangun image atau mengubah runtime node.
 
-Payload `DeployProject` wajib memuat repository GitHub publik, full `commit_sha`, generated domain, internal port, builder, environment map, dan optional resource request. Resource policy berasal dari API; agent memvalidasi request terhadap node safety ceiling sebelum menjalankan proses apa pun. Runtime tidak menerima command shell mentah.
+Payload `DeployProject` wajib memuat repository GitHub public/private, full `commit_sha`, generated domain, internal port, builder, environment map, dan optional resource request. Private repository memakai credential lease sementara; runtime tidak menerima token atau command shell mentah dari payload.
 
 ## Contract Lifecycle v1
 
@@ -60,7 +60,8 @@ container (namun bukan image), sedangkan sleep mempertahankan container supaya w
 tidak membutuhkan checkout atau build. Agent tidak membuat kebijakan retry/restart
 otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane.
 `CleanupRuntime` menolak payload tanpa approval eksplisit, sementara penghapusan
-route memverifikasi marker ownership Sakala sebelum menyentuh file.
+route memverifikasi marker ownership Sakala beserta deployment ID. Command lama
+tidak boleh menghapus route deployment baru pada project yang sama.
 
 State drain tidak hanya disimpan di memory process. Saat connected Agent
 bootstrap, desired lifecycle dipulihkan dari control plane sebelum polling

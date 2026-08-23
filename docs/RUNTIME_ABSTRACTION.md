@@ -38,6 +38,11 @@ Semua adapter command memakai injectable `ProcessRunner`, sehingga test dapat me
 
 Port application-level `RuntimeExecutor` dan `RuntimeReporter` berada di core. Port teknologi seperti `ImageBuilder`, `ContainerEngine`, dan `RouteManager` tetap internal di runtime. Dependency berjalan satu arah: runtime mengimplementasikan port core, sedangkan core tidak bergantung pada runtime. Binary menjadi composition root yang menginjeksi implementasi terpilih.
 
+Host telemetry mengikuti boundary yang sama. Heartbeat core hanya memanggil
+`RuntimeExecutor::node_telemetry`; pembacaan `/proc` serta eksekusi Git, Docker,
+Buildx, Railpack, `df`, dan `du` berada di adapter runtime dan menggunakan
+process runner dengan deadline serta child-process cleanup.
+
 `InspectProject` dan `DeployProject` aktif pada Docker executor. Sleep/wake dan command runtime lain belum diaktifkan.
 
 ## Abstraction Policy
