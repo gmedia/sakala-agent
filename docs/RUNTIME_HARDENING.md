@@ -95,3 +95,30 @@ retention dan pembersihan artifact lama tetap harus Sakala-owned.
 ## Isolation Decision
 
 Docker rootful pada node khusus masih dapat dipakai untuk pilot dengan repository terkontrol. Untuk workload publik tidak tepercaya, target berikutnya adalah isolated/rootless builder terpisah dari runtime daemon. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.
+
+## Batas versi dan riset isolasi lanjut
+
+Node pilot harus memakai Docker Engine dengan Docker Buildx yang tersedia melalui
+`docker buildx version`, serta Railpack CLI yang kompatibel dengan frontend yang
+dipin pada `SAKALA_RAILPACK_FRONTEND`. Agent tidak mengklaim kompatibilitas untuk
+versi dependency yang tidak lolos preflight; versi aktual dicatat oleh preflight
+operator dan harus diuji bersama image frontend sebelum upgrade node.
+
+Pilihan berikut telah dievaluasi sebagai arah hardening, bukan fitur yang
+diaktifkan diam-diam oleh Agent v1:
+
+- **Rootless Docker/BuildKit:** mengurangi privilege daemon, namun memerlukan
+  validasi storage, networking, dan cache pada node khusus.
+- **User namespaces serta seccomp/AppArmor:** pertahanan tambahan yang perlu
+  profile workload dan verifikasi kompatibilitas aplikasi sebelum diwajibkan.
+- **gVisor:** kandidat untuk workload publik tidak tepercaya bila overhead dan
+  kompatibilitas Docker sudah diuji.
+- **containerd:** kandidat backend runtime terpisah; kontrak `RuntimeExecutor`
+  sengaja tidak mengikat core ke Docker.
+- **microVM/Firecracker:** kandidat isolasi paling kuat, tetapi bukan pengganti
+  langsung Docker tanpa control plane, image, networking, dan observability
+  model baru.
+
+Sampai evaluasi tersebut selesai, Agent hanya mendukung node Docker khusus
+dengan workload terkontrol; ia tidak mengiklankan salah satu mekanisme isolasi
+lanjutan tersebut sebagai aktif.
