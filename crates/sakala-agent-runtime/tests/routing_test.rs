@@ -40,6 +40,31 @@ async fn caddy_file_route_restores_previous_content_when_reload_fails() {
     assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test]
+async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    tokio::fs::write(&route_path, "managed route\n")
+        .await
+        .expect("route should be written");
+    let reloader = Arc::new(FailingReloader::default());
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), reloader.clone());
+
+    manager
+        .deactivate(project_id, &NoopReporter)
+        .await
+        .expect_err("reload failure should fail route deactivation");
+
+    assert_eq!(
+        tokio::fs::read_to_string(route_path)
+            .await
+            .expect("route should be restored"),
+        "managed route\n"
+    );
+    assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
+}
+
 fn route(project_id: Uuid) -> RouteSpec {
     RouteSpec {
         project_id,
