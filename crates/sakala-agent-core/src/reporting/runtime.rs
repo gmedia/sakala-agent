@@ -1,13 +1,16 @@
 use async_trait::async_trait;
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, LogBounds};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
     logs::redactor::redact_line,
-    ports::{RuntimeExecutionError, RuntimeReporter, RuntimeReporterFactory},
+    ports::{CommandOutput, RuntimeExecutionError, RuntimeReporter, RuntimeReporterFactory},
 };
 
 pub struct ApiRuntimeReporterFactory {
@@ -41,6 +44,7 @@ pub(crate) struct ApiRuntimeReporter {
     log_bounds: LogBounds,
     log_bytes_sent: Mutex<u64>,
     deployment_committed: AtomicBool,
+    committed_output: StdMutex<Option<CommandOutput>>,
 }
 
 impl ApiRuntimeReporter {
@@ -52,6 +56,7 @@ impl ApiRuntimeReporter {
             log_bounds,
             log_bytes_sent: Mutex::new(0),
             deployment_committed: AtomicBool::new(false),
+            committed_output: StdMutex::new(None),
         }
     }
 }
@@ -78,12 +83,26 @@ impl RuntimeReporter for ApiRuntimeReporter {
         Ok(())
     }
 
-    fn mark_deployment_committed(&self) {
+    fn mark_deployment_committed(&self, output: CommandOutput) {
+        *self
+            .committed_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(output);
         self.deployment_committed.store(true, Ordering::Release);
     }
 
     fn deployment_committed(&self) -> bool {
         self.deployment_committed.load(Ordering::Acquire)
+    }
+
+    fn committed_output(&self) -> Option<CommandOutput> {
+        if !self.deployment_committed() {
+            return None;
+        }
+        self.committed_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

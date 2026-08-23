@@ -244,11 +244,18 @@ pub trait RuntimeReporter: Send + Sync {
 
     /// Marks the irreversible runtime cutover. Core uses this signal to avoid
     /// turning an already-live deployment into a timeout failure.
-    fn mark_deployment_committed(&self) {}
+    fn mark_deployment_committed(&self, _output: CommandOutput) {}
 
     #[must_use]
     fn deployment_committed(&self) -> bool {
         false
+    }
+
+    /// Returns the terminal output captured at cutover when finalization must
+    /// be deferred to reconciliation after its bounded grace period.
+    #[must_use]
+    fn committed_output(&self) -> Option<CommandOutput> {
+        None
     }
 }
 

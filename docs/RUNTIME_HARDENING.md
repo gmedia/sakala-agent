@@ -67,7 +67,9 @@ Follower memakai reporter deployment yang sama dan seluruh baris tetap melewati 
 Route activation adalah commit point. Sebelum titik ini cancellation/error
 mempertahankan deployment lama dan membersihkan candidate. Setelah titik ini,
 traffic sudah berpindah sehingga cancellation atau reporting failure tidak lagi
-mengubah hasil runtime menjadi gagal; finalisasi cleanup/log follower diteruskan.
+mengubah hasil runtime menjadi gagal. Finalisasi cleanup/log follower memiliki
+grace 30 detik; ketika grace habis, hasil cutover tetap dilaporkan sukses dan
+sisa repair/cleanup ditemukan kembali oleh reconciliation atau GC.
 
 Guard ini bukan aggregate scheduler dan belum menghitung total memory/CPU reservation. Penempatan lintas node tetap pekerjaan control plane setelah MVP.
 
@@ -92,9 +94,12 @@ Agent tetap tidak menjalankan restart otomatis atau mutasi recovery.
 
 Probe host heartbeat dimiliki adapter runtime dan memakai `ProcessRunner` dengan
 deadline dua detik, process group termination, serta child reaping. Versi Git,
-Docker, Buildx, dan Railpack di-cache sekali; probe kapasitas, health runtime,
-`df`, dan `du` juga dibatasi agar satu command host yang macet tidak menahan
-heartbeat maupun shutdown tanpa batas. Core hanya memanggil port runtime.
+Versi Git, Docker, Buildx, dan Railpack di-cache sekali sebagai metadata. Status
+operasional tidak berasal dari cache tersebut: setiap heartbeat memeriksa ulang
+Docker daemon, container Caddy, network runtime, dan kemampuan menulis workspace.
+Probe kapasitas, health runtime, `df`, dan `du` juga dibatasi agar satu command
+host yang macet tidak menahan heartbeat maupun shutdown tanpa batas. Core hanya
+memanggil port runtime.
 
 Heartbeat `active` hanya menjadi `ready` ketika telemetry, capacity, health
 snapshot, dependency runtime, dan disk guard operasional. Probe failure atau

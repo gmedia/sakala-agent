@@ -282,6 +282,75 @@ async fn command_deadline_after_cutover_completes_committed_deployment() {
     .expect("committed deployment must complete after its deadline");
 }
 
+#[tokio::test]
+async fn post_commit_finalization_is_bounded_and_uses_cutover_result() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .and(body_json(json!({
+            "result": { "status": "committed-at-cutover" }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut fixture = command_fixture();
+    fixture["payload"]["timeouts"]["command_timeout_seconds"] = json!(1);
+    let command: AgentCommand = serde_json::from_value(fixture).expect("valid command");
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let started = std::time::Instant::now();
+
+    CommandProcessor::new(
+        client,
+        Arc::new(CommittedHangingRuntimeExecutor),
+        std::time::Duration::from_secs(1),
+    )
+    .with_post_commit_finalization_grace(std::time::Duration::from_millis(50))
+    .process(&command, CancellationToken::new())
+    .await
+    .expect("committed deployment must complete from its cutover snapshot");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "post-commit finalization must not wait for a hanging runtime"
+    );
+}
+
+#[tokio::test]
+async fn post_commit_finalization_error_uses_cutover_result() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .and(body_json(json!({
+            "result": { "status": "committed-at-cutover" }
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let command: AgentCommand = serde_json::from_value(command_fixture()).expect("valid command");
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+
+    CommandProcessor::new(
+        client,
+        Arc::new(CommittedFailingRuntimeExecutor),
+        std::time::Duration::from_secs(900),
+    )
+    .process(&command, CancellationToken::new())
+    .await
+    .expect("post-commit finalization error must preserve committed deployment");
+}
+
 async fn mount_lifecycle_mocks(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/agent/v1/commands"))
@@ -397,6 +466,42 @@ struct SlowRuntimeExecutor;
 
 struct CommittedSlowRuntimeExecutor;
 
+struct CommittedHangingRuntimeExecutor;
+
+struct CommittedFailingRuntimeExecutor;
+
+#[async_trait]
+impl RuntimeExecutor for CommittedFailingRuntimeExecutor {
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        reporter.mark_deployment_committed(CommandOutput::with_result(json!({
+            "status": "committed-at-cutover"
+        })));
+        Err(RuntimeExecutionError::new(
+            "runtime_finalization_failed",
+            "simulated post-commit finalization failure",
+        ))
+    }
+}
+
+#[async_trait]
+impl RuntimeExecutor for CommittedHangingRuntimeExecutor {
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        reporter.mark_deployment_committed(CommandOutput::with_result(json!({
+            "status": "committed-at-cutover"
+        })));
+        sleep(std::time::Duration::from_secs(60)).await;
+        unreachable!("bounded finalization must drop the hanging execution")
+    }
+}
+
 #[async_trait]
 impl RuntimeExecutor for CommittedSlowRuntimeExecutor {
     async fn deploy_project(
@@ -404,7 +509,7 @@ impl RuntimeExecutor for CommittedSlowRuntimeExecutor {
         _request: DeployProjectRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
-        reporter.mark_deployment_committed();
+        reporter.mark_deployment_committed(CommandOutput::empty());
         sleep(std::time::Duration::from_millis(1_100)).await;
         Ok(CommandOutput::empty())
     }

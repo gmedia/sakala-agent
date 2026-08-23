@@ -142,6 +142,8 @@ impl DockerRuntimeExecutor {
         let telemetry = NodeTelemetryCollector::new(
             Arc::clone(&preflight.runner),
             preflight.workspace_root.clone(),
+            preflight.runtime_network.clone(),
+            preflight.caddy_container.clone(),
         );
         Self {
             workspace,
@@ -441,7 +443,10 @@ impl DockerRuntimeExecutor {
             )
             .await?;
         route_activated.store(true, Ordering::Release);
-        reporter_ref.mark_deployment_committed();
+        reporter_ref.mark_deployment_committed(CommandOutput::with_result(json!({
+            "requested_resources": payload.resources,
+            "applied_resources": applied_resources,
+        })));
 
         if let Err(error) = self
             .containers

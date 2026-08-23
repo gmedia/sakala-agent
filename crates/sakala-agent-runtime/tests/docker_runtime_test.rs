@@ -3,7 +3,7 @@ use std::{
     fs,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -152,16 +152,25 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
 async fn runtime_owns_bounded_host_telemetry_and_caches_dependency_versions() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
-    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let config = runtime_config(&temp);
+    fs::create_dir_all(&config.workspace_root).expect("workspace should be available");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
 
     let first = RuntimeExecutor::node_telemetry(&executor)
         .await
         .expect("telemetry snapshot should be available");
-    RuntimeExecutor::node_telemetry(&executor)
+    assert_eq!(first.runtime_operational, Some(true));
+    assert!(
+        first.runtime_dependencies["docker"].is_null(),
+        "cached version metadata must not define live readiness"
+    );
+    runner.live_caddy.store(false, Ordering::SeqCst);
+    let second = RuntimeExecutor::node_telemetry(&executor)
         .await
         .expect("second telemetry snapshot should be available");
 
     assert!(first.disk_total_bytes.is_some());
+    assert_eq!(second.runtime_operational, Some(false));
     let commands = runner.commands.lock().expect("command lock");
     assert_eq!(
         commands
@@ -170,6 +179,15 @@ async fn runtime_owns_bounded_host_telemetry_and_caches_dependency_versions() {
                 && command.args.iter().any(|arg| arg == "--version"))
             .count(),
         1
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.program == "docker"
+                && command.args.first().is_some_and(|arg| arg == "info"))
+            .count(),
+        2,
+        "live Docker readiness must not be cached"
     );
     assert!(
         commands
@@ -1977,6 +1995,7 @@ struct FakeRunner {
     image_list_stdout: String,
     image_created_stdout: String,
     follow_delay: Option<Duration>,
+    live_caddy: AtomicBool,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
 }
@@ -2114,6 +2133,7 @@ impl FakeRunner {
             image_list_stdout: String::new(),
             image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
             follow_delay: None,
+            live_caddy: AtomicBool::new(true),
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
         }
@@ -2181,6 +2201,24 @@ impl ProcessRunner for FakeRunner {
             .lock()
             .expect("command lock")
             .push(spec.clone());
+
+        let live_caddy_probe = spec.program == "docker"
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "inspect")
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument == "{{.State.Running}}");
+        if live_caddy_probe && !self.live_caddy.load(Ordering::SeqCst) {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "Caddy is not running".to_owned(),
+            });
+        }
 
         if spec.program == "docker"
             && spec.args.iter().any(|argument| argument == "buildx")
@@ -2255,6 +2293,8 @@ impl ProcessRunner for FakeRunner {
             } else {
                 self.docker_ps_stdout.as_str()
             }
+        } else if live_caddy_probe {
+            "true\n"
         } else if spec.program == "docker"
             && spec
                 .args

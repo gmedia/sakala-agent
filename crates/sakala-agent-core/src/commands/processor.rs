@@ -19,10 +19,13 @@ use crate::{
     repositories::ApiRepositoryCredentialProvider,
 };
 
+const POST_COMMIT_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
+
 pub struct CommandProcessor {
     client: ApiClient,
     dispatcher: CommandDispatcher,
     command_timeout: Duration,
+    post_commit_finalization_grace: Duration,
 }
 
 impl CommandProcessor {
@@ -56,7 +59,16 @@ impl CommandProcessor {
                 node_lifecycle,
             ),
             command_timeout,
+            post_commit_finalization_grace: POST_COMMIT_FINALIZATION_GRACE,
         }
+    }
+
+    /// Overrides the bounded post-cutover finalization grace. Primarily useful
+    /// for deterministic integration tests and embedded Agent policies.
+    #[must_use]
+    pub fn with_post_commit_finalization_grace(mut self, grace: Duration) -> Self {
+        self.post_commit_finalization_grace = grace;
+        self
     }
 
     pub async fn process(
@@ -119,9 +131,34 @@ impl CommandProcessor {
                 if reporter.deployment_committed() {
                     warn!(
                         command_id = %command.id,
-                        "command deadline reached after deployment cutover; waiting for committed finalization"
+                        grace_seconds = self.post_commit_finalization_grace.as_secs(),
+                        "command deadline reached after deployment cutover; entering bounded finalization grace"
                     );
-                    execution.await
+                    match tokio::time::timeout(
+                        self.post_commit_finalization_grace,
+                        &mut execution,
+                    )
+                    .await
+                    {
+                        Ok(Ok(output)) => Ok(output),
+                        Ok(Err(error)) => {
+                            warn!(
+                                command_id = %command.id,
+                                error_code = error.code(),
+                                %error,
+                                "post-commit finalization failed; deferring repair to reconciliation"
+                            );
+                            Ok(reporter.committed_output().unwrap_or_default())
+                        }
+                        Err(_) => {
+                            deadline_cancellation.cancel();
+                            warn!(
+                                command_id = %command.id,
+                                "post-commit finalization grace elapsed; deferring remaining cleanup to reconciliation"
+                            );
+                            Ok(reporter.committed_output().unwrap_or_default())
+                        }
+                    }
                 } else {
                     deadline_cancellation.cancel();
                     // Give cancellation-aware runtimes a short cleanup window.
@@ -136,6 +173,18 @@ impl CommandProcessor {
                     ))
                 }
             }
+        };
+        let execution = match execution {
+            Err(error) if reporter.deployment_committed() => {
+                warn!(
+                    command_id = %command.id,
+                    error_code = error.code(),
+                    %error,
+                    "committed deployment finalization failed; preserving live runtime state"
+                );
+                Ok(reporter.committed_output().unwrap_or_default())
+            }
+            result => result,
         };
 
         match execution {

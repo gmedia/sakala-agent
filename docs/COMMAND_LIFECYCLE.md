@@ -65,9 +65,11 @@ tidak boleh menghapus route deployment baru pada project yang sama.
 
 Aktivasi route candidate adalah deployment commit point. Cancellation, deadline,
 atau kegagalan reporting sebelum cutover membatalkan deployment dan membersihkan
-candidate. Setelah cutover berhasil, Agent menyelesaikan finalisasi committed
-deployment; kegagalan event `deployment.runtime.ready` menjadi warning dan tidak
-boleh mengubah workload yang sudah live menjadi `Failed`.
+candidate. Setelah cutover berhasil, Agent memberi finalisasi committed deployment
+grace maksimum 30 detik. Jika grace habis atau finalisasi gagal, Agent memakai
+hasil yang disimpan saat cutover untuk mengirim `Complete`; sisa cleanup menjadi
+pekerjaan reconciliation/GC. Kegagalan event `deployment.runtime.ready` menjadi
+warning dan tidak boleh mengubah workload yang sudah live menjadi `Failed`.
 
 State drain tidak hanya disimpan di memory process. Saat connected Agent
 bootstrap, desired lifecycle dipulihkan dari control plane sebelum polling
