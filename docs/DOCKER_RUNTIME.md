@@ -39,7 +39,9 @@ Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
 Railpack. Image aktif dilindungi oleh referensi container. Image deployment
 sebelumnya dipertahankan minimal selama `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`
 (default tujuh hari) dan baru eligible saat dangling; cleanup tetap dibatasi
-label ownership Sakala dan tidak memakai `docker image prune -a`.
+label ownership Sakala dan tidak memakai `docker image prune -a`. Startup
+reconciliation hanya melaporkan kandidat; prune baru dijalankan oleh command
+`CleanupRuntime` yang membawa `approved: true`.
 
 ## Batas Keamanan MVP
 

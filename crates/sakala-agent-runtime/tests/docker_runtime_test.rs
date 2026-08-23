@@ -936,7 +936,7 @@ async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
 }
 
 #[tokio::test]
-async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
+async fn approved_image_cleanup_prunes_only_retained_sakala_dangling_images() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner =
         Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2MB\n"));
@@ -944,11 +944,20 @@ async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
     config.image_gc_max_age = Duration::from_secs(3_600);
     let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
 
-    let report = RuntimeExecutor::reconcile(&executor)
-        .await
-        .expect("reconciliation should complete");
+    let output = RuntimeExecutor::cleanup_runtime(
+        &executor,
+        CleanupRuntimeRequest {
+            command_id: Uuid::new_v4(),
+            approved: true,
+            targets: vec![RuntimeCleanupTarget::StaleImages],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("approved cleanup should complete");
 
-    assert_eq!(report.reclaimed_image_bytes, 2 * 1_024 * 1_024);
+    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024 * 1_024);
     let commands = runner.commands.lock().expect("command lock");
     let prune = commands
         .iter()
@@ -991,7 +1000,7 @@ async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
     assert_eq!(report.stale_images[0].image_id, "sha256:stale");
     assert_eq!(report.stale_images[0].project_id, Some(project_id));
     assert_eq!(report.stale_images[0].deployment_id, Some(deployment_id));
-    assert_eq!(report.reclaimed_image_bytes, 1_024);
+    assert_eq!(report.reclaimed_image_bytes, 0);
 }
 
 #[tokio::test]
@@ -1448,6 +1457,18 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     let reconciliation = RuntimeExecutor::reconcile(executor.as_ref())
         .await
         .expect("soak reconciliation should complete");
+    let cleanup = RuntimeExecutor::cleanup_runtime(
+        executor.as_ref(),
+        CleanupRuntimeRequest {
+            command_id: Uuid::new_v4(),
+            approved: true,
+            targets: vec![RuntimeCleanupTarget::StaleImages],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("soak image cleanup should complete");
     RuntimeExecutor::shutdown(executor.as_ref())
         .await
         .expect("soak runtime should shut down cleanly");
@@ -1493,7 +1514,7 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     );
     assert_eq!(retired_containers, ITERATIONS);
     assert_eq!(reconciliation.stale_images.len(), 1);
-    assert_eq!(reconciliation.reclaimed_image_bytes, 1_024);
+    assert_eq!(cleanup.result["reclaimed_image_bytes"], 1_024);
     assert_eq!(directory_entry_count(&workspace_root), 0);
     assert_eq!(regular_file_count(&sites_dir), 1);
     if let (Some(before), Some(after)) = (memory_before, resident_memory_bytes()) {

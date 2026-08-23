@@ -709,10 +709,6 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .workspace
             .cleanup_stale(self.workspace_gc_max_age)
             .await?;
-        report.reclaimed_image_bytes = self
-            .containers
-            .cleanup_stale_images(self.image_gc_max_age)
-            .await?;
         Ok(report)
     }
 

@@ -18,7 +18,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_RUNTIME_DRIVER` | `noop` | `noop` atau executor opt-in `docker`. |
 | `SAKALA_RUNTIME_WORKSPACE` | `/var/lib/sakala/builds` | Root workspace checkout/build sementara. |
 | `SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS` | `86400` | Umur minimum workspace UUID terbengkalai sebelum GC startup boleh menghapusnya. Nama non-UUID dan symlink tidak disentuh. |
-| `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` | `604800` | Retensi minimum image deployment sebelumnya setelah tidak lagi direferensikan container (default 7 hari). Hanya dangling image berlabel Sakala yang boleh direklamasi; image aktif tidak pernah dipilih dan Agent tidak menjalankan `docker image prune -a`. |
+| `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` | `604800` | Retensi minimum image deployment sebelumnya setelah tidak lagi direferensikan container (default 7 hari). Hanya dangling image berlabel Sakala yang boleh direklamasi oleh `CleanupRuntime` yang disetujui; image aktif tidak pernah dipilih dan Agent tidak menjalankan `docker image prune -a`. |
 | `SAKALA_MIN_WORKSPACE_FREE_MB` | `1024` | Ruang bebas minimum filesystem workspace sebelum Agent menerima checkout/build baru. Nilai di bawah batas lokal ditolak sebagai disk pressure. |
 | `SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS` | `30` | Interval pemeriksaan batch workload aktif berlabel Sakala. Agent mencatat perubahan state lokal saja sampai kontrak pelaporan health ke API disepakati. |
 | `SAKALA_CADDY_SITES_DIR` | `/var/lib/sakala/caddy/sites` | Folder route host yang dimount ke Caddy. |
