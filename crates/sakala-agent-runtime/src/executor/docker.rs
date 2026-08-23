@@ -47,6 +47,7 @@ pub struct DockerRuntimeExecutor {
 pub(crate) struct DockerPreflight {
     runner: Arc<dyn ProcessRunner>,
     workspace_root: std::path::PathBuf,
+    runtime_network: String,
     caddy_sites_dir: std::path::PathBuf,
     caddy_container: String,
 }
@@ -65,6 +66,7 @@ impl DockerRuntimeExecutor {
         let preflight = DockerPreflight {
             runner: Arc::clone(&runner),
             workspace_root: config.workspace_root.clone(),
+            runtime_network: config.runtime_network.clone(),
             caddy_sites_dir: config.caddy_sites_dir.clone(),
             caddy_container: config.caddy_container.clone(),
         };
@@ -436,6 +438,21 @@ impl DockerPreflight {
                 CommandSpec::new("docker")
                     .arg("inspect")
                     .arg(&self.caddy_container),
+            )
+            .await,
+            self.command_check(
+                "runtime-network",
+                CommandSpec::new("docker")
+                    .arg("network")
+                    .arg("inspect")
+                    .arg(&self.runtime_network),
+            )
+            .await,
+            self.command_check(
+                "workspace-disk",
+                CommandSpec::new("df")
+                    .arg("-Pk")
+                    .arg(self.workspace_root.as_os_str()),
             )
             .await,
         ];

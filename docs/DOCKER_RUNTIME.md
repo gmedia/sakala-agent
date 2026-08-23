@@ -25,7 +25,7 @@ project/deployment valid dan menyimpan status Docker-nya dalam report lokal.
 Container dengan label tidak lengkap atau status `Created`/`Exited`/`Dead`
 tetap dilaporkan sebagai orphan, bukan dihapus otomatis.
 
-Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, serta direktori workspace dan route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator.
+Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, network runtime, filesystem workspace (termasuk akses direktori), disk workspace, serta direktori route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator.
 
 Image ditag berdasarkan project, commit, dan deployment. Image dan container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
 

@@ -113,13 +113,25 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
         .expect("fake runtime dependencies should be checked");
 
     assert!(!report.has_fatal_failure());
-    assert_eq!(report.checks.len(), 7);
+    assert_eq!(report.checks.len(), 9);
     assert!(report.checks.iter().any(|check| check.name == "git"));
     assert!(
         report
             .checks
             .iter()
             .any(|check| check.name == "caddy-routing")
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "runtime-network")
+    );
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "workspace-disk")
     );
 }
 
