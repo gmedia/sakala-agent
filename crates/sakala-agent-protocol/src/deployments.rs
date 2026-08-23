@@ -49,6 +49,17 @@ pub struct AppliedRuntimeResources {
 pub struct DeployProjectResult {
     pub requested_resources: RuntimeResourceLimits,
     pub applied_resources: AppliedRuntimeResources,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub finalization_deferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_deferred_reason: Option<FinalizationDeferredReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizationDeferredReason {
+    GraceElapsed,
+    RuntimeError,
 }
 
 /// Immutable input required to deploy one HTTP application.
@@ -75,4 +86,8 @@ pub struct DeployProjectPayload {
 
 const fn default_container_port() -> u16 {
     3000
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

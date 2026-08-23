@@ -69,7 +69,9 @@ mempertahankan deployment lama dan membersihkan candidate. Setelah titik ini,
 traffic sudah berpindah sehingga cancellation atau reporting failure tidak lagi
 mengubah hasil runtime menjadi gagal. Finalisasi cleanup/log follower memiliki
 grace 30 detik; ketika grace habis, hasil cutover tetap dilaporkan sukses dan
-sisa repair/cleanup ditemukan kembali oleh reconciliation atau GC.
+result membawa `finalization_deferred=true`. Control plane wajib menargetkan
+deployment sebelumnya dengan `StopProject`; local reconciliation/GC tidak
+menghapus superseded container yang masih running tanpa desired-state command.
 
 Guard ini bukan aggregate scheduler dan belum menghitung total memory/CPU reservation. Penempatan lintas node tetap pekerjaan control plane setelah MVP.
 

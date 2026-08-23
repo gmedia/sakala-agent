@@ -22,7 +22,7 @@ pub use commands::{
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
-    LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
+    FinalizationDeferredReason, LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::HeartbeatPayload;

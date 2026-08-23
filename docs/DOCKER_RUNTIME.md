@@ -59,7 +59,7 @@ Ini belum merupakan multi-tenant sandbox. Docker daemon access tetap privileged;
 
 Lihat `examples/commands/deploy-project.json`. `builder=auto` memilih root Dockerfile bila tersedia dan Railpack bila tidak tersedia. Dockerfile pada subdirectory dan manual command belum didukung.
 
-Resource request berbentuk `memory_mb`, `cpu_millis`, dan `pids_limit`. API adalah source of truth untuk policy produk; agent hanya memakai fallback lokal saat field kosong dan menolak nilai yang melampaui hard maximum node. Completion result mengembalikan nilai `requested_resources` dan `applied_resources` agar API dapat menyimpan konfigurasi runtime aktual.
+Resource request berbentuk `memory_mb`, `cpu_millis`, dan `pids_limit`. API adalah source of truth untuk policy produk; agent hanya memakai fallback lokal saat field kosong dan menolak nilai yang melampaui hard maximum node. Completion result mengembalikan nilai `requested_resources` dan `applied_resources` agar API dapat menyimpan konfigurasi runtime aktual. Jika finalisasi setelah route cutover ditunda, result juga membawa `finalization_deferred=true`; API wajib menghentikan deployment sebelumnya dengan `StopProject` karena Agent tidak menghapus running superseded workload secara otomatis.
 
 ## Verifikasi
 

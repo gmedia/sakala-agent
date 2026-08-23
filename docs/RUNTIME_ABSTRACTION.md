@@ -45,7 +45,8 @@ process runner dengan deadline serta child-process cleanup. Metadata versi
 dependency di-cache, sedangkan readiness Docker daemon, Caddy, network runtime,
 dan workspace diperiksa ulang pada setiap snapshot.
 
-`InspectProject` dan `DeployProject` aktif pada Docker executor. Sleep/wake dan command runtime lain belum diaktifkan.
+Docker executor mengaktifkan inspection, deployment, seluruh workload lifecycle,
+reconciliation eksplisit, cleanup runtime yang disetujui, serta drain/resume node.
 
 ## Abstraction Policy
 

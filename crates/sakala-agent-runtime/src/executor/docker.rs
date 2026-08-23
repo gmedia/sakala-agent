@@ -322,6 +322,8 @@ impl DockerRuntimeExecutor {
         let completion = serde_json::to_value(DeployProjectResult {
             requested_resources: payload.resources,
             applied_resources,
+            finalization_deferred: false,
+            finalization_deferred_reason: None,
         })
         .map_err(|error| {
             RuntimeError::Execution(format!("failed to serialize deployment result: {error}"))

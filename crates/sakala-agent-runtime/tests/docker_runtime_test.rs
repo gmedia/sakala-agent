@@ -48,6 +48,10 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
     );
     assert_eq!(output.result["applied_resources"]["memory_mb"], 256);
     assert_eq!(output.result["applied_resources"]["cpu_millis"], 500);
+    assert!(
+        output.result.get("finalization_deferred").is_none(),
+        "normal completion must not request control-plane repair"
+    );
 
     let commands = runner.commands.lock().expect("command lock");
     assert!(commands.iter().any(|command| {

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use sakala_agent_protocol::{
     AgentCommand, CommandType, CompleteCommandPayload, DeploymentEvent, DeploymentEventLevel,
-    LogBounds,
+    FinalizationDeferredReason, LogBounds,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -14,7 +14,7 @@ use crate::{
     CoreError, NodeLifecycle,
     api::ApiClient,
     commands::CommandDispatcher,
-    ports::{RuntimeExecutor, RuntimeReporter},
+    ports::{CommandOutput, RuntimeExecutor, RuntimeReporter},
     reporting::ApiRuntimeReporter,
     repositories::ApiRepositoryCredentialProvider,
 };
@@ -146,17 +146,23 @@ impl CommandProcessor {
                                 command_id = %command.id,
                                 error_code = error.code(),
                                 %error,
-                                "post-commit finalization failed; deferring repair to reconciliation"
+                                "post-commit finalization failed; requesting control-plane repair"
                             );
-                            Ok(reporter.committed_output().unwrap_or_default())
+                            Ok(deferred_committed_output(
+                                reporter.as_ref(),
+                                FinalizationDeferredReason::RuntimeError,
+                            ))
                         }
                         Err(_) => {
                             deadline_cancellation.cancel();
                             warn!(
                                 command_id = %command.id,
-                                "post-commit finalization grace elapsed; deferring remaining cleanup to reconciliation"
+                                "post-commit finalization grace elapsed; requesting control-plane repair"
                             );
-                            Ok(reporter.committed_output().unwrap_or_default())
+                            Ok(deferred_committed_output(
+                                reporter.as_ref(),
+                                FinalizationDeferredReason::GraceElapsed,
+                            ))
                         }
                     }
                 } else {
@@ -182,7 +188,10 @@ impl CommandProcessor {
                     %error,
                     "committed deployment finalization failed; preserving live runtime state"
                 );
-                Ok(reporter.committed_output().unwrap_or_default())
+                Ok(deferred_committed_output(
+                    reporter.as_ref(),
+                    FinalizationDeferredReason::RuntimeError,
+                ))
             }
             result => result,
         };
@@ -251,4 +260,24 @@ impl CommandProcessor {
         }
         Ok((Duration::from_secs(requested), payload.log_bounds))
     }
+}
+
+fn deferred_committed_output(
+    reporter: &dyn RuntimeReporter,
+    reason: FinalizationDeferredReason,
+) -> CommandOutput {
+    let mut output = reporter.committed_output().unwrap_or_default();
+    if let Some(result) = output.result.as_object_mut() {
+        result.insert("finalization_deferred".to_owned(), json!(true));
+        result.insert("finalization_deferred_reason".to_owned(), json!(reason));
+        return output;
+    }
+
+    let committed_result = std::mem::take(&mut output.result);
+    output.result = json!({
+        "committed_result": committed_result,
+        "finalization_deferred": true,
+        "finalization_deferred_reason": reason,
+    });
+    output
 }

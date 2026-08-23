@@ -1,4 +1,6 @@
-use sakala_agent_protocol::{AgentCommand, CommandType};
+use sakala_agent_protocol::{
+    AgentCommand, CommandType, DeployProjectResult, FinalizationDeferredReason,
+};
 
 #[test]
 fn api_deploy_project_fixture_deserializes_with_runtime_limits() {
@@ -40,7 +42,46 @@ fn api_lifecycle_fixtures_identify_one_managed_workload() {
 }
 
 #[test]
-fn api_reconciliation_and_cleanup_fixtures_match_protocol_revision_three() {
+fn deploy_completion_defaults_to_no_deferred_finalization_signal() {
+    let result: DeployProjectResult = serde_json::from_value(serde_json::json!({
+        "requested_resources": {
+            "memory_mb": 256,
+            "cpu_millis": 500,
+            "pids_limit": 128
+        },
+        "applied_resources": {
+            "memory_mb": 256,
+            "cpu_millis": 500,
+            "pids_limit": 128
+        }
+    }))
+    .expect("legacy normal completion must remain compatible");
+
+    assert!(!result.finalization_deferred);
+    assert_eq!(result.finalization_deferred_reason, None);
+    let wire = serde_json::to_value(result).expect("completion should serialize");
+    assert!(wire.get("finalization_deferred").is_none());
+    assert!(wire.get("finalization_deferred_reason").is_none());
+
+    let deferred: DeployProjectResult = serde_json::from_value(serde_json::json!({
+        "requested_resources": {},
+        "applied_resources": {
+            "memory_mb": 256,
+            "cpu_millis": 500,
+            "pids_limit": 128
+        },
+        "finalization_deferred": true,
+        "finalization_deferred_reason": "grace_elapsed"
+    }))
+    .expect("deferred completion must match protocol");
+    assert_eq!(
+        deferred.finalization_deferred_reason,
+        Some(FinalizationDeferredReason::GraceElapsed)
+    );
+}
+
+#[test]
+fn api_reconciliation_and_cleanup_fixtures_match_protocol_revision_four() {
     let reconciliation: AgentCommand =
         serde_json::from_str(include_str!("../examples/commands/reconcile-workload.json"))
             .expect("API ReconcileWorkload fixture must deserialize");

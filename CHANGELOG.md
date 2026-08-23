@@ -43,6 +43,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Fixed
 
+- Tandai completion deployment yang melewati post-commit finalization grace sebagai `finalization_deferred` agar control plane dapat menghentikan superseded workload secara eksplisit.
 - Batasi finalisasi deployment setelah cutover dengan grace 30 detik dan pisahkan cached dependency versions dari live readiness Docker, Caddy, network, serta workspace.
 - Jadikan route cutover sebagai deployment commit point, lindungi modern route dari stale legacy cleanup, pertahankan partial telemetry, dan laporkan node aktif yang tidak operasional sebagai degraded.
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.

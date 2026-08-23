@@ -292,7 +292,11 @@ async fn post_commit_finalization_is_bounded_and_uses_cutover_result() {
             "/api/agent/v1/commands/{COMMAND_ID}/complete"
         )))
         .and(body_json(json!({
-            "result": { "status": "committed-at-cutover" }
+            "result": {
+                "status": "committed-at-cutover",
+                "finalization_deferred": true,
+                "finalization_deferred_reason": "grace_elapsed"
+            }
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)
@@ -331,7 +335,11 @@ async fn post_commit_finalization_error_uses_cutover_result() {
             "/api/agent/v1/commands/{COMMAND_ID}/complete"
         )))
         .and(body_json(json!({
-            "result": { "status": "committed-at-cutover" }
+            "result": {
+                "status": "committed-at-cutover",
+                "finalization_deferred": true,
+                "finalization_deferred_reason": "runtime_error"
+            }
         })))
         .respond_with(ResponseTemplate::new(204))
         .expect(1)

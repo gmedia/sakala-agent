@@ -252,7 +252,7 @@ pub trait RuntimeReporter: Send + Sync {
     }
 
     /// Returns the terminal output captured at cutover when finalization must
-    /// be deferred to reconciliation after its bounded grace period.
+    /// be deferred to an explicit control-plane repair after its bounded grace.
     #[must_use]
     fn committed_output(&self) -> Option<CommandOutput> {
         None

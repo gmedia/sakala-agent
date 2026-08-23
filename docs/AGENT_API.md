@@ -462,6 +462,37 @@ Completion selalu memakai envelope result. Deployment berhasil mengembalikan req
 }
 ```
 
+Jika route sudah committed tetapi finalisasi cleanup melewati grace Agent atau
+mengembalikan error, command tetap sukses sesuai kondisi runtime dan result
+membawa sinyal repair eksplisit:
+
+```json
+{
+  "result": {
+    "requested_resources": {
+      "memory_mb": 256,
+      "cpu_millis": 500,
+      "pids_limit": 128
+    },
+    "applied_resources": {
+      "memory_mb": 256,
+      "cpu_millis": 500,
+      "pids_limit": 128
+    },
+    "finalization_deferred": true,
+    "finalization_deferred_reason": "grace_elapsed"
+  }
+}
+```
+
+`finalization_deferred_reason` bernilai `grace_elapsed` atau `runtime_error`.
+Ketika `finalization_deferred=true`, API **wajib** mencari deployment sebelumnya
+pada project/node yang sama dan mengirim `StopProject` idempoten untuk setiap
+deployment lama tersebut. Target tidak boleh deployment baru pada command ini.
+API tidak boleh menganggap startup reconciliation atau GC Agent akan menghapus
+container lama yang masih running. Heartbeat/capacity dipakai untuk memastikan
+repair selesai dan node kembali memiliki satu workload aktif yang diinginkan.
+
 Command tanpa output mengirim `null`:
 
 ```json
