@@ -288,6 +288,12 @@ untuk aturan rollout dan command yang belum didukung.
       "active": 2,
       "starting": 0,
       "unhealthy": 0
+    },
+    "runtime_dependencies": {
+      "git": "git version 2.47.0",
+      "docker": "27.3.1",
+      "buildx": "github.com/docker/buildx v0.17.1",
+      "railpack": "railpack 0.23.0"
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"

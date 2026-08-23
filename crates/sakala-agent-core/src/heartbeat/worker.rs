@@ -63,6 +63,7 @@ async fn payload(
 ) -> HeartbeatPayload {
     let resources = node_resources(workspace_root).await;
     let workloads = workload_statistics(runtime).await;
+    let dependencies = runtime_dependency_versions().await;
     HeartbeatPayload {
         status: match lifecycle_state {
             NodeLifecycleState::Active => NodeStatus::Ready,
@@ -95,9 +96,38 @@ async fn payload(
                 "starting": workloads.starting,
                 "unhealthy": workloads.unhealthy,
             },
+            "runtime_dependencies": dependencies,
         }),
         sent_at: OffsetDateTime::now_utc(),
     }
+}
+
+async fn runtime_dependency_versions() -> serde_json::Value {
+    let (git, docker, buildx, railpack) = tokio::join!(
+        command_version("git", &["--version"]),
+        command_version("docker", &["version", "--format", "{{.Server.Version}}"]),
+        command_version("docker", &["buildx", "version"]),
+        command_version("railpack", &["--version"]),
+    );
+    json!({
+        "git": git,
+        "docker": docker,
+        "buildx": buildx,
+        "railpack": railpack,
+    })
+}
+
+async fn command_version(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new(program)
+        .args(arguments)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!version.is_empty()).then_some(version)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
