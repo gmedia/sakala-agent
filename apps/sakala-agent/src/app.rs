@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use sakala_agent_core::{
-    AgentMode,
+    AgentMode, NodeLifecycle,
     api::ApiClient,
     heartbeat,
     ports::{RuntimeExecutor, RuntimePreflightReport},
@@ -61,6 +61,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Err(error) => warn!(%error, "runtime reconciliation scan failed"),
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let node_lifecycle = Arc::new(NodeLifecycle::new());
 
     let runtime_health_task = tokio::spawn(sakala_agent_core::health::worker::run(
         Arc::clone(&runtime),
@@ -71,12 +72,14 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
         config.agent.clone(),
         client.clone(),
+        Arc::clone(&node_lifecycle),
         shutdown_rx.clone(),
     ));
     let poller_task = tokio::spawn(scheduler::poller::run(
         config.agent,
         client,
         Arc::clone(&runtime),
+        node_lifecycle,
         shutdown_rx,
     ));
 

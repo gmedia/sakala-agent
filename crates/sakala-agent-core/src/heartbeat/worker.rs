@@ -1,18 +1,21 @@
+use std::sync::Arc;
+
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
-use crate::{AgentConfig, api::ApiClient};
+use crate::{AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient};
 
 pub async fn run(
     config: AgentConfig,
     client: Option<ApiClient>,
+    node_lifecycle: Arc<NodeLifecycle>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let payload = payload(&config);
+        let payload = payload(&config, node_lifecycle.state());
 
         if let Some(client) = &client {
             if let Err(error) = client.heartbeat(&payload).await {
@@ -39,9 +42,14 @@ pub async fn run(
     info!("heartbeat worker stopped");
 }
 
-fn payload(config: &AgentConfig) -> HeartbeatPayload {
+fn payload(config: &AgentConfig, lifecycle_state: NodeLifecycleState) -> HeartbeatPayload {
     HeartbeatPayload {
-        status: NodeStatus::Ready,
+        status: match lifecycle_state {
+            NodeLifecycleState::Active => NodeStatus::Ready,
+            NodeLifecycleState::Draining => NodeStatus::Draining,
+            NodeLifecycleState::Drained => NodeStatus::Drained,
+            NodeLifecycleState::Maintenance => NodeStatus::Maintenance,
+        },
         node: NodeInfo {
             hostname: std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_owned()),
             runtime_network: config.runtime_network.clone(),
@@ -50,6 +58,7 @@ fn payload(config: &AgentConfig) -> HeartbeatPayload {
         metadata: json!({
             "version": env!("CARGO_PKG_VERSION"),
             "protocol_version": PROTOCOL_VERSION,
+            "lifecycle_state": format!("{lifecycle_state:?}").to_ascii_lowercase(),
         }),
         sent_at: OffsetDateTime::now_utc(),
     }
@@ -61,7 +70,7 @@ mod tests {
 
     use sakala_agent_protocol::PROTOCOL_VERSION;
 
-    use crate::AgentConfig;
+    use crate::{AgentConfig, NodeLifecycleState};
 
     use super::payload;
 
@@ -69,7 +78,7 @@ mod tests {
     fn heartbeat_identifies_the_wire_contract_revision() {
         let config = AgentConfig::from_values(&HashMap::new())
             .expect("default agent config should be valid");
-        let heartbeat = payload(&config);
+        let heartbeat = payload(&config, NodeLifecycleState::Active);
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));

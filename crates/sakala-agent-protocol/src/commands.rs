@@ -16,6 +16,8 @@ pub enum CommandType {
     WakeProject,
     HealthCheck,
     RefreshRoute,
+    DrainNode,
+    ResumeNode,
 }
 
 /// Command record returned by the control-plane polling endpoint.

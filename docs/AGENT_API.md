@@ -122,6 +122,11 @@ mengirim nama Docker, domain, port, command shell, atau credential pada payload
 lifecycle. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
 refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
 
+`DrainNode` dan `ResumeNode` adalah command node-level. Keduanya memakai
+`project_id: null`, `deployment_id: null`, dan payload `{}`. Saat draining atau
+drained, API hanya perlu menawarkan kedua command ini kepada node tersebut;
+command workload lain dibiarkan pending sampai node kembali active.
+
 ## Polling and Claim Semantics
 
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.

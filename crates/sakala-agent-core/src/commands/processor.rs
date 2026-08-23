@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{
-    CoreError, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
+    CoreError, NodeLifecycle, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
     reporting::ApiRuntimeReporter, repositories::ApiRepositoryCredentialProvider,
 };
 
@@ -28,12 +28,28 @@ impl CommandProcessor {
         runtime: Arc<dyn RuntimeExecutor>,
         command_timeout: Duration,
     ) -> Self {
+        Self::with_node_lifecycle(
+            client,
+            runtime,
+            command_timeout,
+            Arc::new(NodeLifecycle::new()),
+        )
+    }
+
+    #[must_use]
+    pub fn with_node_lifecycle(
+        client: ApiClient,
+        runtime: Arc<dyn RuntimeExecutor>,
+        command_timeout: Duration,
+        node_lifecycle: Arc<NodeLifecycle>,
+    ) -> Self {
         let repository_credentials = Arc::new(ApiRepositoryCredentialProvider::new(client.clone()));
         Self {
             client,
-            dispatcher: CommandDispatcher::with_repository_credentials(
+            dispatcher: CommandDispatcher::with_dependencies(
                 runtime,
                 repository_credentials,
+                node_lifecycle,
             ),
             command_timeout,
         }

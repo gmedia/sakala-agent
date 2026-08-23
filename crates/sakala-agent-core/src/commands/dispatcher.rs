@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
-use sakala_agent_protocol::{AgentCommand, CommandType};
+use sakala_agent_protocol::{AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel};
+use serde_json::json;
+use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    NodeLifecycle, NodeLifecycleState,
     commands::handlers::{deploy_project, inspect_project},
     ports::{
         CommandOutput, RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor,
@@ -14,6 +17,7 @@ use crate::{
 pub struct CommandDispatcher {
     runtime: Arc<dyn RuntimeExecutor>,
     repository_credentials: Arc<dyn RepositoryCredentialProvider>,
+    node_lifecycle: Arc<NodeLifecycle>,
 }
 
 impl CommandDispatcher {
@@ -22,6 +26,7 @@ impl CommandDispatcher {
         Self {
             runtime,
             repository_credentials: Arc::new(UnavailableRepositoryCredentialProvider),
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
         }
     }
 
@@ -33,6 +38,20 @@ impl CommandDispatcher {
         Self {
             runtime,
             repository_credentials,
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_dependencies(
+        runtime: Arc<dyn RuntimeExecutor>,
+        repository_credentials: Arc<dyn RepositoryCredentialProvider>,
+        node_lifecycle: Arc<NodeLifecycle>,
+    ) -> Self {
+        Self {
+            runtime,
+            repository_credentials,
+            node_lifecycle,
         }
     }
 
@@ -92,6 +111,40 @@ impl CommandDispatcher {
                 self.runtime
                     .refresh_route(lifecycle_request(command, cancellation)?, reporter)
                     .await
+            }
+            CommandType::DrainNode => {
+                self.node_lifecycle.set(NodeLifecycleState::Draining);
+                reporter
+                    .event(DeploymentEvent {
+                        event_type: "node.drain.started".to_owned(),
+                        level: DeploymentEventLevel::Info,
+                        message: "Node stopped accepting new workload commands.".to_owned(),
+                        metadata: json!({}),
+                        occurred_at: OffsetDateTime::now_utc(),
+                    })
+                    .await?;
+                Ok(CommandOutput::with_result(json!({ "state": "draining" })))
+            }
+            CommandType::ResumeNode => {
+                let preflight = self.runtime.preflight().await?;
+                if preflight.has_fatal_failure() {
+                    return Err(RuntimeExecutionError::new(
+                        "runtime_preflight_failed",
+                        "node cannot resume because runtime preflight has fatal failures",
+                    ));
+                }
+                self.node_lifecycle.set(NodeLifecycleState::Active);
+                reporter
+                    .event(DeploymentEvent {
+                        event_type: "node.resume.completed".to_owned(),
+                        level: DeploymentEventLevel::Info,
+                        message: "Node preflight passed and workload command processing resumed."
+                            .to_owned(),
+                        metadata: json!({}),
+                        occurred_at: OffsetDateTime::now_utc(),
+                    })
+                    .await?;
+                Ok(CommandOutput::with_result(json!({ "state": "active" })))
             }
         }
     }

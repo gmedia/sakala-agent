@@ -4,31 +4,40 @@ use std::{
     sync::Arc,
 };
 
-use sakala_agent_protocol::{AgentCommand, CommandStatus};
+use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
 use tokio::{sync::watch, task::JoinSet, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::{AgentConfig, api::ApiClient, commands::CommandProcessor, ports::RuntimeExecutor};
+use crate::{
+    AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, commands::CommandProcessor,
+    ports::RuntimeExecutor,
+};
 
 pub async fn run(
     config: AgentConfig,
     client: Option<ApiClient>,
     runtime: Arc<dyn RuntimeExecutor>,
+    node_lifecycle: Arc<NodeLifecycle>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let handler = client.as_ref().map(|client| {
-        Arc::new(CommandProcessor::new(
+        Arc::new(CommandProcessor::with_node_lifecycle(
             client.clone(),
             runtime,
             config.command_timeout(),
+            Arc::clone(&node_lifecycle),
         ))
     });
     let mut executions = CommandExecutions::new(config.max_concurrent_commands);
 
     'polling: loop {
         executions.reap_completed();
+        if node_lifecycle.state() == NodeLifecycleState::Draining && executions.len() == 0 {
+            node_lifecycle.set(NodeLifecycleState::Drained);
+            info!("node drain completed; workload command processing is paused");
+        }
 
         if let (Some(client), Some(handler)) = (&client, &handler) {
             match client.poll_commands().await {
@@ -39,6 +48,19 @@ pub async fn run(
                                 command_id = %command.id,
                                 status = ?command.status,
                                 "skipping command that is not pending"
+                            );
+                            continue;
+                        }
+                        if !node_lifecycle.accepts_workload_commands()
+                            && !matches!(
+                                command.command_type,
+                                CommandType::DrainNode | CommandType::ResumeNode
+                            )
+                        {
+                            debug!(
+                                command_id = %command.id,
+                                state = ?node_lifecycle.state(),
+                                "leaving workload command pending while node is not active"
                             );
                             continue;
                         }
