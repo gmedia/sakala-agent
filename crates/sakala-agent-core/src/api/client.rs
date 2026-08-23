@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use reqwest::{Client, Method, RequestBuilder, Url, header::ACCEPT};
 use sakala_agent_protocol::{
-    AgentCommand, CompleteCommandPayload, DeploymentEvent, DeploymentLog, HeartbeatPayload,
+    AgentCommand, CommandStatus, CompleteCommandPayload, DeploymentEvent, DeploymentLog,
+    HeartbeatPayload,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -126,8 +127,12 @@ impl ApiClient {
         command_id: Uuid,
         payload: &CompleteCommandPayload,
     ) -> Result<(), CoreError> {
-        self.post(&endpoints::command_action(command_id, "complete"), payload)
-            .await
+        self.post_terminal(
+            &endpoints::command_action(command_id, "complete"),
+            payload,
+            CommandStatus::Succeeded,
+        )
+        .await
     }
 
     pub async fn fail(
@@ -136,12 +141,13 @@ impl ApiClient {
         error_code: &str,
         error_message: &str,
     ) -> Result<(), CoreError> {
-        self.post(
+        self.post_terminal(
             &endpoints::command_action(command_id, "fail"),
             &FailCommandPayload {
                 error_code,
                 error_message,
             },
+            CommandStatus::Failed,
         )
         .await
     }
@@ -189,6 +195,31 @@ impl ApiClient {
 
         Ok(())
     }
+
+    async fn post_terminal<T: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        payload: &T,
+        expected: CommandStatus,
+    ) -> Result<(), CoreError> {
+        let response = self
+            .request(Method::POST, endpoint)
+            .json(payload)
+            .send()
+            .await?;
+        if response.status() != reqwest::StatusCode::CONFLICT {
+            response.error_for_status()?;
+            return Ok(());
+        }
+        let terminal = response.json::<TerminalConflictPayload>().await?;
+        if terminal.status == expected {
+            return Ok(());
+        }
+        Err(CoreError::CommandTerminalConflict(format!(
+            "{:?}",
+            terminal.status
+        )))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +231,11 @@ struct ApiEnvelope<T> {
 struct FailCommandPayload<'a> {
     error_code: &'a str,
     error_message: &'a str,
+}
+
+#[derive(Deserialize)]
+struct TerminalConflictPayload {
+    status: CommandStatus,
 }
 
 #[derive(Deserialize)]

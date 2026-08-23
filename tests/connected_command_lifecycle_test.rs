@@ -9,7 +9,7 @@ use sakala_agent_core::{
         RuntimeReporter,
     },
 };
-use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
+use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType, CompleteCommandPayload};
 use sakala_agent_runtime::NoopRuntimeExecutor;
 use serde_json::json;
 use tokio::time::sleep;
@@ -71,6 +71,47 @@ async fn private_repository_credential_fixture_matches_agent_contract() {
 
     assert_eq!(credential.username, "x-access-token");
     assert!(!format!("{credential:?}").contains("ghs_ephemeral_fixture_token"));
+}
+
+#[tokio::test]
+async fn terminal_retry_is_idempotent_only_for_the_same_terminal_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "status": "Succeeded",
+            "terminal_at": "2026-08-23T10:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/fail")))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "status": "Succeeded",
+            "terminal_at": "2026-08-23T10:00:00Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let command: AgentCommand = serde_json::from_value(command_fixture())
+        .expect("command fixture should match the protocol");
+    client
+        .complete(command.id, &CompleteCommandPayload { result: json!({}) })
+        .await
+        .expect("same terminal result must be idempotent");
+    let error = client
+        .fail(
+            command.id,
+            "runtime_execution_failed",
+            "must not overwrite success",
+        )
+        .await
+        .expect_err("failure must not overwrite a succeeded command");
+    assert!(error.to_string().contains("Succeeded"));
 }
 
 #[tokio::test]
