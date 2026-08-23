@@ -60,6 +60,27 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         }
         Err(error) => warn!(%error, "runtime reconciliation scan failed"),
     }
+    match runtime.health_snapshot().await {
+        Ok(snapshots) => {
+            let unhealthy = snapshots.iter().filter(|snapshot| !snapshot.ready).count();
+            info!(
+                inspected_workloads = snapshots.len(),
+                unhealthy_workloads = unhealthy,
+                "startup workload health verification completed"
+            );
+            for snapshot in snapshots.into_iter().filter(|snapshot| !snapshot.ready) {
+                warn!(
+                    container_id = %snapshot.workload.container_id,
+                    project_id = %snapshot.workload.project_id,
+                    deployment_id = %snapshot.workload.deployment_id,
+                    status = %snapshot.workload.status,
+                    reason = ?snapshot.reason,
+                    "recovered workload is not ready"
+                );
+            }
+        }
+        Err(error) => warn!(%error, "startup workload health verification failed"),
+    }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let node_lifecycle = Arc::new(NodeLifecycle::new());
 
