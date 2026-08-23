@@ -120,6 +120,13 @@ async fn payload(
                 "starting": workloads.starting,
                 "unhealthy": workloads.unhealthy,
                 "stopped": workloads.stopped,
+                "unhealthy_details": workloads.unhealthy_details.iter().map(|snapshot| json!({
+                    "container_id": snapshot.workload.container_id,
+                    "project_id": snapshot.workload.project_id,
+                    "deployment_id": snapshot.workload.deployment_id,
+                    "status": snapshot.workload.status,
+                    "reason": snapshot.reason,
+                })).collect::<Vec<_>>(),
             },
             "execution": {
                 "active_commands": scheduler_metrics.active_commands(),
@@ -188,7 +195,7 @@ async fn command_version(program: &str, arguments: &[&str]) -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct WorkloadStatistics {
     active: Option<usize>,
     stopped: Option<usize>,
@@ -196,6 +203,7 @@ struct WorkloadStatistics {
     unhealthy: Option<usize>,
     active_builds: Option<usize>,
     maximum_concurrent_builds: Option<usize>,
+    unhealthy_details: Vec<crate::ports::RuntimeHealthSnapshot>,
 }
 
 async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
@@ -225,8 +233,8 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
                 .contains("starting")
         })
         .count();
-    let unhealthy = snapshots
-        .iter()
+    let unhealthy_details = snapshots
+        .into_iter()
         .filter(|snapshot| {
             !snapshot.ready
                 && !snapshot
@@ -235,14 +243,15 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
                     .to_ascii_lowercase()
                     .contains("starting")
         })
-        .count();
+        .collect::<Vec<_>>();
     WorkloadStatistics {
         active,
         stopped,
         active_builds,
         maximum_concurrent_builds,
         starting: Some(starting),
-        unhealthy: Some(unhealthy),
+        unhealthy: Some(unhealthy_details.len()),
+        unhealthy_details,
     }
 }
 

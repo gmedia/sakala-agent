@@ -288,7 +288,8 @@ untuk aturan rollout dan command yang belum didukung.
       "active": 2,
       "starting": 0,
       "unhealthy": 0,
-      "stopped": 1
+      "stopped": 1,
+      "unhealthy_details": []
     },
     "disk_pressure": {
       "state": "normal",
