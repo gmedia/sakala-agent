@@ -1004,6 +1004,26 @@ async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
 }
 
 #[tokio::test]
+async fn reconciliation_does_not_report_recent_dangling_image_as_stale() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let created = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current time should format");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_image_list_output("sha256:recent\t\t\n")
+            .with_image_created_output(format!("{created}\n")),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation should inspect recent image age");
+
+    assert!(report.stale_images.is_empty());
+}
+
+#[tokio::test]
 async fn approved_cleanup_runs_only_requested_sakala_targets() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner =
@@ -1634,6 +1654,7 @@ struct FakeRunner {
     previous_container_inspection: Option<String>,
     image_prune_stdout: String,
     image_list_stdout: String,
+    image_created_stdout: String,
     follow_delay: Option<Duration>,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
@@ -1703,6 +1724,7 @@ impl FakeRunner {
             previous_container_inspection: None,
             image_prune_stdout: String::new(),
             image_list_stdout: String::new(),
+            image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
             follow_delay: None,
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
@@ -1751,6 +1773,11 @@ impl FakeRunner {
 
     fn with_image_list_output(mut self, stdout: impl Into<String>) -> Self {
         self.image_list_stdout = stdout.into();
+        self
+    }
+
+    fn with_image_created_output(mut self, stdout: impl Into<String>) -> Self {
+        self.image_created_stdout = stdout.into();
         self
     }
 }
@@ -1849,6 +1876,14 @@ impl ProcessRunner for FakeRunner {
             self.previous_container_inspection
                 .as_deref()
                 .unwrap_or("true\t/running\n")
+        } else if spec.program == "docker"
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+            && spec.args.iter().any(|argument| argument == "inspect")
+        {
+            &self.image_created_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
             "running\n"

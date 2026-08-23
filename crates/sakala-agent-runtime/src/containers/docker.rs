@@ -10,6 +10,7 @@ use sakala_agent_core::ports::{
     RuntimeStaleImage, RuntimeWorkload,
 };
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -578,7 +579,10 @@ impl ContainerEngine for DockerContainerEngine {
         }
     }
 
-    async fn detect_stale_images(&self) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
+    async fn detect_stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
         let command = CommandSpec::new("docker")
             .arg("image")
             .arg("ls")
@@ -595,19 +599,43 @@ impl ContainerEngine for DockerContainerEngine {
                 output.code
             )));
         }
-        Ok(output
-            .stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                let fields = line.split('\t').collect::<Vec<_>>();
-                RuntimeStaleImage {
-                    image_id: fields.first().copied().unwrap_or_default().to_owned(),
-                    project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
-                    deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
-                }
-            })
-            .collect())
+        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
+            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
+        })?;
+        let now = OffsetDateTime::now_utc();
+        let mut stale = Vec::new();
+        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let image_id = fields.first().copied().unwrap_or_default().to_owned();
+            let inspect = CommandSpec::new("docker")
+                .arg("image")
+                .arg("inspect")
+                .arg("--format")
+                .arg("{{.Created}}")
+                .arg(&image_id);
+            let inspected = self.runner.run(&inspect, &NullOutputSink).await?;
+            if !inspected.success {
+                return Err(RuntimeError::Container(format!(
+                    "Sakala image age inspection exited with status {:?}",
+                    inspected.code
+                )));
+            }
+            let created =
+                OffsetDateTime::parse(inspected.stdout.trim(), &Rfc3339).map_err(|error| {
+                    RuntimeError::Container(format!(
+                        "Docker returned an invalid image creation timestamp: {error}"
+                    ))
+                })?;
+            if now - created < minimum_age {
+                continue;
+            }
+            stale.push(RuntimeStaleImage {
+                image_id,
+                project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
+                deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
+            });
+        }
+        Ok(stale)
     }
 
     async fn cleanup_stale_images(

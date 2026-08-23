@@ -108,7 +108,10 @@ pub trait ContainerEngine: Send + Sync {
     async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
 
     /// Inventories dangling Sakala-managed images before any deletion runs.
-    async fn detect_stale_images(&self) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
+    async fn detect_stale_images(
+        &self,
+        _max_age: std::time::Duration,
+    ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
         Ok(Vec::new())
     }
 

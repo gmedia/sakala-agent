@@ -704,7 +704,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .chain(report.orphans.iter().filter_map(|orphan| orphan.project_id))
             .collect();
         report.stale_routes = self.routes.discover_stale_routes(&known_projects).await?;
-        report.stale_images = self.containers.detect_stale_images().await?;
+        report.stale_images = self
+            .containers
+            .detect_stale_images(self.image_gc_max_age)
+            .await?;
         report.cleaned_workspaces = self
             .workspace
             .cleanup_stale(self.workspace_gc_max_age)
