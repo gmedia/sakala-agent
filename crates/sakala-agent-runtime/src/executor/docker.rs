@@ -312,6 +312,8 @@ impl DockerRuntimeExecutor {
             applied_timeouts.build,
             self.builder.build(
                 &BuildRequest {
+                    project_id,
+                    deployment_id,
                     workspace: workspace.root().to_owned(),
                     source: workspace.source().to_owned(),
                     image: image.to_owned(),

@@ -27,13 +27,18 @@ tetap dilaporkan sebagai orphan, bukan dihapus otomatis.
 
 Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, serta direktori workspace dan route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator.
 
-Image ditag berdasarkan project, commit, dan deployment. Container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
+Image ditag berdasarkan project, commit, dan deployment. Image dan container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
 
 - `dev.sakala.managed=true`
 - `dev.sakala.project-id=<uuid>`
 - `dev.sakala.deployment-id=<uuid>`
 - `dev.sakala.workload-kind=web`
 - `dev.sakala.agent-id=<agent-id>`
+
+Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
+Railpack. Label image belum menjadi izin untuk menghapus image secara otomatis:
+retensi image aktif/previous tetap memerlukan policy dan desired state yang
+belum tersedia dari control plane.
 
 ## Batas Keamanan MVP
 

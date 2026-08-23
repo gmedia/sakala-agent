@@ -72,6 +72,20 @@ async fn auto_builder_deploys_a_root_dockerfile_and_writes_a_route() {
             .iter()
             .any(|argument| argument == "dev.sakala.agent-id=local-agent-01")
     );
+    let build = commands
+        .iter()
+        .find(|command| {
+            command.program == "docker" && command.args.iter().any(|argument| argument == "buildx")
+        })
+        .expect("docker build should execute");
+    assert!(
+        build.args.iter().any(
+            |argument| argument == "dev.sakala.project-id=ff66ed4a-6303-4be6-8ef4-63c28b112680"
+        )
+    );
+    assert!(build.args.iter().any(
+        |argument| argument == "dev.sakala.deployment-id=4f1f21ef-730d-42d5-a46d-d965353cb993"
+    ));
     assert!(
         config
             .caddy_sites_dir
@@ -409,6 +423,12 @@ async fn auto_builder_falls_back_to_railpack_when_dockerfile_is_absent() {
                 .args
                 .iter()
                 .any(|argument| argument.to_string_lossy().starts_with("BUILDKIT_SYNTAX="))
+    }));
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command.args.iter().any(|argument| {
+                argument == "dev.sakala.deployment-id=4f1f21ef-730d-42d5-a46d-d965353cb993"
+            })
     }));
 }
 
