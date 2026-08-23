@@ -50,6 +50,8 @@ dapat drift dari deployment aktif.
 | `WakeProject` | Start kembali container hasil sleep, tunggu readiness, lalu restore route dari label domain/port. | Container yang sudah running hanya merevalidasi readiness dan route. |
 | `HealthCheck` | Menginspeksi container managed dan mengembalikan state running, ready, status Docker, serta reason aman. | Read-only. |
 | `RefreshRoute` | Menolak container yang tidak ready; kemudian membangun ulang route deterministik dari label domain/port dan menjalankan validate/reload Caddy. | Menulis konten route yang sama secara atomik; aman diulang. |
+| `ReconcileWorkload` | Melaporkan desired/actual state. Mutasi hanya dijalankan bila payload memuat aksi `restart_log_follower`, `cleanup_failed_candidate`, atau `restore_route` secara eksplisit. | Tanpa `actions` bersifat read-only; follower didedup per container, route deterministik, dan candidate hanya boleh berstatus Created/Exited/Dead. |
+| `CleanupRuntime` | Menjalankan target GC yang disetujui: `stale_workspaces`, `stale_images`, dan/atau `stale_routes`. | Wajib `approved: true`; seluruh discovery/deletion dibatasi ownership Sakala dan aman diulang. |
 | `DrainNode` | Mengubah node ke `draining`: workload aktif tetap berjalan, tetapi scheduler tidak mengklaim command workload baru. Setelah command aktif habis, node menjadi `drained`. | Aman diulang. |
 | `ResumeNode` | Menjalankan runtime preflight; hanya bila tidak ada kegagalan fatal scheduler kembali menerima command workload. | Aman diulang saat node sudah active. |
 
@@ -57,6 +59,8 @@ dapat drift dari deployment aktif.
 container (namun bukan image), sedangkan sleep mempertahankan container supaya wake
 tidak membutuhkan checkout atau build. Agent tidak membuat kebijakan retry/restart
 otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane.
+`CleanupRuntime` menolak payload tanpa approval eksplisit, sementara penghapusan
+route memverifikasi marker ownership Sakala sebelum menyentuh file.
 
 `DrainNode` dan `ResumeNode` tidak memerlukan `project_id` atau `deployment_id`.
 
@@ -83,4 +87,8 @@ SleepProject
 WakeProject
 HealthCheck
 RefreshRoute
+ReconcileWorkload
+CleanupRuntime
+DrainNode
+ResumeNode
 ```

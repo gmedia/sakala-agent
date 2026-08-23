@@ -78,7 +78,14 @@ async fn remove_route(sites_dir: &Path, project_id: Uuid) -> Result<RouteSnapsho
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    if previous.is_some() {
+    if let Some(content) = &previous {
+        let owned_prefix = format!("{MANAGED_ROUTE_PREFIX}{project_id}.");
+        if !content.starts_with(owned_prefix.as_bytes()) {
+            return Err(RuntimeError::Routing(format!(
+                "refusing to delete route {} because it is not owned by Sakala",
+                path.display()
+            )));
+        }
         fs::remove_file(&path).await?;
     }
     Ok(RouteSnapshot { path, previous })
@@ -154,5 +161,19 @@ impl RouteManager for CaddyFileRouteManager {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn cleanup_stale_routes(
+        &self,
+        known_projects: &HashSet<Uuid>,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<usize, RuntimeError> {
+        let stale = self.discover_stale_routes(known_projects).await?;
+        let mut cleaned = 0;
+        for route in stale {
+            self.deactivate(route.project_id, reporter).await?;
+            cleaned += 1;
+        }
+        Ok(cleaned)
     }
 }

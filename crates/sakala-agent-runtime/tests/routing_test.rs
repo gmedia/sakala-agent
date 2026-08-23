@@ -48,7 +48,8 @@ async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails(
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
     let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
-    tokio::fs::write(&route_path, "managed route\n")
+    let managed_route = format!("# Managed by sakala-agent for project {project_id}.\n");
+    tokio::fs::write(&route_path, &managed_route)
         .await
         .expect("route should be written");
     let reloader = Arc::new(FailingReloader::default());
@@ -63,9 +64,28 @@ async fn caddy_file_route_restores_deleted_route_when_deactivation_reload_fails(
         tokio::fs::read_to_string(route_path)
             .await
             .expect("route should be restored"),
-        "managed route\n"
+        managed_route
     );
     assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn route_deactivation_refuses_file_not_owned_by_sakala() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    tokio::fs::write(&route_path, "# managed by another system\n")
+        .await
+        .expect("unmanaged route should be written");
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+
+    let error = manager
+        .deactivate(project_id, &NoopReporter)
+        .await
+        .expect_err("unmanaged route deletion must be rejected");
+
+    assert!(error.to_string().contains("not owned by Sakala"));
+    assert!(route_path.exists());
 }
 
 #[tokio::test]
@@ -137,6 +157,20 @@ impl CaddyReloader for FailingReloader {
 }
 
 struct NoopReporter;
+
+struct SuccessfulReloader;
+
+#[async_trait]
+impl CaddyReloader for SuccessfulReloader {
+    async fn validate_and_reload(
+        &self,
+        _reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn reload_after_rollback(&self) {}
+}
 
 #[async_trait]
 impl RuntimeReporter for NoopReporter {

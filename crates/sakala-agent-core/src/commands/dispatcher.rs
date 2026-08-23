@@ -9,8 +9,8 @@ use crate::{
     NodeLifecycle, NodeLifecycleState,
     commands::handlers::{deploy_project, inspect_project},
     ports::{
-        CommandOutput, ReconcileWorkloadRequest, RepositoryCredentialProvider,
-        RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
+        CleanupRuntimeRequest, CommandOutput, ReconcileWorkloadRequest,
+        RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
         UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
     },
 };
@@ -126,7 +126,36 @@ impl CommandDispatcher {
                             project_id: lifecycle.project_id,
                             deployment_id: lifecycle.deployment_id,
                             desired_state: payload.desired_state,
+                            actions: payload.actions,
                             cancellation: lifecycle.cancellation,
+                        },
+                        reporter,
+                    )
+                    .await
+            }
+            CommandType::CleanupRuntime => {
+                let payload = command.cleanup_runtime_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "CleanupRuntime payload is invalid: {error}"
+                    ))
+                })?;
+                if !payload.approved {
+                    return Err(RuntimeExecutionError::invalid_command(
+                        "CleanupRuntime requires approved=true",
+                    ));
+                }
+                if payload.targets.is_empty() {
+                    return Err(RuntimeExecutionError::invalid_command(
+                        "CleanupRuntime requires at least one target",
+                    ));
+                }
+                self.runtime
+                    .cleanup_runtime(
+                        CleanupRuntimeRequest {
+                            command_id: command.id,
+                            approved: payload.approved,
+                            targets: payload.targets,
+                            cancellation,
                         },
                         reporter,
                     )

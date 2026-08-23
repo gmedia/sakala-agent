@@ -139,14 +139,18 @@ izin untuk melewati safety limit node.
 ## Desired versus actual workload state
 
 Control plane tetap menjadi pemilik desired state. Untuk reconciliation,
-command lifecycle atau endpoint inventory yang akan ditambahkan API harus
-mengirim identity workload serta desired state minimal berikut:
+command `ReconcileWorkload` mengirim identity workload, desired state, dan aksi
+lokal yang memang diotorisasi:
 
 ```json
 {
+  "type": "ReconcileWorkload",
   "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
   "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
-  "desired_state": "running"
+  "payload": {
+    "desired_state": "running",
+    "actions": ["restart_log_follower", "restore_route"]
+  }
 }
 ```
 
@@ -166,6 +170,33 @@ Nilai `actual_state` yang diizinkan adalah `running`, `stopped`, `unhealthy`,
 atau `missing`. Bila desired dan actual berbeda, Agent melaporkan drift tetapi
 tidak melakukan restart, deploy, atau delete secara otomatis. Control plane
 memutuskan policy recovery dan bila perlu mengirim command lifecycle eksplisit.
+Tanpa `actions`, `ReconcileWorkload` selalu read-only. Aksi
+`cleanup_failed_candidate` ditolak kecuali workload Sakala ditemukan dalam state
+`Created`, `Exited`, atau `Dead`.
+
+### Approved runtime cleanup
+
+Cleanup node menggunakan command terpisah agar authorization destruktif mudah
+diaudit dan tidak tersirat dari heartbeat:
+
+```json
+{
+  "id": "b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+  "type": "CleanupRuntime",
+  "status": "Pending",
+  "project_id": null,
+  "deployment_id": null,
+  "payload": {
+    "approved": true,
+    "targets": ["stale_workspaces", "stale_images", "stale_routes"]
+  }
+}
+```
+
+Agent menolak `approved: false` dan target kosong. Workspace dibatasi direktori
+UUID owned Agent, image memakai label `dev.sakala.managed=true` dan hanya
+dangling image yang melewati umur minimum, sedangkan route harus memiliki nama
+UUID serta marker ownership yang cocok sebelum dihapus dan Caddy di-reload.
 
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.
 
@@ -271,7 +302,7 @@ untuk aturan rollout dan command yang belum didukung.
   ],
   "metadata": {
     "version": "0.1.0",
-    "protocol_version": 2,
+    "protocol_version": 3,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
     "uptime_seconds": 86400,
@@ -312,9 +343,12 @@ untuk aturan rollout dan command yang belum didukung.
     "reconciliation": {
       "inspected_containers": 2,
       "cleaned_workspaces": 0,
+      "reattached_log_followers": 1,
+      "recovered_execution_records": 2,
       "recovered_workloads": [],
       "orphans": [],
-      "stale_routes": []
+      "stale_routes": [],
+      "stale_images": []
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"

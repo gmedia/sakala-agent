@@ -7,8 +7,9 @@ pub use repository::{
 };
 
 pub use runtime::{
-    CommandOutput, DeployProjectRequest, InspectProjectRequest, ReconcileWorkloadRequest,
-    RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeOrphan,
-    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
+    CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
+    ReconcileWorkloadRequest, RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor,
+    RuntimeHealthSnapshot, RuntimeOrphan, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, RuntimeStaleImage,
     RuntimeStaleRoute, RuntimeWorkload, WorkloadLifecycleRequest,
 };

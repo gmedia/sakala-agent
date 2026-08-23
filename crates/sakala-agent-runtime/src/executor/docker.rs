@@ -5,14 +5,15 @@ use std::sync::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
-    CommandOutput, DeployProjectRequest, InspectProjectRequest, ReconcileWorkloadRequest,
-    RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot,
-    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
-    WorkloadLifecycleRequest,
+    CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
+    ReconcileWorkloadRequest, RuntimeCapacity, RuntimeExecutionError, RuntimeExecutor,
+    RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
-    DeploymentEventLevel, DeploymentLog, InspectProjectPayload, LogStream,
+    DeploymentEventLevel, DeploymentLog, InspectProjectPayload, LogStream, ReconcileWorkloadAction,
+    RuntimeCleanupTarget,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -260,6 +261,7 @@ impl DockerRuntimeExecutor {
 
         let result = tokio::select! {
             result = self.deploy_inner(
+                request.command_id,
                 project_id,
                 deployment_id,
                 &payload,
@@ -318,6 +320,7 @@ impl DockerRuntimeExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn deploy_inner(
         &self,
+        command_id: Uuid,
         project_id: Uuid,
         deployment_id: Uuid,
         payload: &DeployProjectPayload,
@@ -374,6 +377,7 @@ impl DockerRuntimeExecutor {
             self.containers
                 .start(
                     &RunContainerRequest {
+                        command_id,
                         project_id,
                         deployment_id,
                         name: container.to_owned(),
@@ -383,6 +387,7 @@ impl DockerRuntimeExecutor {
                         resources: applied_resources,
                         domain: payload.domain.clone(),
                         port: payload.container_port,
+                        log_bounds: payload.log_bounds,
                     },
                     reporter_ref,
                 )
@@ -443,7 +448,7 @@ impl DockerRuntimeExecutor {
             }),
         )
         .await?;
-        self.containers.start_log_follower(container, reporter);
+        let _ = self.containers.start_log_follower(container, reporter);
         Ok(())
     }
 
@@ -699,6 +704,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .chain(report.orphans.iter().filter_map(|orphan| orphan.project_id))
             .collect();
         report.stale_routes = self.routes.discover_stale_routes(&known_projects).await?;
+        report.stale_images = self.containers.detect_stale_images().await?;
         report.cleaned_workspaces = self
             .workspace
             .cleanup_stale(self.workspace_gc_max_age)
@@ -707,6 +713,40 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .containers
             .cleanup_stale_images(self.image_gc_max_age)
             .await?;
+        Ok(report)
+    }
+
+    async fn recover(
+        &self,
+        reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
+    ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
+        let mut report = self.reconcile().await?;
+        for discovered in report.workloads.clone() {
+            let Some(workload) = self
+                .containers
+                .workload(discovered.project_id, discovered.deployment_id)
+                .await?
+            else {
+                continue;
+            };
+            let Some(command_id) = workload.command_id else {
+                continue;
+            };
+            report.recovered_execution_records += 1;
+            if !workload.status.to_ascii_lowercase().starts_with("up") {
+                continue;
+            }
+            let Some(factory) = &reporter_factory else {
+                continue;
+            };
+            let reporter = factory.reporter(command_id, workload.log_bounds);
+            if self
+                .containers
+                .start_log_follower(&workload.container_id, reporter)
+            {
+                report.reattached_log_followers += 1;
+            }
+        }
         Ok(report)
     }
 
@@ -727,7 +767,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     async fn reconcile_workload(
         &self,
         request: ReconcileWorkloadRequest,
-        _reporter: Arc<dyn RuntimeReporter>,
+        reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         if request.cancellation.is_cancelled() {
             return Err(RuntimeError::Cancelled.into());
@@ -746,12 +786,120 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             sakala_agent_protocol::DesiredWorkloadState::Stopped => "stopped",
             sakala_agent_protocol::DesiredWorkloadState::Missing => "missing",
         };
+        let mut actions_applied = Vec::new();
+        for action in request.actions {
+            if request.cancellation.is_cancelled() {
+                return Err(RuntimeError::Cancelled.into());
+            }
+            match action {
+                ReconcileWorkloadAction::RestartLogFollower => {
+                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
+                    if !workload.status.to_ascii_lowercase().starts_with("up") {
+                        return Err(RuntimeError::WorkloadNotRunning.into());
+                    }
+                    let started = self
+                        .containers
+                        .start_log_follower(&workload.container_id, Arc::clone(&reporter));
+                    actions_applied.push(json!({
+                        "action": "restart_log_follower",
+                        "started": started,
+                    }));
+                }
+                ReconcileWorkloadAction::CleanupFailedCandidate => {
+                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
+                    let status = workload.status.to_ascii_lowercase();
+                    if !(status.starts_with("created")
+                        || status.starts_with("exited")
+                        || status.starts_with("dead"))
+                    {
+                        return Err(RuntimeError::InvalidCommand(
+                            "cleanup_failed_candidate requires a Created, Exited, or Dead workload"
+                                .to_owned(),
+                        )
+                        .into());
+                    }
+                    self.containers.remove(workload).await?;
+                    actions_applied.push(json!({
+                        "action": "cleanup_failed_candidate",
+                        "container_id": workload.container_id,
+                    }));
+                }
+                ReconcileWorkloadAction::RestoreRoute => {
+                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
+                    if !workload.status.to_ascii_lowercase().starts_with("up") {
+                        return Err(RuntimeError::WorkloadNotRunning.into());
+                    }
+                    self.activate_workload(workload, reporter.as_ref()).await?;
+                    actions_applied.push(json!({ "action": "restore_route" }));
+                }
+            }
+        }
         Ok(CommandOutput::with_result(json!({
             "desired_state": desired_state,
             "actual_state": actual_state,
             "in_sync": desired_state == actual_state,
             "drift_reason": (desired_state != actual_state).then_some("workload_state_mismatch"),
             "container_id": workload.map(|workload| workload.container_id),
+            "actions_applied": actions_applied,
+        })))
+    }
+
+    async fn cleanup_runtime(
+        &self,
+        request: CleanupRuntimeRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        if !request.approved {
+            return Err(RuntimeError::InvalidCommand(
+                "runtime cleanup requires explicit approval".to_owned(),
+            )
+            .into());
+        }
+        let mut cleaned_workspaces = 0;
+        let mut reclaimed_image_bytes = 0;
+        let mut cleaned_routes = 0;
+        for target in request.targets {
+            if request.cancellation.is_cancelled() {
+                return Err(RuntimeError::Cancelled.into());
+            }
+            match target {
+                RuntimeCleanupTarget::StaleWorkspaces => {
+                    cleaned_workspaces += self
+                        .workspace
+                        .cleanup_stale(self.workspace_gc_max_age)
+                        .await?;
+                }
+                RuntimeCleanupTarget::StaleImages => {
+                    reclaimed_image_bytes += self
+                        .containers
+                        .cleanup_stale_images(self.image_gc_max_age)
+                        .await?;
+                }
+                RuntimeCleanupTarget::StaleRoutes => {
+                    let discovered = self.containers.detect_orphans().await?;
+                    let known_projects = discovered
+                        .workloads
+                        .iter()
+                        .map(|workload| workload.project_id)
+                        .chain(
+                            discovered
+                                .orphans
+                                .iter()
+                                .filter_map(|orphan| orphan.project_id),
+                        )
+                        .collect();
+                    cleaned_routes += self
+                        .routes
+                        .cleanup_stale_routes(&known_projects, reporter.as_ref())
+                        .await?;
+                }
+            }
+        }
+        Ok(CommandOutput::with_result(json!({
+            "approved": true,
+            "cleaned_workspaces": cleaned_workspaces,
+            "cleaned_routes": cleaned_routes,
+            "reclaimed_image_bytes": reclaimed_image_bytes,
         })))
     }
 

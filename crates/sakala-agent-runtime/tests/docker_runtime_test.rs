@@ -11,13 +11,14 @@ use async_trait::async_trait;
 use sakala_agent_core::{
     commands::CommandDispatcher,
     ports::{
-        CommandOutput, DeployProjectRequest, InspectProjectRequest, ReconcileWorkloadRequest,
-        RepositoryCredential, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
-        SecretString, WorkloadLifecycleRequest,
+        CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
+        ReconcileWorkloadRequest, RepositoryCredential, RuntimeExecutionError, RuntimeExecutor,
+        RuntimeReporter, RuntimeReporterFactory, SecretString, WorkloadLifecycleRequest,
     },
 };
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
+    LogBounds, ReconcileWorkloadAction, RuntimeCleanupTarget,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -352,7 +353,7 @@ async fn build_timeout_reports_a_stable_failure_and_cleans_candidate_artifacts()
 }
 
 #[tokio::test]
-async fn cancelled_deployment_cleans_workspace_and_candidate_artifacts() {
+async fn agent_restart_during_build_cleans_workspace_and_candidate_artifacts() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_build_delay(Duration::from_secs(60)));
     let reporter = Arc::new(RecordingReporter::default());
@@ -383,6 +384,72 @@ async fn cancelled_deployment_cleans_workspace_and_candidate_artifacts() {
     assert_eq!(error.code(), "runtime_cancelled");
     assert!(!workspace.exists());
     let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
+async fn agent_restart_during_startup_cleans_unactivated_candidate() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_inspect_delay(Duration::from_secs(60)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let workspace = config.workspace_root.join(
+        Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b")
+            .expect("command UUID")
+            .to_string(),
+    );
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let cancellation = CancellationToken::new();
+    let command = deploy_command("auto");
+    let task_executor = Arc::clone(&executor);
+    let task_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        CommandDispatcher::new(task_executor)
+            .dispatch(&command, reporter, task_cancellation)
+            .await
+    });
+
+    for _ in 0..100 {
+        let candidate_started =
+            runner
+                .commands
+                .lock()
+                .expect("command lock")
+                .iter()
+                .any(|command| {
+                    command.program == "docker"
+                        && command
+                            .args
+                            .first()
+                            .is_some_and(|argument| argument == "run")
+                });
+        if candidate_started {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cancellation.cancel();
+    let error = task
+        .await
+        .expect("deployment task should join")
+        .expect_err("startup interrupted by restart should fail");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert!(!workspace.exists());
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "run")
+    }));
     assert!(commands.iter().any(|command| {
         command.program == "docker"
             && command
@@ -823,6 +890,52 @@ async fn agent_restart_recovers_healthy_workload_and_orphan_visibility() {
 }
 
 #[tokio::test]
+async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let command_id = Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b")
+        .expect("command UUID should be valid");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(format!(
+                "healthy\tUp 10 minutes (healthy)\tportfolio.run.sakala.localhost\t3000\t{command_id}\t1024\t20\t65536\n"
+            ))
+            .with_follow_delay(Duration::from_secs(60)),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let factory = Arc::new(RecordingReporterFactory::default());
+
+    let first = RuntimeExecutor::recover(&executor, Some(factory.clone()))
+        .await
+        .expect("restart recovery should reattach the log follower");
+    let second = RuntimeExecutor::recover(&executor, Some(factory.clone()))
+        .await
+        .expect("repeated recovery should remain idempotent");
+
+    assert_eq!(first.recovered_execution_records, 1);
+    assert_eq!(first.reattached_log_followers, 1);
+    assert_eq!(second.recovered_execution_records, 1);
+    assert_eq!(second.reattached_log_followers, 0);
+    assert_eq!(factory.created.load(Ordering::SeqCst), 2);
+    let followers = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| {
+            command.program == "docker"
+                && command.args.iter().any(|argument| argument == "--follow")
+        })
+        .count();
+    assert_eq!(followers, 1);
+    RuntimeExecutor::shutdown(&executor)
+        .await
+        .expect("recovered follower should stop during shutdown");
+}
+
+#[tokio::test]
 async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner =
@@ -859,6 +972,155 @@ async fn reconciliation_prunes_only_retained_sakala_dangling_images() {
 }
 
 #[tokio::test]
+async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_image_list_output(format!("sha256:stale\t{project_id}\t{deployment_id}\n"))
+            .with_image_prune_output("Total reclaimed space: 1KB\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation should inventory images before cleanup");
+
+    assert_eq!(report.stale_images.len(), 1);
+    assert_eq!(report.stale_images[0].image_id, "sha256:stale");
+    assert_eq!(report.stale_images[0].project_id, Some(project_id));
+    assert_eq!(report.stale_images[0].deployment_id, Some(deployment_id));
+    assert_eq!(report.reclaimed_image_bytes, 1_024);
+}
+
+#[tokio::test]
+async fn approved_cleanup_runs_only_requested_sakala_targets() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2KB\n"));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::cleanup_runtime(
+        &executor,
+        CleanupRuntimeRequest {
+            command_id: Uuid::new_v4(),
+            approved: true,
+            targets: vec![RuntimeCleanupTarget::StaleImages],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("approved image cleanup should succeed");
+
+    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024);
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command.args.iter().any(|argument| argument == "prune")
+            && command
+                .args
+                .iter()
+                .any(|argument| argument == "label=dev.sakala.managed=true")
+    }));
+    assert!(!commands.iter().any(|command| {
+        command.program == "docker" && command.args.iter().any(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
+async fn reconciliation_applies_only_explicit_safe_workload_actions() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID");
+    let deployment_id =
+        Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("deployment UUID");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("candidate\tCreated\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id,
+            deployment_id,
+            desired_state: DesiredWorkloadState::Missing,
+            actions: vec![ReconcileWorkloadAction::CleanupFailedCandidate],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("explicit failed candidate cleanup should succeed");
+
+    assert_eq!(
+        output.result["actions_applied"][0]["action"],
+        "cleanup_failed_candidate"
+    );
+    assert!(
+        runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|command| {
+                command.program == "docker"
+                    && command
+                        .args
+                        .first()
+                        .is_some_and(|argument| argument == "rm")
+                    && command.args.iter().any(|argument| argument == "candidate")
+                    && !command.args.iter().any(|argument| argument == "--force")
+            })
+    );
+}
+
+#[tokio::test]
+async fn reconciliation_restores_known_route_only_when_explicitly_instructed() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID");
+    let deployment_id =
+        Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("deployment UUID");
+    let config = runtime_config(&temp);
+    let route_path = config
+        .caddy_sites_dir
+        .join(format!("{project_id}.Caddyfile"));
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "running\tUp 10 minutes (healthy)\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let output = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id,
+            deployment_id,
+            desired_state: DesiredWorkloadState::Running,
+            actions: vec![ReconcileWorkloadAction::RestoreRoute],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("explicit route restoration should succeed");
+
+    assert_eq!(
+        output.result["actions_applied"][0]["action"],
+        "restore_route"
+    );
+    assert!(route_path.exists());
+    assert!(
+        fs::read_to_string(route_path)
+            .expect("route should be readable")
+            .starts_with(&format!(
+                "# Managed by sakala-agent for project {project_id}."
+            ))
+    );
+}
+
+#[tokio::test]
 async fn reconciliation_reports_drift_without_mutating_the_workload() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(
@@ -877,6 +1139,7 @@ async fn reconciliation_reports_drift_without_mutating_the_workload() {
                 .parse()
                 .expect("deployment id"),
             desired_state: DesiredWorkloadState::Stopped,
+            actions: Vec::new(),
             cancellation: CancellationToken::new(),
         },
         Arc::new(RecordingReporter::default()),
@@ -909,6 +1172,7 @@ async fn reconciliation_reports_missing_workload_without_creating_one() {
                 .parse()
                 .expect("deployment id"),
             desired_state: DesiredWorkloadState::Running,
+            actions: Vec::new(),
             cancellation: CancellationToken::new(),
         },
         Arc::new(RecordingReporter::default()),
@@ -1147,6 +1411,99 @@ async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
     }));
 }
 
+#[tokio::test]
+async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
+    const ITERATIONS: usize = 100;
+    const MEMORY_GROWTH_LIMIT_BYTES: u64 = 64 * 1_024 * 1_024;
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut config = runtime_config(&temp);
+    config.image_gc_max_age = Duration::from_secs(1);
+    let workspace_root = config.workspace_root.clone();
+    let sites_dir = config.caddy_sites_dir.clone();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("previous-container\n")
+            .with_previous_container_inspection("false\t/previous\n")
+            .with_image_list_output("sha256:stale\t\t\n")
+            .with_image_prune_output("Total reclaimed space: 1KB\n"),
+    );
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let memory_before = resident_memory_bytes();
+
+    for iteration in 0..ITERATIONS {
+        let mut command = deploy_command("auto");
+        command.id = Uuid::new_v4();
+        command.deployment_id = Some(Uuid::new_v4());
+        command.payload["domain"] = json!(format!("soak-{iteration}.run.sakala.localhost"));
+        CommandDispatcher::new(executor.clone())
+            .dispatch(
+                &command,
+                Arc::new(RecordingReporter::default()),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("soak deployment should complete");
+    }
+    let reconciliation = RuntimeExecutor::reconcile(executor.as_ref())
+        .await
+        .expect("soak reconciliation should complete");
+    RuntimeExecutor::shutdown(executor.as_ref())
+        .await
+        .expect("soak runtime should shut down cleanly");
+
+    let commands = runner.commands.lock().expect("command lock");
+    let runs = commands
+        .iter()
+        .filter(|command| {
+            command.program == "docker"
+                && command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "run")
+        })
+        .count();
+    let followers = commands
+        .iter()
+        .filter(|command| {
+            command.program == "docker"
+                && command.args.iter().any(|argument| argument == "--follow")
+        })
+        .count();
+    let retired_containers = commands
+        .iter()
+        .filter(|command| {
+            command.program == "docker"
+                && command
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "rm")
+                && command
+                    .args
+                    .iter()
+                    .any(|argument| argument == "previous-container")
+        })
+        .count();
+    drop(commands);
+
+    assert_eq!(runs, ITERATIONS);
+    assert_eq!(
+        followers, ITERATIONS,
+        "one follower is allowed per deployment"
+    );
+    assert_eq!(retired_containers, ITERATIONS);
+    assert_eq!(reconciliation.stale_images.len(), 1);
+    assert_eq!(reconciliation.reclaimed_image_bytes, 1_024);
+    assert_eq!(directory_entry_count(&workspace_root), 0);
+    assert_eq!(regular_file_count(&sites_dir), 1);
+    if let (Some(before), Some(after)) = (memory_before, resident_memory_bytes()) {
+        assert!(
+            after.saturating_sub(before) <= MEMORY_GROWTH_LIMIT_BYTES,
+            "resident memory grew from {before} to {after} bytes"
+        );
+    }
+}
+
 async fn dispatch<R>(
     executor: DockerRuntimeExecutor,
     command: &AgentCommand,
@@ -1168,6 +1525,35 @@ fn runtime_config(temp: &TempDir) -> DockerRuntimeConfig {
         health_interval: Duration::ZERO,
         ..DockerRuntimeConfig::default()
     }
+}
+
+fn resident_memory_bytes() -> Option<u64> {
+    let pages = fs::read_to_string("/proc/self/statm")
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()?;
+    pages.checked_mul(4_096)
+}
+
+fn regular_file_count(root: &std::path::Path) -> usize {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .count()
+}
+
+fn directory_entry_count(root: &std::path::Path) -> usize {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .count()
 }
 
 fn deploy_command(builder: &str) -> AgentCommand {
@@ -1220,11 +1606,14 @@ struct FakeRunner {
     dockerfile: bool,
     commands: Mutex<Vec<CommandSpec>>,
     docker_ps_stdout: String,
+    workload_lookup_stdout: Option<String>,
     df_stdout: String,
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
     image_prune_stdout: String,
+    image_list_stdout: String,
+    follow_delay: Option<Duration>,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
 }
@@ -1286,11 +1675,14 @@ impl FakeRunner {
             dockerfile,
             commands: Mutex::new(Vec::new()),
             docker_ps_stdout: String::new(),
+            workload_lookup_stdout: None,
             df_stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1000 9999000 1% /\n".to_owned(),
             build_delay: None,
             inspect_delay: None,
             previous_container_inspection: None,
             image_prune_stdout: String::new(),
+            image_list_stdout: String::new(),
+            follow_delay: None,
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
         }
@@ -1298,6 +1690,16 @@ impl FakeRunner {
 
     fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
         self.docker_ps_stdout = stdout.into();
+        self
+    }
+
+    fn with_workload_lookup(mut self, stdout: impl Into<String>) -> Self {
+        self.workload_lookup_stdout = Some(stdout.into());
+        self
+    }
+
+    fn with_follow_delay(mut self, delay: Duration) -> Self {
+        self.follow_delay = Some(delay);
         self
     }
 
@@ -1323,6 +1725,11 @@ impl FakeRunner {
 
     fn with_image_prune_output(mut self, stdout: impl Into<String>) -> Self {
         self.image_prune_stdout = stdout.into();
+        self
+    }
+
+    fn with_image_list_output(mut self, stdout: impl Into<String>) -> Self {
+        self.image_list_stdout = stdout.into();
         self
     }
 }
@@ -1352,6 +1759,12 @@ impl ProcessRunner for FakeRunner {
         if spec.program == "docker"
             && spec.args.iter().any(|argument| argument == "inspect")
             && let Some(delay) = self.inspect_delay
+        {
+            tokio::time::sleep(delay).await;
+        }
+        if spec.program == "docker"
+            && spec.args.iter().any(|argument| argument == "--follow")
+            && let Some(delay) = self.follow_delay
         {
             tokio::time::sleep(delay).await;
         }
@@ -1395,7 +1808,17 @@ impl ProcessRunner for FakeRunner {
 
         let stdout = if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "ps")
         {
-            self.docker_ps_stdout.as_str()
+            if spec
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("dev.sakala.command-id"))
+            {
+                self.workload_lookup_stdout
+                    .as_deref()
+                    .unwrap_or(&self.docker_ps_stdout)
+            } else {
+                self.docker_ps_stdout.as_str()
+            }
         } else if spec.program == "docker"
             && spec
                 .args
@@ -1416,6 +1839,14 @@ impl ProcessRunner for FakeRunner {
             && spec.args.iter().any(|argument| argument == "prune")
         {
             &self.image_prune_stdout
+        } else if spec.program == "docker"
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+            && spec.args.iter().any(|argument| argument == "ls")
+        {
+            &self.image_list_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "logs") {
             "application listening\n"
         } else if spec.program == "df" {
@@ -1440,6 +1871,18 @@ impl ProcessRunner for FakeRunner {
 struct RecordingReporter {
     events: Mutex<Vec<DeploymentEvent>>,
     logs: Mutex<Vec<DeploymentLog>>,
+}
+
+#[derive(Default)]
+struct RecordingReporterFactory {
+    created: AtomicUsize,
+}
+
+impl RuntimeReporterFactory for RecordingReporterFactory {
+    fn reporter(&self, _command_id: Uuid, _log_bounds: LogBounds) -> Arc<dyn RuntimeReporter> {
+        self.created.fetch_add(1, Ordering::SeqCst);
+        Arc::new(RecordingReporter::default())
+    }
 }
 
 #[async_trait]

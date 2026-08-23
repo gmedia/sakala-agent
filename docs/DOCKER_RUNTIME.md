@@ -36,9 +36,10 @@ Image ditag berdasarkan project, commit, dan deployment. Image dan container dib
 - `dev.sakala.agent-id=<agent-id>`
 
 Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
-Railpack. Label image belum menjadi izin untuk menghapus image secara otomatis:
-retensi image aktif/previous tetap memerlukan policy dan desired state yang
-belum tersedia dari control plane.
+Railpack. Image aktif dilindungi oleh referensi container. Image deployment
+sebelumnya dipertahankan minimal selama `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`
+(default tujuh hari) dan baru eligible saat dangling; cleanup tetap dibatasi
+label ownership Sakala dan tidak memakai `docker image prune -a`.
 
 ## Batas Keamanan MVP
 

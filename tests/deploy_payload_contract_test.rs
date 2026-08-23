@@ -38,3 +38,29 @@ fn api_lifecycle_fixtures_identify_one_managed_workload() {
         assert_eq!(command.payload, serde_json::json!({}));
     }
 }
+
+#[test]
+fn api_reconciliation_and_cleanup_fixtures_match_protocol_revision_three() {
+    let reconciliation: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/reconcile-workload.json"))
+            .expect("API ReconcileWorkload fixture must deserialize");
+    let cleanup: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/cleanup-runtime.json"))
+            .expect("API CleanupRuntime fixture must deserialize");
+
+    assert_eq!(reconciliation.command_type, CommandType::ReconcileWorkload);
+    assert_eq!(cleanup.command_type, CommandType::CleanupRuntime);
+    assert_eq!(
+        reconciliation
+            .reconcile_workload_payload()
+            .expect("reconciliation payload")
+            .actions
+            .len(),
+        2
+    );
+    let cleanup = cleanup
+        .cleanup_runtime_payload()
+        .expect("cleanup payload must be valid");
+    assert!(cleanup.approved);
+    assert_eq!(cleanup.targets.len(), 3);
+}

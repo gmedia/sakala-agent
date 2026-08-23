@@ -16,7 +16,7 @@ async fn connected_heartbeat_uses_the_agent_contract() {
         "capabilities": ["noop-runtime"],
         "metadata": {
             "version": "0.1.0",
-            "protocol_version": 2,
+            "protocol_version": 3,
             "runtime_driver": "docker",
             "lifecycle_state": "active",
             "uptime_seconds": 86400,
@@ -45,7 +45,7 @@ async fn connected_heartbeat_uses_the_agent_contract() {
             "capabilities": ["noop-runtime"],
             "metadata": {
                 "version": "0.1.0",
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "runtime_driver": "docker",
                 "lifecycle_state": "active",
                 "uptime_seconds": 86400,

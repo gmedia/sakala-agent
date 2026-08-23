@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
-    RuntimeWorkload,
+    RuntimeStaleImage, RuntimeWorkload,
 };
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use tokio::{
@@ -31,6 +31,10 @@ const AGENT_ID_LABEL: &str = "dev.sakala.agent-id";
 const WORKLOAD_KIND_LABEL: &str = "dev.sakala.workload-kind=web";
 const DOMAIN_LABEL: &str = "dev.sakala.domain";
 const PORT_LABEL: &str = "dev.sakala.port";
+const COMMAND_ID_LABEL: &str = "dev.sakala.command-id";
+const LOG_MAX_LINE_LABEL: &str = "dev.sakala.log-max-line-length";
+const LOG_MAX_BATCH_LABEL: &str = "dev.sakala.log-max-batch-lines";
+const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
@@ -38,7 +42,7 @@ pub struct DockerContainerEngine {
     resource_safety: ResourceSafetyConfig,
     max_active_containers: u32,
     agent_id: String,
-    log_followers: Mutex<Vec<JoinHandle<()>>>,
+    log_followers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl DockerContainerEngine {
@@ -56,7 +60,7 @@ impl DockerContainerEngine {
             resource_safety,
             max_active_containers,
             agent_id,
-            log_followers: Mutex::new(Vec::new()),
+            log_followers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -261,7 +265,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
             .arg("--format")
-            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.domain\"}}\t{{.Label \"dev.sakala.port\"}}");
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.domain\"}}\t{{.Label \"dev.sakala.port\"}}\t{{.Label \"dev.sakala.command-id\"}}\t{{.Label \"dev.sakala.log-max-line-length\"}}\t{{.Label \"dev.sakala.log-max-batch-lines\"}}\t{{.Label \"dev.sakala.log-max-total-bytes\"}}");
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
@@ -294,6 +298,12 @@ impl ContainerEngine for DockerContainerEngine {
             deployment_id,
             domain: domain.to_owned(),
             port,
+            command_id: fields.get(4).and_then(|value| Uuid::parse_str(value).ok()),
+            log_bounds: sakala_agent_protocol::LogBounds {
+                max_line_length: parse_optional_label(fields.get(5).copied()),
+                max_batch_lines: parse_optional_label(fields.get(6).copied()),
+                max_total_bytes: parse_optional_label(fields.get(7).copied()),
+            },
         }))
     }
 
@@ -400,9 +410,20 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--label")
             .arg(format!("{PORT_LABEL}={}", request.port))
             .arg("--label")
+            .arg(format!("{COMMAND_ID_LABEL}={}", request.command_id))
+            .arg("--label")
             .arg(WORKLOAD_KIND_LABEL)
             .arg("--label")
             .arg(format!("{AGENT_ID_LABEL}={}", self.agent_id));
+        for (label, value) in [
+            (LOG_MAX_LINE_LABEL, request.log_bounds.max_line_length),
+            (LOG_MAX_BATCH_LABEL, request.log_bounds.max_batch_lines),
+            (LOG_MAX_TOTAL_LABEL, request.log_bounds.max_total_bytes),
+        ] {
+            if let Some(value) = value {
+                command = command.arg("--label").arg(format!("{label}={value}"));
+            }
+        }
         if let Some(env_file) = &env_file {
             command = command.arg("--env-file").arg(env_file.as_os_str());
         }
@@ -433,7 +454,13 @@ impl ContainerEngine for DockerContainerEngine {
             .map(|_| ())
     }
 
-    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) {
+    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool {
+        let mut followers = self.log_followers.lock().expect("log follower lock");
+        followers.retain(|_, follower| !follower.is_finished());
+        if followers.contains_key(container) {
+            return false;
+        }
+
         let runner = Arc::clone(&self.runner);
         let container = container.to_owned();
         let follower_container = container.clone();
@@ -461,10 +488,9 @@ impl ContainerEngine for DockerContainerEngine {
             }
         });
 
-        let mut followers = self.log_followers.lock().expect("log follower lock");
-        followers.retain(|follower| !follower.is_finished());
-        followers.push(handle);
+        followers.insert(container.clone(), handle);
         debug!(%container, "container log follower started");
+        true
     }
 
     async fn cleanup_previous(
@@ -552,6 +578,38 @@ impl ContainerEngine for DockerContainerEngine {
         }
     }
 
+    async fn detect_stale_images(&self) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("image")
+            .arg("ls")
+            .arg("--filter")
+            .arg("dangling=true")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "Sakala stale image inspection exited with status {:?}",
+                output.code
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                RuntimeStaleImage {
+                    image_id: fields.first().copied().unwrap_or_default().to_owned(),
+                    project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
+                    deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
+                }
+            })
+            .collect())
+    }
+
     async fn cleanup_stale_images(
         &self,
         max_age: std::time::Duration,
@@ -579,13 +637,19 @@ impl ContainerEngine for DockerContainerEngine {
             let mut followers = self.log_followers.lock().expect("log follower lock");
             std::mem::take(&mut *followers)
         };
-        for follower in &followers {
+        for follower in followers.values() {
             follower.abort();
         }
-        for follower in followers {
+        for (_, follower) in followers {
             let _ = follower.await;
         }
     }
+}
+
+fn parse_optional_label(value: Option<&str>) -> Option<u64> {
+    value
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok())
 }
 
 fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {

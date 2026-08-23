@@ -1,7 +1,8 @@
 use sakala_agent_core::commands::lifecycle::can_transition;
 use sakala_agent_protocol::{
-    CommandStatus, CommandType, DeployProjectPayload, DeploymentBuilder, DeploymentEvent,
-    DeploymentLog, HeartbeatPayload, InspectProjectPayload,
+    CleanupRuntimePayload, CommandStatus, CommandType, DeployProjectPayload, DeploymentBuilder,
+    DeploymentEvent, DeploymentLog, HeartbeatPayload, InspectProjectPayload,
+    ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
 };
 use serde_json::json;
 
@@ -16,6 +17,42 @@ fn command_types_use_control_plane_json_names() {
     let inspect = serde_json::to_string(&CommandType::InspectProject)
         .expect("inspection type should serialize");
     assert_eq!(inspect, "\"InspectProject\"");
+}
+
+#[test]
+fn reconciliation_and_cleanup_contracts_require_explicit_actions() {
+    let reconciliation: ReconcileWorkloadPayload = serde_json::from_value(json!({
+        "desired_state": "running",
+        "actions": ["restart_log_follower", "restore_route"]
+    }))
+    .expect("reconciliation payload should deserialize");
+    let cleanup: CleanupRuntimePayload = serde_json::from_value(json!({
+        "approved": true,
+        "targets": ["stale_workspaces", "stale_images", "stale_routes"]
+    }))
+    .expect("cleanup payload should deserialize");
+
+    assert_eq!(
+        reconciliation.actions,
+        vec![
+            ReconcileWorkloadAction::RestartLogFollower,
+            ReconcileWorkloadAction::RestoreRoute,
+        ]
+    );
+    assert!(cleanup.approved);
+    assert_eq!(
+        cleanup.targets,
+        vec![
+            RuntimeCleanupTarget::StaleWorkspaces,
+            RuntimeCleanupTarget::StaleImages,
+            RuntimeCleanupTarget::StaleRoutes,
+        ]
+    );
+    assert_eq!(
+        serde_json::to_string(&CommandType::CleanupRuntime)
+            .expect("cleanup command should serialize"),
+        "\"CleanupRuntime\""
+    );
 }
 
 #[test]

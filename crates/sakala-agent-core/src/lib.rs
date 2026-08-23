@@ -9,7 +9,7 @@ pub mod heartbeat;
 pub mod logs;
 pub mod node_state;
 pub mod ports;
-mod reporting;
+pub mod reporting;
 pub mod repositories;
 pub mod scheduler;
 pub mod support;

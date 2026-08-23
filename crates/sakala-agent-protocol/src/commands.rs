@@ -12,9 +12,34 @@ pub enum DesiredWorkloadState {
     Missing,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileWorkloadAction {
+    RestartLogFollower,
+    CleanupFailedCandidate,
+    RestoreRoute,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ReconcileWorkloadPayload {
     pub desired_state: DesiredWorkloadState,
+    #[serde(default)]
+    pub actions: Vec<ReconcileWorkloadAction>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCleanupTarget {
+    StaleWorkspaces,
+    StaleImages,
+    StaleRoutes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CleanupRuntimePayload {
+    /// Explicit destructive-action gate supplied by the control plane.
+    pub approved: bool,
+    pub targets: Vec<RuntimeCleanupTarget>,
 }
 
 /// Operation requested by the control plane for execution on a runtime node.
@@ -30,6 +55,7 @@ pub enum CommandType {
     HealthCheck,
     RefreshRoute,
     ReconcileWorkload,
+    CleanupRuntime,
     DrainNode,
     ResumeNode,
 }
@@ -59,6 +85,10 @@ impl AgentCommand {
     pub fn reconcile_workload_payload(
         &self,
     ) -> Result<ReconcileWorkloadPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn cleanup_runtime_payload(&self) -> Result<CleanupRuntimePayload, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
     }
 }

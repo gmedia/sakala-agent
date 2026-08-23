@@ -124,6 +124,8 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
             "reconciliation": {
                 "inspected_containers": reconciliation.inspected_containers,
                 "cleaned_workspaces": reconciliation.cleaned_workspaces,
+                "reattached_log_followers": reconciliation.reattached_log_followers,
+                "recovered_execution_records": reconciliation.recovered_execution_records,
                 "recovered_workloads": reconciliation.workloads.iter().map(|workload| json!({
                     "container_id": workload.container_id,
                     "project_id": workload.project_id,
@@ -138,6 +140,11 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                 "stale_routes": reconciliation.stale_routes.iter().map(|route| json!({
                     "path": route.path,
                     "project_id": route.project_id,
+                })).collect::<Vec<_>>(),
+                "stale_images": reconciliation.stale_images.iter().map(|image| json!({
+                    "image_id": image.image_id,
+                    "project_id": image.project_id,
+                    "deployment_id": image.deployment_id,
                 })).collect::<Vec<_>>(),
             },
             "runtime_dependencies": dependencies,

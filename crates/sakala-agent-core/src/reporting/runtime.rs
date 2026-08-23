@@ -6,8 +6,33 @@ use uuid::Uuid;
 use crate::{
     api::ApiClient,
     logs::redactor::redact_line,
-    ports::{RuntimeExecutionError, RuntimeReporter},
+    ports::{RuntimeExecutionError, RuntimeReporter, RuntimeReporterFactory},
 };
+
+pub struct ApiRuntimeReporterFactory {
+    client: ApiClient,
+}
+
+impl ApiRuntimeReporterFactory {
+    #[must_use]
+    pub fn new(client: ApiClient) -> Self {
+        Self { client }
+    }
+}
+
+impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
+    fn reporter(
+        &self,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+    ) -> std::sync::Arc<dyn RuntimeReporter> {
+        std::sync::Arc::new(ApiRuntimeReporter::new(
+            self.client.clone(),
+            command_id,
+            log_bounds,
+        ))
+    }
+}
 
 pub(crate) struct ApiRuntimeReporter {
     client: ApiClient,

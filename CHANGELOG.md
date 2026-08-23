@@ -23,6 +23,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Control-plane API client skeleton untuk connected mode.
 - `NoopRuntimeExecutor` sebagai runtime driver default tanpa host mutation.
 - Protocol types, log redaction, integration tests, CI, dan dokumentasi awal.
+- Protocol revision 3 untuk recovery log follower, explicit workload reconciliation actions, dan approval-gated Sakala-only runtime cleanup.
+- Restart-in-flight serta repeated redeploy soak coverage untuk memory, process cleanup, workspace/container/image/route retention, follower deduplication, dan API retry pacing.
 
 ### Changed
 
@@ -33,3 +35,4 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Integrasi connected mode diarahkan ke `sakala-api` melalui `SAKALA_API_URL` dan modul `api`.
 - Update transitive `quinn-proto` dependency to `0.11.15` to address `RUSTSEC-2026-0185`.
 - Update transitive `h2` dependency to `0.4.16` to address `RUSTSEC-2026-0258`.
+- Container runtime menyimpan command identity dan bounded-log policy sebagai label agar execution bookkeeping dan follower dapat dipulihkan setelah Agent restart.

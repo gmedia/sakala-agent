@@ -6,6 +6,7 @@ use sakala_agent_core::{
     api::ApiClient,
     heartbeat,
     ports::{RuntimeExecutor, RuntimePreflightReport, RuntimeReconciliationReport},
+    reporting::ApiRuntimeReporterFactory,
     scheduler,
 };
 use sakala_agent_runtime::{DockerRuntimeExecutor, NoopRuntimeExecutor};
@@ -43,7 +44,11 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     if preflight.has_fatal_failure() {
         anyhow::bail!("runtime preflight found one or more fatal dependency failures");
     }
-    match runtime.reconcile().await {
+    let reporter_factory = client.clone().map(|client| {
+        Arc::new(ApiRuntimeReporterFactory::new(client))
+            as Arc<dyn sakala_agent_core::ports::RuntimeReporterFactory>
+    });
+    match runtime.recover(reporter_factory).await {
         Ok(report) => {
             if let Ok(mut snapshot) = reconciliation.write() {
                 *snapshot = report.clone();
@@ -53,6 +58,8 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 discovered_workloads = report.workloads.len(),
                 orphaned_containers = report.orphans.len(),
                 cleaned_workspaces = report.cleaned_workspaces,
+                reattached_log_followers = report.reattached_log_followers,
+                recovered_execution_records = report.recovered_execution_records,
                 "runtime reconciliation scan completed"
             );
             for orphan in report.orphans {

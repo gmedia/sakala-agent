@@ -1,18 +1,20 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use sakala_agent_core::{
+    AgentConfig, NodeLifecycle,
     api::ApiClient,
     commands::CommandProcessor,
     ports::{
         CommandOutput, DeployProjectRequest, RuntimeExecutionError, RuntimeExecutor,
         RuntimeReporter,
     },
+    scheduler,
 };
 use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType, CompleteCommandPayload};
 use sakala_agent_runtime::NoopRuntimeExecutor;
 use serde_json::json;
-use tokio::time::sleep;
+use tokio::{sync::watch, time::sleep};
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -20,6 +22,51 @@ use wiremock::{
 };
 
 const COMMAND_ID: &str = "b3c8cb55-3bc8-4725-a004-e69d9917d40b";
+
+#[tokio::test]
+async fn failed_api_polling_respects_interval_without_retry_storm() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/commands"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let mut values = HashMap::new();
+    values.insert("SAKALA_AGENT_MODE".to_owned(), "connected".to_owned());
+    values.insert(
+        "SAKALA_AGENT_TOKEN".to_owned(),
+        "test-agent-token".to_owned(),
+    );
+    values.insert("SAKALA_API_URL".to_owned(), server.uri());
+    values.insert("SAKALA_POLL_INTERVAL_SECONDS".to_owned(), "1".to_owned());
+    values.insert("SAKALA_SHUTDOWN_GRACE_SECONDS".to_owned(), "1".to_owned());
+    let config = AgentConfig::from_values(&values).expect("connected config should be valid");
+    let client = ApiClient::from_config(&config).expect("test client should be valid");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(scheduler::poller::run(
+        config,
+        Some(client),
+        Arc::new(NoopRuntimeExecutor),
+        Arc::new(NodeLifecycle::new()),
+        Arc::new(scheduler::metrics::SchedulerMetrics::default()),
+        shutdown_rx,
+    ));
+
+    sleep(std::time::Duration::from_millis(2_200)).await;
+    shutdown_tx
+        .send(true)
+        .expect("poller should still be running");
+    task.await.expect("poller task should stop cleanly");
+
+    let polls = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded")
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/agent/v1/commands")
+        .count();
+    assert!((2..=3).contains(&polls), "unexpected poll count: {polls}");
+}
 
 #[tokio::test]
 async fn claim_conflict_skips_runtime_execution_and_terminal_reporting() {

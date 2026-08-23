@@ -23,6 +23,12 @@ jobs:
       - name: Verify release candidate
         run: make check
 
+      - name: Verify tag matches binary version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sakala-agent") | .version')"
+          test "$tag_version" = "$package_version"
+
       - name: Build release binary
         run: cargo build --release --locked -p sakala-agent
 

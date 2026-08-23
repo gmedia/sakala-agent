@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     DeployProjectPayload, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
-    InspectProjectPayload,
+    InspectProjectPayload, LogBounds, ReconcileWorkloadAction, RuntimeCleanupTarget,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -44,6 +44,15 @@ pub struct ReconcileWorkloadRequest {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub desired_state: DesiredWorkloadState,
+    pub actions: Vec<ReconcileWorkloadAction>,
+    pub cancellation: CancellationToken,
+}
+
+#[derive(Clone, Debug)]
+pub struct CleanupRuntimeRequest {
+    pub command_id: Uuid,
+    pub approved: bool,
+    pub targets: Vec<RuntimeCleanupTarget>,
     pub cancellation: CancellationToken,
 }
 
@@ -65,6 +74,14 @@ pub struct RuntimeOrphan {
 pub struct RuntimeStaleRoute {
     pub path: String,
     pub project_id: Uuid,
+}
+
+/// A dangling Sakala-managed image discovered before an approved/local GC pass.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStaleImage {
+    pub image_id: String,
+    pub project_id: Option<Uuid>,
+    pub deployment_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +133,9 @@ pub struct RuntimeReconciliationReport {
     pub workloads: Vec<RuntimeWorkload>,
     pub orphans: Vec<RuntimeOrphan>,
     pub stale_routes: Vec<RuntimeStaleRoute>,
+    pub stale_images: Vec<RuntimeStaleImage>,
+    pub reattached_log_followers: usize,
+    pub recovered_execution_records: usize,
 }
 
 /// Result of a local runtime dependency check performed before command polling.
@@ -194,6 +214,14 @@ pub trait RuntimeReporter: Send + Sync {
     async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError>;
 }
 
+/// Creates a bounded reporter for runtime work recovered after an Agent restart.
+///
+/// The runtime only receives opaque reporters; API credentials and transport
+/// remain owned by core.
+pub trait RuntimeReporterFactory: Send + Sync {
+    fn reporter(&self, command_id: Uuid, log_bounds: LogBounds) -> Arc<dyn RuntimeReporter>;
+}
+
 #[async_trait]
 pub trait RuntimeExecutor: Send + Sync {
     async fn preflight(&self) -> Result<RuntimePreflightReport, RuntimeExecutionError> {
@@ -202,6 +230,14 @@ pub trait RuntimeExecutor: Send + Sync {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         Ok(RuntimeReconciliationReport::default())
+    }
+
+    /// Rebuilds runtime-owned background state after an Agent restart.
+    async fn recover(
+        &self,
+        _reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
+    ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
+        self.reconcile().await
     }
 
     /// Mengambil kapasitas deployment lokal tanpa mengubah runtime.
@@ -307,6 +343,16 @@ pub trait RuntimeExecutor: Send + Sync {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support workload reconciliation",
+        ))
+    }
+
+    async fn cleanup_runtime(
+        &self,
+        _request: CleanupRuntimeRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support approved cleanup",
         ))
     }
 }

@@ -42,6 +42,17 @@ pub trait RouteManager: Send + Sync {
         project_id: Uuid,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
+
+    /// Deletes only stale route files that pass the same Sakala ownership
+    /// validation used by lifecycle deactivation.
+    async fn cleanup_stale_routes(
+        &self,
+        known_projects: &HashSet<Uuid>,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<usize, RuntimeError> {
+        let _ = (known_projects, reporter);
+        Ok(0)
+    }
 }
 
 #[async_trait]

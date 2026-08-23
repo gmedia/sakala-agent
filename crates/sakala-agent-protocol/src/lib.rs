@@ -4,7 +4,7 @@
 ///
 /// This is intentionally independent from the crate semantic version so the
 /// control plane can reject an incompatible agent before assigning work.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub mod commands;
 pub mod deployments;
@@ -17,8 +17,8 @@ pub mod repositories;
 pub mod status;
 
 pub use commands::{
-    AgentCommand, CommandType, CompleteCommandPayload, DesiredWorkloadState,
-    ReconcileWorkloadPayload,
+    AgentCommand, CleanupRuntimePayload, CommandType, CompleteCommandPayload, DesiredWorkloadState,
+    ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,

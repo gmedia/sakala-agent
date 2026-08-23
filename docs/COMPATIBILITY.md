@@ -7,10 +7,11 @@ Sakala Agent reports two independent values in every heartbeat:
 - `metadata.version`: semantic version of the Agent binary;
 - `metadata.protocol_version`: revision of the Agent/API wire contract.
 
-The current protocol revision is `2`. Revision 2 adds workload lifecycle
-commands (`RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
-`HealthCheck`, `RefreshRoute`) and node maintenance commands (`DrainNode`,
-`ResumeNode`) plus the corresponding node status values. A control plane must only assign work to
+The current protocol revision is `3`. Revision 3 adds recovery metadata,
+explicit safe actions on `ReconcileWorkload`, and approval-gated
+`CleanupRuntime`. Revision 2 added workload lifecycle commands
+(`RestartProject`, `StopProject`, `SleepProject`, `WakeProject`, `HealthCheck`,
+`RefreshRoute`) and node maintenance commands (`DrainNode`, `ResumeNode`). A control plane must only assign work to
 an Agent revision it supports. Until the control plane enforces that admission
 check, operators must deploy compatible `sakala-api` and Agent releases as a
 pair and verify the heartbeat metadata before enabling a node.
@@ -21,9 +22,10 @@ Unknown protocol command values fail during deserialization. Known command
 types without an Agent handler fail explicitly with
 `unsupported_runtime_command`; they are never acknowledged as successful.
 
-`DeployProject`, `InspectProject`, workload lifecycle, and node maintenance
-commands are supported by the current runtime. A control plane that only
-supports revision 1 must not assign revision-2 commands to the node.
+`DeployProject`, `InspectProject`, workload lifecycle, reconciliation, approved
+runtime cleanup, and node maintenance commands are supported by the current
+runtime. A control plane that only supports revision 1 or 2 must not assign
+revision-3 commands to the node.
 
 ## Upgrade procedure
 
@@ -47,6 +49,15 @@ an API begins assigning those commands, deploy an Agent that reports
 can also check the installed binary with `sakala-agent --version`. The Agent
 continues to reject unknown command values; an older revision-1 API must not
 assign revision-2 commands.
+
+### Protocol revision 2 → 3
+
+Revision 3 menyimpan command identity dan bounded-log policy sebagai label
+container agar Agent dapat membangun ulang log follower setelah restart.
+`ReconcileWorkload.actions` bersifat opt-in dan `CleanupRuntime` mewajibkan
+`approved: true`. API revision 2 tetap dapat memakai command lama, tetapi tidak
+boleh mengirim command revision 3 sebelum mendukung payload serta completion
+result yang didokumentasikan.
 
 The Agent repository owns binary behavior, protocol fixtures, and release
 notes. Host installation, service management, and rollout orchestration remain
