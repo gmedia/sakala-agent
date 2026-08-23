@@ -562,6 +562,34 @@ async fn node_capacity_rejects_a_new_project_but_allows_replacement() {
 }
 
 #[tokio::test]
+async fn deployment_refuses_build_when_workspace_disk_is_below_local_floor() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_df(
+        "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000 9900 100 99% /\n",
+    ));
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut config = runtime_config(&temp);
+    config.min_workspace_free_bytes = 200 * 1_024;
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(executor, &deploy_command("auto"), reporter)
+        .await
+        .expect_err("deployment must not begin with critically low workspace disk");
+
+    assert_eq!(error.code(), "runtime_disk_pressure");
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|command| {
+                command.program == "git" && command.args.iter().any(|argument| argument == "init")
+            })
+    );
+}
+
+#[tokio::test]
 async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
@@ -723,6 +751,7 @@ struct FakeRunner {
     dockerfile: bool,
     commands: Mutex<Vec<CommandSpec>>,
     docker_ps_stdout: String,
+    df_stdout: String,
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
     active_builds: AtomicUsize,
@@ -741,7 +770,11 @@ impl ProcessRunner for FailingGitRunner {
         Ok(ProcessOutput {
             success: spec.program != "git",
             code: (spec.program != "git").then_some(0).or(Some(1)),
-            stdout: String::new(),
+            stdout: if spec.program == "df" {
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1000 9999000 1% /\n".to_owned()
+            } else {
+                String::new()
+            },
             stderr: String::new(),
         })
     }
@@ -753,6 +786,7 @@ impl FakeRunner {
             dockerfile,
             commands: Mutex::new(Vec::new()),
             docker_ps_stdout: String::new(),
+            df_stdout: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1000 9999000 1% /\n".to_owned(),
             build_delay: None,
             inspect_delay: None,
             active_builds: AtomicUsize::new(0),
@@ -762,6 +796,11 @@ impl FakeRunner {
 
     fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
         self.docker_ps_stdout = stdout.into();
+        self
+    }
+
+    fn with_df(mut self, stdout: impl Into<String>) -> Self {
+        self.df_stdout = stdout.into();
         self
     }
 
@@ -850,6 +889,8 @@ impl ProcessRunner for FakeRunner {
             "running\n"
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "logs") {
             "application listening\n"
+        } else if spec.program == "df" {
+            &self.df_stdout
         } else {
             ""
         };

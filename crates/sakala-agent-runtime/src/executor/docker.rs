@@ -41,6 +41,7 @@ pub struct DockerRuntimeExecutor {
     timeout_safety: crate::TimeoutSafetyConfig,
     build_permits: Arc<Semaphore>,
     workspace_gc_max_age: std::time::Duration,
+    min_workspace_free_bytes: u64,
     preflight: DockerPreflight,
 }
 
@@ -73,6 +74,7 @@ impl DockerRuntimeExecutor {
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let workspace_gc_max_age = config.workspace_gc_max_age;
+        let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -103,6 +105,7 @@ impl DockerRuntimeExecutor {
             config.timeout_safety,
             max_concurrent_builds,
             workspace_gc_max_age,
+            min_workspace_free_bytes,
             preflight,
         )
     }
@@ -119,6 +122,7 @@ impl DockerRuntimeExecutor {
         timeout_safety: crate::TimeoutSafetyConfig,
         max_concurrent_builds: usize,
         workspace_gc_max_age: std::time::Duration,
+        min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
     ) -> Self {
         Self {
@@ -131,6 +135,7 @@ impl DockerRuntimeExecutor {
             timeout_safety,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             workspace_gc_max_age,
+            min_workspace_free_bytes,
             preflight,
         }
     }
@@ -198,6 +203,7 @@ impl DockerRuntimeExecutor {
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload, request.repository_credential)?;
+        self.ensure_workspace_capacity().await?;
         self.containers.ensure_capacity(project_id).await?;
 
         emit_event(
@@ -280,6 +286,17 @@ impl DockerRuntimeExecutor {
             RuntimeError::Execution(format!("failed to serialize deployment result: {error}"))
         })?;
         Ok(CommandOutput::with_result(completion))
+    }
+
+    async fn ensure_workspace_capacity(&self) -> Result<(), RuntimeError> {
+        let available = self.workspace.available_disk_bytes().await?;
+        if available < self.min_workspace_free_bytes {
+            return Err(RuntimeError::DiskPressure(format!(
+                "workspace has {available} free bytes; node requires at least {} bytes before a deployment build",
+                self.min_workspace_free_bytes
+            )));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

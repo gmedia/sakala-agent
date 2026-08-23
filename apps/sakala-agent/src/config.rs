@@ -88,6 +88,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
     runtime_health_interval_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_MIN_WORKSPACE_FREE_MB")]
+    min_workspace_free_mb: Option<String>,
+
     #[arg(long, env = "SAKALA_CADDY_SITES_DIR")]
     caddy_sites_dir: Option<String>,
 
@@ -181,6 +184,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
         cli.runtime_health_interval_seconds,
     );
+    insert(
+        &mut values,
+        "SAKALA_MIN_WORKSPACE_FREE_MB",
+        cli.min_workspace_free_mb,
+    );
     insert(&mut values, "SAKALA_CADDY_SITES_DIR", cli.caddy_sites_dir);
     insert(&mut values, "SAKALA_CADDY_CONTAINER", cli.caddy_container);
     insert(
@@ -248,6 +256,13 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     let mut agent = AgentConfig::from_values(values)?;
     agent.capabilities = capabilities(runtime_driver);
     let resource_safety = resource_safety(values)?;
+    let min_workspace_free_bytes = positive_u64(values, "SAKALA_MIN_WORKSPACE_FREE_MB", 1_024)?
+        .checked_mul(1_024 * 1_024)
+        .ok_or_else(|| {
+            CoreError::InvalidConfiguration(
+                "SAKALA_MIN_WORKSPACE_FREE_MB is too large to represent".to_owned(),
+            )
+        })?;
     let build_timeout_seconds = positive_u64(values, "SAKALA_BUILD_TIMEOUT_SECONDS", 600)?;
     let start_timeout_seconds = positive_u64(values, "SAKALA_START_TIMEOUT_SECONDS", 120)?;
     if build_timeout_seconds >= agent.command_timeout_seconds
@@ -269,6 +284,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
                 86_400,
             )?),
+            min_workspace_free_bytes,
             runtime_network: agent.runtime_network.clone(),
             caddy_sites_dir: get(
                 values,
@@ -446,6 +462,10 @@ mod tests {
         assert_eq!(config.agent.max_concurrent_commands, 4);
         assert_eq!(config.docker_runtime.max_concurrent_builds, 1);
         assert_eq!(config.runtime_health_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.docker_runtime.min_workspace_free_bytes,
+            1_024 * 1_024 * 1_024
+        );
         assert_eq!(config.log_level, "info");
     }
 
@@ -521,5 +541,16 @@ mod tests {
 
         let error = from_values(&values).expect_err("zero interval must be rejected");
         assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn configures_workspace_disk_floor_in_mebibytes() {
+        let values = HashMap::from([("SAKALA_MIN_WORKSPACE_FREE_MB".to_owned(), "256".to_owned())]);
+
+        let config = from_values(&values).expect("disk floor should be valid");
+        assert_eq!(
+            config.docker_runtime.min_workspace_free_bytes,
+            256 * 1_024 * 1_024
+        );
     }
 }

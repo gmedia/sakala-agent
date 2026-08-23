@@ -159,6 +159,41 @@ impl WorkspaceManager for GitWorkspaceManager {
 
         Ok(cleaned)
     }
+
+    async fn available_disk_bytes(&self) -> Result<u64, RuntimeError> {
+        let command = CommandSpec::new("df").arg("-Pk").arg(self.root.as_os_str());
+        let output = self.runner.run(&command, &crate::NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Dependency(format!(
+                "workspace disk inspection exited with status {:?}",
+                output.code
+            )));
+        }
+        parse_available_disk_bytes(&output.stdout)
+    }
+}
+
+fn parse_available_disk_bytes(output: &str) -> Result<u64, RuntimeError> {
+    let line = output
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| {
+            RuntimeError::Dependency("workspace disk inspection returned no data".to_owned())
+        })?;
+    let available_blocks = line
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| {
+            RuntimeError::Dependency("workspace disk inspection format is invalid".to_owned())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            RuntimeError::Dependency("workspace disk availability is invalid".to_owned())
+        })?;
+    available_blocks.checked_mul(1_024).ok_or_else(|| {
+        RuntimeError::Dependency("workspace disk availability is too large to represent".to_owned())
+    })
 }
 
 async fn restrict_workspace_permissions(root: &Path) -> Result<(), RuntimeError> {
@@ -198,7 +233,7 @@ mod tests {
         workspace::{GitWorkspaceManager, WorkspaceManager},
     };
 
-    use super::{restrict_workspace_permissions, write_askpass};
+    use super::{parse_available_disk_bytes, restrict_workspace_permissions, write_askpass};
 
     #[tokio::test]
     async fn temporary_checkout_files_are_owner_only() {
@@ -275,6 +310,16 @@ mod tests {
         assert_eq!(cleaned, 0);
         assert!(symlink.exists());
         assert!(target.exists());
+    }
+
+    #[test]
+    fn parses_posix_df_available_blocks() {
+        let available = parse_available_disk_bytes(
+            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000 2500 7500 25% /var/lib/sakala\n",
+        )
+        .expect("df output should parse");
+
+        assert_eq!(available, 7_500 * 1_024);
     }
 
     struct UnusedRunner;

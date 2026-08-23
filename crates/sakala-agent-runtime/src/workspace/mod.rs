@@ -69,4 +69,7 @@ pub trait WorkspaceManager: Send + Sync {
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;
 
     async fn cleanup_stale(&self, minimum_age: Duration) -> Result<usize, RuntimeError>;
+
+    /// Free bytes available on the filesystem that owns the workspace root.
+    async fn available_disk_bytes(&self) -> Result<u64, RuntimeError>;
 }

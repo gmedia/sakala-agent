@@ -79,6 +79,13 @@ Phase 9 hanya melaporkan warning. Auto-removal sengaja tidak dilakukan karena ag
 
 Workspace checkout berbeda: saat startup, agent dapat menghapus direktori terbengkalai yang namanya tepat UUID command Sakala dan umurnya melewati `SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS`. GC tidak mengikuti symlink, tidak menyentuh nama lain, dan tidak dijalankan saat command aktif diproses.
 
+Sebelum checkout deployment baru, Agent juga membaca free space filesystem
+workspace dengan `df -Pk`. Bila jumlahnya di bawah
+`SAKALA_MIN_WORKSPACE_FREE_MB`, command gagal dengan
+`runtime_disk_pressure` sebelum Git atau builder dimulai. Guard ini tidak
+menjalankan `docker image prune -a` atau cleanup host generik; keputusan
+retention dan pembersihan artifact lama tetap harus Sakala-owned.
+
 ## Isolation Decision
 
 Docker rootful pada node khusus masih dapat dipakai untuk pilot dengan repository terkontrol. Untuk workload publik tidak tepercaya, target berikutnya adalah isolated/rootless builder terpisah dari runtime daemon. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.
