@@ -174,6 +174,28 @@ async fn preflight_reports_each_missing_runtime_dependency_as_fatal() {
 }
 
 #[tokio::test]
+async fn preflight_rejects_a_workspace_path_that_cannot_be_created() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let workspace_file = temp.path().join("not-a-directory");
+    fs::write(&workspace_file, "occupied").expect("workspace fixture should be written");
+    let mut config = runtime_config(&temp);
+    config.workspace_root = workspace_file;
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    let report = RuntimeExecutor::preflight(&executor)
+        .await
+        .expect("preflight should return a report");
+
+    assert!(report.has_fatal_failure());
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "workspace" && !check.ready && check.fatal)
+    );
+}
+
+#[tokio::test]
 async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_arguments() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
