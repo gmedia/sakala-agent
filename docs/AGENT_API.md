@@ -18,6 +18,7 @@ Token harus diterbitkan secara aman, disimpan hashed oleh `sakala-api`, dan tida
 | `GET` | `/api/agent/v1/commands` | Poll command tersedia untuk node. |
 | `GET` | `/api/agent/v1/node-state` | Ambil desired lifecycle node sebelum scheduler mulai polling. |
 | `POST` | `/api/agent/v1/commands/{command}/claim` | Klaim command sebelum eksekusi. |
+| `POST` | `/api/agent/v1/commands/{command}/repository-credential` | Lease credential sementara untuk repository private. |
 | `POST` | `/api/agent/v1/commands/{command}/events` | Kirim lifecycle event. |
 | `POST` | `/api/agent/v1/commands/{command}/logs` | Kirim baris log teredaksi. |
 | `POST` | `/api/agent/v1/commands/{command}/complete` | Tandai eksekusi berhasil. |
@@ -53,6 +54,34 @@ POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/complete
 `type` menjelaskan **pekerjaan apa** yang harus dilakukan, misalnya
 `InspectProject` atau `DeployProject`. Sedangkan `id` command adalah identitas
 rekam pekerjaan tersebut untuk claim, event, log, dan status akhirnya.
+
+### Private repository credential lease
+
+Agent hanya memanggil endpoint berikut setelah command berhasil di-claim dan
+payload memakai `repository_access: "temporary_credential"`:
+
+```http
+POST /api/agent/v1/commands/{command}/repository-credential
+```
+
+API wajib memverifikasi bahwa command dimiliki agent peminta, repository cocok
+dengan command, authorization user/workspace masih valid, dan credential hanya
+memiliki akses minimum ke satu repository (`contents:read`). Credential harus
+short-lived, tidak disimpan pada record command, serta tidak dimasukkan ke log
+atau response lain.
+
+Response endpoint ini sengaja memakai object langsung, **bukan** envelope
+Laravel `{ "data": ... }`:
+
+```json
+{
+  "username": "x-access-token",
+  "token": "ghs_ephemeral_installation_token"
+}
+```
+
+Nilai kosong ditolak Agent. Token hanya diteruskan melalui environment
+`GIT_ASKPASS`, tidak pernah dimasukkan ke repository URL atau process arguments.
 
 ## Command Response Shape
 

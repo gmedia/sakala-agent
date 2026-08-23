@@ -137,6 +137,40 @@ async fn stale_deployment_cannot_deactivate_the_current_project_route() {
 }
 
 #[tokio::test]
+async fn stale_legacy_discovery_cannot_delete_a_modern_route_generation() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let current_deployment = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let current_route = format!(
+        "# Managed by sakala-agent for project {project_id} deployment {current_deployment}.\nexample.test:80 {{}}\n"
+    );
+    tokio::fs::write(&route_path, &current_route)
+        .await
+        .expect("modern route should be written");
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+
+    let changed = manager
+        .deactivate(
+            RouteIdentity {
+                project_id,
+                deployment_id: None,
+            },
+            &NoopReporter,
+        )
+        .await
+        .expect("legacy cleanup should be a safe no-op after route replacement");
+
+    assert!(!changed);
+    assert_eq!(
+        tokio::fs::read_to_string(route_path)
+            .await
+            .expect("modern route must remain"),
+        current_route
+    );
+}
+
+#[tokio::test]
 async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workloads() {
     let temp = TempDir::new().expect("temp directory should be available");
     let active_project = Uuid::new_v4();

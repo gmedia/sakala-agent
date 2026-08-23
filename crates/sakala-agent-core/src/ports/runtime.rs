@@ -140,6 +140,7 @@ pub struct NodeTelemetry {
     pub disk_total_bytes: Option<u64>,
     pub disk_available_bytes: Option<u64>,
     pub workspace_used_bytes: Option<u64>,
+    pub runtime_operational: Option<bool>,
     pub runtime_dependencies: Value,
 }
 
@@ -240,6 +241,15 @@ impl RuntimeExecutionError {
 pub trait RuntimeReporter: Send + Sync {
     async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError>;
     async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError>;
+
+    /// Marks the irreversible runtime cutover. Core uses this signal to avoid
+    /// turning an already-live deployment into a timeout failure.
+    fn mark_deployment_committed(&self) {}
+
+    #[must_use]
+    fn deployment_committed(&self) -> bool {
+        false
+    }
 }
 
 /// Creates a bounded reporter for runtime work recovered after an Agent restart.

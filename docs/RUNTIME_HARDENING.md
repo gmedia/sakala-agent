@@ -64,6 +64,11 @@ Follower memakai reporter deployment yang sama dan seluruh baris tetap melewati 
 
 `SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard admission guard untuk project aktif pada steady state. Agent melakukan pemeriksaan awal dan pemeriksaan authoritative yang di-serialize tepat sebelum `docker run`, sehingga deployment project baru yang concurrent tidak dapat melewati batas. Redeploy project aktif mengizinkan satu candidate surge sementara untuk cutover sehat, lalu container lama dihentikan dan dihapus.
 
+Route activation adalah commit point. Sebelum titik ini cancellation/error
+mempertahankan deployment lama dan membersihkan candidate. Setelah titik ini,
+traffic sudah berpindah sehingga cancellation atau reporting failure tidak lagi
+mengubah hasil runtime menjadi gagal; finalisasi cleanup/log follower diteruskan.
+
 Guard ini bukan aggregate scheduler dan belum menghitung total memory/CPU reservation. Penempatan lintas node tetap pekerjaan control plane setelah MVP.
 
 Perubahan resource user dilakukan melalui redeploy dengan payload resource baru. Agent tidak memakai `docker update` untuk mengubah container aktif secara diam-diam karena deployment harus tetap memiliki desired state, applied state, image, health check, dan route cutover yang dapat diaudit.
@@ -90,6 +95,11 @@ deadline dua detik, process group termination, serta child reaping. Versi Git,
 Docker, Buildx, dan Railpack di-cache sekali; probe kapasitas, health runtime,
 `df`, dan `du` juga dibatasi agar satu command host yang macet tidak menahan
 heartbeat maupun shutdown tanpa batas. Core hanya memanggil port runtime.
+
+Heartbeat `active` hanya menjadi `ready` ketika telemetry, capacity, health
+snapshot, dependency runtime, dan disk guard operasional. Probe failure atau
+critical disk pressure menghasilkan status `degraded`; lifecycle
+draining/drained/maintenance tetap memiliki status khususnya sendiri.
 
 Container yang dibuat oleh Agent revision lama mungkin belum memiliki label
 domain, port, command ID, atau batas log yang dibutuhkan recovery modern. Agent

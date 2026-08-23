@@ -61,11 +61,10 @@ pub async fn run(
 }
 
 async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> HeartbeatPayload {
-    let resources = tokio::time::timeout(probe_timeout(), context.runtime.node_telemetry())
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_else(NodeTelemetry::default);
+    let (resources, telemetry_available) = match context.runtime.node_telemetry().await {
+        Ok(resources) => (resources, true),
+        Err(_) => (NodeTelemetry::default(), false),
+    };
     let workloads = workload_statistics(context.runtime.as_ref()).await;
     let reconciliation = context
         .reconciliation
@@ -74,6 +73,18 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         .unwrap_or_default();
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
+            NodeLifecycleState::Active
+                if !telemetry_available
+                    || resources.runtime_operational == Some(false)
+                    || !workloads.capacity_available
+                    || !workloads.health_available
+                    || disk_pressure_state(
+                        resources.disk_available_bytes,
+                        context.minimum_workspace_free_bytes,
+                    ) == "critical" =>
+            {
+                NodeStatus::Degraded
+            }
             NodeLifecycleState::Active => NodeStatus::Ready,
             NodeLifecycleState::Draining => NodeStatus::Draining,
             NodeLifecycleState::Drained => NodeStatus::Drained,
@@ -183,6 +194,8 @@ struct WorkloadStatistics {
     active_builds: Option<usize>,
     maximum_concurrent_builds: Option<usize>,
     unhealthy_details: Vec<crate::ports::RuntimeHealthSnapshot>,
+    capacity_available: bool,
+    health_available: bool,
 }
 
 async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistics {
@@ -190,6 +203,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         .await
         .ok()
         .and_then(Result::ok);
+    let capacity_available = capacity.is_some();
     let active = capacity.as_ref().and_then(|value| value.active_workloads);
     let stopped = capacity.as_ref().and_then(|value| value.stopped_workloads);
     let active_builds = capacity.as_ref().and_then(|value| value.active_builds);
@@ -203,6 +217,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
             stopped,
             active_builds,
             maximum_concurrent_builds,
+            capacity_available,
             ..WorkloadStatistics::default()
         };
     };
@@ -235,6 +250,8 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         starting: Some(starting),
         unhealthy: Some(unhealthy_details.len()),
         unhealthy_details,
+        capacity_available,
+        health_available: true,
     }
 }
 
@@ -256,13 +273,13 @@ mod tests {
         sync::{Arc, RwLock},
     };
 
-    use sakala_agent_protocol::PROTOCOL_VERSION;
+    use sakala_agent_protocol::{NodeStatus, PROTOCOL_VERSION};
     use time::OffsetDateTime;
     use uuid::Uuid;
 
     use crate::{
         AgentConfig, NodeLifecycle,
-        ports::RuntimeExecutor,
+        ports::{NodeTelemetry, RuntimeExecutionError, RuntimeExecutor},
         ports::{RuntimeReconciliationReport, RuntimeStaleRoute},
         scheduler::metrics::SchedulerMetrics,
     };
@@ -273,6 +290,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuntimeExecutor for EmptyRuntime {}
+
+    struct FailedTelemetryRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for FailedTelemetryRuntime {
+        async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {
+            Err(RuntimeExecutionError::new(
+                "runtime_telemetry_failed",
+                "telemetry unavailable",
+            ))
+        }
+    }
 
     #[tokio::test]
     async fn heartbeat_identifies_the_wire_contract_revision() {
@@ -310,5 +339,25 @@ mod tests {
         assert_eq!(disk_pressure_state(Some(99), 100), "critical");
         assert_eq!(disk_pressure_state(Some(100), 100), "normal");
         assert_eq!(disk_pressure_state(None, 100), "unknown");
+    }
+
+    #[tokio::test]
+    async fn active_node_is_degraded_when_runtime_telemetry_fails() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let context = HeartbeatRuntimeContext {
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
+            runtime_driver: "docker".to_owned(),
+            runtime: Arc::new(FailedTelemetryRuntime),
+            scheduler_metrics: Arc::new(SchedulerMetrics::default()),
+            reconciliation: Arc::new(RwLock::new(RuntimeReconciliationReport::default())),
+            startup_reconciliation_at: OffsetDateTime::now_utc(),
+            minimum_workspace_free_bytes: 0,
+        };
+
+        assert_eq!(
+            payload(&config, &context).await.status,
+            NodeStatus::Degraded
+        );
     }
 }

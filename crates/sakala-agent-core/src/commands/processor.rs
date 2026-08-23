@@ -11,8 +11,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::{
-    CoreError, NodeLifecycle, api::ApiClient, commands::CommandDispatcher, ports::RuntimeExecutor,
-    reporting::ApiRuntimeReporter, repositories::ApiRepositoryCredentialProvider,
+    CoreError, NodeLifecycle,
+    api::ApiClient,
+    commands::CommandDispatcher,
+    ports::{RuntimeExecutor, RuntimeReporter},
+    reporting::ApiRuntimeReporter,
+    repositories::ApiRepositoryCredentialProvider,
 };
 
 pub struct CommandProcessor {
@@ -103,20 +107,36 @@ impl CommandProcessor {
             log_bounds,
         ));
 
-        let execution = tokio::time::timeout(
-            execution_timeout,
-            self.dispatcher.dispatch(command, reporter, cancellation),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            Err(crate::ports::RuntimeExecutionError::new(
-                "runtime_timeout",
-                format!(
-                    "command execution exceeded its {}s timeout",
-                    execution_timeout.as_secs()
-                ),
-            ))
-        });
+        let deadline_cancellation = cancellation.clone();
+        let execution = self
+            .dispatcher
+            .dispatch(command, reporter.clone(), cancellation);
+        tokio::pin!(execution);
+        let execution = tokio::select! {
+            biased;
+            result = &mut execution => result,
+            () = tokio::time::sleep(execution_timeout) => {
+                if reporter.deployment_committed() {
+                    warn!(
+                        command_id = %command.id,
+                        "command deadline reached after deployment cutover; waiting for committed finalization"
+                    );
+                    execution.await
+                } else {
+                    deadline_cancellation.cancel();
+                    // Give cancellation-aware runtimes a short cleanup window.
+                    // The terminal error remains timeout even when cleanup returns Cancelled.
+                    let _ = tokio::time::timeout(Duration::from_secs(1), &mut execution).await;
+                    Err(crate::ports::RuntimeExecutionError::new(
+                        "runtime_timeout",
+                        format!(
+                            "command execution exceeded its {}s timeout",
+                            execution_timeout.as_secs()
+                        ),
+                    ))
+                }
+            }
+        };
 
         match execution {
             Ok(output) => {

@@ -271,21 +271,30 @@ impl DockerRuntimeExecutor {
         let container = container_name(project_id, deployment_id);
         let route_activated = AtomicBool::new(false);
 
+        let deployment = self.deploy_inner(
+            request.command_id,
+            project_id,
+            deployment_id,
+            &payload,
+            &workspace,
+            &image,
+            &container,
+            applied_resources,
+            applied_timeouts,
+            &route_activated,
+            Arc::clone(&reporter),
+        );
+        tokio::pin!(deployment);
         let result = tokio::select! {
-            result = self.deploy_inner(
-                request.command_id,
-                project_id,
-                deployment_id,
-                &payload,
-                &workspace,
-                &image,
-                &container,
-                applied_resources,
-                applied_timeouts,
-                &route_activated,
-                Arc::clone(&reporter),
-            ) => result,
-            () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+            biased;
+            result = &mut deployment => result,
+            () = request.cancellation.cancelled() => {
+                if route_activated.load(Ordering::Acquire) {
+                    deployment.await
+                } else {
+                    Err(RuntimeError::Cancelled)
+                }
+            },
         };
 
         if result.is_err()
@@ -432,6 +441,7 @@ impl DockerRuntimeExecutor {
             )
             .await?;
         route_activated.store(true, Ordering::Release);
+        reporter_ref.mark_deployment_committed();
 
         if let Err(error) = self
             .containers
@@ -456,7 +466,7 @@ impl DockerRuntimeExecutor {
                 .await;
         }
 
-        emit_event(
+        if let Err(error) = emit_event(
             reporter_ref,
             "deployment.runtime.ready",
             "Application container and route are ready.",
@@ -468,7 +478,15 @@ impl DockerRuntimeExecutor {
                 "resources": applied_resources,
             }),
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(
+                %error,
+                %project_id,
+                %deployment_id,
+                "deployment committed but ready event reporting failed"
+            );
+        }
         let _ = self.containers.start_log_follower(container, reporter);
         Ok(())
     }

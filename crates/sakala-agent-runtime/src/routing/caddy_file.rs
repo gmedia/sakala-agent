@@ -110,6 +110,14 @@ async fn remove_route(
                     changed: false,
                 });
             }
+        } else if !content.starts_with(legacy_prefix.as_bytes()) {
+            // A stale legacy discovery may race with activation of a modern
+            // deployment-aware route. None means "still legacy", not wildcard.
+            return Ok(RouteSnapshot {
+                path,
+                previous,
+                changed: false,
+            });
         }
         fs::remove_file(&path).await?;
     }

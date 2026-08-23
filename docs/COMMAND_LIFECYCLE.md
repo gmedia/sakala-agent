@@ -63,6 +63,12 @@ otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane
 route memverifikasi marker ownership Sakala beserta deployment ID. Command lama
 tidak boleh menghapus route deployment baru pada project yang sama.
 
+Aktivasi route candidate adalah deployment commit point. Cancellation, deadline,
+atau kegagalan reporting sebelum cutover membatalkan deployment dan membersihkan
+candidate. Setelah cutover berhasil, Agent menyelesaikan finalisasi committed
+deployment; kegagalan event `deployment.runtime.ready` menjadi warning dan tidak
+boleh mengubah workload yang sudah live menjadi `Failed`.
+
 State drain tidak hanya disimpan di memory process. Saat connected Agent
 bootstrap, desired lifecycle dipulihkan dari control plane sebelum polling
 command dimulai. Karena itu restart binary tidak boleh mengaktifkan node yang

@@ -29,6 +29,9 @@ impl NodeTelemetryCollector {
             .get_or_init(|| dependency_versions(Arc::clone(&self.runner)))
             .await
             .clone();
+        let runtime_operational = ["git", "docker", "buildx", "railpack"]
+            .iter()
+            .all(|name| dependencies.get(name).is_some_and(Value::is_string));
         let memory = read_memory().await;
         let disk = disk_resources(self.runner.as_ref(), &self.workspace_root).await;
         NodeTelemetry {
@@ -48,6 +51,7 @@ impl NodeTelemetryCollector {
             disk_total_bytes: disk.0,
             disk_available_bytes: disk.1,
             workspace_used_bytes: disk.2,
+            runtime_operational: Some(runtime_operational),
             runtime_dependencies: dependencies,
         }
     }

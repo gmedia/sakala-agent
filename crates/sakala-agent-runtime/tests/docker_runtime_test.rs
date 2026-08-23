@@ -792,11 +792,11 @@ async fn activated_route_is_not_cleaned_up_when_ready_reporting_fails() {
     let reporter = Arc::new(FailingReadyReporter::default());
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    let error = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+    let output = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
         .await
-        .expect_err("ready report should fail");
+        .expect("ready event failure after cutover must not fail deployment");
 
-    assert!(error.to_string().contains("ready event rejected"));
+    assert_eq!(output.result["applied_resources"]["memory_mb"], 256);
     let commands = runner.commands.lock().expect("command lock");
     assert!(!commands.iter().any(|command| {
         command.program == "docker"
@@ -808,6 +808,41 @@ async fn activated_route_is_not_cleaned_up_when_ready_reporting_fails() {
                 .args
                 .iter()
                 .any(|argument| argument.to_string_lossy().starts_with("sakala-app-"))
+    }));
+}
+
+#[tokio::test]
+async fn cancellation_after_route_cutover_finishes_committed_deployment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let cancellation = CancellationToken::new();
+    let reporter = Arc::new(CutoverCancellingReporter {
+        cancellation: cancellation.clone(),
+    });
+    let command = deploy_command("auto");
+
+    let output = CommandDispatcher::new(executor)
+        .dispatch(&command, reporter, cancellation)
+        .await
+        .expect("post-cutover cancellation must finish as committed");
+
+    assert_eq!(output.result["applied_resources"]["memory_mb"], 256);
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(!commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+            && command.args.iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .starts_with("sakala-app-ff66ed4a")
+            })
     }));
 }
 
@@ -2310,6 +2345,25 @@ impl RuntimeReporter for RecordingReporter {
 #[derive(Default)]
 struct FailingReadyReporter {
     logs: Mutex<Vec<DeploymentLog>>,
+}
+
+struct CutoverCancellingReporter {
+    cancellation: CancellationToken,
+}
+
+#[async_trait]
+impl RuntimeReporter for CutoverCancellingReporter {
+    async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+        if event.event_type == "deployment.runtime.ready" {
+            self.cancellation.cancel();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
+    async fn log(&self, _log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]

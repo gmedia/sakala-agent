@@ -252,6 +252,36 @@ async fn connected_agent_reports_command_timeout_with_stable_failure_status() {
     assert!(error.to_string().contains("exceeded its 1s timeout"));
 }
 
+#[tokio::test]
+async fn command_deadline_after_cutover_completes_committed_deployment() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .and(body_json(json!({ "result": null })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut fixture = command_fixture();
+    fixture["payload"]["timeouts"]["command_timeout_seconds"] = json!(1);
+    let command: AgentCommand = serde_json::from_value(fixture).expect("valid command");
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+
+    CommandProcessor::new(
+        client,
+        Arc::new(CommittedSlowRuntimeExecutor),
+        std::time::Duration::from_secs(1),
+    )
+    .process(&command, CancellationToken::new())
+    .await
+    .expect("committed deployment must complete after its deadline");
+}
+
 async fn mount_lifecycle_mocks(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/api/agent/v1/commands"))
@@ -364,6 +394,21 @@ fn command_fixture() -> serde_json::Value {
 struct FailingRuntimeExecutor;
 
 struct SlowRuntimeExecutor;
+
+struct CommittedSlowRuntimeExecutor;
+
+#[async_trait]
+impl RuntimeExecutor for CommittedSlowRuntimeExecutor {
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        reporter.mark_deployment_committed();
+        sleep(std::time::Duration::from_millis(1_100)).await;
+        Ok(CommandOutput::empty())
+    }
+}
 
 #[async_trait]
 impl RuntimeExecutor for SlowRuntimeExecutor {

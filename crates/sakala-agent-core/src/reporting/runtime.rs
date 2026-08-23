@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, LogBounds};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -39,6 +40,7 @@ pub(crate) struct ApiRuntimeReporter {
     command_id: Uuid,
     log_bounds: LogBounds,
     log_bytes_sent: Mutex<u64>,
+    deployment_committed: AtomicBool,
 }
 
 impl ApiRuntimeReporter {
@@ -49,6 +51,7 @@ impl ApiRuntimeReporter {
             command_id,
             log_bounds,
             log_bytes_sent: Mutex::new(0),
+            deployment_committed: AtomicBool::new(false),
         }
     }
 }
@@ -73,6 +76,14 @@ impl RuntimeReporter for ApiRuntimeReporter {
             .map_err(|error| RuntimeExecutionError::reporting(error.to_string()))?;
         *sent += u64::try_from(log.message.len()).unwrap_or(u64::MAX);
         Ok(())
+    }
+
+    fn mark_deployment_committed(&self) {
+        self.deployment_committed.store(true, Ordering::Release);
+    }
+
+    fn deployment_committed(&self) -> bool {
+        self.deployment_committed.load(Ordering::Acquire)
     }
 }
 
