@@ -163,6 +163,10 @@ mod tests {
             ),
             ("fatal: token has expired", "repository_credential_expired"),
             (
+                "fatal: GitHub App installation token has been revoked",
+                "repository_credential_expired",
+            ),
+            (
                 "fatal: Could not read from remote repository.",
                 "repository_access_denied",
             ),
