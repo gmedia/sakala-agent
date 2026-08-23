@@ -147,6 +147,33 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
 }
 
 #[tokio::test]
+async fn preflight_reports_each_missing_runtime_dependency_as_fatal() {
+    for (program, required_argument, expected_check) in [
+        ("git", None, "git"),
+        ("docker", Some("version"), "docker"),
+        ("docker", Some("buildx"), "docker-buildx"),
+        ("railpack", None, "railpack"),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(UnavailableDependencyRunner {
+            program,
+            required_argument,
+        });
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+        let report = RuntimeExecutor::preflight(&executor)
+            .await
+            .expect("preflight should return a report even when a dependency is absent");
+        assert!(report.has_fatal_failure());
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == expected_check && !check.ready && check.fatal)
+        );
+    }
+}
+
+#[tokio::test]
 async fn private_checkout_uses_ephemeral_askpass_without_credential_url_or_arguments() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
@@ -968,6 +995,35 @@ struct FakeRunner {
 }
 
 struct FailingGitRunner;
+
+struct UnavailableDependencyRunner {
+    program: &'static str,
+    required_argument: Option<&'static str>,
+}
+
+#[async_trait]
+impl ProcessRunner for UnavailableDependencyRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        _sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        let unavailable = spec.program == self.program
+            && self
+                .required_argument
+                .is_none_or(|argument| spec.args.iter().any(|value| value == argument));
+        Ok(ProcessOutput {
+            success: !unavailable,
+            code: (!unavailable).then_some(0).or(Some(127)),
+            stdout: if spec.program == "df" {
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 10000000 1000 9999000 1% /\n".to_owned()
+            } else {
+                String::new()
+            },
+            stderr: String::new(),
+        })
+    }
+}
 
 #[async_trait]
 impl ProcessRunner for FailingGitRunner {
