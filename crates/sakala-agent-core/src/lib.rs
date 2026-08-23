@@ -4,6 +4,7 @@ pub mod api;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod heartbeat;
 pub mod logs;
 pub mod ports;

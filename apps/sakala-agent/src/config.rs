@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fmt, str::FromStr};
+use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError};
@@ -39,6 +39,7 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub runtime_driver: RuntimeDriver,
     pub docker_runtime: DockerRuntimeConfig,
+    pub runtime_health_interval: Duration,
     pub log_level: String,
 }
 
@@ -83,6 +84,9 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS")]
     workspace_gc_max_age_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
+    runtime_health_interval_seconds: Option<String>,
 
     #[arg(long, env = "SAKALA_CADDY_SITES_DIR")]
     caddy_sites_dir: Option<String>,
@@ -171,6 +175,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
         cli.workspace_gc_max_age_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
+        cli.runtime_health_interval_seconds,
     );
     insert(&mut values, "SAKALA_CADDY_SITES_DIR", cli.caddy_sites_dir);
     insert(&mut values, "SAKALA_CADDY_CONTAINER", cli.caddy_container);
@@ -283,6 +292,11 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             ..DockerRuntimeConfig::default()
         },
+        runtime_health_interval: Duration::from_secs(positive_u64(
+            values,
+            "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
+            30,
+        )?),
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -431,6 +445,7 @@ mod tests {
         assert_eq!(config.docker_runtime.resource_safety.max_memory_mb, 512);
         assert_eq!(config.agent.max_concurrent_commands, 4);
         assert_eq!(config.docker_runtime.max_concurrent_builds, 1);
+        assert_eq!(config.runtime_health_interval, Duration::from_secs(30));
         assert_eq!(config.log_level, "info");
     }
 
@@ -495,5 +510,16 @@ mod tests {
         let config = from_values(&values).expect("concurrency limits should be valid");
         assert_eq!(config.agent.max_concurrent_commands, 6);
         assert_eq!(config.docker_runtime.max_concurrent_builds, 2);
+    }
+
+    #[test]
+    fn rejects_zero_runtime_health_interval() {
+        let values = HashMap::from([(
+            "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS".to_owned(),
+            "0".to_owned(),
+        )]);
+
+        let error = from_values(&values).expect_err("zero interval must be rejected");
+        assert!(error.to_string().contains("must be greater than zero"));
     }
 }

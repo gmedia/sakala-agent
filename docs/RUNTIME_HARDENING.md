@@ -33,6 +33,27 @@ Agent tidak mengetahui plan berbayar, membership, atau kuota workspace. Jika use
 
 Build timeout harus lebih pendek daripada command timeout agar runtime sempat menjalankan cleanup dan mengirim failure status.
 
+## Continuous Workload Health
+
+Saat deploy, readiness kandidat ditentukan oleh `DockerHealthChecker`: container
+harus berstatus `running` atau `healthy` sebelum route boleh diaktifkan. Setelah
+deploy selesai, worker health lokal menjalankan snapshot batch setiap
+`SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS` (default 30 detik) terhadap container
+aktif dengan label `dev.sakala.managed=true` dan identity project/deployment
+yang valid.
+
+Snapshot membedakan `healthy/running`, `health: starting`, dan `unhealthy`.
+State terakhir disimpan hanya di memori Agent; perubahan saja yang dicatat pada
+log terstruktur beserta container, project, deployment, status, dan alasan
+aman. Pengecekan mendapat jitter deterministik dari agent ID, satu query batch
+per interval, dan tidak memeriksa container stopped karena `docker ps` tanpa
+`--all` digunakan. Tidak ada environment atau secret container yang dibaca.
+
+Worker ini **tidak** melakukan restart otomatis dan belum mengirim event health
+baru ke control plane. Recovery policy dan payload pelaporan health tetap
+membutuhkan kontrak lifecycle `sakala-api`; hingga itu ada, Agent hanya
+mendeteksi dan memberi sinyal operator lokal.
+
 ## Runtime Log Lifecycle
 
 Setelah candidate sehat, route aktif, dan startup log terkirim, runtime memulai follower `docker logs --follow --tail 0`. Follower berjalan sebagai task milik `DockerContainerEngine`, sehingga bukan task yang terlepas dari lifecycle agent. Saat shutdown, seluruh task follower dibatalkan dan process group subprocess dihentikan sebelum binary keluar.

@@ -570,6 +570,32 @@ async fn reconciliation_discovers_valid_managed_workloads() {
 }
 
 #[tokio::test]
+async fn runtime_health_snapshot_only_checks_active_workloads_and_marks_unhealthy_state() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\nunhealthy\tUp 1 minute (unhealthy)\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\ninvalid\tUp 1 minute\t\t\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let snapshots = RuntimeExecutor::health_snapshot(&executor)
+        .await
+        .expect("health snapshot should complete");
+
+    assert_eq!(snapshots.len(), 2);
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot.workload.container_id == "healthy" && snapshot.ready && snapshot.reason.is_none()
+    }));
+    assert!(snapshots.iter().any(|snapshot| {
+        snapshot.workload.container_id == "unhealthy"
+            && !snapshot.ready
+            && snapshot
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unhealthy"))
+    }));
+}
+
+#[tokio::test]
 async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));

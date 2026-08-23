@@ -49,6 +49,17 @@ pub struct RuntimeWorkload {
     pub status: String,
 }
 
+/// Snapshot kesehatan workload yang dikumpulkan Agent dari runtime lokal.
+///
+/// Snapshot ini sengaja tidak memakai payload control-plane. Pelaporan ke API
+/// akan ditambahkan setelah kontrak health lifecycle disepakati.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeHealthSnapshot {
+    pub workload: RuntimeWorkload,
+    pub ready: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeReconciliationReport {
     pub inspected_containers: usize,
@@ -141,6 +152,11 @@ pub trait RuntimeExecutor: Send + Sync {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         Ok(RuntimeReconciliationReport::default())
+    }
+
+    /// Mengambil kesehatan workload aktif tanpa melakukan mutasi runtime.
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
+        Ok(Vec::new())
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

@@ -5,7 +5,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use sakala_agent_core::ports::{RuntimeOrphan, RuntimeReconciliationReport, RuntimeWorkload};
+use sakala_agent_core::ports::{
+    RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport, RuntimeWorkload,
+};
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use tokio::{
     fs::{self, OpenOptions},
@@ -176,6 +178,51 @@ impl ContainerEngine for DockerContainerEngine {
         }
 
         Ok(report)
+    }
+
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError> {
+        // `docker ps` deliberately excludes stopped workloads. Mereka tidak
+        // seharusnya terus diperiksa oleh worker kesehatan runtime.
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker health inspection exited with status {:?}",
+                output.code
+            )));
+        }
+
+        let mut snapshots = Vec::new();
+        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let Some(project_id) = fields.get(2).and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let Some(deployment_id) = fields.get(3).and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let status = fields.get(1).copied().unwrap_or_default().to_owned();
+            let (ready, reason) = health_state(&status);
+            snapshots.push(RuntimeHealthSnapshot {
+                workload: RuntimeWorkload {
+                    container_id: fields.first().copied().unwrap_or_default().to_owned(),
+                    project_id,
+                    deployment_id,
+                    status,
+                },
+                ready,
+                reason,
+            });
+        }
+
+        Ok(snapshots)
     }
 
     async fn start(
@@ -358,4 +405,22 @@ impl ContainerEngine for DockerContainerEngine {
             let _ = follower.await;
         }
     }
+}
+
+fn health_state(status: &str) -> (bool, Option<String>) {
+    let normalized = status.to_ascii_lowercase();
+    if normalized.contains("unhealthy") {
+        return (false, Some("Docker health status is unhealthy".to_owned()));
+    }
+    if normalized.contains("health: starting") {
+        return (
+            false,
+            Some("Docker health check is still starting".to_owned()),
+        );
+    }
+    if normalized.starts_with("up") {
+        return (true, None);
+    }
+
+    (false, Some(format!("container is not running: {status}")))
 }

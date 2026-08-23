@@ -62,6 +62,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     }
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    let runtime_health_task = tokio::spawn(sakala_agent_core::health::worker::run(
+        Arc::clone(&runtime),
+        config.agent.agent_id.clone(),
+        config.runtime_health_interval,
+        shutdown_rx.clone(),
+    ));
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
         config.agent.clone(),
         client.clone(),
@@ -86,6 +92,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .await
         .context("heartbeat worker task failed")?;
     poller_task.await.context("command poller task failed")?;
+    runtime_health_task
+        .await
+        .context("runtime health worker task failed")?;
     runtime
         .shutdown()
         .await

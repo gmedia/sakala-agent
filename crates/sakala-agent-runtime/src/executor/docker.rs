@@ -6,8 +6,8 @@ use std::sync::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
-    RuntimeExecutor, RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
-    RuntimeReporter,
+    RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -497,6 +497,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .cleanup_stale(self.workspace_gc_max_age)
             .await?;
         Ok(report)
+    }
+
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
+        self.containers.health_snapshot().await.map_err(Into::into)
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeExecutionError> {

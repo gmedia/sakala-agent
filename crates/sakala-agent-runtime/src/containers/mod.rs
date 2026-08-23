@@ -5,7 +5,7 @@ use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
-use sakala_agent_core::ports::RuntimeReconciliationReport;
+use sakala_agent_core::ports::{RuntimeHealthSnapshot, RuntimeReconciliationReport};
 
 mod docker;
 pub(crate) mod limits;
@@ -34,6 +34,8 @@ pub trait ContainerEngine: Send + Sync {
     async fn ensure_capacity(&self, project_id: Uuid) -> Result<(), RuntimeError>;
 
     async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
+
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError>;
 
     async fn start(
         &self,
