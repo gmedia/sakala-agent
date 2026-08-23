@@ -88,6 +88,7 @@ async fn payload(
                 "memory_available_bytes": resources.memory_available_bytes,
                 "disk_total_bytes": resources.disk_total_bytes,
                 "disk_available_bytes": resources.disk_available_bytes,
+                "workspace_used_bytes": resources.workspace_used_bytes,
             },
             "workloads": {
                 "active": workloads.active,
@@ -155,6 +156,7 @@ struct NodeResources {
     memory_available_bytes: Option<u64>,
     disk_total_bytes: Option<u64>,
     disk_available_bytes: Option<u64>,
+    workspace_used_bytes: Option<u64>,
 }
 
 async fn node_resources(workspace_root: &Path) -> NodeResources {
@@ -162,6 +164,7 @@ async fn node_resources(workspace_root: &Path) -> NodeResources {
         .ok()
         .map(|contents| parse_meminfo(&contents))
         .unwrap_or_default();
+    let disk = workspace_disk_resources(workspace_root).await;
     NodeResources {
         uptime_seconds: std::fs::read_to_string("/proc/uptime")
             .ok()
@@ -173,7 +176,7 @@ async fn node_resources(workspace_root: &Path) -> NodeResources {
             .and_then(|contents| contents.split_whitespace().next()?.parse::<f64>().ok()),
         memory_total_bytes: memory.0,
         memory_available_bytes: memory.1,
-        ..workspace_disk_resources(workspace_root).await
+        ..disk
     }
 }
 
@@ -202,9 +205,20 @@ async fn workspace_disk_resources(workspace_root: &Path) -> NodeResources {
         .get(3)
         .and_then(|value| value.parse::<u64>().ok())
         .and_then(|value| value.checked_mul(1_024));
+    let workspace_used_bytes = tokio::process::Command::new("du")
+        .arg("-sk")
+        .arg(workspace_root)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| output.split_whitespace().next()?.parse::<u64>().ok())
+        .and_then(|value| value.checked_mul(1_024));
     NodeResources {
         disk_total_bytes,
         disk_available_bytes,
+        workspace_used_bytes,
         ..NodeResources::default()
     }
 }

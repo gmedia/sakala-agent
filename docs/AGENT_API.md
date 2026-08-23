@@ -250,7 +250,8 @@ untuk aturan rollout dan command yang belum didukung.
       "memory_total_bytes": 8589934592,
       "memory_available_bytes": 4294967296,
       "disk_total_bytes": 107374182400,
-      "disk_available_bytes": 53687091200
+      "disk_available_bytes": 53687091200,
+      "workspace_used_bytes": 104857600
     },
     "workloads": {
       "active": 2,
