@@ -160,6 +160,10 @@ Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan 
 
 `agent_id` tidak diulang di body karena identitas node berasal dari header `X-Agent-Id` yang telah diautentikasi.
 
+`metadata.protocol_version` adalah revision contract Agent/API dan terpisah dari
+semantic version binary. Lihat [Compatibility and Release Policy](COMPATIBILITY.md)
+untuk aturan rollout dan command yang belum didukung.
+
 ```json
 {
   "status": "ready",
