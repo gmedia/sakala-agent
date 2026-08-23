@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use sakala_agent_core::ports::{
     CommandOutput, DeployProjectRequest, InspectProjectRequest, RuntimeExecutionError,
     RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck, RuntimePreflightReport,
-    RuntimeReconciliationReport, RuntimeReporter,
+    RuntimeReconciliationReport, RuntimeReporter, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
@@ -23,7 +23,8 @@ use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
-        ContainerEngine, DockerContainerEngine, RunContainerRequest, container_name, image_name,
+        ContainerEngine, DockerContainerEngine, ManagedWorkload, RunContainerRequest,
+        container_name, image_name,
     },
     health::{DockerHealthChecker, HealthChecker},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -365,6 +366,8 @@ impl DockerRuntimeExecutor {
                         workspace: workspace.root().to_owned(),
                         environment: payload.environment.clone(),
                         resources: applied_resources,
+                        domain: payload.domain.clone(),
+                        port: payload.container_port,
                     },
                     reporter_ref,
                 )
@@ -427,6 +430,152 @@ impl DockerRuntimeExecutor {
         .await?;
         self.containers.start_log_follower(container, reporter);
         Ok(())
+    }
+
+    async fn workload(
+        &self,
+        request: &WorkloadLifecycleRequest,
+    ) -> Result<ManagedWorkload, RuntimeError> {
+        self.containers
+            .workload(request.project_id, request.deployment_id)
+            .await?
+            .ok_or(RuntimeError::WorkloadNotFound)
+    }
+
+    async fn activate_workload(
+        &self,
+        workload: &ManagedWorkload,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        self.health.wait_until_ready(&workload.container_id).await?;
+        self.routes
+            .activate(
+                &RouteSpec {
+                    project_id: workload.project_id,
+                    domain: workload.domain.clone(),
+                    upstream: container_name(workload.project_id, workload.deployment_id),
+                    port: workload.port,
+                },
+                reporter,
+            )
+            .await
+    }
+
+    async fn run_restart(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let workload = self.workload(&request).await?;
+        if !workload.status.to_ascii_lowercase().starts_with("up") {
+            return Err(RuntimeError::WorkloadNotRunning);
+        }
+        self.containers.restart(&workload, 10).await?;
+        self.activate_workload(&workload, reporter.as_ref()).await?;
+        emit_event(
+            reporter.as_ref(),
+            "workload.restart.completed",
+            "Workload restarted and route revalidated.",
+            json!({ "project_id": workload.project_id, "deployment_id": workload.deployment_id }),
+        )
+        .await?;
+        Ok(CommandOutput::with_result(json!({ "status": "ready" })))
+    }
+
+    async fn run_stop(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+        remove: bool,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let Some(workload) = self
+            .containers
+            .workload(request.project_id, request.deployment_id)
+            .await?
+        else {
+            return Ok(CommandOutput::with_result(
+                json!({ "status": "already_stopped" }),
+            ));
+        };
+        self.containers.stop(&workload, 10).await?;
+        self.routes
+            .deactivate(workload.project_id, reporter.as_ref())
+            .await?;
+        if remove {
+            self.containers.remove(&workload).await?;
+        }
+        let event_type = if remove {
+            "workload.stop.completed"
+        } else {
+            "workload.sleep.completed"
+        };
+        emit_event(
+            reporter.as_ref(),
+            event_type,
+            if remove {
+                "Workload stopped and container removed; image is retained."
+            } else {
+                "Workload stopped for sleep; container and image are retained."
+            },
+            json!({ "project_id": workload.project_id, "deployment_id": workload.deployment_id }),
+        )
+        .await?;
+        Ok(CommandOutput::with_result(
+            json!({ "status": if remove { "stopped" } else { "sleeping" } }),
+        ))
+    }
+
+    async fn run_wake(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let workload = self.workload(&request).await?;
+        self.containers.start_existing(&workload).await?;
+        self.activate_workload(&workload, reporter.as_ref()).await?;
+        emit_event(
+            reporter.as_ref(),
+            "workload.wake.completed",
+            "Sleeping workload is ready and its route is restored.",
+            json!({ "project_id": workload.project_id, "deployment_id": workload.deployment_id }),
+        )
+        .await?;
+        Ok(CommandOutput::with_result(json!({ "status": "ready" })))
+    }
+
+    async fn run_health_check(
+        &self,
+        request: WorkloadLifecycleRequest,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let workload = self.workload(&request).await?;
+        let running = workload.status.to_ascii_lowercase().starts_with("up");
+        let readiness = if running {
+            self.health.wait_until_ready(&workload.container_id).await
+        } else {
+            Err(RuntimeError::WorkloadNotRunning)
+        };
+        let ready = readiness.is_ok();
+        let reason = readiness.err().map(|error| error.to_string());
+        Ok(CommandOutput::with_result(json!({
+            "container_id": workload.container_id,
+            "running": running,
+            "ready": ready,
+            "docker_status": workload.status,
+            "reason": reason,
+        })))
+    }
+
+    async fn run_refresh_route(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let workload = self.workload(&request).await?;
+        if !workload.status.to_ascii_lowercase().starts_with("up") {
+            return Err(RuntimeError::WorkloadNotRunning);
+        }
+        self.activate_workload(&workload, reporter.as_ref()).await?;
+        Ok(CommandOutput::with_result(json!({ "status": "ready" })))
     }
 }
 
@@ -560,6 +709,62 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         self.run_deployment(request, reporter)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn restart_project(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_restart(request, reporter)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn stop_project(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_stop(request, reporter, true)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn sleep_project(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_stop(request, reporter, false)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn wake_project(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_wake(request, reporter).await.map_err(Into::into)
+    }
+
+    async fn health_check(
+        &self,
+        request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_health_check(request).await.map_err(Into::into)
+    }
+
+    async fn refresh_route(
+        &self,
+        request: WorkloadLifecycleRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_refresh_route(request, reporter)
             .await
             .map_err(Into::into)
     }

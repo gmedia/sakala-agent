@@ -100,6 +100,28 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
 
 `sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
+### Workload Lifecycle Commands
+
+Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
+`HealthCheck`, dan `RefreshRoute`, API mengirim `project_id` serta
+`deployment_id` target dan memakai payload object kosong:
+
+```json
+{
+  "id": "b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+  "type": "SleepProject",
+  "status": "Pending",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": {}
+}
+```
+
+Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
+mengirim nama Docker, domain, port, command shell, atau credential pada payload
+lifecycle. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
+refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
+
 ## Polling and Claim Semantics
 
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.

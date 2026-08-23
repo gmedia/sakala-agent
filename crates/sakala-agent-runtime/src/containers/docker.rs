@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
-    containers::{ContainerEngine, ResourceSafetyConfig, RunContainerRequest},
+    containers::{ContainerEngine, ManagedWorkload, ResourceSafetyConfig, RunContainerRequest},
     logs::ReporterOutputSink,
     process::run_checked,
 };
@@ -28,6 +28,8 @@ use crate::{
 const MANAGED_LABEL: &str = "dev.sakala.managed=true";
 const AGENT_ID_LABEL: &str = "dev.sakala.agent-id";
 const WORKLOAD_KIND_LABEL: &str = "dev.sakala.workload-kind=web";
+const DOMAIN_LABEL: &str = "dev.sakala.domain";
+const PORT_LABEL: &str = "dev.sakala.port";
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
@@ -225,6 +227,119 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(snapshots)
     }
 
+    async fn workload(
+        &self,
+        project_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<Option<ManagedWorkload>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--filter")
+            .arg(format!("label=dev.sakala.project-id={project_id}"))
+            .arg("--filter")
+            .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.domain\"}}\t{{.Label \"dev.sakala.port\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker workload lookup exited with status {:?}",
+                output.code
+            )));
+        }
+        let Some(line) = output.stdout.lines().find(|line| !line.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let domain = fields
+            .get(2)
+            .copied()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::Container("managed workload is missing its domain label".to_owned())
+            })?;
+        let port = fields
+            .get(3)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                RuntimeError::Container("managed workload has an invalid port label".to_owned())
+            })?;
+        Ok(Some(ManagedWorkload {
+            container_id: fields.first().copied().unwrap_or_default().to_owned(),
+            status: fields.get(1).copied().unwrap_or_default().to_owned(),
+            project_id,
+            deployment_id,
+            domain: domain.to_owned(),
+            port,
+        }))
+    }
+
+    async fn restart(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError> {
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("restart")
+                .arg("--time")
+                .arg(grace_seconds.to_string())
+                .arg(&workload.container_id),
+            "docker-restart",
+        )
+        .await
+    }
+
+    async fn stop(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError> {
+        if !workload.status.to_ascii_lowercase().starts_with("up") {
+            return Ok(());
+        }
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("stop")
+                .arg("--time")
+                .arg(grace_seconds.to_string())
+                .arg(&workload.container_id),
+            "docker-stop",
+        )
+        .await
+    }
+
+    async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
+        if workload.status.to_ascii_lowercase().starts_with("up") {
+            return Ok(());
+        }
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("start")
+                .arg(&workload.container_id),
+            "docker-start",
+        )
+        .await
+    }
+
+    async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("rm")
+                .arg(&workload.container_id),
+            "docker-remove",
+        )
+        .await
+    }
+
     async fn start(
         &self,
         request: &RunContainerRequest,
@@ -261,6 +376,10 @@ impl ContainerEngine for DockerContainerEngine {
                 "dev.sakala.deployment-id={}",
                 request.deployment_id
             ))
+            .arg("--label")
+            .arg(format!("{DOMAIN_LABEL}={}", request.domain))
+            .arg("--label")
+            .arg(format!("{PORT_LABEL}={}", request.port))
             .arg("--label")
             .arg(WORKLOAD_KIND_LABEL)
             .arg("--label")
@@ -404,6 +523,23 @@ impl ContainerEngine for DockerContainerEngine {
         for follower in followers {
             let _ = follower.await;
         }
+    }
+}
+
+async fn run_container_command(
+    runner: &dyn ProcessRunner,
+    command: CommandSpec,
+    phase: &str,
+) -> Result<(), RuntimeError> {
+    let output = runner.run(&command, &NullOutputSink).await?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(RuntimeError::failed_process(
+            phase,
+            output.code,
+            &output.stderr,
+        ))
     }
 }
 

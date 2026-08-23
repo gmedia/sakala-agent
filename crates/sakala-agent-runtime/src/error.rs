@@ -38,6 +38,10 @@ pub enum RuntimeError {
     Capacity(String),
     #[error("runtime disk pressure: {0}")]
     DiskPressure(String),
+    #[error("managed workload was not found")]
+    WorkloadNotFound,
+    #[error("managed workload is not running")]
+    WorkloadNotRunning,
     #[error("runtime operation was cancelled")]
     Cancelled,
     #[error("runtime operation {operation} exceeded its {seconds}s timeout")]
@@ -69,6 +73,8 @@ impl RuntimeError {
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
             Self::DiskPressure(_) => "runtime_disk_pressure",
+            Self::WorkloadNotFound => "runtime_workload_not_found",
+            Self::WorkloadNotRunning => "runtime_workload_not_running",
             Self::Cancelled => "runtime_cancelled",
             Self::Timeout { .. } => "runtime_timeout",
             Self::Reporting(_) => "runtime_reporting_failed",

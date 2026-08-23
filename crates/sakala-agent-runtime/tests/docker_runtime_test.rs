@@ -12,7 +12,7 @@ use sakala_agent_core::{
     commands::CommandDispatcher,
     ports::{
         CommandOutput, DeployProjectRequest, RepositoryCredential, RuntimeExecutionError,
-        RuntimeExecutor, RuntimeReporter, SecretString,
+        RuntimeExecutor, RuntimeReporter, SecretString, WorkloadLifecycleRequest,
     },
 };
 use sakala_agent_protocol::{
@@ -656,6 +656,160 @@ async fn runtime_health_snapshot_only_checks_active_workloads_and_marks_unhealth
 }
 
 #[tokio::test]
+async fn sleep_stops_managed_workload_without_removing_the_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::sleep_project(&executor, lifecycle_request(), reporter)
+        .await
+        .expect("sleep should stop an existing workload");
+
+    assert_eq!(output.result["status"], "sleeping");
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "stop")
+    }));
+    assert!(!commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
+async fn stop_removes_workload_container_but_not_its_image() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("stopping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::stop_project(&executor, lifecycle_request(), reporter)
+        .await
+        .expect("stop should remove an existing workload");
+
+    assert_eq!(output.result["status"], "stopped");
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "rm")
+    }));
+    assert!(!commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+            && command.args.get(1).is_some_and(|argument| argument == "rm")
+    }));
+}
+
+#[tokio::test]
+async fn wake_starts_stopped_workload_and_restores_its_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "sleeping\tExited (0) 1 minute ago\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route_path = config
+        .caddy_sites_dir
+        .join("ff66ed4a-6303-4be6-8ef4-63c28b112680.Caddyfile");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::wake_project(&executor, lifecycle_request(), reporter)
+        .await
+        .expect("wake should restore a sleeping workload");
+
+    assert_eq!(output.result["status"], "ready");
+    assert!(route_path.exists());
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "start")
+    }));
+}
+
+#[tokio::test]
+async fn restart_rechecks_readiness_and_revalidates_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_docker_ps(
+            "running\tUp 1 minute (healthy)\tportfolio.run.sakala.localhost\t3000\n",
+        ));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route_path = config
+        .caddy_sites_dir
+        .join("ff66ed4a-6303-4be6-8ef4-63c28b112680.Caddyfile");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::restart_project(&executor, lifecycle_request(), reporter)
+        .await
+        .expect("restart should revalidate the workload route");
+
+    assert_eq!(output.result["status"], "ready");
+    assert!(route_path.exists());
+    let commands = runner.commands.lock().expect("command lock");
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "restart")
+    }));
+    assert!(commands.iter().any(|command| {
+        command.program == "docker"
+            && command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "inspect")
+    }));
+}
+
+#[tokio::test]
+async fn explicit_health_check_returns_structured_unready_state_for_stopped_workload() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "stopped\tExited (0) 1 minute ago\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let output = RuntimeExecutor::health_check(&executor, lifecycle_request(), reporter)
+        .await
+        .expect("health check should report a stopped workload without failing the command");
+
+    assert_eq!(output.result["running"], false);
+    assert_eq!(output.result["ready"], false);
+    assert_eq!(output.result["docker_status"], "Exited (0) 1 minute ago");
+    assert!(
+        output.result["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not running"))
+    );
+}
+
+#[tokio::test]
 async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(true));
@@ -744,6 +898,16 @@ fn inspect_command() -> AgentCommand {
             "repository_url": "https://github.com/gmedia/example-app.git",
             "commit_sha": "0123456789abcdef0123456789abcdef01234567"
         }),
+    }
+}
+
+fn lifecycle_request() -> WorkloadLifecycleRequest {
+    WorkloadLifecycleRequest {
+        command_id: Uuid::new_v4(),
+        project_id: Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID"),
+        deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
+            .expect("deployment UUID"),
+        cancellation: CancellationToken::new(),
     }
 }
 

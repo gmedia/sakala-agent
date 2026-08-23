@@ -22,6 +22,18 @@ pub struct RunContainerRequest {
     pub workspace: PathBuf,
     pub environment: BTreeMap<String, String>,
     pub resources: AppliedRuntimeResources,
+    pub domain: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedWorkload {
+    pub container_id: String,
+    pub status: String,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub domain: String,
+    pub port: u16,
 }
 
 #[async_trait]
@@ -36,6 +48,28 @@ pub trait ContainerEngine: Send + Sync {
     async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError>;
+
+    async fn workload(
+        &self,
+        project_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<Option<ManagedWorkload>, RuntimeError>;
+
+    async fn restart(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError>;
+
+    async fn stop(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError>;
+
+    async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
+
+    async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
 
     async fn start(
         &self,

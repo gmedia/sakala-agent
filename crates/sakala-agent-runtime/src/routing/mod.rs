@@ -24,6 +24,12 @@ pub trait RouteManager: Send + Sync {
         route: &RouteSpec,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
+
+    async fn deactivate(
+        &self,
+        project_id: Uuid,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError>;
 }
 
 #[async_trait]

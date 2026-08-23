@@ -5,6 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use tokio::fs;
+use uuid::Uuid;
 
 use crate::{
     RuntimeError, RuntimeReporter,
@@ -66,6 +67,19 @@ impl RouteSnapshot {
     }
 }
 
+async fn remove_route(sites_dir: &Path, project_id: Uuid) -> Result<RouteSnapshot, RuntimeError> {
+    let path = sites_dir.join(format!("{project_id}.Caddyfile"));
+    let previous = match fs::read(&path).await {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if previous.is_some() {
+        fs::remove_file(&path).await?;
+    }
+    Ok(RouteSnapshot { path, previous })
+}
+
 #[async_trait]
 impl RouteManager for CaddyFileRouteManager {
     async fn activate(
@@ -74,6 +88,23 @@ impl RouteManager for CaddyFileRouteManager {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         let snapshot = write_route(&self.sites_dir, route).await?;
+        if let Err(error) = self.reloader.validate_and_reload(reporter).await {
+            snapshot.restore().await?;
+            self.reloader.reload_after_rollback().await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn deactivate(
+        &self,
+        project_id: Uuid,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        let snapshot = remove_route(&self.sites_dir, project_id).await?;
+        if snapshot.previous.is_none() {
+            return Ok(());
+        }
         if let Err(error) = self.reloader.validate_and_reload(reporter).await {
             snapshot.restore().await?;
             self.reloader.reload_after_rollback().await;

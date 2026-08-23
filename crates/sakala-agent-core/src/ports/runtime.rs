@@ -29,6 +29,15 @@ pub struct DeployProjectRequest {
     pub cancellation: CancellationToken,
 }
 
+/// Lifecycle request identified exclusively by the command record.
+#[derive(Clone, Debug)]
+pub struct WorkloadLifecycleRequest {
+    pub command_id: Uuid,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub cancellation: CancellationToken,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CommandOutput {
     pub result: Value,
@@ -182,6 +191,66 @@ pub trait RuntimeExecutor: Send + Sync {
         let _ = reporter;
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support project deployment",
+        ))
+    }
+
+    async fn restart_project(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support project restart",
+        ))
+    }
+
+    async fn stop_project(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support project stop",
+        ))
+    }
+
+    async fn sleep_project(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support project sleep",
+        ))
+    }
+
+    async fn wake_project(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support project wake",
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support explicit health checks",
+        ))
+    }
+
+    async fn refresh_route(
+        &self,
+        _request: WorkloadLifecycleRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support route refresh",
         ))
     }
 }
