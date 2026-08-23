@@ -54,6 +54,12 @@ Angka tersebut adalah default pilot yang harus divalidasi berdasarkan kapasitas 
 
 ## Foundation Behavior
 
+Setiap lifecycle command menghasilkan log terstruktur dengan `command_id`,
+`project_id`, `deployment_id`, `command_type`, outcome, dan `elapsed_ms`.
+Payload command, nilai environment, dan credential repository tidak menjadi
+field telemetry. Ini memungkinkan korelasi log node dengan event/deployment di
+control plane tanpa menambah endpoint observability publik.
+
 Local mode hanya menulis startup, heartbeat tick, polling tick, dan shutdown. Noop executor baru menghasilkan deployment logs jika dipanggil dalam connected command lifecycle.
 
 Docker runtime mengambil maksimal 100 baris startup setelah health check, lalu menjalankan `docker logs --follow --tail 0` sebagai task background. Follower memakai reporter command yang sama, tetap melewati redaction core, dan tidak memiliki subprocess timeout karena lifecycle-nya mengikuti container. `RuntimeExecutor::shutdown` membatalkan seluruh follower dan process group sebelum binary berhenti.
