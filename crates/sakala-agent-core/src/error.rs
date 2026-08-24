@@ -8,6 +8,12 @@ pub enum CoreError {
     #[error("control-plane API request failed: {0}")]
     Api(#[from] reqwest::Error),
 
+    #[error("control-plane command is no longer claimable")]
+    CommandNotClaimable,
+
+    #[error("control-plane command already reached incompatible terminal state: {0}")]
+    CommandTerminalConflict(String),
+
     #[error("runtime execution failed: {0}")]
     Runtime(#[from] crate::ports::RuntimeExecutionError),
 }

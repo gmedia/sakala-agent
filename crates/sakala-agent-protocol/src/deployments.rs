@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::RepositoryAccess;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeploymentBuilder {
@@ -47,6 +49,17 @@ pub struct AppliedRuntimeResources {
 pub struct DeployProjectResult {
     pub requested_resources: RuntimeResourceLimits,
     pub applied_resources: AppliedRuntimeResources,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub finalization_deferred: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization_deferred_reason: Option<FinalizationDeferredReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizationDeferredReason {
+    GraceElapsed,
+    RuntimeError,
 }
 
 /// Immutable input required to deploy one HTTP application.
@@ -54,6 +67,8 @@ pub struct DeployProjectResult {
 pub struct DeployProjectPayload {
     pub repository_url: String,
     pub commit_sha: String,
+    #[serde(default)]
+    pub repository_access: RepositoryAccess,
     pub domain: String,
     #[serde(default = "default_container_port")]
     pub container_port: u16,
@@ -71,4 +86,8 @@ pub struct DeployProjectPayload {
 
 const fn default_container_port() -> u16 {
     3000
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }

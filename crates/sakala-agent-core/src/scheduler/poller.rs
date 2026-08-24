@@ -1,23 +1,48 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+};
 
-use sakala_agent_protocol::CommandStatus;
-use tokio::{sync::watch, time::sleep};
-use tracing::{info, warn};
+use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType};
+use tokio::{sync::watch, task::JoinSet, time::sleep};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::{AgentConfig, api::ApiClient, commands::CommandProcessor, ports::RuntimeExecutor};
+use crate::{
+    AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, commands::CommandProcessor,
+    ports::RuntimeExecutor, scheduler::metrics::SchedulerMetrics,
+};
 
 pub async fn run(
     config: AgentConfig,
     client: Option<ApiClient>,
     runtime: Arc<dyn RuntimeExecutor>,
+    node_lifecycle: Arc<NodeLifecycle>,
+    metrics: Arc<SchedulerMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let handler = client
-        .as_ref()
-        .map(|client| CommandProcessor::new(client.clone(), runtime, config.command_timeout()));
+    let handler = client.as_ref().map(|client| {
+        Arc::new(CommandProcessor::with_node_lifecycle(
+            client.clone(),
+            runtime,
+            config.command_timeout(),
+            Arc::clone(&node_lifecycle),
+        ))
+    });
+    let mut executions =
+        CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));
 
     'polling: loop {
+        executions.reap_completed();
+        if node_lifecycle.state() == NodeLifecycleState::Draining && executions.len() == 0 {
+            node_lifecycle.set(NodeLifecycleState::Drained);
+            info!("node drain completed; workload command processing is paused");
+        }
+
         if let (Some(client), Some(handler)) = (&client, &handler) {
+            metrics.begin_poll();
             match client.poll_commands().await {
                 Ok(commands) => {
                     for command in commands {
@@ -29,19 +54,38 @@ pub async fn run(
                             );
                             continue;
                         }
+                        if !node_lifecycle.accepts_workload_commands()
+                            && !matches!(
+                                command.command_type,
+                                CommandType::DrainNode | CommandType::ResumeNode
+                            )
+                        {
+                            debug!(
+                                command_id = %command.id,
+                                state = ?node_lifecycle.state(),
+                                "leaving workload command pending while node is not active"
+                            );
+                            continue;
+                        }
 
-                        tokio::select! {
-                            result = handler.process(&command) => {
-                                if let Err(error) = result {
-                                    warn!(command_id = %command.id, %error, "command execution failed");
+                        let command_id = command.id;
+                        let project_id = command.project_id;
+                        let work_command = command.clone();
+                        let cancellation = CancellationToken::new();
+                        if !executions.try_start(command, cancellation.clone(), {
+                            let handler = Arc::clone(handler);
+                            async move {
+                                if let Err(error) = handler.process(&work_command, cancellation).await {
+                                    warn!(command_id = %command_id, %error, "command execution failed");
                                 }
                             }
-                            result = shutdown.changed() => {
-                                if result.is_err() || *shutdown.borrow() {
-                                    info!(command_id = %command.id, "cancelling in-flight command during shutdown");
-                                    break 'polling;
-                                }
-                            }
+                        }) {
+                            metrics.command_deferred();
+                            debug!(
+                                command_id = %command_id,
+                                project_id = ?project_id,
+                                "command remains pending because the bounded scheduler is at capacity or its project is busy"
+                            );
                         }
                     }
                 }
@@ -59,11 +103,346 @@ pub async fn run(
             () = sleep(config.poll_interval()) => {}
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
-                    break;
+                    info!(in_flight_commands = executions.len(), "cancelling in-flight commands during shutdown");
+                    break 'polling;
                 }
             }
         }
     }
 
+    executions.cancel_and_wait(config.shutdown_grace()).await;
     info!("command poller stopped");
+}
+
+/// Bounds active command work without creating queued tasks. Commands that cannot
+/// start remain pending in the control plane and will be considered again on a
+/// later poll. A project may own at most one active command at a time.
+struct CommandExecutions {
+    heavy_limit: usize,
+    lightweight_limit: usize,
+    active_heavy: usize,
+    active_lightweight: usize,
+    active_projects: HashSet<Uuid>,
+    metrics: Arc<SchedulerMetrics>,
+    task_metadata: HashMap<tokio::task::Id, TaskMetadata>,
+    tasks: JoinSet<(Uuid, Option<Uuid>)>,
+}
+
+struct TaskMetadata {
+    command_id: Uuid,
+    project_id: Option<Uuid>,
+    cancellation: CancellationToken,
+    lightweight: bool,
+}
+
+impl CommandExecutions {
+    fn new(limit: usize, metrics: Arc<SchedulerMetrics>) -> Self {
+        Self {
+            heavy_limit: limit,
+            lightweight_limit: 1,
+            active_heavy: 0,
+            active_lightweight: 0,
+            active_projects: HashSet::new(),
+            metrics,
+            task_metadata: HashMap::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn try_start<F>(
+        &mut self,
+        command: AgentCommand,
+        cancellation: CancellationToken,
+        work: F,
+    ) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let command_id = command.id;
+        let project_id = command.project_id;
+        let lightweight = is_lightweight(command.command_type);
+        if (lightweight && self.active_lightweight >= self.lightweight_limit)
+            || (!lightweight && self.active_heavy >= self.heavy_limit)
+            || project_id.is_some_and(|project_id| self.active_projects.contains(&project_id))
+        {
+            return false;
+        }
+
+        if let Some(project_id) = project_id {
+            self.active_projects.insert(project_id);
+        }
+        if lightweight {
+            self.active_lightweight += 1;
+        } else {
+            self.active_heavy += 1;
+        }
+        self.metrics.command_started();
+        let task = self.tasks.spawn(async move {
+            work.await;
+            (command_id, project_id)
+        });
+        self.task_metadata.insert(
+            task.id(),
+            TaskMetadata {
+                command_id,
+                project_id,
+                cancellation,
+                lightweight,
+            },
+        );
+        true
+    }
+
+    fn reap_completed(&mut self) {
+        while let Some(result) = self.tasks.try_join_next() {
+            match result {
+                Ok((command_id, project_id)) => {
+                    if let Some(project_id) = project_id {
+                        self.active_projects.remove(&project_id);
+                    }
+                    self.release_task(command_id);
+                }
+                Err(error) => {
+                    if let Some(task) = self.task_metadata.remove(&error.id()) {
+                        self.release_metadata(task);
+                    }
+                    warn!(%error, "command task terminated unexpectedly");
+                }
+            }
+        }
+    }
+
+    fn release_task(&mut self, command_id: Uuid) {
+        let task_ids = self
+            .task_metadata
+            .iter()
+            .filter_map(|(id, task)| (task.command_id == command_id).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in task_ids {
+            if let Some(task) = self.task_metadata.remove(&id) {
+                self.release_metadata(task);
+            }
+        }
+    }
+
+    fn release_metadata(&mut self, task: TaskMetadata) {
+        if let Some(project_id) = task.project_id {
+            self.active_projects.remove(&project_id);
+        }
+        if task.lightweight {
+            self.active_lightweight = self.active_lightweight.saturating_sub(1);
+        } else {
+            self.active_heavy = self.active_heavy.saturating_sub(1);
+        }
+        self.metrics.command_finished();
+    }
+
+    async fn cancel_and_wait(&mut self, grace: std::time::Duration) {
+        for task in self.task_metadata.values() {
+            task.cancellation.cancel();
+        }
+        if tokio::time::timeout(grace, self.wait_for_tasks())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        warn!(
+            grace_seconds = grace.as_secs(),
+            "command cancellation grace period elapsed; aborting remaining tasks"
+        );
+        self.tasks.abort_all();
+        self.wait_for_tasks().await;
+    }
+
+    async fn wait_for_tasks(&mut self) {
+        while let Some(result) = self.tasks.join_next().await {
+            match result {
+                Ok((command_id, project_id)) => {
+                    let _ = project_id;
+                    self.release_task(command_id);
+                }
+                Err(error) => {
+                    if let Some(task) = self.task_metadata.remove(&error.id()) {
+                        self.release_metadata(task);
+                    }
+                    if !error.is_cancelled() {
+                        warn!(%error, "command task terminated unexpectedly during shutdown");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_lightweight(command_type: CommandType) -> bool {
+    matches!(
+        command_type,
+        CommandType::InspectProject
+            | CommandType::HealthCheck
+            | CommandType::RefreshRoute
+            | CommandType::DrainNode
+            | CommandType::ResumeNode
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use sakala_agent_protocol::{CommandStatus, CommandType};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::CommandExecutions;
+    use crate::scheduler::metrics::SchedulerMetrics;
+
+    fn command(project_id: Option<Uuid>) -> sakala_agent_protocol::AgentCommand {
+        command_with_type(project_id, CommandType::DeployProject)
+    }
+
+    fn command_with_type(
+        project_id: Option<Uuid>,
+        command_type: CommandType,
+    ) -> sakala_agent_protocol::AgentCommand {
+        sakala_agent_protocol::AgentCommand {
+            id: Uuid::new_v4(),
+            command_type,
+            status: CommandStatus::Pending,
+            project_id,
+            deployment_id: None,
+            payload: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn lightweight_work_uses_a_slot_separate_from_heavy_build_work() {
+        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
+        let (release_build, wait_build) = oneshot::channel();
+        let (release_health, wait_health) = oneshot::channel();
+
+        assert!(executions.try_start(
+            command(Some(Uuid::new_v4())),
+            CancellationToken::new(),
+            async move {
+                let _ = wait_build.await;
+            }
+        ));
+        assert!(executions.try_start(
+            command_with_type(Some(Uuid::new_v4()), CommandType::HealthCheck),
+            CancellationToken::new(),
+            async move {
+                let _ = wait_health.await;
+            }
+        ));
+        assert_eq!(executions.len(), 2);
+        release_build.send(()).expect("build should still run");
+        release_health
+            .send(())
+            .expect("health check should still run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        executions.reap_completed();
+        assert_eq!(executions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounds_global_work_and_serializes_each_project() {
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (release_a, wait_a) = oneshot::channel();
+        let (release_b, wait_b) = oneshot::channel();
+
+        assert!(executions.try_start(
+            command(Some(project_a)),
+            CancellationToken::new(),
+            tracked(wait_a, Arc::clone(&active), Arc::clone(&maximum))
+        ));
+        assert!(
+            !executions.try_start(command(Some(project_a)), CancellationToken::new(), async {})
+        );
+        assert!(executions.try_start(
+            command(Some(project_b)),
+            CancellationToken::new(),
+            tracked(wait_b, Arc::clone(&active), Arc::clone(&maximum))
+        ));
+        assert!(!executions.try_start(command(None), CancellationToken::new(), async {}));
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        release_a.send(()).expect("first command should still run");
+        release_b.send(()).expect("second command should still run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        executions.reap_completed();
+
+        assert!(executions.try_start(command(Some(project_a)), CancellationToken::new(), async {}));
+        assert_eq!(executions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_cancels_multiple_in_flight_commands() {
+        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
+        let first_cancellation = CancellationToken::new();
+        let second_cancellation = CancellationToken::new();
+
+        for cancellation in [first_cancellation.clone(), second_cancellation.clone()] {
+            let task_cancellation = cancellation.clone();
+            assert!(executions.try_start(
+                command(Some(Uuid::new_v4())),
+                cancellation,
+                async move { task_cancellation.cancelled().await }
+            ));
+        }
+
+        executions.cancel_and_wait(Duration::from_secs(1)).await;
+
+        assert!(first_cancellation.is_cancelled());
+        assert!(second_cancellation.is_cancelled());
+        assert_eq!(executions.len(), 0);
+        assert!(executions.active_projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_task_releases_its_project_and_capacity() {
+        let project_id = Uuid::new_v4();
+        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
+
+        assert!(
+            executions.try_start(command(Some(project_id)), CancellationToken::new(), async {
+                panic!("simulated command task failure")
+            })
+        );
+
+        tokio::task::yield_now().await;
+        executions.reap_completed();
+
+        assert!(
+            executions.try_start(command(Some(project_id)), CancellationToken::new(), async {
+            })
+        );
+    }
+
+    async fn tracked(
+        release: oneshot::Receiver<()>,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    ) {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
+        let _ = release.await;
+        active.fetch_sub(1, Ordering::SeqCst);
+    }
 }

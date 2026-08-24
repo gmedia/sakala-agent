@@ -3,6 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use sakala_agent_protocol::DeploymentBuilder;
 use tokio::fs;
+use uuid::Uuid;
 
 use crate::{ProcessRunner, RuntimeError, RuntimeReporter, process::run_checked};
 
@@ -10,6 +11,8 @@ mod dockerfile;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildRequest {
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
     pub workspace: PathBuf,
     pub source: PathBuf,
     pub image: String,
@@ -70,6 +73,8 @@ impl ImageBuilder for ImageBuildService {
                     &request.source,
                     &request.source.join("Dockerfile"),
                     &request.image,
+                    request.project_id,
+                    request.deployment_id,
                 );
                 run_checked(self.runner.as_ref(), &command, "docker-build", reporter).await?;
             }
@@ -83,6 +88,8 @@ impl ImageBuilder for ImageBuildService {
                     &plan,
                     &request.image,
                     &self.railpack_frontend,
+                    request.project_id,
+                    request.deployment_id,
                 );
                 run_checked(self.runner.as_ref(), &build, "railpack-build", reporter).await?;
             }

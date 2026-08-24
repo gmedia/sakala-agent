@@ -4,6 +4,44 @@ use uuid::Uuid;
 
 use crate::{CommandStatus, DeployProjectPayload, InspectProjectPayload};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesiredWorkloadState {
+    Running,
+    Stopped,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileWorkloadAction {
+    RestartLogFollower,
+    CleanupFailedCandidate,
+    RestoreRoute,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReconcileWorkloadPayload {
+    pub desired_state: DesiredWorkloadState,
+    #[serde(default)]
+    pub actions: Vec<ReconcileWorkloadAction>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeCleanupTarget {
+    StaleWorkspaces,
+    StaleImages,
+    StaleRoutes,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CleanupRuntimePayload {
+    /// Explicit destructive-action gate supplied by the control plane.
+    pub approved: bool,
+    pub targets: Vec<RuntimeCleanupTarget>,
+}
+
 /// Operation requested by the control plane for execution on a runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -16,6 +54,10 @@ pub enum CommandType {
     WakeProject,
     HealthCheck,
     RefreshRoute,
+    ReconcileWorkload,
+    CleanupRuntime,
+    DrainNode,
+    ResumeNode,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -37,6 +79,16 @@ impl AgentCommand {
     }
 
     pub fn inspect_payload(&self) -> Result<InspectProjectPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn reconcile_workload_payload(
+        &self,
+    ) -> Result<ReconcileWorkloadPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn cleanup_runtime_payload(&self) -> Result<CleanupRuntimePayload, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
     }
 }

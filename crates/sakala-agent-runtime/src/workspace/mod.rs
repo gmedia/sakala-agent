@@ -1,9 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
+use sakala_agent_core::ports::RepositoryCredential;
 
 mod git;
 
@@ -13,6 +18,7 @@ pub use git::GitWorkspaceManager;
 pub struct RepositorySource {
     pub repository_url: String,
     pub commit_sha: String,
+    pub credential: Option<RepositoryCredential>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +45,17 @@ impl DeploymentWorkspace {
     }
 }
 
+impl RepositorySource {
+    #[must_use]
+    pub fn without_credential(&self) -> Self {
+        Self {
+            repository_url: self.repository_url.clone(),
+            commit_sha: self.commit_sha.clone(),
+            credential: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait WorkspaceManager: Send + Sync {
     async fn checkout(
@@ -46,7 +63,13 @@ pub trait WorkspaceManager: Send + Sync {
         command_id: Uuid,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
+        cancellation: CancellationToken,
     ) -> Result<DeploymentWorkspace, RuntimeError>;
 
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;
+
+    async fn cleanup_stale(&self, minimum_age: Duration) -> Result<usize, RuntimeError>;
+
+    /// Free bytes available on the filesystem that owns the workspace root.
+    async fn available_disk_bytes(&self) -> Result<u64, RuntimeError>;
 }

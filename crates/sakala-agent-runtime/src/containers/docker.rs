@@ -1,12 +1,16 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
-use sakala_agent_core::ports::{RuntimeOrphan, RuntimeReconciliationReport};
+use sakala_agent_core::ports::{
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
+    RuntimeStaleImage, RuntimeWorkload,
+};
 use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -18,19 +22,28 @@ use uuid::Uuid;
 use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
-    containers::{ContainerEngine, ResourceSafetyConfig, RunContainerRequest},
+    containers::{ContainerEngine, ManagedWorkload, ResourceSafetyConfig, RunContainerRequest},
     logs::ReporterOutputSink,
     process::run_checked,
 };
 
 const MANAGED_LABEL: &str = "dev.sakala.managed=true";
+const AGENT_ID_LABEL: &str = "dev.sakala.agent-id";
+const WORKLOAD_KIND_LABEL: &str = "dev.sakala.workload-kind=web";
+const DOMAIN_LABEL: &str = "dev.sakala.domain";
+const PORT_LABEL: &str = "dev.sakala.port";
+const COMMAND_ID_LABEL: &str = "dev.sakala.command-id";
+const LOG_MAX_LINE_LABEL: &str = "dev.sakala.log-max-line-length";
+const LOG_MAX_BATCH_LABEL: &str = "dev.sakala.log-max-batch-lines";
+const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
     runtime_network: String,
     resource_safety: ResourceSafetyConfig,
     max_active_containers: u32,
-    log_followers: Mutex<Vec<JoinHandle<()>>>,
+    agent_id: String,
+    log_followers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl DockerContainerEngine {
@@ -40,13 +53,15 @@ impl DockerContainerEngine {
         runtime_network: String,
         resource_safety: ResourceSafetyConfig,
         max_active_containers: u32,
+        agent_id: String,
     ) -> Self {
         Self {
             runner,
             runtime_network,
             resource_safety,
             max_active_containers,
-            log_followers: Mutex::new(Vec::new()),
+            agent_id,
+            log_followers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -143,13 +158,14 @@ impl ContainerEngine for DockerContainerEngine {
             let status = fields.get(1).copied().unwrap_or_default();
             let project_id = fields.get(2).and_then(|value| Uuid::parse_str(value).ok());
             let deployment_id = fields.get(3).and_then(|value| Uuid::parse_str(value).ok());
-            let reason = if project_id.is_none() || deployment_id.is_none() {
-                Some("managed container has incomplete Sakala identity labels")
-            } else if status.starts_with("Exited")
-                || status.starts_with("Dead")
-                || status.starts_with("Created")
-            {
-                Some("managed container is not running")
+            let reason = if project_id.is_none() {
+                Some("managed container has an unknown project identity")
+            } else if deployment_id.is_none() {
+                Some("managed container has incomplete deployment identity labels")
+            } else if status.starts_with("Created") {
+                Some("dangling candidate container was never started")
+            } else if status.starts_with("Exited") || status.starts_with("Dead") {
+                Some("stale stopped deployment container")
             } else {
                 None
             };
@@ -160,10 +176,198 @@ impl ContainerEngine for DockerContainerEngine {
                     project_id,
                     reason: reason.to_owned(),
                 });
+            } else if let (Some(project_id), Some(deployment_id)) = (project_id, deployment_id) {
+                report.workloads.push(RuntimeWorkload {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    status: status.to_owned(),
+                });
             }
         }
 
         Ok(report)
+    }
+
+    async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError> {
+        let report = self.detect_orphans().await?;
+        Ok(RuntimeCapacity {
+            active_workloads: Some(report.workloads.len()),
+            stopped_workloads: Some(
+                report
+                    .orphans
+                    .iter()
+                    .filter(|orphan| orphan.reason == "stale stopped deployment container")
+                    .count(),
+            ),
+            maximum_active_workloads: Some(self.max_active_containers as usize),
+            active_builds: None,
+            maximum_concurrent_builds: None,
+        })
+    }
+
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError> {
+        // `docker ps` deliberately excludes stopped workloads. Mereka tidak
+        // seharusnya terus diperiksa oleh worker kesehatan runtime.
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker health inspection exited with status {:?}",
+                output.code
+            )));
+        }
+
+        let mut snapshots = Vec::new();
+        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let Some(project_id) = fields.get(2).and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let Some(deployment_id) = fields.get(3).and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let status = fields.get(1).copied().unwrap_or_default().to_owned();
+            let (ready, reason) = health_state(&status);
+            snapshots.push(RuntimeHealthSnapshot {
+                workload: RuntimeWorkload {
+                    container_id: fields.first().copied().unwrap_or_default().to_owned(),
+                    project_id,
+                    deployment_id,
+                    status,
+                },
+                ready,
+                reason,
+            });
+        }
+
+        Ok(snapshots)
+    }
+
+    async fn workload(
+        &self,
+        project_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<Option<ManagedWorkload>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--filter")
+            .arg(format!("label=dev.sakala.project-id={project_id}"))
+            .arg("--filter")
+            .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.domain\"}}\t{{.Label \"dev.sakala.port\"}}\t{{.Label \"dev.sakala.command-id\"}}\t{{.Label \"dev.sakala.log-max-line-length\"}}\t{{.Label \"dev.sakala.log-max-batch-lines\"}}\t{{.Label \"dev.sakala.log-max-total-bytes\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker workload lookup exited with status {:?}",
+                output.code
+            )));
+        }
+        let Some(line) = output.stdout.lines().find(|line| !line.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let fields = line.split('\t').collect::<Vec<_>>();
+        let domain = fields
+            .get(2)
+            .copied()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                RuntimeError::Container("managed workload is missing its domain label".to_owned())
+            })?;
+        let port = fields
+            .get(3)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                RuntimeError::Container("managed workload has an invalid port label".to_owned())
+            })?;
+        Ok(Some(ManagedWorkload {
+            container_id: fields.first().copied().unwrap_or_default().to_owned(),
+            status: fields.get(1).copied().unwrap_or_default().to_owned(),
+            project_id,
+            deployment_id,
+            domain: domain.to_owned(),
+            port,
+            command_id: fields.get(4).and_then(|value| Uuid::parse_str(value).ok()),
+            log_bounds: sakala_agent_protocol::LogBounds {
+                max_line_length: parse_optional_label(fields.get(5).copied()),
+                max_batch_lines: parse_optional_label(fields.get(6).copied()),
+                max_total_bytes: parse_optional_label(fields.get(7).copied()),
+            },
+        }))
+    }
+
+    async fn restart(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError> {
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("restart")
+                .arg("--time")
+                .arg(grace_seconds.to_string())
+                .arg(&workload.container_id),
+            "docker-restart",
+        )
+        .await
+    }
+
+    async fn stop(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError> {
+        if !workload.status.to_ascii_lowercase().starts_with("up") {
+            return Ok(());
+        }
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("stop")
+                .arg("--time")
+                .arg(grace_seconds.to_string())
+                .arg(&workload.container_id),
+            "docker-stop",
+        )
+        .await
+    }
+
+    async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
+        if workload.status.to_ascii_lowercase().starts_with("up") {
+            return Ok(());
+        }
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("start")
+                .arg(&workload.container_id),
+            "docker-start",
+        )
+        .await
+    }
+
+    async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
+        run_container_command(
+            self.runner.as_ref(),
+            CommandSpec::new("docker")
+                .arg("rm")
+                .arg(&workload.container_id),
+            "docker-remove",
+        )
+        .await
     }
 
     async fn start(
@@ -201,7 +405,26 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(format!(
                 "dev.sakala.deployment-id={}",
                 request.deployment_id
-            ));
+            ))
+            .arg("--label")
+            .arg(format!("{DOMAIN_LABEL}={}", request.domain))
+            .arg("--label")
+            .arg(format!("{PORT_LABEL}={}", request.port))
+            .arg("--label")
+            .arg(format!("{COMMAND_ID_LABEL}={}", request.command_id))
+            .arg("--label")
+            .arg(WORKLOAD_KIND_LABEL)
+            .arg("--label")
+            .arg(format!("{AGENT_ID_LABEL}={}", self.agent_id));
+        for (label, value) in [
+            (LOG_MAX_LINE_LABEL, request.log_bounds.max_line_length),
+            (LOG_MAX_BATCH_LABEL, request.log_bounds.max_batch_lines),
+            (LOG_MAX_TOTAL_LABEL, request.log_bounds.max_total_bytes),
+        ] {
+            if let Some(value) = value {
+                command = command.arg("--label").arg(format!("{label}={value}"));
+            }
+        }
         if let Some(env_file) = &env_file {
             command = command.arg("--env-file").arg(env_file.as_os_str());
         }
@@ -232,7 +455,13 @@ impl ContainerEngine for DockerContainerEngine {
             .map(|_| ())
     }
 
-    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) {
+    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool {
+        let mut followers = self.log_followers.lock().expect("log follower lock");
+        followers.retain(|_, follower| !follower.is_finished());
+        if followers.contains_key(container) {
+            return false;
+        }
+
         let runner = Arc::clone(&self.runner);
         let container = container.to_owned();
         let follower_container = container.clone();
@@ -260,10 +489,9 @@ impl ContainerEngine for DockerContainerEngine {
             }
         });
 
-        let mut followers = self.log_followers.lock().expect("log follower lock");
-        followers.retain(|follower| !follower.is_finished());
-        followers.push(handle);
+        followers.insert(container.clone(), handle);
         debug!(%container, "container log follower started");
+        true
     }
 
     async fn cleanup_previous(
@@ -292,16 +520,36 @@ impl ContainerEngine for DockerContainerEngine {
             let inspect = CommandSpec::new("docker")
                 .arg("inspect")
                 .arg("--format")
-                .arg("{{.Name}}")
+                .arg("{{.State.Running}}\t{{.Name}}")
                 .arg(container_id);
             let inspected_name = self.runner.run(&inspect, &NullOutputSink).await?;
-            if inspected_name.stdout.trim().trim_start_matches('/') == current {
+            if !inspected_name.success {
+                return Err(RuntimeError::Container(format!(
+                    "docker-inspect-previous exited with status {:?}",
+                    inspected_name.code
+                )));
+            }
+            let mut fields = inspected_name.stdout.trim().split('\t');
+            let running = matches!(fields.next(), Some("true"));
+            let name = fields.next().unwrap_or_default().trim_start_matches('/');
+            if name == current {
                 continue;
             }
-            let remove = CommandSpec::new("docker")
-                .arg("rm")
-                .arg("--force")
-                .arg(container_id);
+            if running {
+                let stop = CommandSpec::new("docker")
+                    .arg("stop")
+                    .arg("--time")
+                    .arg("10")
+                    .arg(container_id);
+                run_checked(
+                    self.runner.as_ref(),
+                    &stop,
+                    "docker-stop-previous",
+                    reporter,
+                )
+                .await?;
+            }
+            let remove = CommandSpec::new("docker").arg("rm").arg(container_id);
             run_checked(
                 self.runner.as_ref(),
                 &remove,
@@ -314,19 +562,127 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(())
     }
 
-    async fn cleanup_candidate(&self, container: &str, image: &str) {
-        for command in [
-            CommandSpec::new("docker")
-                .arg("rm")
-                .arg("--force")
-                .arg(container),
-            CommandSpec::new("docker")
-                .arg("image")
-                .arg("rm")
-                .arg("--force")
-                .arg(image),
+    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError> {
+        let mut failures = Vec::new();
+        for (artifact, command) in [
+            (
+                "candidate container",
+                CommandSpec::new("docker")
+                    .arg("rm")
+                    .arg("--force")
+                    .arg(container),
+            ),
+            (
+                "candidate image",
+                CommandSpec::new("docker")
+                    .arg("image")
+                    .arg("rm")
+                    .arg("--force")
+                    .arg(image),
+            ),
         ] {
-            let _ = self.runner.run(&command, &NullOutputSink).await;
+            match self.runner.run(&command, &NullOutputSink).await {
+                Ok(output) if output.success => {}
+                Ok(output) => {
+                    failures.push(format!("{artifact} exited with status {:?}", output.code))
+                }
+                Err(error) => failures.push(format!("{artifact}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Container(format!(
+                "candidate cleanup incomplete: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    async fn detect_stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("image")
+            .arg("ls")
+            .arg("--filter")
+            .arg("dangling=true")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "Sakala stale image inspection exited with status {:?}",
+                output.code
+            )));
+        }
+        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
+            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
+        })?;
+        let now = OffsetDateTime::now_utc();
+        let mut stale = Vec::new();
+        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let image_id = fields.first().copied().unwrap_or_default().to_owned();
+            let inspect = CommandSpec::new("docker")
+                .arg("image")
+                .arg("inspect")
+                .arg("--format")
+                .arg("{{.Created}}")
+                .arg(&image_id);
+            let inspected = self.runner.run(&inspect, &NullOutputSink).await?;
+            if !inspected.success {
+                return Err(RuntimeError::Container(format!(
+                    "Sakala image age inspection exited with status {:?}",
+                    inspected.code
+                )));
+            }
+            let created =
+                OffsetDateTime::parse(inspected.stdout.trim(), &Rfc3339).map_err(|error| {
+                    RuntimeError::Container(format!(
+                        "Docker returned an invalid image creation timestamp: {error}"
+                    ))
+                })?;
+            if now - created < minimum_age {
+                continue;
+            }
+            stale.push(RuntimeStaleImage {
+                image_id,
+                project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
+                deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
+            });
+        }
+        Ok(stale)
+    }
+
+    async fn cleanup_stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<u64, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("image")
+            .arg("prune")
+            .arg("--force")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--filter")
+            .arg(format!("until={}s", max_age.as_secs()));
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "Sakala image GC exited with status {:?}",
+                output.code
+            )));
+        }
+        match parse_reclaimed_bytes(&output.stdout) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) => {
+                tracing::warn!(%error, "Docker image prune succeeded but reclaimed-space telemetry was not parseable");
+                Ok(0)
+            }
         }
     }
 
@@ -335,11 +691,109 @@ impl ContainerEngine for DockerContainerEngine {
             let mut followers = self.log_followers.lock().expect("log follower lock");
             std::mem::take(&mut *followers)
         };
-        for follower in &followers {
+        for follower in followers.values() {
             follower.abort();
         }
-        for follower in followers {
+        for (_, follower) in followers {
             let _ = follower.await;
         }
+    }
+}
+
+fn parse_optional_label(value: Option<&str>) -> Option<u64> {
+    value
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok())
+}
+
+fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
+    let Some(value) = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Total reclaimed space: "))
+    else {
+        return Ok(0);
+    };
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .unwrap_or(value.len());
+    let number = value[..split].parse::<f64>().map_err(|_| {
+        RuntimeError::Container(
+            "Docker image GC returned an invalid reclaimed-space value".to_owned(),
+        )
+    })?;
+    let multiplier = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "b" | "bytes" | "" => 1,
+        "kb" | "kib" => 1_024,
+        "mb" | "mib" => 1_024 * 1_024,
+        "gb" | "gib" => 1_024 * 1_024 * 1_024,
+        _ => {
+            return Err(RuntimeError::Container(
+                "Docker image GC returned an unknown reclaimed-space unit".to_owned(),
+            ));
+        }
+    };
+    let bytes = number * multiplier as f64;
+    if !bytes.is_finite() || bytes.is_sign_negative() || bytes > u64::MAX as f64 {
+        return Err(RuntimeError::Container(
+            "Docker image GC reclaimed-space value overflowed".to_owned(),
+        ));
+    }
+    Ok(bytes.round() as u64)
+}
+
+async fn run_container_command(
+    runner: &dyn ProcessRunner,
+    command: CommandSpec,
+    phase: &str,
+) -> Result<(), RuntimeError> {
+    let output = runner.run(&command, &NullOutputSink).await?;
+    if output.success {
+        Ok(())
+    } else {
+        Err(RuntimeError::failed_process(
+            phase,
+            output.code,
+            &output.stderr,
+        ))
+    }
+}
+
+fn health_state(status: &str) -> (bool, Option<String>) {
+    let normalized = status.to_ascii_lowercase();
+    if normalized.contains("unhealthy") {
+        return (false, Some("Docker health status is unhealthy".to_owned()));
+    }
+    if normalized.contains("health: starting") {
+        return (
+            false,
+            Some("Docker health check is still starting".to_owned()),
+        );
+    }
+    if normalized.starts_with("up") {
+        return (true, None);
+    }
+
+    (false, Some(format!("container is not running: {status}")))
+}
+
+#[cfg(test)]
+mod reclaimed_space_tests {
+    use super::parse_reclaimed_bytes;
+
+    #[test]
+    fn parses_decimal_and_compact_docker_sizes() {
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 16.43 MB\n").expect("decimal MB"),
+            (16.43_f64 * 1_048_576_f64).round() as u64
+        );
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 1.84kB\n").expect("compact kB"),
+            (1.84_f64 * 1_024_f64).round() as u64
+        );
+        assert_eq!(
+            parse_reclaimed_bytes("Total reclaimed space: 0B\n").expect("zero bytes"),
+            0
+        );
     }
 }

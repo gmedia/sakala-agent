@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, fmt, str::FromStr};
+use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError};
@@ -39,11 +39,16 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     pub runtime_driver: RuntimeDriver,
     pub docker_runtime: DockerRuntimeConfig,
+    pub runtime_health_interval: Duration,
     pub log_level: String,
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "sakala-agent", about = "Sakala runtime-node executor")]
+#[command(
+    name = "sakala-agent",
+    about = "Sakala runtime-node executor",
+    version = env!("CARGO_PKG_VERSION")
+)]
 struct Cli {
     #[arg(long, env = "SAKALA_AGENT_MODE")]
     mode: Option<String>,
@@ -66,6 +71,12 @@ struct Cli {
     #[arg(long, env = "SAKALA_COMMAND_TIMEOUT_SECONDS")]
     command_timeout_seconds: Option<String>,
 
+    #[arg(long, env = "SAKALA_MAX_CONCURRENT_COMMANDS")]
+    max_concurrent_commands: Option<String>,
+
+    #[arg(long, env = "SAKALA_SHUTDOWN_GRACE_SECONDS")]
+    shutdown_grace_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_RUNTIME_NETWORK")]
     runtime_network: Option<String>,
 
@@ -74,6 +85,18 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_RUNTIME_WORKSPACE")]
     runtime_workspace: Option<String>,
+
+    #[arg(long, env = "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS")]
+    workspace_gc_max_age_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS")]
+    image_gc_max_age_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
+    runtime_health_interval_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_MIN_WORKSPACE_FREE_MB")]
+    min_workspace_free_mb: Option<String>,
 
     #[arg(long, env = "SAKALA_CADDY_SITES_DIR")]
     caddy_sites_dir: Option<String>,
@@ -89,6 +112,9 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_START_TIMEOUT_SECONDS")]
     start_timeout_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_MAX_CONCURRENT_BUILDS")]
+    max_concurrent_builds: Option<String>,
 
     #[arg(long, env = "SAKALA_MAX_ACTIVE_CONTAINERS")]
     max_active_containers: Option<String>,
@@ -138,12 +164,42 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_COMMAND_TIMEOUT_SECONDS",
         cli.command_timeout_seconds,
     );
+    insert(
+        &mut values,
+        "SAKALA_MAX_CONCURRENT_COMMANDS",
+        cli.max_concurrent_commands,
+    );
+    insert(
+        &mut values,
+        "SAKALA_SHUTDOWN_GRACE_SECONDS",
+        cli.shutdown_grace_seconds,
+    );
     insert(&mut values, "SAKALA_RUNTIME_NETWORK", cli.runtime_network);
     insert(&mut values, "SAKALA_RUNTIME_DRIVER", cli.runtime_driver);
     insert(
         &mut values,
         "SAKALA_RUNTIME_WORKSPACE",
         cli.runtime_workspace,
+    );
+    insert(
+        &mut values,
+        "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
+        cli.workspace_gc_max_age_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
+        cli.image_gc_max_age_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
+        cli.runtime_health_interval_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_MIN_WORKSPACE_FREE_MB",
+        cli.min_workspace_free_mb,
     );
     insert(&mut values, "SAKALA_CADDY_SITES_DIR", cli.caddy_sites_dir);
     insert(&mut values, "SAKALA_CADDY_CONTAINER", cli.caddy_container);
@@ -161,6 +217,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_START_TIMEOUT_SECONDS",
         cli.start_timeout_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_MAX_CONCURRENT_BUILDS",
+        cli.max_concurrent_builds,
     );
     insert(
         &mut values,
@@ -207,6 +268,13 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     let mut agent = AgentConfig::from_values(values)?;
     agent.capabilities = capabilities(runtime_driver);
     let resource_safety = resource_safety(values)?;
+    let min_workspace_free_bytes = positive_u64(values, "SAKALA_MIN_WORKSPACE_FREE_MB", 1_024)?
+        .checked_mul(1_024 * 1_024)
+        .ok_or_else(|| {
+            CoreError::InvalidConfiguration(
+                "SAKALA_MIN_WORKSPACE_FREE_MB is too large to represent".to_owned(),
+            )
+        })?;
     let build_timeout_seconds = positive_u64(values, "SAKALA_BUILD_TIMEOUT_SECONDS", 600)?;
     let start_timeout_seconds = positive_u64(values, "SAKALA_START_TIMEOUT_SECONDS", 120)?;
     if build_timeout_seconds >= agent.command_timeout_seconds
@@ -220,8 +288,20 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
 
     Ok(AppConfig {
         docker_runtime: DockerRuntimeConfig {
+            agent_id: agent.agent_id.clone(),
             workspace_root: get(values, "SAKALA_RUNTIME_WORKSPACE", "/var/lib/sakala/builds")
                 .into(),
+            workspace_gc_max_age: std::time::Duration::from_secs(positive_u64(
+                values,
+                "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
+                86_400,
+            )?),
+            image_gc_max_age: std::time::Duration::from_secs(positive_u64(
+                values,
+                "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
+                604_800,
+            )?),
+            min_workspace_free_bytes,
             runtime_network: agent.runtime_network.clone(),
             caddy_sites_dir: get(
                 values,
@@ -241,9 +321,15 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 max_start_timeout: std::time::Duration::from_secs(start_timeout_seconds),
                 max_command_timeout: agent.command_timeout(),
             },
+            max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             ..DockerRuntimeConfig::default()
         },
+        runtime_health_interval: Duration::from_secs(positive_u64(
+            values,
+            "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
+            30,
+        )?),
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -351,6 +437,26 @@ fn positive_u64(
     Ok(value)
 }
 
+fn positive_usize(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: usize,
+) -> Result<usize, CoreError> {
+    let value = values
+        .get(key)
+        .map_or_else(|| default.to_string(), Clone::clone)
+        .parse::<usize>()
+        .map_err(|_| CoreError::InvalidConfiguration(format!("{key} must be a number")))?;
+
+    if value == 0 {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+
+    Ok(value)
+}
+
 fn insert(values: &mut HashMap<String, String>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         values.insert(key.to_owned(), value);
@@ -362,6 +468,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exposes_the_binary_version_for_operator_compatibility_checks() {
+        let error = Cli::try_parse_from(["sakala-agent", "--version"])
+            .expect_err("version flag should stop normal command parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
     fn defaults_to_noop_runtime() {
         let config = from_values(&HashMap::new()).expect("default app config should load");
 
@@ -370,6 +484,13 @@ mod tests {
         assert_eq!(config.docker_runtime.runtime_network, "sakala-runtime");
         assert_eq!(config.docker_runtime.resource_safety.default_memory_mb, 256);
         assert_eq!(config.docker_runtime.resource_safety.max_memory_mb, 512);
+        assert_eq!(config.agent.max_concurrent_commands, 4);
+        assert_eq!(config.docker_runtime.max_concurrent_builds, 1);
+        assert_eq!(config.runtime_health_interval, Duration::from_secs(30));
+        assert_eq!(
+            config.docker_runtime.min_workspace_free_bytes,
+            1_024 * 1_024 * 1_024
+        );
         assert_eq!(config.log_level, "info");
     }
 
@@ -422,5 +543,39 @@ mod tests {
 
         let error = from_values(&values).expect_err("build deadline must precede command deadline");
         assert!(error.to_string().contains("must be shorter"));
+    }
+
+    #[test]
+    fn accepts_independent_command_and_build_concurrency_limits() {
+        let values = HashMap::from([
+            ("SAKALA_MAX_CONCURRENT_COMMANDS".to_owned(), "6".to_owned()),
+            ("SAKALA_MAX_CONCURRENT_BUILDS".to_owned(), "2".to_owned()),
+        ]);
+
+        let config = from_values(&values).expect("concurrency limits should be valid");
+        assert_eq!(config.agent.max_concurrent_commands, 6);
+        assert_eq!(config.docker_runtime.max_concurrent_builds, 2);
+    }
+
+    #[test]
+    fn rejects_zero_runtime_health_interval() {
+        let values = HashMap::from([(
+            "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS".to_owned(),
+            "0".to_owned(),
+        )]);
+
+        let error = from_values(&values).expect_err("zero interval must be rejected");
+        assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn configures_workspace_disk_floor_in_mebibytes() {
+        let values = HashMap::from([("SAKALA_MIN_WORKSPACE_FREE_MB".to_owned(), "256".to_owned())]);
+
+        let config = from_values(&values).expect("disk floor should be valid");
+        assert_eq!(
+            config.docker_runtime.min_workspace_free_bytes,
+            256 * 1_024 * 1_024
+        );
     }
 }

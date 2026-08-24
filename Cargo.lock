@@ -1328,7 +1328,9 @@ dependencies = [
  "sakala-agent-runtime",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "wiremock",
@@ -1347,6 +1349,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -1375,6 +1378,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "uuid",
@@ -1751,6 +1755,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

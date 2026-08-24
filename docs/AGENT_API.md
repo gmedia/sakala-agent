@@ -16,7 +16,9 @@ Token harus diterbitkan secara aman, disimpan hashed oleh `sakala-api`, dan tida
 | Method | Endpoint | Tujuan |
 | --- | --- | --- |
 | `GET` | `/api/agent/v1/commands` | Poll command tersedia untuk node. |
+| `GET` | `/api/agent/v1/node-state` | Ambil desired lifecycle node sebelum scheduler mulai polling. |
 | `POST` | `/api/agent/v1/commands/{command}/claim` | Klaim command sebelum eksekusi. |
+| `POST` | `/api/agent/v1/commands/{command}/repository-credential` | Lease credential sementara untuk repository private. |
 | `POST` | `/api/agent/v1/commands/{command}/events` | Kirim lifecycle event. |
 | `POST` | `/api/agent/v1/commands/{command}/logs` | Kirim baris log teredaksi. |
 | `POST` | `/api/agent/v1/commands/{command}/complete` | Tandai eksekusi berhasil. |
@@ -52,6 +54,34 @@ POST /api/agent/v1/commands/b3c8cb55-3bc8-4725-a004-e69d9917d40b/complete
 `type` menjelaskan **pekerjaan apa** yang harus dilakukan, misalnya
 `InspectProject` atau `DeployProject`. Sedangkan `id` command adalah identitas
 rekam pekerjaan tersebut untuk claim, event, log, dan status akhirnya.
+
+### Private repository credential lease
+
+Agent hanya memanggil endpoint berikut setelah command berhasil di-claim dan
+payload memakai `repository_access: "temporary_credential"`:
+
+```http
+POST /api/agent/v1/commands/{command}/repository-credential
+```
+
+API wajib memverifikasi bahwa command dimiliki agent peminta, repository cocok
+dengan command, authorization user/workspace masih valid, dan credential hanya
+memiliki akses minimum ke satu repository (`contents:read`). Credential harus
+short-lived, tidak disimpan pada record command, serta tidak dimasukkan ke log
+atau response lain.
+
+Response endpoint ini sengaja memakai object langsung, **bukan** envelope
+Laravel `{ "data": ... }`:
+
+```json
+{
+  "username": "x-access-token",
+  "token": "ghs_ephemeral_installation_token"
+}
+```
+
+Nilai kosong ditolak Agent. Token hanya diteruskan melalui environment
+`GIT_ASKPASS`, tidak pernah dimasukkan ke repository URL atau process arguments.
 
 ## Command Response Shape
 
@@ -100,11 +130,152 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
 
 `sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
+### Workload Lifecycle Commands
+
+Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
+`HealthCheck`, dan `RefreshRoute`, API mengirim `project_id` serta
+`deployment_id` target dan memakai payload object kosong:
+
+```json
+{
+  "id": "b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+  "type": "SleepProject",
+  "status": "Pending",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": {}
+}
+```
+
+Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
+mengirim nama Docker, domain, port, command shell, atau credential pada payload
+lifecycle. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
+refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
+
+`DrainNode` dan `ResumeNode` adalah command node-level. Keduanya memakai
+`project_id: null`, `deployment_id: null`, dan payload `{}`. Saat draining atau
+drained, API hanya perlu menawarkan kedua command ini kepada node tersebut;
+command workload lain dibiarkan pending sampai node kembali active.
+
+Connected Agent wajib memanggil `GET /api/agent/v1/node-state` saat bootstrap,
+sebelum scheduler dapat mengambil atau mengklaim command. Respons menggunakan
+envelope berikut:
+
+```json
+{
+  "data": {
+    "desired_state": "drained"
+  }
+}
+```
+
+Nilai yang valid adalah `active`, `draining`, `drained`, dan `maintenance`.
+Control plane merupakan sumber kebenaran state ini: API harus menyimpan desired
+state secara atomik sebelum menawarkan `DrainNode`/`ResumeNode`. Bila bootstrap
+state gagal diambil, connected Agent berhenti secara fail-closed dan tidak
+mengklaim pekerjaan baru. Local mode selalu mulai sebagai `active`.
+
+Sebelum kembali `active`, `ResumeNode` menjalankan preflight dan mengambil
+snapshot kapasitas lokal. Completion result menyertakan
+`capacity.active_workloads`, `maximum_active_workloads`, dan
+`available_workload_slots`; nilai `null` berarti driver tidak dapat menentukan
+nilai tersebut dengan aman. API harus memperlakukannya sebagai telemetry, bukan
+izin untuk melewati safety limit node.
+
 ## Polling and Claim Semantics
+
+## Desired versus actual workload state
+
+Control plane tetap menjadi pemilik desired state. Untuk reconciliation,
+command `ReconcileWorkload` mengirim identity workload, desired state, dan aksi
+lokal yang memang diotorisasi:
+
+```json
+{
+  "type": "ReconcileWorkload",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": {
+    "desired_state": "running",
+    "actions": ["restart_log_follower", "restore_route"]
+  }
+}
+```
+
+Agent melaporkan actual state secara read-only melalui reconciliation/heartbeat
+dengan bentuk berikut:
+
+```json
+{
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "actual_state": "missing",
+  "reason": "container_missing"
+}
+```
+
+Nilai `actual_state` yang diizinkan adalah `running`, `stopped`, `unhealthy`,
+atau `missing`. Bila desired dan actual berbeda, Agent melaporkan drift tetapi
+tidak melakukan restart, deploy, atau delete secara otomatis. Control plane
+memutuskan policy recovery dan bila perlu mengirim command lifecycle eksplisit.
+Tanpa `actions`, `ReconcileWorkload` selalu read-only. Aksi
+`cleanup_failed_candidate` ditolak kecuali workload Sakala ditemukan dalam state
+`Created`, `Exited`, atau `Dead`.
+
+### Approved runtime cleanup
+
+Cleanup node menggunakan command terpisah agar authorization destruktif mudah
+diaudit dan tidak tersirat dari heartbeat:
+
+```json
+{
+  "id": "b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+  "type": "CleanupRuntime",
+  "status": "Pending",
+  "project_id": null,
+  "deployment_id": null,
+  "payload": {
+    "approved": true,
+    "targets": ["stale_workspaces", "stale_images", "stale_routes"]
+  }
+}
+```
+
+Agent menolak `approved: false` dan target kosong. Workspace dibatasi direktori
+UUID owned Agent, image memakai label `dev.sakala.managed=true` dan hanya
+dangling image yang melewati umur minimum, sedangkan route harus memiliki nama
+UUID serta marker ownership yang cocok sebelum dihapus dan Caddy di-reload.
 
 Polling bukan pemberian ownership. Endpoint `GET /api/agent/v1/commands` hanya mengembalikan command `Pending` yang eligible untuk agent/node terautentikasi. Agent wajib memanggil endpoint claim sebelum melakukan inspection atau perubahan runtime.
 
 Claim harus dilakukan atomik di `sakala-api`, misalnya melalui conditional update atau transaction yang memastikan status masih `Pending`. Hanya satu agent boleh menerima claim sukses. Bila claim mendapat conflict karena command sudah diklaim, dibatalkan, kedaluwarsa, atau tidak lagi eligible, agent harus melewati command tersebut tanpa menjalankannya.
+
+### Idempotensi terminal command
+
+`claim`, `complete`, dan `fail` wajib bersifat aman terhadap retry jaringan.
+API harus memakai transisi atomik dan tidak boleh mengubah terminal state:
+
+| Request | State saat ini | Respons yang diharapkan | Perilaku Agent |
+| --- | --- | --- | --- |
+| `claim` | bukan `Pending` | `409 Conflict` dengan state saat ini | Jangan eksekusi command. |
+| `complete` | sudah `Succeeded` dengan command yang sama | `204 No Content` | Anggap sukses idempoten. |
+| `fail` | sudah `Failed` dengan command yang sama | `204 No Content` | Anggap gagal yang sama telah tercatat. |
+| `complete` | `Failed`/`Cancelled`/`Expired` | `409 Conflict` | Jangan menimpa state terminal. |
+| `fail` | `Succeeded` | `409 Conflict` | Jangan menimpa state terminal. |
+
+Respons conflict harus menyertakan state command yang aman untuk ditampilkan
+(`status` dan, bila relevan, `terminal_at`), tetapi tidak boleh memantulkan
+payload deployment atau credential. Retry command polling tidak memberi izin
+untuk menjalankan ulang command yang tidak berhasil di-claim.
+
+Bentuk respons `409` yang ditetapkan adalah:
+
+```json
+{
+  "status": "Succeeded",
+  "terminal_at": "2026-08-23T10:00:00Z"
+}
+```
 
 Command yang sudah `Claimed`, `Running`, `Succeeded`, `Failed`, `Cancelled`, atau `Expired` tidak boleh dikembalikan lagi sebagai pekerjaan pending. Polling berikutnya hanya mengembalikan pekerjaan baru atau pekerjaan yang secara eksplisit dikembalikan ke antrean oleh policy lease/recovery API.
 
@@ -160,6 +331,10 @@ Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan 
 
 `agent_id` tidak diulang di body karena identitas node berasal dari header `X-Agent-Id` yang telah diautentikasi.
 
+`metadata.protocol_version` adalah revision contract Agent/API dan terpisah dari
+semantic version binary. Lihat [Compatibility and Release Policy](COMPATIBILITY.md)
+untuk aturan rollout dan command yang belum didukung.
+
 ```json
 {
   "status": "ready",
@@ -174,11 +349,65 @@ Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan 
     "caddy-file-routing"
   ],
   "metadata": {
-    "version": "0.1.0"
+    "version": "0.1.0",
+    "protocol_version": 4,
+    "runtime_driver": "docker",
+    "lifecycle_state": "active",
+    "uptime_seconds": 86400,
+    "resources": {
+      "cpu_total": 4,
+      "cpu_load_1m": 0.42,
+      "memory_total_bytes": 8589934592,
+      "memory_available_bytes": 4294967296,
+      "disk_total_bytes": 107374182400,
+      "disk_available_bytes": 53687091200,
+      "workspace_used_bytes": 104857600
+    },
+    "workloads": {
+      "active": 2,
+      "starting": 0,
+      "unhealthy": 0,
+      "stopped": 1,
+      "unhealthy_details": []
+    },
+    "disk_pressure": {
+      "state": "normal",
+      "minimum_workspace_free_bytes": 2147483648,
+      "available_workspace_bytes": 53687091200
+    },
+    "runtime_dependencies": {
+      "git": "git version 2.47.0",
+      "docker": "27.3.1",
+      "buildx": "github.com/docker/buildx v0.17.1",
+      "railpack": "railpack 0.23.0"
+    },
+    "execution": {
+      "active_commands": 1,
+      "queued_local_commands": 0,
+      "capacity_waiting_commands": 1,
+      "active_builds": 1,
+      "maximum_concurrent_builds": 2
+    },
+    "startup_reconciliation": {
+      "captured_at": "2026-06-23T07:59:58Z",
+      "inspected_containers": 2,
+      "cleaned_workspaces": 0,
+      "reattached_log_followers": 1,
+      "recovered_execution_records": 2,
+      "recovered_workloads": [],
+      "orphans": [],
+      "stale_routes": [],
+      "stale_images": []
+    }
   },
   "sent_at": "2026-06-23T08:00:00Z"
 }
 ```
+
+`startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
+bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
+eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
+hasil command reconciliation eksplisit.
 
 ## Event and Log Payloads
 
@@ -232,6 +461,37 @@ Completion selalu memakai envelope result. Deployment berhasil mengembalikan req
   }
 }
 ```
+
+Jika route sudah committed tetapi finalisasi cleanup melewati grace Agent atau
+mengembalikan error, command tetap sukses sesuai kondisi runtime dan result
+membawa sinyal repair eksplisit:
+
+```json
+{
+  "result": {
+    "requested_resources": {
+      "memory_mb": 256,
+      "cpu_millis": 500,
+      "pids_limit": 128
+    },
+    "applied_resources": {
+      "memory_mb": 256,
+      "cpu_millis": 500,
+      "pids_limit": 128
+    },
+    "finalization_deferred": true,
+    "finalization_deferred_reason": "grace_elapsed"
+  }
+}
+```
+
+`finalization_deferred_reason` bernilai `grace_elapsed` atau `runtime_error`.
+Ketika `finalization_deferred=true`, API **wajib** mencari deployment sebelumnya
+pada project/node yang sama dan mengirim `StopProject` idempoten untuk setiap
+deployment lama tersebut. Target tidak boleh deployment baru pada command ini.
+API tidak boleh menganggap startup reconciliation atau GC Agent akan menghapus
+container lama yang masih running. Heartbeat/capacity dipakai untuk memastikan
+repair selesai dan node kembali memiliki satu workload aktif yang diinginkan.
 
 Command tanpa output mengirim `null`:
 

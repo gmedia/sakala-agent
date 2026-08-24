@@ -1,11 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
+use sakala_agent_protocol::{AppliedRuntimeResources, LogBounds, RuntimeResourceLimits};
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
-use sakala_agent_core::ports::RuntimeReconciliationReport;
+use sakala_agent_core::ports::{
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeReconciliationReport, RuntimeStaleImage,
+};
 
 mod docker;
 pub(crate) mod limits;
@@ -15,6 +17,7 @@ pub use limits::ResourceSafetyConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunContainerRequest {
+    pub command_id: Uuid,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub name: String,
@@ -22,6 +25,21 @@ pub struct RunContainerRequest {
     pub workspace: PathBuf,
     pub environment: BTreeMap<String, String>,
     pub resources: AppliedRuntimeResources,
+    pub domain: String,
+    pub port: u16,
+    pub log_bounds: LogBounds,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedWorkload {
+    pub container_id: String,
+    pub status: String,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub domain: String,
+    pub port: u16,
+    pub command_id: Option<Uuid>,
+    pub log_bounds: LogBounds,
 }
 
 #[async_trait]
@@ -35,6 +53,32 @@ pub trait ContainerEngine: Send + Sync {
 
     async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
 
+    async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError>;
+
+    async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError>;
+
+    async fn workload(
+        &self,
+        project_id: Uuid,
+        deployment_id: Uuid,
+    ) -> Result<Option<ManagedWorkload>, RuntimeError>;
+
+    async fn restart(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError>;
+
+    async fn stop(
+        &self,
+        workload: &ManagedWorkload,
+        grace_seconds: u64,
+    ) -> Result<(), RuntimeError>;
+
+    async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
+
+    async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
+
     async fn start(
         &self,
         request: &RunContainerRequest,
@@ -47,7 +91,9 @@ pub trait ContainerEngine: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>);
+    /// Starts at most one follower for a container. Returns whether a new
+    /// follower was registered.
+    fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool;
 
     async fn cleanup_previous(
         &self,
@@ -56,7 +102,23 @@ pub trait ContainerEngine: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    async fn cleanup_candidate(&self, container: &str, image: &str);
+    /// Attempts every candidate cleanup action. A failure is returned only
+    /// after all owned artifacts have been attempted, so callers can report
+    /// partial cleanup without replacing the primary deployment error.
+    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
+
+    /// Inventories dangling Sakala-managed images before any deletion runs.
+    async fn detect_stale_images(
+        &self,
+        _max_age: std::time::Duration,
+    ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    /// Reclaims only dangling images explicitly labeled as Sakala-managed.
+    /// Docker itself refuses images referenced by any container.
+    async fn cleanup_stale_images(&self, max_age: std::time::Duration)
+    -> Result<u64, RuntimeError>;
 
     async fn shutdown(&self);
 }

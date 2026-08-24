@@ -79,13 +79,18 @@ fn resolve_timeout(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DockerRuntimeConfig {
+    pub agent_id: String,
     pub workspace_root: PathBuf,
+    pub workspace_gc_max_age: Duration,
+    pub image_gc_max_age: Duration,
+    pub min_workspace_free_bytes: u64,
     pub runtime_network: String,
     pub caddy_sites_dir: PathBuf,
     pub caddy_container: String,
     pub railpack_frontend: String,
     pub resource_safety: ResourceSafetyConfig,
     pub timeout_safety: TimeoutSafetyConfig,
+    pub max_concurrent_builds: usize,
     pub max_active_containers: u32,
     pub health_attempts: u32,
     pub health_interval: Duration,
@@ -94,13 +99,18 @@ pub struct DockerRuntimeConfig {
 impl Default for DockerRuntimeConfig {
     fn default() -> Self {
         Self {
+            agent_id: "local-agent-01".to_owned(),
             workspace_root: PathBuf::from("/var/lib/sakala/builds"),
+            workspace_gc_max_age: Duration::from_secs(86_400),
+            image_gc_max_age: Duration::from_secs(604_800),
+            min_workspace_free_bytes: 1_024 * 1_024 * 1_024,
             runtime_network: "sakala-runtime".to_owned(),
             caddy_sites_dir: PathBuf::from("/var/lib/sakala/caddy/sites"),
             caddy_container: "sakala-caddy".to_owned(),
             railpack_frontend: "ghcr.io/railwayapp/railpack-frontend:v0.23.0".to_owned(),
             resource_safety: ResourceSafetyConfig::default(),
             timeout_safety: TimeoutSafetyConfig::default(),
+            max_concurrent_builds: 1,
             max_active_containers: 20,
             health_attempts: 10,
             health_interval: Duration::from_secs(1),

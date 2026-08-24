@@ -1,19 +1,50 @@
 use async_trait::async_trait;
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, LogBounds};
+use std::sync::{
+    Mutex as StdMutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
     logs::redactor::redact_line,
-    ports::{RuntimeExecutionError, RuntimeReporter},
+    ports::{CommandOutput, RuntimeExecutionError, RuntimeReporter, RuntimeReporterFactory},
 };
+
+pub struct ApiRuntimeReporterFactory {
+    client: ApiClient,
+}
+
+impl ApiRuntimeReporterFactory {
+    #[must_use]
+    pub fn new(client: ApiClient) -> Self {
+        Self { client }
+    }
+}
+
+impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
+    fn reporter(
+        &self,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+    ) -> std::sync::Arc<dyn RuntimeReporter> {
+        std::sync::Arc::new(ApiRuntimeReporter::new(
+            self.client.clone(),
+            command_id,
+            log_bounds,
+        ))
+    }
+}
 
 pub(crate) struct ApiRuntimeReporter {
     client: ApiClient,
     command_id: Uuid,
     log_bounds: LogBounds,
     log_bytes_sent: Mutex<u64>,
+    deployment_committed: AtomicBool,
+    committed_output: StdMutex<Option<CommandOutput>>,
 }
 
 impl ApiRuntimeReporter {
@@ -24,6 +55,8 @@ impl ApiRuntimeReporter {
             command_id,
             log_bounds,
             log_bytes_sent: Mutex::new(0),
+            deployment_committed: AtomicBool::new(false),
+            committed_output: StdMutex::new(None),
         }
     }
 }
@@ -48,6 +81,28 @@ impl RuntimeReporter for ApiRuntimeReporter {
             .map_err(|error| RuntimeExecutionError::reporting(error.to_string()))?;
         *sent += u64::try_from(log.message.len()).unwrap_or(u64::MAX);
         Ok(())
+    }
+
+    fn mark_deployment_committed(&self, output: CommandOutput) {
+        *self
+            .committed_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(output);
+        self.deployment_committed.store(true, Ordering::Release);
+    }
+
+    fn deployment_committed(&self) -> bool {
+        self.deployment_committed.load(Ordering::Acquire)
+    }
+
+    fn committed_output(&self) -> Option<CommandOutput> {
+        if !self.deployment_committed() {
+            return None;
+        }
+        self.committed_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 

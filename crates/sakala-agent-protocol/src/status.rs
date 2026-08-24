@@ -19,4 +19,7 @@ pub enum NodeStatus {
     Ready,
     Busy,
     Degraded,
+    Draining,
+    Drained,
+    Maintenance,
 }

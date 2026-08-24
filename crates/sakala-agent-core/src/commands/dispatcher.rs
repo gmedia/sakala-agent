@@ -1,37 +1,231 @@
 use std::sync::Arc;
 
-use sakala_agent_protocol::{AgentCommand, CommandType};
+use sakala_agent_protocol::{AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel};
+use serde_json::json;
+use time::OffsetDateTime;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
+    NodeLifecycle, NodeLifecycleState,
     commands::handlers::{deploy_project, inspect_project},
-    ports::{CommandOutput, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter},
+    ports::{
+        CleanupRuntimeRequest, CommandOutput, ReconcileWorkloadRequest,
+        RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
+        UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
+    },
 };
 
 pub struct CommandDispatcher {
     runtime: Arc<dyn RuntimeExecutor>,
+    repository_credentials: Arc<dyn RepositoryCredentialProvider>,
+    node_lifecycle: Arc<NodeLifecycle>,
 }
 
 impl CommandDispatcher {
     #[must_use]
     pub fn new(runtime: Arc<dyn RuntimeExecutor>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            repository_credentials: Arc::new(UnavailableRepositoryCredentialProvider),
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_repository_credentials(
+        runtime: Arc<dyn RuntimeExecutor>,
+        repository_credentials: Arc<dyn RepositoryCredentialProvider>,
+    ) -> Self {
+        Self {
+            runtime,
+            repository_credentials,
+            node_lifecycle: Arc::new(NodeLifecycle::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_dependencies(
+        runtime: Arc<dyn RuntimeExecutor>,
+        repository_credentials: Arc<dyn RepositoryCredentialProvider>,
+        node_lifecycle: Arc<NodeLifecycle>,
+    ) -> Self {
+        Self {
+            runtime,
+            repository_credentials,
+            node_lifecycle,
+        }
     }
 
     pub async fn dispatch(
         &self,
         command: &AgentCommand,
         reporter: Arc<dyn RuntimeReporter>,
+        cancellation: CancellationToken,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         match command.command_type {
             CommandType::InspectProject => {
-                inspect_project::handle(command, self.runtime.as_ref(), reporter).await
+                inspect_project::handle(
+                    command,
+                    self.runtime.as_ref(),
+                    self.repository_credentials.as_ref(),
+                    reporter,
+                    cancellation,
+                )
+                .await
             }
             CommandType::DeployProject => {
-                deploy_project::handle(command, self.runtime.as_ref(), reporter).await
+                deploy_project::handle(
+                    command,
+                    self.runtime.as_ref(),
+                    self.repository_credentials.as_ref(),
+                    reporter,
+                    cancellation,
+                )
+                .await
             }
-            command_type => Err(RuntimeExecutionError::unsupported_command(format!(
-                "command {command_type:?} does not have a core handler yet"
-            ))),
+            CommandType::RestartProject => {
+                self.runtime
+                    .restart_project(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::StopProject => {
+                self.runtime
+                    .stop_project(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::SleepProject => {
+                self.runtime
+                    .sleep_project(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::WakeProject => {
+                self.runtime
+                    .wake_project(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::HealthCheck => {
+                self.runtime
+                    .health_check(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::RefreshRoute => {
+                self.runtime
+                    .refresh_route(lifecycle_request(command, cancellation)?, reporter)
+                    .await
+            }
+            CommandType::ReconcileWorkload => {
+                let lifecycle = lifecycle_request(command, cancellation)?;
+                let payload = command.reconcile_workload_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "ReconcileWorkload payload is invalid: {error}"
+                    ))
+                })?;
+                self.runtime
+                    .reconcile_workload(
+                        ReconcileWorkloadRequest {
+                            project_id: lifecycle.project_id,
+                            deployment_id: lifecycle.deployment_id,
+                            desired_state: payload.desired_state,
+                            actions: payload.actions,
+                            cancellation: lifecycle.cancellation,
+                        },
+                        reporter,
+                    )
+                    .await
+            }
+            CommandType::CleanupRuntime => {
+                let payload = command.cleanup_runtime_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "CleanupRuntime payload is invalid: {error}"
+                    ))
+                })?;
+                if !payload.approved {
+                    return Err(RuntimeExecutionError::invalid_command(
+                        "CleanupRuntime requires approved=true",
+                    ));
+                }
+                if payload.targets.is_empty() {
+                    return Err(RuntimeExecutionError::invalid_command(
+                        "CleanupRuntime requires at least one target",
+                    ));
+                }
+                self.runtime
+                    .cleanup_runtime(
+                        CleanupRuntimeRequest {
+                            command_id: command.id,
+                            approved: payload.approved,
+                            targets: payload.targets,
+                            cancellation,
+                        },
+                        reporter,
+                    )
+                    .await
+            }
+            CommandType::DrainNode => {
+                self.node_lifecycle.set(NodeLifecycleState::Draining);
+                reporter
+                    .event(DeploymentEvent {
+                        event_type: "node.drain.started".to_owned(),
+                        level: DeploymentEventLevel::Info,
+                        message: "Node stopped accepting new workload commands.".to_owned(),
+                        metadata: json!({}),
+                        occurred_at: OffsetDateTime::now_utc(),
+                    })
+                    .await?;
+                Ok(CommandOutput::with_result(json!({ "state": "draining" })))
+            }
+            CommandType::ResumeNode => {
+                let preflight = self.runtime.preflight().await?;
+                if preflight.has_fatal_failure() {
+                    return Err(RuntimeExecutionError::new(
+                        "runtime_preflight_failed",
+                        "node cannot resume because runtime preflight has fatal failures",
+                    ));
+                }
+                let capacity = self.runtime.capacity().await?;
+                let available_workload_slots = capacity.available_workload_slots();
+                self.node_lifecycle.set(NodeLifecycleState::Active);
+                reporter
+                    .event(DeploymentEvent {
+                        event_type: "node.resume.completed".to_owned(),
+                        level: DeploymentEventLevel::Info,
+                        message: "Node preflight passed and workload command processing resumed."
+                            .to_owned(),
+                        metadata: json!({
+                            "active_workloads": capacity.active_workloads,
+                            "maximum_active_workloads": capacity.maximum_active_workloads,
+                            "available_workload_slots": available_workload_slots,
+                        }),
+                        occurred_at: OffsetDateTime::now_utc(),
+                    })
+                    .await?;
+                Ok(CommandOutput::with_result(json!({
+                    "state": "active",
+                    "capacity": {
+                        "active_workloads": capacity.active_workloads,
+                        "maximum_active_workloads": capacity.maximum_active_workloads,
+                        "available_workload_slots": available_workload_slots,
+                    },
+                })))
+            }
         }
     }
+}
+
+fn lifecycle_request(
+    command: &AgentCommand,
+    cancellation: CancellationToken,
+) -> Result<WorkloadLifecycleRequest, RuntimeExecutionError> {
+    let project_id = command.project_id.ok_or_else(|| {
+        RuntimeExecutionError::invalid_command("lifecycle command requires project_id")
+    })?;
+    let deployment_id = command.deployment_id.ok_or_else(|| {
+        RuntimeExecutionError::invalid_command("lifecycle command requires deployment_id")
+    })?;
+    Ok(WorkloadLifecycleRequest {
+        command_id: command.id,
+        project_id,
+        deployment_id,
+        cancellation,
+    })
 }

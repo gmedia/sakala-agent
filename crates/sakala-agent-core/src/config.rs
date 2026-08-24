@@ -41,6 +41,8 @@ pub struct AgentConfig {
     pub poll_interval_seconds: u64,
     pub heartbeat_interval_seconds: u64,
     pub command_timeout_seconds: u64,
+    pub max_concurrent_commands: usize,
+    pub shutdown_grace_seconds: u64,
     pub runtime_network: String,
     pub capabilities: Vec<String>,
 }
@@ -85,6 +87,8 @@ impl AgentConfig {
                 "SAKALA_COMMAND_TIMEOUT_SECONDS",
                 900,
             )?,
+            max_concurrent_commands: positive_usize(values, "SAKALA_MAX_CONCURRENT_COMMANDS", 4)?,
+            shutdown_grace_seconds: positive_number(values, "SAKALA_SHUTDOWN_GRACE_SECONDS", 30)?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
             capabilities: vec!["noop-runtime".to_owned()],
         })
@@ -104,6 +108,31 @@ impl AgentConfig {
     pub fn command_timeout(&self) -> Duration {
         Duration::from_secs(self.command_timeout_seconds)
     }
+
+    #[must_use]
+    pub fn shutdown_grace(&self) -> Duration {
+        Duration::from_secs(self.shutdown_grace_seconds)
+    }
+}
+
+fn positive_usize(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: usize,
+) -> Result<usize, CoreError> {
+    let value = values
+        .get(key)
+        .map_or_else(|| default.to_string(), Clone::clone)
+        .parse::<usize>()
+        .map_err(|_| CoreError::InvalidConfiguration(format!("{key} must be a number")))?;
+
+    if value == 0 {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{key} must be greater than zero"
+        )));
+    }
+
+    Ok(value)
 }
 
 fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
