@@ -638,7 +638,7 @@ async fn requested_build_timeout_is_used_when_shorter_than_node_maximum() {
     let reporter = Arc::new(RecordingReporter::default());
     let mut config = runtime_config(&temp);
     config.timeout_safety.max_build_timeout = Duration::from_secs(10);
-    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
     let mut command = deploy_command("auto");
     command.payload["timeouts"] = json!({
         "build_timeout_seconds": 1,
@@ -964,6 +964,75 @@ async fn successful_redeploy_stops_and_removes_a_running_previous_container() {
                 .iter()
                 .any(|argument| argument == "previous-container")
     }));
+}
+
+#[tokio::test]
+async fn failed_previous_cleanup_becomes_a_post_commit_finalization_error() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let mut command = deploy_command("auto");
+    command.project_id = Some(project_id);
+    command.deployment_id = Some(deployment_id);
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("previous-container\n")
+            .with_previous_container_inspection("true\t/old-deployment\n")
+            .with_failed_previous_stop(),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = config
+        .caddy_sites_dir
+        .join(format!("{project_id}.Caddyfile"));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(executor, &command, Arc::clone(&reporter))
+        .await
+        .expect_err("failed cleanup must enter post-commit repair machinery");
+    tokio::task::yield_now().await;
+
+    assert_eq!(error.code(), "runtime_container_failed");
+    assert!(reporter.deployment_committed());
+    assert_eq!(
+        reporter
+            .committed_output()
+            .expect("cutover result must be retained")
+            .result["applied_resources"]["memory_mb"],
+        256
+    );
+    assert!(route.exists(), "the committed route must stay active");
+    assert!(
+        reporter
+            .events
+            .lock()
+            .expect("event lock")
+            .iter()
+            .any(|event| event.event_type == "deployment.runtime.ready"),
+        "ready reporting must still be attempted before propagating cleanup failure"
+    );
+    assert!(
+        reporter
+            .logs
+            .lock()
+            .expect("log lock")
+            .iter()
+            .any(|log| log.message.contains("previous container cleanup warning"))
+    );
+    assert!(
+        runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|process| process.program == "docker"
+                && process
+                    .args
+                    .first()
+                    .is_some_and(|argument| argument == "logs")
+                && process.args.iter().any(|argument| argument == "--follow")),
+        "log follower must be started before cleanup failure is propagated"
+    );
 }
 
 #[tokio::test]
@@ -1995,6 +2064,7 @@ struct FakeRunner {
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
+    fail_previous_stop: bool,
     image_prune_stdout: String,
     image_list_stdout: String,
     image_created_stdout: String,
@@ -2133,6 +2203,7 @@ impl FakeRunner {
             build_delay: None,
             inspect_delay: None,
             previous_container_inspection: None,
+            fail_previous_stop: false,
             image_prune_stdout: String::new(),
             image_list_stdout: String::new(),
             image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
@@ -2175,6 +2246,11 @@ impl FakeRunner {
 
     fn with_previous_container_inspection(mut self, stdout: impl Into<String>) -> Self {
         self.previous_container_inspection = Some(stdout.into());
+        self
+    }
+
+    fn with_failed_previous_stop(mut self) -> Self {
+        self.fail_previous_stop = true;
         self
     }
 
@@ -2221,6 +2297,20 @@ impl ProcessRunner for FakeRunner {
                 code: Some(1),
                 stdout: String::new(),
                 stderr: "Caddy is not running".to_owned(),
+            });
+        }
+        let previous_stop = spec.program == "docker"
+            && spec.args.first().is_some_and(|argument| argument == "stop")
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument == "previous-container");
+        if previous_stop && self.fail_previous_stop {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated previous container stop failure".to_owned(),
             });
         }
 
@@ -2359,6 +2449,7 @@ impl ProcessRunner for FakeRunner {
 struct RecordingReporter {
     events: Mutex<Vec<DeploymentEvent>>,
     logs: Mutex<Vec<DeploymentLog>>,
+    committed_output: Mutex<Option<CommandOutput>>,
 }
 
 #[derive(Default)]
@@ -2383,6 +2474,18 @@ impl RuntimeReporter for RecordingReporter {
     async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
         self.logs.lock().expect("log lock").push(log);
         Ok(())
+    }
+
+    fn mark_deployment_committed(&self, output: CommandOutput) {
+        *self.committed_output.lock().expect("commit lock") = Some(output);
+    }
+
+    fn deployment_committed(&self) -> bool {
+        self.committed_output.lock().expect("commit lock").is_some()
+    }
+
+    fn committed_output(&self) -> Option<CommandOutput> {
+        self.committed_output.lock().expect("commit lock").clone()
     }
 }
 

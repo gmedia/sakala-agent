@@ -43,6 +43,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Fixed
 
+- Propagasikan kegagalan cleanup container deployment sebelumnya setelah ready/follower agar completion meminta deferred control-plane repair.
 - Tandai completion deployment yang melewati post-commit finalization grace sebagai `finalization_deferred` agar control plane dapat menghentikan superseded workload secara eksplisit.
 - Batasi finalisasi deployment setelah cutover dengan grace 30 detik dan pisahkan cached dependency versions dari live readiness Docker, Caddy, network, serta workspace.
 - Jadikan route cutover sebagai deployment commit point, lindungi modern route dari stale legacy cleanup, pertahankan partial telemetry, dan laporkan node aktif yang tidak operasional sebagai degraded.

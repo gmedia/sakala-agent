@@ -72,7 +72,9 @@ hasil yang disimpan saat cutover untuk mengirim `Complete` dengan
 deployment sebelumnya; reconciliation/GC Agent tidak menghapus superseded
 container yang masih running secara otomatis. Kegagalan event
 `deployment.runtime.ready` menjadi warning dan tidak boleh mengubah workload
-yang sudah live menjadi `Failed`.
+yang sudah live menjadi `Failed`. Kegagalan `cleanup_previous` tetap memberi
+kesempatan ready event dan log follower berjalan, lalu dipropagasikan sebagai
+post-commit `runtime_error` agar repair signal tidak hilang.
 
 State drain tidak hanya disimpan di memory process. Saat connected Agent
 bootstrap, desired lifecycle dipulihkan dari control plane sebelum polling

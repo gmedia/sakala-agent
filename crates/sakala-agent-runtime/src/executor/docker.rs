@@ -461,17 +461,21 @@ impl DockerRuntimeExecutor {
                 )))
                 .await;
         }
-        if let Err(error) = self
+        let finalization_error = match self
             .containers
             .cleanup_previous(project_id, container, reporter_ref)
             .await
         {
-            let _ = reporter
-                .log(system_log(format!(
-                    "previous container cleanup warning for project {project_id}: {error}"
-                )))
-                .await;
-        }
+            Ok(()) => None,
+            Err(error) => {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "previous container cleanup warning for project {project_id}: {error}"
+                    )))
+                    .await;
+                Some(error)
+            }
+        };
 
         if let Err(error) = emit_event(
             reporter_ref,
@@ -495,6 +499,9 @@ impl DockerRuntimeExecutor {
             );
         }
         let _ = self.containers.start_log_follower(container, reporter);
+        if let Some(error) = finalization_error {
+            return Err(error);
+        }
         Ok(())
     }
 
