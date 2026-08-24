@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-24
+
 ### Added
 
 - Protocol revision 4 dengan bootstrap desired lifecycle node dari control plane sebelum scheduler mengklaim command.
@@ -49,3 +51,6 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Jadikan route cutover sebagai deployment commit point, lindungi modern route dari stale legacy cleanup, pertahankan partial telemetry, dan laporkan node aktif yang tidak operasional sebagai degraded.
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
+
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/gmedia/sakala-agent/releases/tag/v0.1.0
