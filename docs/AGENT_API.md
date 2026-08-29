@@ -335,6 +335,12 @@ Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan 
 semantic version binary. Lihat [Compatibility and Release Policy](COMPATIBILITY.md)
 untuk aturan rollout dan command yang belum didukung.
 
+Nilai `status` heartbeat yang valid adalah `ready`, `busy`, `degraded`,
+`draining`, `drained`, dan `maintenance`. Heartbeat adalah summary kesehatan dan
+telemetry operasional node, bukan endpoint full inventory runtime. Karena itu,
+telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
+`null` tidak boleh ditafsirkan sebagai angka nol atau kapasitas tanpa batas.
+
 ```json
 {
   "status": "ready",
@@ -354,6 +360,14 @@ untuk aturan rollout dan command yang belum didukung.
     "runtime_driver": "docker",
     "lifecycle_state": "active",
     "uptime_seconds": 86400,
+    "detail_counts": {
+      "unhealthy_details": 0,
+      "recovered_workloads": 0,
+      "orphans": 0,
+      "stale_routes": 0,
+      "stale_images": 0,
+      "compatibility_issues": 0
+    },
     "resources": {
       "cpu_total": 4,
       "cpu_load_1m": 0.42,
@@ -397,7 +411,8 @@ untuk aturan rollout dan command yang belum didukung.
       "recovered_workloads": [],
       "orphans": [],
       "stale_routes": [],
-      "stale_images": []
+      "stale_images": [],
+      "compatibility_issues": []
     }
   },
   "sent_at": "2026-06-23T08:00:00Z"
@@ -408,6 +423,21 @@ untuk aturan rollout dan command yang belum didukung.
 bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
 eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
 hasil command reconciliation eksplisit.
+
+Collection detail yang berpotensi membesar (`unhealthy_details`,
+`recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
+`compatibility_issues`) dibatasi maksimal 50 item per heartbeat. Agent
+mempertahankan urutan hasil runtime dan mengirim 50 item pertama secara
+deterministik, bukan memilih item secara acak. `metadata.detail_counts` selalu
+menyimpan jumlah asli sebelum pembatasan; nilai `0` berarti collection kosong,
+sedangkan count yang lebih besar dari jumlah item yang dikirim menandakan ada
+detail yang dipotong. `compatibility_issues` adalah temuan container yang
+metadata/label-nya belum kompatibel untuk recovery saat ini, bukan inventaris
+lengkap atau izin mutasi runtime.
+
+Batas ukuran serialized heartbeat 256 KiB tetap merupakan enforcement terakhir di
+API. Agent membatasi collection sumber seperti di atas dan tidak menggagalkan
+heartbeat hanya karena perkiraan ukuran JSON.
 
 ## Event and Log Payloads
 
