@@ -28,11 +28,11 @@ runtime cleanup, and node maintenance commands are supported by the current
 runtime. A control plane that only supports revision 1–3 must not admit a
 revision-4 connected node until it implements `GET /api/agent/v1/node-state`.
 
-## Revision 4 wire additions after v0.1.0
+## Revision 4 wire additions in v0.2.0
 
-The following changes stay within protocol revision 4 because the control
-plane accepted them before the Agent adopted them, and an older API answers
-them compatibly. `sakala-api` gates admitted revisions through
+The following changes ship in Agent v0.2.0 and stay within protocol revision 4
+because the control plane accepted them before the Agent adopted them, and an
+older API answers them compatibly. `sakala-api` gates admitted revisions through
 `SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS`; none of these require raising it.
 
 | Capability | Agent decision | Notes |

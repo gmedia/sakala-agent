@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-20
+
 ### Added
 
 - `metadata.detail_counts` pada heartbeat dan batas 50 item untuk collection detail (`unhealthy_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, `compatibility_issues`) agar payload tetap di bawah batas 256 KiB API (#48).
@@ -68,5 +70,6 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gmedia/sakala-agent/releases/tag/v0.1.0
