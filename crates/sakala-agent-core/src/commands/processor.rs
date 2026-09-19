@@ -15,7 +15,7 @@ use crate::{
     api::ApiClient,
     commands::CommandDispatcher,
     ports::{CommandOutput, RuntimeExecutor, RuntimeReporter},
-    reporting::ApiRuntimeReporter,
+    reporting::{ApiRuntimeReporter, ApiRuntimeReporterFactory},
     repositories::ApiRepositoryCredentialProvider,
 };
 
@@ -51,13 +51,15 @@ impl CommandProcessor {
         node_lifecycle: Arc<NodeLifecycle>,
     ) -> Self {
         let repository_credentials = Arc::new(ApiRepositoryCredentialProvider::new(client.clone()));
+        let reporter_factory = Arc::new(ApiRuntimeReporterFactory::new(client.clone()));
         Self {
             client,
             dispatcher: CommandDispatcher::with_dependencies(
                 runtime,
                 repository_credentials,
                 node_lifecycle,
-            ),
+            )
+            .with_reporter_factory(reporter_factory),
             command_timeout,
             post_commit_finalization_grace: POST_COMMIT_FINALIZATION_GRACE,
         }
@@ -195,6 +197,14 @@ impl CommandProcessor {
             }
             result => result,
         };
+
+        // Buffered log batches are delivered before the terminal transition so
+        // the control-plane timeline is complete. Undeliverable logs are a
+        // warning: the command outcome is decided by the runtime, not by log
+        // transport.
+        if let Err(error) = reporter.flush().await {
+            warn!(command_id = %command.id, %error, "deployment logs could not be fully delivered");
+        }
 
         match execution {
             Ok(output) => {

@@ -160,6 +160,7 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                 "stale_routes": bounded_values(&reconciliation.stale_routes, |route| json!({
                     "path": route.path,
                     "project_id": route.project_id,
+                    "deployment_id": route.deployment_id,
                 })),
                 "stale_images": bounded_values(&reconciliation.stale_images, |image| json!({
                     "image_id": image.image_id,
@@ -380,6 +381,10 @@ mod tests {
         assert_eq!(
             heartbeat.metadata["startup_reconciliation"]["stale_routes"][0]["project_id"],
             stale_project.to_string()
+        );
+        assert!(
+            heartbeat.metadata["startup_reconciliation"]["stale_routes"][0]["deployment_id"]
+                .is_null()
         );
         let detail_counts = &heartbeat.metadata["detail_counts"];
         assert_eq!(detail_counts["unhealthy_details"].as_u64(), Some(0));
@@ -628,6 +633,7 @@ mod tests {
             stale_routes[0]["path"],
             "/var/lib/sakala/caddy/stale-00.Caddyfile"
         );
+        assert_eq!(stale_routes[0]["deployment_id"], deployment_id.to_string());
         assert_eq!(
             stale_routes[49]["path"],
             "/var/lib/sakala/caddy/stale-49.Caddyfile"

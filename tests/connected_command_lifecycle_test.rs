@@ -18,7 +18,7 @@ use tokio::{sync::watch, time::sleep};
 use tokio_util::sync::CancellationToken;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, body_partial_json, header, method, path},
+    matchers::{body_json, body_partial_json, header, header_exists, method, path},
 };
 
 const COMMAND_ID: &str = "b3c8cb55-3bc8-4725-a004-e69d9917d40b";
@@ -385,11 +385,21 @@ async fn mount_lifecycle_mocks(server: &MockServer) {
         .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/logs")))
         .and(header("authorization", "Bearer test-agent-token"))
         .and(header("x-agent-id", "runtime-01"))
+        .and(header_exists("idempotency-key"))
         .and(body_partial_json(json!({
-            "stream": "system",
-            "message": "Foundation mode: no Docker, Caddy, or Railpack operation executed."
+            "logs": [{
+                "stream": "system",
+                "message": "Foundation mode: no Docker, Caddy, or Railpack operation executed."
+            }]
         })))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 1,
+                "last_sequence": 1
+            }
+        })))
         .expect(1)
         .mount(server)
         .await;
@@ -412,12 +422,22 @@ async fn mount_event_mock(server: &MockServer, event_type: &str, message: &str) 
         .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/events")))
         .and(header("authorization", "Bearer test-agent-token"))
         .and(header("x-agent-id", "runtime-01"))
+        .and(header_exists("idempotency-key"))
         .and(body_partial_json(json!({
-            "type": event_type,
-            "level": "info",
-            "message": message
+            "events": [{
+                "type": event_type,
+                "level": "info",
+                "message": message
+            }]
         })))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 1,
+                "last_sequence": 1
+            }
+        })))
         .expect(1)
         .mount(server)
         .await;

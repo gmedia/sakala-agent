@@ -28,6 +28,29 @@ runtime cleanup, and node maintenance commands are supported by the current
 runtime. A control plane that only supports revision 1–3 must not admit a
 revision-4 connected node until it implements `GET /api/agent/v1/node-state`.
 
+## Revision 4 wire additions after v0.1.0
+
+The following changes stay within protocol revision 4 because the control
+plane accepted them before the Agent adopted them, and an older API answers
+them compatibly. `sakala-api` gates admitted revisions through
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS`; none of these require raising it.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `metadata.detail_counts` and 50-item bound on heartbeat detail collections | Adopted (#48). | Optional for the API; validated fully when present. |
+| `stale_routes[].deployment_id` on heartbeat | Adopted. | Additive field, `null` for legacy route generations. |
+| Batch report bodies `{ "events": [...] }` / `{ "logs": [...] }` | Adopted (#49). | Single-object bodies are no longer sent. The API accepts both. |
+| `Idempotency-Key` header and bounded retry on reports, `complete`, `fail` | Adopted (#49). | Retries reuse the key; the API deduplicates per item and answers `409` when a key is reused for a different payload. A `200` must carry a valid acknowledgement; `204` without a body is still accepted for older control planes. |
+| `409` body `terminal_at` | Adopted (#49). | Parsed when present and included in the conflict message; `null` is tolerated. |
+| `409`/`422`/`413` on log reports stop delivery | Adopted (#49). | Matches the API guidance for followers after `complete`. |
+| Claim response carrying the materialised command resource | **Not adopted**, recorded here. | The Agent keeps the polled record as the payload source. Using the claim body for secret materialisation would move payload trust to a second code path without a current need; revisit when the API stops materialising `environment` on poll. |
+| `NodeStatus::busy` | Not emitted. | Reserved in the enum; capacity pressure is reported through `execution`/`workloads` instead. |
+
+Control-plane semantics the Agent relies on (lease expiry, offline detection,
+pinned command types, `Claimed -> Running` on first report, report
+sanitisation limits) are documented in
+[Sakala Agent API](AGENT_API.md#semantik-control-plane-yang-diandalkan-agent).
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

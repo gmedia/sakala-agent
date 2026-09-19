@@ -1,4 +1,4 @@
 pub mod client;
 pub mod endpoints;
 
-pub use client::ApiClient;
+pub use client::{ApiClient, ReportAcknowledgement};

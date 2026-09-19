@@ -64,4 +64,22 @@ Local mode hanya menulis startup, heartbeat tick, polling tick, dan shutdown. No
 
 Docker runtime mengambil maksimal 100 baris startup setelah health check, lalu menjalankan `docker logs --follow --tail 0` sebagai task background. Follower memakai reporter command yang sama, tetap melewati redaction core, dan tidak memiliki subprocess timeout karena lifecycle-nya mengikuti container. `RuntimeExecutor::shutdown` membatalkan seluruh follower dan process group sebelum binary berhenti.
 
-Follower bukan storage. Jika API tidak dapat menerima log, follower berhenti dan menulis warning pada log operator agar kegagalan reporting tidak tumbuh menjadi retry loop tanpa batas. Resume cursor dan reconnect terkontrol menjadi pekerjaan lanjutan setelah endpoint log menyediakan kontrak sequence/cursor.
+Baris log tidak dikirim satu per satu. Reporter mem-buffer baris yang sudah
+diredaksi dan mengirim batch `{ "logs": [...] }` saat mencapai
+`min(log_bounds.max_batch_lines, 100)` baris atau 512 KiB message, atau paling
+lambat 200 ms setelah baris pertama masuk buffer. Urutan baris dipertahankan.
+Setiap request membawa `Idempotency-Key` unik; kegagalan transport dan respons
+`408`/`429`/`5xx` di-retry dengan key yang sama (backoff 500 ms–5 s, maksimum
+tiga percobaan) sehingga API mendeduplikasi item yang terkirim ganda. Sebelum
+`complete`/`fail`, core mem-flush sisa buffer; kegagalan flush hanya menjadi
+warning karena hasil command ditentukan runtime, bukan transport log.
+
+Follower bukan storage. Respons `409` (command terminal atau bukan node
+pemilik) dan `422` (budget `max_total_bytes` habis) menghentikan delivery log
+command tersebut tanpa retry: reporter menolak baris berikutnya sehingga
+follower berhenti dan menulis warning pada log operator. Kegagalan transient
+yang tetap gagal setelah retry berakhir dengan cara yang sama agar kegagalan
+reporting tidak tumbuh menjadi retry loop tanpa batas. Batch yang masih berada
+di buffer saat follower dibatalkan pada shutdown Agent (paling banyak 200 ms
+output) tidak dikirim. Resume cursor dan reconnect terkontrol menjadi pekerjaan
+lanjutan setelah endpoint log menyediakan kontrak sequence/cursor.

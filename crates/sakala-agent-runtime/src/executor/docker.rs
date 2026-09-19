@@ -901,12 +901,31 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     if !workload.status.to_ascii_lowercase().starts_with("up") {
                         return Err(RuntimeError::WorkloadNotRunning.into());
                     }
+                    // The follower outlives this reconcile command, so it must
+                    // report under the workload's original DeployProject
+                    // identity, exactly like startup recovery does.
+                    let Some(command_id) = workload.command_id else {
+                        return Err(RuntimeError::InvalidCommand(
+                            "managed workload predates recovery command-id labels; redeploy is required before its log follower can be restarted"
+                                .to_owned(),
+                        )
+                        .into());
+                    };
+                    let Some(factory) = &request.reporter_factory else {
+                        return Err(RuntimeError::InvalidCommand(
+                            "restart_log_follower requires a connected control plane reporter"
+                                .to_owned(),
+                        )
+                        .into());
+                    };
+                    let follower_reporter = factory.reporter(command_id, workload.log_bounds);
                     let started = self
                         .containers
-                        .start_log_follower(&workload.container_id, Arc::clone(&reporter));
+                        .start_log_follower(&workload.container_id, follower_reporter);
                     actions_applied.push(json!({
                         "action": "restart_log_follower",
                         "started": started,
+                        "command_id": command_id,
                     }));
                 }
                 ReconcileWorkloadAction::CleanupFailedCandidate => {

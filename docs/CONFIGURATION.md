@@ -9,7 +9,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_AGENT_TOKEN` | tidak ada | Bearer token; wajib dan bukan `change-me` pada connected mode. |
 | `SAKALA_API_URL` | `http://localhost:8000` | Base URL `sakala-api` control plane. |
 | `SAKALA_POLL_INTERVAL_SECONDS` | `3` | Interval polling command, harus lebih besar dari nol. |
-| `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. |
+| `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. `sakala-api` menandai node `offline` dan berhenti menawarkan command bila tidak ada heartbeat selama `SAKALA_AGENT_OFFLINE_AFTER_SECONDS` (default API 60 detik); jangan mendekati batas itu tanpa koordinasi. |
 | `SAKALA_COMMAND_TIMEOUT_SECONDS` | `900` | Hard maximum node untuk deadline seluruh lifecycle command setelah claim; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_MAX_CONCURRENT_COMMANDS` | `4` | Batas global command aktif. Command pada project yang sama tetap diproses satu per satu; command yang belum mendapat slot tetap pending di control plane. |
 | `SAKALA_SHUTDOWN_GRACE_SECONDS` | `30` | Waktu maksimum untuk command aktif menyelesaikan cancellation dan cleanup sebelum agent membatalkan task yang tersisa. |
@@ -76,4 +76,4 @@ Perubahan memory/CPU/PID dilakukan dengan command redeploy yang membawa resource
 
 `sakala-api` mengirim `timeouts` dan `log_bounds` yang telah di-resolve dari policy produk. Untuk `DeployProject`, agent memakai deadline payload pada fase build, start/health, dan lifecycle command. Konfigurasi `SAKALA_*_TIMEOUT_SECONDS` tetap merupakan hard maximum node: nilai nol atau nilai payload di atas maximum ditolak, bukan di-clamp diam-diam.
 
-Log deployment selalu melewati redaksi sebelum dikirim. Agent kemudian memotong setiap message pada `log_bounds.max_line_length` dan berhenti mengirim setelah `log_bounds.max_total_bytes`; endpoint log agent saat ini mengirim satu baris per request, sehingga setiap request secara inheren berada di bawah `max_batch_lines` selama policy nilainya minimal satu. API tetap harus memvalidasi ulang seluruh batas ini sebagai trust boundary terakhir.
+Log deployment selalu melewati redaksi sebelum dikirim. Agent kemudian memotong setiap message pada `log_bounds.max_line_length` dan berhenti mengirim setelah `log_bounds.max_total_bytes`. Baris dikirim dalam batch `{ "logs": [...] }` yang dibatasi `min(log_bounds.max_batch_lines, 100)` baris dan 512 KiB message per request; `max_batch_lines = 0` berarti tidak ada log yang dikirim. Setiap request membawa `Idempotency-Key` sehingga retry transient aman. API tetap harus memvalidasi ulang seluruh batas ini sebagai trust boundary terakhir.
