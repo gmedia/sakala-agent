@@ -434,7 +434,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "caddy-file-routing"
   ],
   "metadata": {
-    "version": "0.1.0",
+    "version": "0.2.0",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
