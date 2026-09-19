@@ -12,7 +12,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use uuid::Uuid;
 use wiremock::{
-    Mock, MockServer, Request, ResponseTemplate,
+    Mock, MockServer, Request, Respond, ResponseTemplate,
     matchers::{header_exists, method, path},
 };
 
@@ -45,6 +45,21 @@ fn accepted(count: u64) -> ResponseTemplate {
             "last_sequence": count
         }
     }))
+}
+
+/// Acknowledges every item of the received batch, as the control plane does
+/// (`accepted_count = count(items)`).
+struct AcceptWholeBatch;
+
+impl Respond for AcceptWholeBatch {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let count = request
+            .body_json::<serde_json::Value>()
+            .ok()
+            .and_then(|body| body["logs"].as_array().map(Vec::len))
+            .unwrap_or(0) as u64;
+        accepted(count)
+    }
 }
 
 fn log(message: &str) -> DeploymentLog {
@@ -123,7 +138,7 @@ async fn reporter_flushes_a_full_batch_and_the_remainder_by_timer() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(logs_path()))
-        .respond_with(accepted(1))
+        .respond_with(AcceptWholeBatch)
         .mount(&server)
         .await;
 
@@ -225,6 +240,71 @@ async fn malformed_acknowledgement_is_not_treated_as_delivered() {
         .await
         .expect_err("non-JSON 200 is not delivery");
     assert!(matches!(error, CoreError::InvalidReportAcknowledgement(_)));
+}
+
+#[tokio::test]
+async fn partial_acknowledgement_is_not_treated_as_delivered() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 10,
+                "last_sequence": 10
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .logs(command_id(), &[log("one"), log("two"), log("three")])
+        .await
+        .expect_err("an acknowledgement for fewer items than sent is not delivery");
+    assert!(
+        matches!(error, CoreError::InvalidReportAcknowledgement(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("accepted 1 of 3"), "{error}");
+    assert!(error.stops_report_delivery());
+}
+
+#[tokio::test]
+async fn reporter_does_not_drop_a_partially_acknowledged_batch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 1,
+                "last_sequence": 1
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let reporter = reporter(
+        &server,
+        LogBounds {
+            max_batch_lines: Some(2),
+            ..LogBounds::default()
+        },
+    );
+    reporter.log(log("one")).await.expect("first line queues");
+    let error = reporter
+        .log(log("two"))
+        .await
+        .expect_err("the full batch flush must fail on a partial acknowledgement");
+    assert!(error.to_string().contains("accepted 1 of 2"), "{error}");
+    reporter
+        .log(log("three"))
+        .await
+        .expect_err("delivery stays stopped after the partial acknowledgement");
 }
 
 #[tokio::test]

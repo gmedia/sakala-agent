@@ -180,6 +180,7 @@ impl ApiClient {
         self.report(
             &endpoints::command_action(command_id, "events"),
             &json!({ "events": events }),
+            events.len(),
         )
         .await
     }
@@ -201,6 +202,7 @@ impl ApiClient {
         self.report(
             &endpoints::command_action(command_id, "logs"),
             &json!({ "logs": logs }),
+            logs.len(),
         )
         .await
     }
@@ -272,11 +274,14 @@ impl ApiClient {
     /// is retried under the same key (that is what the key is for), while a
     /// body that parses but does not match the contract is surfaced as a
     /// delivery failure so a batch is never dropped as "acknowledged" on a
-    /// broken response.
+    /// broken response. The acknowledgement must account for every item of
+    /// the batch (`accepted_count == item_count`); a partial acknowledgement is
+    /// equally undelivered.
     async fn report<T: Serialize + ?Sized>(
         &self,
         endpoint: &str,
         payload: &T,
+        item_count: usize,
     ) -> Result<ReportAcknowledgement, CoreError> {
         let idempotency_key = Uuid::new_v4().to_string();
         let attempts = self.retry.max_attempts.max(1);
@@ -292,7 +297,7 @@ impl ApiClient {
                 Ok(response) if is_retryable_status(response.status()) => {
                     format!("HTTP {}", response.status().as_u16())
                 }
-                Ok(response) => match self.report_outcome(response).await {
+                Ok(response) => match Self::report_outcome(response, item_count).await {
                     Ok(acknowledgement) => return Ok(acknowledgement),
                     Err(CoreError::Api(error)) if is_retryable_transport_error(&error) => {
                         error.to_string()
@@ -319,7 +324,10 @@ impl ApiClient {
         }
     }
 
-    async fn report_outcome(&self, response: Response) -> Result<ReportAcknowledgement, CoreError> {
+    async fn report_outcome(
+        response: Response,
+        item_count: usize,
+    ) -> Result<ReportAcknowledgement, CoreError> {
         let status = response.status();
         if status == StatusCode::CONFLICT {
             return Err(CoreError::ReportRejected {
@@ -352,6 +360,17 @@ impl ApiClient {
                     "acknowledgement body does not match the contract: {error}"
                 ))
             })?;
+        // The control plane defines `accepted_count` as the number of items in
+        // the request, duplicates included. Anything else means part of the
+        // batch is not known to be persisted.
+        if u64::try_from(item_count)
+            .is_ok_and(|expected| acknowledgement.accepted_count != expected)
+        {
+            return Err(CoreError::InvalidReportAcknowledgement(format!(
+                "acknowledgement accepted {} of {item_count} items: {acknowledgement:?}",
+                acknowledgement.accepted_count
+            )));
+        }
         if acknowledgement.duplicate_count > acknowledgement.accepted_count
             || acknowledgement.last_sequence < acknowledgement.first_sequence
         {

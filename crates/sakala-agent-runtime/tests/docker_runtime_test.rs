@@ -1173,6 +1173,9 @@ async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
     assert_eq!(second.recovered_execution_records, 1);
     assert_eq!(second.reattached_log_followers, 0);
     assert_eq!(factory.created.load(Ordering::SeqCst), 2);
+    // The follower runs as a spawned task; give it a moment to issue its
+    // `docker logs --follow` before counting.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     let followers = runner
         .commands
         .lock()

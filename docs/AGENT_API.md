@@ -589,7 +589,9 @@ Idempotency-Key: 8b4a0d3e-6f7c-4a3e-9c3f-3f2f1c1c0a11
 API menjawab `200` dengan acknowledgement berikut. `accepted_count` adalah
 jumlah seluruh item pada request dan `duplicate_count` adalah subset yang
 sudah pernah tersimpan di bawah `Idempotency-Key` yang sama. Semua field wajib
-ada; `200` yang body-nya tidak dapat dibaca di-retry dengan key yang sama,
+ada dan `accepted_count` harus sama dengan jumlah item yang dikirim;
+acknowledgement parsial dianggap tidak terkirim. `200` yang body-nya tidak
+dapat dibaca di-retry dengan key yang sama,
 sedangkan `200` yang body-nya tidak sesuai kontrak dianggap **tidak
 terkirim** (bukan sukses diam-diam) dan menghentikan delivery. `204` tanpa
 body dari control plane lama tetap diterima sebagai sukses:
