@@ -15,7 +15,7 @@ use crate::{
     api::ApiClient,
     commands::CommandDispatcher,
     ports::{CommandOutput, RuntimeExecutor, RuntimeReporter},
-    reporting::ApiRuntimeReporter,
+    reporting::{ApiRuntimeReporter, ApiRuntimeReporterFactory},
     repositories::ApiRepositoryCredentialProvider,
 };
 
@@ -51,13 +51,15 @@ impl CommandProcessor {
         node_lifecycle: Arc<NodeLifecycle>,
     ) -> Self {
         let repository_credentials = Arc::new(ApiRepositoryCredentialProvider::new(client.clone()));
+        let reporter_factory = Arc::new(ApiRuntimeReporterFactory::new(client.clone()));
         Self {
             client,
             dispatcher: CommandDispatcher::with_dependencies(
                 runtime,
                 repository_credentials,
                 node_lifecycle,
-            ),
+            )
+            .with_reporter_factory(reporter_factory),
             command_timeout,
             post_commit_finalization_grace: POST_COMMIT_FINALIZATION_GRACE,
         }

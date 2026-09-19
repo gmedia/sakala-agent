@@ -39,13 +39,32 @@ pub struct WorkloadLifecycleRequest {
     pub cancellation: CancellationToken,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ReconcileWorkloadRequest {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub desired_state: DesiredWorkloadState,
     pub actions: Vec<ReconcileWorkloadAction>,
     pub cancellation: CancellationToken,
+    /// Source of reporters bound to the workload's original `DeployProject`
+    /// command. A restarted log follower must report under that identity:
+    /// the control plane only accepts post-terminal logs for `DeployProject`,
+    /// so a follower attached to the reconcile command would be rejected as
+    /// soon as the reconcile command completes.
+    pub reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
+}
+
+impl std::fmt::Debug for ReconcileWorkloadRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReconcileWorkloadRequest")
+            .field("project_id", &self.project_id)
+            .field("deployment_id", &self.deployment_id)
+            .field("desired_state", &self.desired_state)
+            .field("actions", &self.actions)
+            .field("reporter_factory", &self.reporter_factory.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]

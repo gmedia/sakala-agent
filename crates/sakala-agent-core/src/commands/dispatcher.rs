@@ -11,7 +11,7 @@ use crate::{
     ports::{
         CleanupRuntimeRequest, CommandOutput, ReconcileWorkloadRequest,
         RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
-        UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
+        RuntimeReporterFactory, UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
     },
 };
 
@@ -19,6 +19,7 @@ pub struct CommandDispatcher {
     runtime: Arc<dyn RuntimeExecutor>,
     repository_credentials: Arc<dyn RepositoryCredentialProvider>,
     node_lifecycle: Arc<NodeLifecycle>,
+    reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
 }
 
 impl CommandDispatcher {
@@ -28,6 +29,7 @@ impl CommandDispatcher {
             runtime,
             repository_credentials: Arc::new(UnavailableRepositoryCredentialProvider),
             node_lifecycle: Arc::new(NodeLifecycle::new()),
+            reporter_factory: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl CommandDispatcher {
             runtime,
             repository_credentials,
             node_lifecycle: Arc::new(NodeLifecycle::new()),
+            reporter_factory: None,
         }
     }
 
@@ -53,7 +56,20 @@ impl CommandDispatcher {
             runtime,
             repository_credentials,
             node_lifecycle,
+            reporter_factory: None,
         }
+    }
+
+    /// Supplies reporters bound to a workload's original deploy command for
+    /// runtime work that outlives the command being dispatched (restarted
+    /// log followers).
+    #[must_use]
+    pub fn with_reporter_factory(
+        mut self,
+        reporter_factory: Arc<dyn RuntimeReporterFactory>,
+    ) -> Self {
+        self.reporter_factory = Some(reporter_factory);
+        self
     }
 
     pub async fn dispatch(
@@ -128,6 +144,7 @@ impl CommandDispatcher {
                             desired_state: payload.desired_state,
                             actions: payload.actions,
                             cancellation: lifecycle.cancellation,
+                            reporter_factory: self.reporter_factory.clone(),
                         },
                         reporter,
                     )

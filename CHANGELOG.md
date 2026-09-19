@@ -13,6 +13,9 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ### Changed
 
+- `ReconcileWorkload` aksi `restart_log_follower` memasang follower di bawah identitas `DeployProject` asli milik workload (label command-id dan log bounds container) melalui `RuntimeReporterFactory`, bukan command reconcile yang memerintahkannya; workload tanpa label command-id ditolak (#49).
+- Respons `200` report wajib membawa acknowledgement yang valid; body yang tidak dapat dibaca di-retry dengan `Idempotency-Key` yang sama, body yang tidak sesuai kontrak dianggap tidak terkirim (#49).
+- Update transitive `rustls` ke `0.23.45` untuk `RUSTSEC-2026-0285`.
 - Respons `409`/`422`/`413` pada report menghentikan delivery log command tersebut tanpa retry sehingga follower berhenti setelah lease expired atau budget log habis; `terminal_at` pada `409` disertakan dalam pesan konflik terminal (#49).
 - Body `fail` disanitasi sesuai batas control plane (`error_code` `[A-Za-z0-9._-]` ≤ 64, `error_message` tanpa control/bidi/zero-width ≤ 1000) (#49).
 - Dokumentasi `AGENT_API.md`: bagian polling/claim diisi, shape completion `ReconcileWorkload` disamakan dengan kode, semantik lease/offline/pinning/`Claimed -> Running`, log setelah `complete`, dan catatan `NodeStatus::busy`; keputusan adopsi dicatat di `COMPATIBILITY.md` (#49).

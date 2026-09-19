@@ -20,6 +20,11 @@ pub enum CoreError {
     #[error("control-plane rejected report with HTTP {status}: {detail}")]
     ReportRejected { status: u16, detail: String },
 
+    /// A `200` report response did not carry a valid acknowledgement. The
+    /// batch is not known to be persisted, so it is treated as undelivered.
+    #[error("control-plane report acknowledgement is invalid: {0}")]
+    InvalidReportAcknowledgement(String),
+
     #[error("runtime execution failed: {0}")]
     Runtime(#[from] crate::ports::RuntimeExecutionError),
 }
@@ -30,7 +35,9 @@ impl CoreError {
     pub fn stops_report_delivery(&self) -> bool {
         matches!(
             self,
-            Self::CommandTerminalConflict(_) | Self::ReportRejected { .. }
+            Self::CommandTerminalConflict(_)
+                | Self::ReportRejected { .. }
+                | Self::InvalidReportAcknowledgement(_)
         )
     }
 }

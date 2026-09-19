@@ -35,16 +35,17 @@ pub struct ApiClient {
 }
 
 /// Acknowledgement returned by the batch report endpoints.
+///
+/// `accepted_count` is the number of items in the request; `duplicate_count`
+/// is the subset the control plane had already persisted under the same
+/// `Idempotency-Key`. All fields are mandatory on a `200` response.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ReportAcknowledgement {
-    #[serde(default)]
     pub accepted_count: u64,
-    #[serde(default)]
     pub duplicate_count: u64,
-    #[serde(default)]
-    pub first_sequence: Option<u64>,
-    #[serde(default)]
-    pub last_sequence: Option<u64>,
+    pub first_sequence: u64,
+    pub last_sequence: u64,
 }
 
 impl ApiClient {
@@ -264,19 +265,61 @@ impl ApiClient {
             .header(ACCEPT, "application/json")
     }
 
+    /// Sends one report batch under one `Idempotency-Key`.
+    ///
+    /// A `204` from an older control plane is accepted as delivered. A `200`
+    /// must carry a valid acknowledgement envelope: a body that cannot be read
+    /// is retried under the same key (that is what the key is for), while a
+    /// body that parses but does not match the contract is surfaced as a
+    /// delivery failure so a batch is never dropped as "acknowledged" on a
+    /// broken response.
     async fn report<T: Serialize + ?Sized>(
         &self,
         endpoint: &str,
         payload: &T,
     ) -> Result<ReportAcknowledgement, CoreError> {
         let idempotency_key = Uuid::new_v4().to_string();
-        let response = self
-            .send_with_retry(|| {
-                self.request(Method::POST, endpoint)
-                    .header("Idempotency-Key", &idempotency_key)
-                    .json(payload)
-            })
-            .await?;
+        let attempts = self.retry.max_attempts.max(1);
+        let mut attempt = 0;
+        loop {
+            let outcome = self
+                .request(Method::POST, endpoint)
+                .header("Idempotency-Key", &idempotency_key)
+                .json(payload)
+                .send()
+                .await;
+            let transient = match outcome {
+                Ok(response) if is_retryable_status(response.status()) => {
+                    format!("HTTP {}", response.status().as_u16())
+                }
+                Ok(response) => match self.report_outcome(response).await {
+                    Ok(acknowledgement) => return Ok(acknowledgement),
+                    Err(CoreError::Api(error)) if is_retryable_transport_error(&error) => {
+                        error.to_string()
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(error) if is_retryable_transport_error(&error) => error.to_string(),
+                Err(error) => return Err(CoreError::Api(error)),
+            };
+            if attempt + 1 >= attempts {
+                return Err(CoreError::InvalidReportAcknowledgement(format!(
+                    "report not acknowledged after {attempts} attempts: {transient}"
+                )));
+            }
+            let delay = self.retry.delay_after(attempt);
+            warn!(
+                error = %transient,
+                attempt = attempt + 1,
+                delay_ms = delay.as_millis(),
+                "control-plane report will be retried with the same idempotency key"
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
+    async fn report_outcome(&self, response: Response) -> Result<ReportAcknowledgement, CoreError> {
         let status = response.status();
         if status == StatusCode::CONFLICT {
             return Err(CoreError::ReportRejected {
@@ -294,13 +337,28 @@ impl ApiClient {
         if response.status() == StatusCode::NO_CONTENT {
             return Ok(ReportAcknowledgement::default());
         }
-        // Older control planes answered reports without a body; treat any
-        // unparseable 2xx body as accepted rather than failing delivery.
-        let acknowledgement = response
-            .json::<ApiEnvelope<ReportAcknowledgement>>()
-            .await
+        if response.status() != StatusCode::OK {
+            return Err(CoreError::InvalidReportAcknowledgement(format!(
+                "unexpected HTTP {} for report",
+                response.status().as_u16()
+            )));
+        }
+        // Body read failures are transport errors and retried by the caller.
+        let body = response.bytes().await?;
+        let acknowledgement = serde_json::from_slice::<ApiEnvelope<ReportAcknowledgement>>(&body)
             .map(|envelope| envelope.data)
-            .unwrap_or_default();
+            .map_err(|error| {
+                CoreError::InvalidReportAcknowledgement(format!(
+                    "acknowledgement body does not match the contract: {error}"
+                ))
+            })?;
+        if acknowledgement.duplicate_count > acknowledgement.accepted_count
+            || acknowledgement.last_sequence < acknowledgement.first_sequence
+        {
+            return Err(CoreError::InvalidReportAcknowledgement(format!(
+                "acknowledgement counters are inconsistent: {acknowledgement:?}"
+            )));
+        }
         if acknowledgement.duplicate_count > 0 {
             debug!(
                 duplicate_count = acknowledgement.duplicate_count,
@@ -381,7 +439,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || error.is_request()
+    error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
 }
 
 async fn conflict_detail(response: Response) -> String {

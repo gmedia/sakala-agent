@@ -322,9 +322,17 @@ workload running dilaporkan terpisah melalui `workloads.unhealthy_details` pada
 heartbeat, bukan sebagai state reconciliation. `drift_reason` bernilai
 `workload_state_mismatch` bila desired dan actual berbeda, selain itu `null`.
 `actions_applied` memuat satu objek per aksi yang dijalankan, misalnya
-`{"action":"restart_log_follower","started":true}`,
+`{"action":"restart_log_follower","started":true,"command_id":"<deploy command id>"}`,
 `{"action":"cleanup_failed_candidate","container_id":"..."}`, atau
 `{"action":"restore_route"}`.
+
+`restart_log_follower` memasang follower di bawah identitas command
+`DeployProject` asli milik workload (label `dev.sakala.command-id` dan batas
+log pada container), bukan command `ReconcileWorkload` yang memerintahkannya:
+API hanya menerima log setelah terminal untuk `DeployProject`, sehingga
+follower yang terikat ke command reconcile akan ditolak `409` begitu command
+itu selesai. Workload tanpa label command-id (generasi lama) ditolak dengan
+`invalid_runtime_command` dan perlu redeploy.
 
 Bila desired dan actual berbeda, Agent melaporkan drift tetapi tidak melakukan
 restart, deploy, atau delete secara otomatis. Control plane memutuskan policy
@@ -578,8 +586,13 @@ Idempotency-Key: 8b4a0d3e-6f7c-4a3e-9c3f-3f2f1c1c0a11
 }
 ```
 
-API menjawab dengan acknowledgement berikut; `204` tanpa body dari control
-plane lama juga diterima sebagai sukses:
+API menjawab `200` dengan acknowledgement berikut. `accepted_count` adalah
+jumlah seluruh item pada request dan `duplicate_count` adalah subset yang
+sudah pernah tersimpan di bawah `Idempotency-Key` yang sama. Semua field wajib
+ada; `200` yang body-nya tidak dapat dibaca di-retry dengan key yang sama,
+sedangkan `200` yang body-nya tidak sesuai kontrak dianggap **tidak
+terkirim** (bukan sukses diam-diam) dan menghentikan delivery. `204` tanpa
+body dari control plane lama tetap diterima sebagai sukses:
 
 ```json
 {
@@ -596,7 +609,8 @@ Respons yang diperlakukan Agent:
 
 | Respons | Arti | Perilaku Agent |
 | --- | --- | --- |
-| `2xx` | Diterima (duplikat tetap di-ack). | Lanjut. |
+| `200` dengan acknowledgement valid, atau `204` | Diterima (duplikat tetap di-ack). | Lanjut. |
+| `200` dengan body tidak sesuai kontrak | Tidak diketahui apakah tersimpan. | Hentikan delivery log command ini; batch tidak dianggap terkirim. |
 | `408`, `429`, `5xx`, kegagalan transport | Transien. | Retry dengan key yang sama, backoff eksponensial 500 ms–5 s, maksimum 3 percobaan. |
 | `409` | Command terminal, bukan node pemilik, atau `Idempotency-Key` dipakai untuk payload berbeda. | Hentikan delivery log command ini tanpa retry. |
 | `422` | Budget `max_total_bytes` habis atau field tidak valid. | Hentikan delivery log command ini tanpa retry. |

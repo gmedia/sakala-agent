@@ -161,9 +161,11 @@ async fn transient_failure_is_retried_with_the_same_idempotency_key() {
         .await;
     Mock::given(method("POST"))
         .and(path(logs_path()))
+        // The API counts every item of the request in `accepted_count` and
+        // reports the already-persisted subset in `duplicate_count`.
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": {
-                "accepted_count": 0,
+                "accepted_count": 1,
                 "duplicate_count": 1,
                 "first_sequence": 1,
                 "last_sequence": 1
@@ -172,14 +174,101 @@ async fn transient_failure_is_retried_with_the_same_idempotency_key() {
         .mount(&server)
         .await;
 
-    client(&server)
+    let acknowledgement = client(&server)
         .logs(command_id(), &[log("retry me")])
         .await
         .expect("retry must succeed after a transient failure");
+    assert_eq!(acknowledgement.accepted_count, 1);
+    assert_eq!(acknowledgement.duplicate_count, 1);
 
     let requests = log_requests(&server).await;
     assert_eq!(requests.len(), 2);
     assert_eq!(idempotency_key(&requests[0]), idempotency_key(&requests[1]));
+}
+
+#[tokio::test]
+async fn malformed_acknowledgement_is_not_treated_as_delivered() {
+    for body in [
+        json!({ "ok": true }),
+        json!({ "data": { "accepted_count": 1 } }),
+        json!({ "data": { "accepted_count": 1, "duplicate_count": 2, "first_sequence": 1, "last_sequence": 1 } }),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(logs_path()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = client(&server)
+            .logs(command_id(), &[log("unacknowledged")])
+            .await
+            .expect_err("a 200 without a valid acknowledgement is not delivery");
+        assert!(
+            matches!(error, CoreError::InvalidReportAcknowledgement(_)),
+            "{body}: {error}"
+        );
+        assert!(error.stops_report_delivery());
+    }
+
+    // A 200 whose body is not JSON at all is equally undelivered.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>proxy error</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server)
+        .logs(command_id(), &[log("unacknowledged")])
+        .await
+        .expect_err("non-JSON 200 is not delivery");
+    assert!(matches!(error, CoreError::InvalidReportAcknowledgement(_)));
+}
+
+#[tokio::test]
+async fn legacy_no_content_acknowledgement_is_still_accepted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .logs(command_id(), &[log("legacy")])
+        .await
+        .expect("204 from an older control plane remains a delivery");
+}
+
+#[tokio::test]
+async fn reporter_does_not_drop_a_batch_on_malformed_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": {} })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let reporter = reporter(
+        &server,
+        LogBounds {
+            max_batch_lines: Some(1),
+            ..LogBounds::default()
+        },
+    );
+    let error = reporter
+        .log(log("first"))
+        .await
+        .expect_err("undelivered batch must surface as a delivery failure");
+    assert!(error.to_string().contains("acknowledgement"), "{error}");
+    reporter
+        .log(log("second"))
+        .await
+        .expect_err("delivery stays stopped so the follower terminates");
 }
 
 #[tokio::test]

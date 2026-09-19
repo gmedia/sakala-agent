@@ -1413,6 +1413,7 @@ async fn reconciliation_applies_only_explicit_safe_workload_actions() {
             desired_state: DesiredWorkloadState::Missing,
             actions: vec![ReconcileWorkloadAction::CleanupFailedCandidate],
             cancellation: CancellationToken::new(),
+            reporter_factory: None,
         },
         Arc::new(RecordingReporter::default()),
     )
@@ -1442,6 +1443,124 @@ async fn reconciliation_applies_only_explicit_safe_workload_actions() {
 }
 
 #[tokio::test]
+async fn restarted_log_follower_reports_under_the_original_deploy_command() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID");
+    let deployment_id =
+        Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("deployment UUID");
+    let deploy_command_id =
+        Uuid::parse_str("b3c8cb55-3bc8-4725-a004-e69d9917d40b").expect("deploy command UUID");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(format!(
+                "healthy\tUp 10 minutes (healthy)\tportfolio.run.sakala.localhost\t3000\t{deploy_command_id}\t1024\t20\t65536\n"
+            ))
+            .with_follow_lines(&["app listening on :3000"])
+            .with_follow_delay(Duration::from_secs(60)),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+    let factory = Arc::new(RecordingReporterFactory::default());
+    let reconcile_reporter = Arc::new(RecordingReporter::default());
+
+    let output = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id,
+            deployment_id,
+            desired_state: DesiredWorkloadState::Running,
+            actions: vec![ReconcileWorkloadAction::RestartLogFollower],
+            cancellation: CancellationToken::new(),
+            reporter_factory: Some(factory.clone()),
+        },
+        reconcile_reporter.clone(),
+    )
+    .await
+    .expect("explicit follower restart should succeed");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        output.result["actions_applied"][0],
+        json!({
+            "action": "restart_log_follower",
+            "started": true,
+            "command_id": deploy_command_id,
+        })
+    );
+    let reporters = factory.reporters.lock().expect("factory lock").clone();
+    assert_eq!(
+        reporters.len(),
+        1,
+        "one reporter bound to the deploy command"
+    );
+    let (command_id, log_bounds, follower_reporter) = &reporters[0];
+    assert_eq!(*command_id, deploy_command_id);
+    assert_eq!(
+        *log_bounds,
+        LogBounds {
+            max_line_length: Some(1024),
+            max_batch_lines: Some(20),
+            max_total_bytes: Some(65536),
+        }
+    );
+    let follower_logs = follower_reporter.logs.lock().expect("log lock").clone();
+    assert_eq!(follower_logs.len(), 1);
+    assert_eq!(follower_logs[0].message, "[runtime] app listening on :3000");
+    assert!(
+        reconcile_reporter.logs.lock().expect("log lock").is_empty(),
+        "the reconcile command reporter must never carry follower output"
+    );
+    RuntimeExecutor::shutdown(&executor)
+        .await
+        .expect("follower should stop during shutdown");
+}
+
+#[tokio::test]
+async fn restart_log_follower_is_refused_without_a_deploy_command_identity() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID");
+    let deployment_id =
+        Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("deployment UUID");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "legacy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(
+                "legacy\tUp 10 minutes (healthy)\tportfolio.run.sakala.localhost\t3000\t\t\t\t\n",
+            ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id,
+            deployment_id,
+            desired_state: DesiredWorkloadState::Running,
+            actions: vec![ReconcileWorkloadAction::RestartLogFollower],
+            cancellation: CancellationToken::new(),
+            reporter_factory: Some(Arc::new(RecordingReporterFactory::default())),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("legacy workload cannot restart a follower under an unknown command");
+
+    assert_eq!(error.code(), "invalid_runtime_command");
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|command| { command.args.iter().any(|argument| argument == "--follow") })
+    );
+}
+
+#[tokio::test]
 async fn reconciliation_restores_known_route_only_when_explicitly_instructed() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID");
@@ -1464,6 +1583,7 @@ async fn reconciliation_restores_known_route_only_when_explicitly_instructed() {
             desired_state: DesiredWorkloadState::Running,
             actions: vec![ReconcileWorkloadAction::RestoreRoute],
             cancellation: CancellationToken::new(),
+            reporter_factory: None,
         },
         Arc::new(RecordingReporter::default()),
     )
@@ -1505,6 +1625,7 @@ async fn reconciliation_reports_drift_without_mutating_the_workload() {
             desired_state: DesiredWorkloadState::Stopped,
             actions: Vec::new(),
             cancellation: CancellationToken::new(),
+            reporter_factory: None,
         },
         Arc::new(RecordingReporter::default()),
     )
@@ -1538,6 +1659,7 @@ async fn reconciliation_reports_missing_workload_without_creating_one() {
             desired_state: DesiredWorkloadState::Running,
             actions: Vec::new(),
             cancellation: CancellationToken::new(),
+            reporter_factory: None,
         },
         Arc::new(RecordingReporter::default()),
     )
@@ -2069,6 +2191,7 @@ struct FakeRunner {
     image_list_stdout: String,
     image_created_stdout: String,
     follow_delay: Option<Duration>,
+    follow_lines: Vec<String>,
     live_caddy: AtomicBool,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
@@ -2208,6 +2331,7 @@ impl FakeRunner {
             image_list_stdout: String::new(),
             image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
             follow_delay: None,
+            follow_lines: Vec::new(),
             live_caddy: AtomicBool::new(true),
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
@@ -2226,6 +2350,11 @@ impl FakeRunner {
 
     fn with_follow_delay(mut self, delay: Duration) -> Self {
         self.follow_delay = Some(delay);
+        self
+    }
+
+    fn with_follow_lines(mut self, lines: &[&str]) -> Self {
+        self.follow_lines = lines.iter().map(|line| (*line).to_owned()).collect();
         self
     }
 
@@ -2330,11 +2459,13 @@ impl ProcessRunner for FakeRunner {
         {
             tokio::time::sleep(delay).await;
         }
-        if spec.program == "docker"
-            && spec.args.iter().any(|argument| argument == "--follow")
-            && let Some(delay) = self.follow_delay
-        {
-            tokio::time::sleep(delay).await;
+        if spec.program == "docker" && spec.args.iter().any(|argument| argument == "--follow") {
+            for line in &self.follow_lines {
+                sink.line(ProcessStream::Stdout, line).await?;
+            }
+            if let Some(delay) = self.follow_delay {
+                tokio::time::sleep(delay).await;
+            }
         }
 
         if spec.program == "git" && spec.args.iter().any(|argument| argument == "init") {
@@ -2455,12 +2586,19 @@ struct RecordingReporter {
 #[derive(Default)]
 struct RecordingReporterFactory {
     created: AtomicUsize,
+    reporters: Mutex<Vec<(Uuid, LogBounds, Arc<RecordingReporter>)>>,
 }
 
 impl RuntimeReporterFactory for RecordingReporterFactory {
-    fn reporter(&self, _command_id: Uuid, _log_bounds: LogBounds) -> Arc<dyn RuntimeReporter> {
+    fn reporter(&self, command_id: Uuid, log_bounds: LogBounds) -> Arc<dyn RuntimeReporter> {
         self.created.fetch_add(1, Ordering::SeqCst);
-        Arc::new(RecordingReporter::default())
+        let reporter = Arc::new(RecordingReporter::default());
+        self.reporters.lock().expect("factory lock").push((
+            command_id,
+            log_bounds,
+            Arc::clone(&reporter),
+        ));
+        reporter
     }
 }
 
