@@ -240,7 +240,17 @@ impl RuntimeExecutionError {
 #[async_trait]
 pub trait RuntimeReporter: Send + Sync {
     async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError>;
+
+    /// Queues one log line. Implementations may batch delivery; a returned
+    /// error means the line (or an earlier buffered batch) could not be
+    /// delivered and further delivery for this command should stop.
     async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError>;
+
+    /// Delivers any buffered log lines. Core calls this before the terminal
+    /// `complete`/`fail` transition so the control plane timeline is complete.
+    async fn flush(&self) -> Result<(), RuntimeExecutionError> {
+        Ok(())
+    }
 
     /// Marks the irreversible runtime cutover. Core uses this signal to avoid
     /// turning an already-live deployment into a timeout failure.

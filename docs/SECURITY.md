@@ -18,7 +18,7 @@ Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh r
 - Container memakai resource limits dari command API yang telah diverifikasi terhadap hard maximum node, `no-new-privileges`, dan drop seluruh Linux capabilities.
 - Runtime environment ditulis sementara dengan mode `0600`, tidak dimasukkan ke command arguments, lalu dihapus setelah container dibuat.
 - Deployment logs melewati redactor case-insensitive untuk env-style, JSON, authorization header, bearer token, dan prefix token GitHub umum.
-- Output subprocess dikirim per baris dan capture internal dibatasi 1 MiB per stream.
+- Output subprocess diredaksi per baris, dikirim dalam batch terbatas (100 baris/512 KiB per request) dengan `Idempotency-Key`, dan capture internal dibatasi 1 MiB per stream.
 - Build dan command memiliki deadline terpisah. Timeout atau pembatalan mematikan process group agar subprocess tidak tertinggal.
 - Startup melakukan detection-only reconciliation terhadap container managed yang berhenti atau kehilangan identity label. Agent tidak menghapus orphan otomatis tanpa desired state dari control plane.
 - Node menolak project baru saat guard `SAKALA_MAX_ACTIVE_CONTAINERS` tercapai, tetapi kuota user/workspace tetap ditentukan API.

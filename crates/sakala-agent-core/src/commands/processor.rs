@@ -196,6 +196,14 @@ impl CommandProcessor {
             result => result,
         };
 
+        // Buffered log batches are delivered before the terminal transition so
+        // the control-plane timeline is complete. Undeliverable logs are a
+        // warning: the command outcome is decided by the runtime, not by log
+        // transport.
+        if let Err(error) = reporter.flush().await {
+            warn!(command_id = %command.id, %error, "deployment logs could not be fully delivered");
+        }
+
         match execution {
             Ok(output) => {
                 self.client

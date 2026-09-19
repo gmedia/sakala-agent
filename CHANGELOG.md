@@ -4,6 +4,19 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- `metadata.detail_counts` pada heartbeat dan batas 50 item untuk collection detail (`unhealthy_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, `compatibility_issues`) agar payload tetap di bawah batas 256 KiB API (#48).
+- Report event/log dikirim sebagai batch `{ "events": [...] }` / `{ "logs": [...] }` dengan header `Idempotency-Key` per request; log di-buffer dan di-flush per 100 baris/512 KiB/200 ms serta sebelum `complete`/`fail` (#49).
+- Retry backoff terbatas untuk report, `complete`, dan `fail` pada kegagalan transport dan `408`/`429`/`5xx`; `RetryPolicy` pada `ApiClient` (#49).
+- `stale_routes[].deployment_id` pada heartbeat `startup_reconciliation` (#49).
+
+### Changed
+
+- Respons `409`/`422`/`413` pada report menghentikan delivery log command tersebut tanpa retry sehingga follower berhenti setelah lease expired atau budget log habis; `terminal_at` pada `409` disertakan dalam pesan konflik terminal (#49).
+- Body `fail` disanitasi sesuai batas control plane (`error_code` `[A-Za-z0-9._-]` ≤ 64, `error_message` tanpa control/bidi/zero-width ≤ 1000) (#49).
+- Dokumentasi `AGENT_API.md`: bagian polling/claim diisi, shape completion `ReconcileWorkload` disamakan dengan kode, semantik lease/offline/pinning/`Claimed -> Running`, log setelah `complete`, dan catatan `NodeStatus::busy`; keputusan adopsi dicatat di `COMPATIBILITY.md` (#49).
+
 ## [0.1.0] - 2026-08-24
 
 ### Added
