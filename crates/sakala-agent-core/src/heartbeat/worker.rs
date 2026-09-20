@@ -5,7 +5,7 @@ use std::{
 
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
@@ -141,7 +141,14 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },
             "startup_reconciliation": {
-                "captured_at": context.startup_reconciliation_at,
+                // `sent_at` goes through the typed payload's rfc3339 serializer;
+                // this timestamp lives inside the untyped metadata map, where
+                // OffsetDateTime would otherwise serialize as a tuple the API
+                // rejects as an invalid date.
+                "captured_at": context
+                    .startup_reconciliation_at
+                    .format(&Rfc3339)
+                    .expect("UTC timestamp formats as RFC 3339"),
                 "inspected_containers": reconciliation.inspected_containers,
                 "cleaned_workspaces": reconciliation.cleaned_workspaces,
                 "reattached_log_followers": reconciliation.reattached_log_followers,
@@ -293,7 +300,7 @@ mod tests {
     };
 
     use sakala_agent_protocol::{NodeStatus, PROTOCOL_VERSION};
-    use time::OffsetDateTime;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use uuid::Uuid;
 
     use crate::{
@@ -378,6 +385,13 @@ mod tests {
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
+        let captured_at = heartbeat.metadata["startup_reconciliation"]["captured_at"]
+            .as_str()
+            .expect("captured_at is an RFC 3339 string, not a time tuple");
+        assert_eq!(
+            OffsetDateTime::parse(captured_at, &Rfc3339).expect("captured_at parses as RFC 3339"),
+            context.startup_reconciliation_at
+        );
         assert_eq!(
             heartbeat.metadata["startup_reconciliation"]["stale_routes"][0]["project_id"],
             stale_project.to_string()
