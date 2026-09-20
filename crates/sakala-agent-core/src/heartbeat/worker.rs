@@ -669,6 +669,61 @@ mod tests {
         assert_eq!(compatibility_issues[49]["container_id"], "compatibility-49");
     }
 
+    #[tokio::test]
+    async fn every_timestamp_on_the_wire_is_an_rfc3339_string() {
+        // Typed fields such as `sent_at` declare the rfc3339 serializer, but
+        // values inside the untyped metadata map fall back to `time`'s default
+        // tuple form, which the control plane rejects as an invalid date. Walk
+        // the serialized payload so any future `*_at` field is covered too.
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        let wire = serde_json::to_value(&heartbeat).expect("heartbeat should serialize");
+
+        let mut timestamps = Vec::new();
+        collect_timestamp_fields(&wire, &mut timestamps);
+        assert!(
+            timestamps.iter().any(|(key, _)| key == "captured_at"),
+            "captured_at should be part of the wire payload"
+        );
+        for (key, value) in timestamps {
+            let text = value
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} must be a string, got {value}"));
+            OffsetDateTime::parse(text, &Rfc3339)
+                .unwrap_or_else(|error| panic!("{key} must be RFC 3339: {text} ({error})"));
+        }
+    }
+
+    fn collect_timestamp_fields(
+        value: &serde_json::Value,
+        found: &mut Vec<(String, serde_json::Value)>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key.ends_with("_at") {
+                        found.push((key.clone(), value.clone()));
+                    }
+                    collect_timestamp_fields(value, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_timestamp_fields(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
     fn classifies_workspace_disk_pressure_without_guessing_missing_capacity() {
         assert_eq!(disk_pressure_state(Some(99), 100), "critical");
