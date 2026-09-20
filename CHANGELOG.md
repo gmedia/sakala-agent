@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- `metadata.startup_reconciliation.captured_at` pada heartbeat kini diserialisasi sebagai string RFC 3339. Sebelumnya nilai `OffsetDateTime` di dalam `json!` metadata terkirim sebagai tuple `[tahun, hari-dalam-tahun, ...]`, sehingga `sakala-api` menolak setiap heartbeat node connected (driver `noop` maupun `docker`) dengan `422` dan node tidak pernah menjadi `ready`. Test heartbeat kini memverifikasi seluruh field `*_at` pada payload yang diserialisasi sebagai string RFC 3339.
+
 ## [0.2.0] - 2026-09-20
 
 ### Added

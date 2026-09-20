@@ -5,7 +5,7 @@ use std::{
 
 use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
 use serde_json::{Value, json};
-use time::OffsetDateTime;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 
@@ -141,7 +141,14 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                 "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
             },
             "startup_reconciliation": {
-                "captured_at": context.startup_reconciliation_at,
+                // `sent_at` goes through the typed payload's rfc3339 serializer;
+                // this timestamp lives inside the untyped metadata map, where
+                // OffsetDateTime would otherwise serialize as a tuple the API
+                // rejects as an invalid date.
+                "captured_at": context
+                    .startup_reconciliation_at
+                    .format(&Rfc3339)
+                    .expect("UTC timestamp formats as RFC 3339"),
                 "inspected_containers": reconciliation.inspected_containers,
                 "cleaned_workspaces": reconciliation.cleaned_workspaces,
                 "reattached_log_followers": reconciliation.reattached_log_followers,
@@ -293,7 +300,7 @@ mod tests {
     };
 
     use sakala_agent_protocol::{NodeStatus, PROTOCOL_VERSION};
-    use time::OffsetDateTime;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use uuid::Uuid;
 
     use crate::{
@@ -378,6 +385,13 @@ mod tests {
 
         assert_eq!(heartbeat.metadata["protocol_version"], PROTOCOL_VERSION);
         assert_eq!(heartbeat.metadata["version"], env!("CARGO_PKG_VERSION"));
+        let captured_at = heartbeat.metadata["startup_reconciliation"]["captured_at"]
+            .as_str()
+            .expect("captured_at is an RFC 3339 string, not a time tuple");
+        assert_eq!(
+            OffsetDateTime::parse(captured_at, &Rfc3339).expect("captured_at parses as RFC 3339"),
+            context.startup_reconciliation_at
+        );
         assert_eq!(
             heartbeat.metadata["startup_reconciliation"]["stale_routes"][0]["project_id"],
             stale_project.to_string()
@@ -653,6 +667,61 @@ mod tests {
         assert_eq!(compatibility_issues.len(), 50);
         assert_eq!(compatibility_issues[0]["container_id"], "compatibility-00");
         assert_eq!(compatibility_issues[49]["container_id"], "compatibility-49");
+    }
+
+    #[tokio::test]
+    async fn every_timestamp_on_the_wire_is_an_rfc3339_string() {
+        // Typed fields such as `sent_at` declare the rfc3339 serializer, but
+        // values inside the untyped metadata map fall back to `time`'s default
+        // tuple form, which the control plane rejects as an invalid date. Walk
+        // the serialized payload so any future `*_at` field is covered too.
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        let wire = serde_json::to_value(&heartbeat).expect("heartbeat should serialize");
+
+        let mut timestamps = Vec::new();
+        collect_timestamp_fields(&wire, &mut timestamps);
+        assert!(
+            timestamps.iter().any(|(key, _)| key == "captured_at"),
+            "captured_at should be part of the wire payload"
+        );
+        for (key, value) in timestamps {
+            let text = value
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} must be a string, got {value}"));
+            OffsetDateTime::parse(text, &Rfc3339)
+                .unwrap_or_else(|error| panic!("{key} must be RFC 3339: {text} ({error})"));
+        }
+    }
+
+    fn collect_timestamp_fields(
+        value: &serde_json::Value,
+        found: &mut Vec<(String, serde_json::Value)>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key.ends_with("_at") {
+                        found.push((key.clone(), value.clone()));
+                    }
+                    collect_timestamp_fields(value, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_timestamp_fields(item, found);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
