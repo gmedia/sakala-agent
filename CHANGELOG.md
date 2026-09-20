@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-20
+
 ### Fixed
 
 - `metadata.startup_reconciliation.captured_at` pada heartbeat kini diserialisasi sebagai string RFC 3339. Sebelumnya nilai `OffsetDateTime` di dalam `json!` metadata terkirim sebagai tuple `[tahun, hari-dalam-tahun, ...]`, sehingga `sakala-api` menolak setiap heartbeat node connected (driver `noop` maupun `docker`) dengan `422` dan node tidak pernah menjadi `ready`. Test heartbeat kini memverifikasi seluruh field `*_at` pada payload yang diserialisasi sebagai string RFC 3339.
@@ -74,6 +76,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gmedia/sakala-agent/releases/tag/v0.1.0
