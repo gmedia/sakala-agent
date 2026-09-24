@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-24
+
 ### Fixed
 
 - Nama container managed dipotong agar tetap di bawah batas 63 oktet satu label DNS (`sakala-app-<project8>-<deployment-id>`). Nama sebelumnya berisi dua UUID penuh (84 oktet); Docker menerimanya sebagai nama container tetapi DNS internalnya membalas `Message too large`, sehingga setiap route runtime gagal resolve dan edge membalas `502`.
@@ -81,7 +83,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gmedia/sakala-agent/releases/tag/v0.1.0
