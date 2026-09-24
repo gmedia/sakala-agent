@@ -4,6 +4,11 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Nama container managed dipotong agar tetap di bawah batas 63 oktet satu label DNS (`sakala-app-<project8>-<deployment-id>`). Nama sebelumnya berisi dua UUID penuh (84 oktet); Docker menerimanya sebagai nama container tetapi DNS internalnya membalas `Message too large`, sehingga setiap route runtime gagal resolve dan edge membalas `502`.
+- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya, karena image Railpack menyajikan aplikasi pada `$PORT` sementara route dibuat dari port pilihan control plane. `PORT` payload yang berbeda dari `container_port` kini ditolak sebagai command tidak valid.
+
 ## [0.2.1] - 2026-09-20
 
 ### Fixed

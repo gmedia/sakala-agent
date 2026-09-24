@@ -14,7 +14,9 @@ Contract `sakala-infra` memasang folder route read-only ke `/etc/caddy/sites`, m
 
 ## Topologi yang Didukung Saat Ini
 
-Adapter MVP hanya mendukung Caddy container dari `sakala-infra`. Caddy dan container aplikasi bergabung pada network `sakala-runtime`, sehingga upstream seperti `sakala-project-...:3000` dapat ditemukan melalui Docker DNS.
+Adapter MVP hanya mendukung Caddy container dari `sakala-infra`. Caddy dan container aplikasi bergabung pada network `sakala-runtime`, sehingga upstream seperti `sakala-app-<project8>-<deployment-id>:3000` dapat ditemukan melalui Docker DNS.
+
+Nama container sekaligus menjadi hostname upstream, sehingga harus tetap berada di bawah batas 63 oktet satu label DNS. Karena itu nama memakai delapan karakter pertama project id ditambah deployment id penuh; dua UUID penuh diterima Docker sebagai nama container tetapi tidak dapat dijawab oleh DNS internalnya, dan route akan gagal resolve.
 
 Instalasi Caddy host pada `/usr/bin/caddy` tidak otomatis kompatibel dengan route tersebut. Proses host tidak menggunakan DNS internal Docker dan tidak dapat mengandalkan nama container sebagai upstream. Karena itu, jangan hanya mengganti reload `docker exec` dengan `caddy reload`.
 

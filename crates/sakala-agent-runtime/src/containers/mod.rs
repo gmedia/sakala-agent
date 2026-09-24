@@ -132,7 +132,38 @@ pub fn image_name(project_id: Uuid, deployment_id: Uuid, commit_sha: &str) -> St
     )
 }
 
+/// Names a managed workload so the runtime router can reach it by name.
+///
+/// The name doubles as the Caddy upstream host, so it must stay inside the
+/// 63-octet DNS label limit. Two full UUIDs plus the prefix are 84 octets,
+/// which Docker accepts as a container name but its embedded DNS server
+/// cannot answer for, so every route resolved to nothing and returned 502.
+/// The deployment UUID alone identifies the workload; a short project prefix
+/// is kept so `docker ps` still groups a project's containers visibly.
 #[must_use]
 pub fn container_name(project_id: Uuid, deployment_id: Uuid) -> String {
-    format!("sakala-app-{project_id}-{deployment_id}")
+    let project = project_id.to_string();
+    format!("sakala-app-{}-{deployment_id}", &project[..8])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::container_name;
+    use uuid::Uuid;
+
+    #[test]
+    fn container_name_fits_a_dns_label() {
+        let name = container_name(
+            Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID"),
+            Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("deployment UUID"),
+        );
+
+        // Caddy resolves this name through Docker's embedded DNS, which cannot
+        // answer for a label longer than 63 octets.
+        assert!(name.len() <= 63, "{name} is {} octets", name.len());
+        assert_eq!(
+            name,
+            "sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993"
+        );
+    }
 }

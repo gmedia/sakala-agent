@@ -49,6 +49,7 @@ reconciliation hanya melaporkan kandidat; prune baru dijalankan oleh command
 - Checkout harus memakai full 40-character commit SHA.
 - Tidak ada shell interpolation; executable dan arguments dikirim langsung ke process API.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
+- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak, bukan dimenangkan salah satu.
 - Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability.
 - Tidak ada host volume atau Docker socket di aplikasi user.
 - Caddy dan aplikasi user tidak menerima Docker socket.

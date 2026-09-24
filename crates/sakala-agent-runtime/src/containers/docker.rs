@@ -65,6 +65,24 @@ impl DockerContainerEngine {
         }
     }
 
+    /// Railpack images serve on `$PORT` (its Caddyfile listens on
+    /// `:{$PORT:80}`, its Node starters read `process.env.PORT`), and the
+    /// generated route points at the port the control plane chose. Without
+    /// exporting it the workload listened on its own default while the route
+    /// pointed elsewhere, so the edge returned 502. `validate_payload` already
+    /// rejects a conflicting `PORT` from the deployment environment, so this
+    /// only fills in the value.
+    fn effective_environment(
+        environment: &BTreeMap<String, String>,
+        port: u16,
+    ) -> BTreeMap<String, String> {
+        let mut effective = environment.clone();
+        effective
+            .entry("PORT".to_owned())
+            .or_insert_with(|| port.to_string());
+        effective
+    }
+
     async fn write_env_file(
         workspace: &Path,
         environment: &BTreeMap<String, String>,
@@ -375,7 +393,8 @@ impl ContainerEngine for DockerContainerEngine {
         request: &RunContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        let env_file = Self::write_env_file(&request.workspace, &request.environment).await?;
+        let environment = Self::effective_environment(&request.environment, request.port);
+        let env_file = Self::write_env_file(&request.workspace, &environment).await?;
         let mut command = CommandSpec::new("docker")
             .arg("run")
             .arg("--detach")
@@ -779,7 +798,9 @@ fn health_state(status: &str) -> (bool, Option<String>) {
 
 #[cfg(test)]
 mod reclaimed_space_tests {
-    use super::parse_reclaimed_bytes;
+    use std::collections::BTreeMap;
+
+    use super::{DockerContainerEngine, parse_reclaimed_bytes};
 
     #[test]
     fn parses_decimal_and_compact_docker_sizes() {
@@ -795,5 +816,26 @@ mod reclaimed_space_tests {
             parse_reclaimed_bytes("Total reclaimed space: 0B\n").expect("zero bytes"),
             0
         );
+    }
+
+    #[test]
+    fn effective_environment_exports_the_routed_port() {
+        let mut environment = BTreeMap::new();
+        environment.insert("APP_ENV".to_owned(), "production".to_owned());
+
+        let effective = DockerContainerEngine::effective_environment(&environment, 3000);
+
+        assert_eq!(effective.get("PORT"), Some(&"3000".to_owned()));
+        assert_eq!(effective.get("APP_ENV"), Some(&"production".to_owned()));
+    }
+
+    #[test]
+    fn effective_environment_keeps_a_matching_deployment_port() {
+        let mut environment = BTreeMap::new();
+        environment.insert("PORT".to_owned(), "3000".to_owned());
+
+        let effective = DockerContainerEngine::effective_environment(&environment, 3000);
+
+        assert_eq!(effective.get("PORT"), Some(&"3000".to_owned()));
     }
 }
