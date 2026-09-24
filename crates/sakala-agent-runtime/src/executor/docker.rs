@@ -1117,6 +1117,17 @@ fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> 
             )));
         }
     }
+    // The agent exports PORT so the workload listens where the generated route
+    // points. A deployment environment that disagrees would serve on one port
+    // and be routed on another, so reject it rather than pick a winner.
+    if let Some(port) = payload.environment.get("PORT")
+        && port.parse::<u16>() != Ok(payload.container_port)
+    {
+        return Err(RuntimeError::InvalidCommand(format!(
+            "environment PORT={port} must match container_port {}",
+            payload.container_port
+        )));
+    }
     Ok(())
 }
 
@@ -1233,7 +1244,21 @@ fn system_log(message: String) -> DeploymentLog {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_domain;
+    use std::collections::BTreeMap;
+
+    use sakala_agent_protocol::DeployProjectPayload;
+
+    use super::{valid_domain, validate_payload};
+
+    fn payload() -> DeployProjectPayload {
+        serde_json::from_value(serde_json::json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.run.staging.sakala.dev",
+            "container_port": 3000,
+        }))
+        .expect("deploy payload")
+    }
 
     #[test]
     fn accepts_staging_runtime_domains() {
@@ -1244,5 +1269,23 @@ mod tests {
     fn rejects_domains_outside_runtime_zones() {
         assert!(!valid_domain("portfolio.staging.sakala.dev"));
         assert!(!valid_domain("portfolio.run.example.test"));
+    }
+
+    #[test]
+    fn accepts_an_environment_port_matching_the_routed_port() {
+        let mut payload = payload();
+        payload.environment = BTreeMap::from([("PORT".to_owned(), "3000".to_owned())]);
+
+        assert!(validate_payload(&payload).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_environment_port_that_contradicts_the_route() {
+        let mut payload = payload();
+        payload.environment = BTreeMap::from([("PORT".to_owned(), "8080".to_owned())]);
+
+        let error = validate_payload(&payload).expect_err("conflicting PORT must be rejected");
+
+        assert!(error.to_string().contains("must match container_port"));
     }
 }
