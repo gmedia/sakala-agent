@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 nix = { version = "0.31.3", features = ["signal", "process"] }
-sakala-agent-core = { version = "0.2.1", path = "../sakala-agent-core" }
+sakala-agent-core = { version = "0.2.2", path = "../sakala-agent-core" }
 sakala-agent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
