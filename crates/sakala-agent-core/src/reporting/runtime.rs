@@ -255,7 +255,7 @@ fn bounded_log(mut log: DeploymentLog, bounds: LogBounds, sent: u64) -> Option<D
     if bounds.max_batch_lines == Some(0) {
         return None;
     }
-    log.message = redact_line(&log.message);
+    log.message = sanitise_line(&redact_line(&log.message));
     truncate_utf8(&mut log.message, bounds.max_line_length);
     if let Some(maximum) = bounds.max_total_bytes {
         if sent >= maximum {
@@ -264,6 +264,26 @@ fn bounded_log(mut log: DeploymentLog, bounds: LogBounds, sent: u64) -> Option<D
         truncate_utf8(&mut log.message, Some(maximum - sent));
     }
     (!log.message.is_empty()).then_some(log)
+}
+
+/// Collapses the control characters a log message may not contain.
+///
+/// The control plane requires one message to be one line and rejects the whole
+/// batch otherwise. Build tooling redraws progress with carriage returns, so a
+/// single line of process output can carry several of them; a rejected batch
+/// used to abort the deployment that produced it. Callers that can split a
+/// line do so first (see the runtime's process sink); this is the last guard
+/// for the paths that cannot.
+fn sanitise_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\r' | '\n' => ' ',
+            other => other,
+        })
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
 }
 
 fn truncate_utf8(value: &mut String, maximum: Option<u64>) {
@@ -338,5 +358,26 @@ mod tests {
         assert_eq!(first.message, "abcd");
         assert_eq!(second.message, "ef");
         assert!(third.is_none());
+    }
+
+    #[test]
+    fn collapses_carriage_returns_the_control_plane_rejects() {
+        // Build progress redraws with carriage returns, and a message holding
+        // one was rejected with HTTP 422, which used to fail the deployment.
+        let bounded = bounded_log(
+            log("#5 0.1 downloading\r#5 1.0 done"),
+            LogBounds::default(),
+            0,
+        )
+        .expect("a progress line is still worth reporting");
+
+        assert!(!bounded.message.contains('\r'));
+        assert!(!bounded.message.contains('\n'));
+        assert_eq!(bounded.message, "#5 0.1 downloading #5 1.0 done");
+    }
+
+    #[test]
+    fn drops_a_line_that_is_only_control_characters() {
+        assert!(bounded_log(log("\r\n"), LogBounds::default(), 0).is_none());
     }
 }

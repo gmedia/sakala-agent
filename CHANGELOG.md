@@ -4,6 +4,11 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Baris output proses dipecah pada carriage return sebelum dilaporkan, dan CR/LF yang tersisa dinetralkan di reporter. Build tooling menggambar ulang progress dengan `\r`, sehingga satu baris output dapat memuat beberapa frame; `sakala-api` mewajibkan satu message satu baris dan menolak seluruh batch dengan `422 The logs.N.message field format is invalid`.
+- Kegagalan pengiriman log tidak lagi menggagalkan command. Sebelumnya satu batch log yang ditolak membuat deployment staging yang build-nya sudah berjalan berakhir `runtime_reporting_failed`; log adalah telemetri dan tidak menentukan apakah pekerjaannya berhasil. Penghentian delivery tetap dicatat pada log agent.
+
 ## [0.2.2] - 2026-09-24
 
 ### Fixed
