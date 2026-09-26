@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-26
+
 ### Fixed
 
 - Baris output proses dipecah pada carriage return sebelum dilaporkan, dan CR/LF yang tersisa dinetralkan di reporter. Build tooling menggambar ulang progress dengan `\r`, sehingga satu baris output dapat memuat beberapa frame; `sakala-api` mewajibkan satu message satu baris dan menolak seluruh batch dengan `422 The logs.N.message field format is invalid`.
@@ -88,7 +90,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/gmedia/sakala-agent/compare/v0.1.0...v0.2.0
