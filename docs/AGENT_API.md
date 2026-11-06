@@ -128,6 +128,35 @@ Endpoint polling wajib memakai envelope Laravel API Resource:
 
 `type` dan `status` memakai PascalCase. Identifier command, project, dan deployment memakai UUID. Lihat juga `examples/commands/deploy-project.json`.
 
+### Field build opsional
+
+Payload `DeployProject` boleh membawa `root_directory`, `build_command`, dan
+`start_command`, contohnya di `examples/commands/deploy-project-build-config.json`.
+Ketiganya tidak pernah dijalankan di shell host. Payload tanpa field ini berperilaku
+seperti sebelumnya, dan nilai kosong berarti tidak diisi.
+
+| Field | Dockerfile | Railpack |
+| --- | --- | --- |
+| `root_directory` | Menjadi konteks build, dan `Dockerfile` dicari di sana. | Menjadi direktori `railpack prepare` dan konteks build. |
+| `build_command` | Tidak bisa dipakai, karena langkah build ditentukan Dockerfile. Agent mencatatnya di log. | Diteruskan sebagai `RAILPACK_BUILD_CMD`, dan berjalan di dalam build. |
+| `start_command` | Menggantikan entrypoint dan command image: `docker run --entrypoint sh <image> -c <command>`. Image tanpa `sh` gagal dengan `runtime_app_crashed`. | Diteruskan sebagai `RAILPACK_START_CMD`, dan menjadi command image. |
+
+`container_port` adalah port efektif pilihan API. Agent mengekspornya sebagai `PORT`,
+memprobe-nya, dan membuat route ke sana.
+
+Agent memvalidasi ulang `root_directory`, karena nilai ini memilih path di host.
+Path absolut, `..`, backslash, dan control character ditolak sebelum proses apa pun
+berjalan. Setelah checkout, path di-resolve: symlink yang keluar dari repository,
+path yang tidak ada, dan yang bukan direktori ditolak dengan
+`runtime_root_directory_invalid`. Symlink yang tetap di dalam repository diterima, dan
+path hasil resolve itulah yang dipakai. `Dockerfile` berupa symlink ke luar checkout
+gagal dengan `runtime_build_failed`.
+
+`InspectProject` juga menerima `root_directory` opsional dengan aturan yang sama. Bila
+API mengirimnya, `railpack info` dan scanner manifest bekerja di direktori itu,
+termasuk `dockerfile_found`. Tanpa field ini, inspection tetap memeriksa root
+repository.
+
 `sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
 ### Workload Lifecycle Commands
@@ -181,6 +210,30 @@ snapshot kapasitas lokal. Completion result menyertakan
 `available_workload_slots`; nilai `null` berarti driver tidak dapat menentukan
 nilai tersebut dengan aman. API harus memperlakukannya sebagai telemetry, bukan
 izin untuk melewati safety limit node.
+
+## Pembatalan command
+
+`GET /api/agent/v1/commands` boleh membawa `cancel_requested` di samping `data`, contohnya
+di `examples/commands/poll-cancel-requested.json`:
+
+```json
+{ "data": [], "cancel_requested": ["b3c8cb55-3bc8-4725-a004-e69d9917d40b"] }
+```
+
+Agent tetap melakukan poll selama command berjalan, termasuk saat slot penuh atau node
+draining, karena eksekusi berjalan di task terpisah dari loop polling. Untuk tiap ID yang
+sedang dijalankannya, Agent membatalkan cancellation token command itu. ID yang sama
+boleh berulang, dan ID lain diabaikan.
+
+| Saat pembatalan tiba | Yang terjadi | Report |
+| --- | --- | --- |
+| Checkout, build, start, atau readiness | Process group dimatikan. Candidate, image, dan workspace dihapus. | `fail` dengan `runtime_cancelled` |
+| Aktivasi route sedang berjalan | Aktivasi dibiarkan selesai, karena menghentikannya di tengah bisa merusak route deployment yang sedang live. | `complete`, atau `fail` dengan `runtime_routing_failed` bila aktivasinya sendiri gagal |
+| Setelah cutover | Deployment diselesaikan. | `complete` |
+| Command yang tidak memeriksa token, seperti `RestartProject` | Berjalan sampai selesai. | Hasil aslinya |
+
+Command yang dibatalkan tidak mengirim output aplikasi, karena tidak ada kegagalan
+aplikasi yang perlu dijelaskan.
 
 ## Polling and Claim Semantics
 
@@ -445,7 +498,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "orphans": 0,
       "stale_routes": 0,
       "stale_images": 0,
-      "compatibility_issues": 0
+      "compatibility_issues": 0,
+      "crashed_details": 0
     },
     "resources": {
       "cpu_total": 4,
@@ -461,7 +515,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "starting": 0,
       "unhealthy": 0,
       "stopped": 1,
-      "unhealthy_details": []
+      "unhealthy_details": [],
+      "crashed_details": []
     },
     "disk_pressure": {
       "state": "normal",
@@ -472,7 +527,9 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "git": "git version 2.47.0",
       "docker": "27.3.1",
       "buildx": "github.com/docker/buildx v0.17.1",
-      "railpack": "railpack 0.23.0"
+      "railpack": "ghcr.io/example/sakala-railpack@sha256:abc",
+      "container_runtime": "runsc",
+      "container_runtime_limits_enforced": false
     },
     "execution": {
       "active_commands": 1,
@@ -515,13 +572,88 @@ Bentuk item pada collection detail `startup_reconciliation`:
 deployment marker. `workloads.unhealthy_details` memakai bentuk
 `{ container_id, project_id, deployment_id, status, reason }`.
 
+`workloads.crashed_details` melaporkan workload managed yang sedang tidak berjalan
+karena process-nya keluar sendiri, atau yang crash berulang.
+Field ini opsional bagi API, bersifat aditif pada revision 4, dan contohnya ada di
+`examples/heartbeat/crashed-workloads.json`:
+
+```json
+{
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "exit_code": 137,
+  "oom_killed": true,
+  "finished_at": "2026-11-05T14:28:41Z",
+  "restart_count": 8,
+  "running": false
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `project_id` | UUID | Project pemilik workload, dari label container. |
+| `deployment_id` | UUID | Deployment pemilik workload, dari label container. |
+| `exit_code` | integer atau `null` | Exit code run terakhir. Bisa `0`, karena aplikasi yang selesai dengan normal pun di-restart oleh policy `unless-stopped`. `null` berarti Docker tidak lagi punya nilainya. |
+| `oom_killed` | boolean | Apakah run terakhir dimatikan kernel karena memory. `false` juga dipakai bila riwayatnya tidak tersedia, jadi `exit_code: null` berarti nilai ini tidak terbukti. |
+| `finished_at` | RFC 3339 atau `null` | Waktu run terakhir berakhir, tanpa pecahan detik. |
+| `restart_count` | integer | Jumlah restart oleh Docker sejak terakhir di-start dengan sengaja. |
+| `running` | boolean | Apakah ada process yang berjalan saat ini. `false` berarti aplikasi sedang tidak berjalan. `true` berarti ia sedang hidup di antara dua crash, jadi UI sebaiknya menyebutnya crash berulang, bukan mati. |
+
+Sebuah workload masuk list bila salah satu kondisi ini terpenuhi:
+
+- Docker menunjukkan status `restarting` saat ini.
+- Crash berulang: statusnya `running`, `RestartCount` minimal 3, dan `State.StartedAt`
+  kurang dari 5 menit yang lalu.
+
+Aplikasi yang crash satu atau dua kali lalu kembali melayani tidak masuk list, karena
+ia memang sedang melayani. Agent mencatatnya di log operator. Satu-satunya saat ia
+terlihat adalah bila heartbeat jatuh tepat pada jeda `restarting` Docker, yang pada
+restart pertama hanya sepersekian detik. Aplikasi yang crash berulang tetap masuk list,
+termasuk saat ia sebentar `running` di antara dua crash, jadi API tidak perlu debounce.
+Begitu ia bertahan hidup 5 menit, ia hilang dari list. `RestartCount` tetap di atas 0
+setelah itu, tetapi tidak dipakai lagi.
+
+Cara membaca list ini:
+
+- **Restart dan wake yang disengaja bukan crash.** Docker mengembalikan
+  `RestartCount` ke 0 pada `docker restart` dan `docker start`, sudah diverifikasi
+  pada Docker 29.9.2, sehingga `RestartProject` dan `WakeProject` langsung
+  menghapus workload dari list.
+- **Container `exited` tidak pernah dilaporkan.** `docker stop`, `docker kill`,
+  dan `SleepProject` semuanya berakhir di `exited` dengan exit code apa pun
+  (stop saat `restarting` terlihat sebagai `Exited (1)`), dan Docker tidak
+  mengekspos apakah stop itu disengaja. Kasus langka yang ikut terlewat: Docker
+  menyerah me-restart karena start gagal.
+- **List yang hadir dan tidak memuat suatu workload** berarti workload itu tidak
+  dianggap crash. **List yang tidak hadir** (`crashed_details` dan
+  `detail_counts.crashed_details` sama-sama hilang) berarti Agent tidak tahu,
+  karena query Docker gagal. API tidak boleh mengubah status dari heartbeat
+  seperti itu; `workloads.unhealthy` juga `null` pada kondisi ini.
+- **Candidate yang sedang gagal bisa ikut muncul** sampai cleanup selesai. API
+  harus mencocokkan `deployment_id` dengan deployment aktif project.
+- Workload berstatus `restarting` juga muncul di `unhealthy_details`, karena
+  keduanya menjawab pertanyaan berbeda. Jangan menjumlahkan keduanya. Workload
+  crash berulang yang sedang `running` hanya muncul di `crashed_details`.
+
+Docker mengosongkan `State.ExitCode` dan `State.OOMKilled` begitu restart berhasil,
+jadi nilai itu tidak bisa dibaca dari container yang sedang `running`. Agent
+membacanya dari event `die` dan `oom` milik Docker, dan event `oom` hanya dihitung
+untuk `die` berikutnya, sehingga worker yang mati karena memory pada run sekarang
+tidak dianggap sebagai sebab exit terakhir. Riwayat event Docker terbatas dan hilang
+saat daemon restart. Dalam kasus itu `exit_code` bernilai `null`, bukan `0`.
+
+Satu heartbeat memakai listing batch `docker ps` yang sama dengan
+`unhealthy_details`, lalu satu `docker inspect` batch atas container yang terdaftar,
+dan satu `docker events` batch hanya bila ada exit yang perlu dibaca. Tidak ada query
+per container, dan Agent tidak membaca environment atau secret container.
+
 `startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
 bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
 eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
 hasil command reconciliation eksplisit.
 
 Collection detail yang berpotensi membesar (`unhealthy_details`,
-`recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
+`crashed_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
 `compatibility_issues`) dibatasi maksimal 50 item per heartbeat. Agent
 mempertahankan urutan hasil runtime dan mengirim 50 item pertama secara
 deterministik, bukan memilih item secara acak. `metadata.detail_counts` selalu
@@ -586,6 +718,31 @@ Idempotency-Key: 8b4a0d3e-6f7c-4a3e-9c3f-3f2f1c1c0a11
 }
 ```
 
+Tahap `DeployProject` dikirim sebagai event, tepat saat tahap itu dimulai, dalam
+urutan berikut. API yang belum mengenal suatu `type` tetap menyimpannya di timeline
+dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
+
+| `type` | Kapan | Status deployment yang cocok |
+| --- | --- | --- |
+| `deployment.checkout.started` | Clone repository dimulai. | `cloning` |
+| `deployment.analysis.started` | `railpack prepare` dimulai. Hanya pada build Railpack, karena memilih Dockerfile hanyalah memeriksa satu file. | `analyzing` |
+| `deployment.build.started` | Build image dimulai. Pada Railpack, event ini kini datang setelah analisis. | `building` |
+| `deployment.container.started` | `docker run` candidate akan dijalankan. | `deploying` |
+| `deployment.health.started` | Container sudah jalan, probe readiness dimulai. | `health_checking` |
+| `deployment.route.started` | Aplikasi sudah menjawab, route akan diaktifkan. | `routing` |
+| `deployment.runtime.ready` | Route aktif dan cleanup selesai. Bukan penanda routing. | tidak ada; `succeeded` hanya dari `complete` |
+
+Health check selalu terjadi sebelum routing. Route tidak boleh aktif sebelum
+aplikasi terbukti menjawab.
+
+Semua message dan metadata event, baris log, dan pesan `fail` milik `DeployProject`
+melewati redaksi Agent: nama key, prefix token, dan nilai environment command itu.
+Nilai di bawah 8 karakter dan kata umum seperti `production` atau `localhost` tidak
+diredaksi agar log tetap terbaca. Pencocokan bersifat persis, jadi bentuk terenkode
+seperti base64 atau URL-encoded tidak tertangkap, dan API tetap harus meredaksi
+ulang. Follower yang dipulihkan setelah Agent restart membaca nilai itu dari
+`docker inspect` container-nya, karena Agent tidak menyimpan payload command.
+
 API menjawab `200` dengan acknowledgement berikut. `accepted_count` adalah
 jumlah seluruh item pada request dan `duplicate_count` adalah subset yang
 sudah pernah tersimpan di bawah `Idempotency-Key` yang sama. Semua field wajib
@@ -641,7 +798,43 @@ Failure memakai field stabil yang sama dengan persistence model API:
 Agent menyanitasi body ini dengan aturan yang sama seperti API sebelum
 mengirim: `error_code` dibatasi ke `[A-Za-z0-9._-]` (maksimum 64 karakter,
 karakter lain menjadi `_`), `error_message` dibersihkan dari control, bidi,
-dan zero-width character lalu dipotong pada 1000 karakter.
+dan zero-width character lalu dipotong pada 1000 karakter. Pemotongan ini tidak
+memberi tanda apa pun, jadi fakta penting ditaruh di awal pesan. Semua pesan pada
+tabel di bawah jauh lebih pendek dari batas itu.
+
+### Kegagalan yang disebabkan aplikasi
+
+Code berikut dikirim saat aplikasi user yang bermasalah, bukan node-nya, sehingga
+pesannya aman ditampilkan ke user dan menyebut fakta konkret. Pesan persisnya ada
+di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh test.
+
+| `error_code` | Kapan | Fakta di pesan |
+| --- | --- | --- |
+| `runtime_app_not_listening` | Sampai deadline start tidak ada yang menjawab pada port. Termasuk aplikasi yang hanya listen di `127.0.0.1`. | Port, lama menunggu, dan kewajiban listen di `0.0.0.0:$PORT`. |
+| `runtime_app_unhealthy` | Aplikasi hanya menjawab 5xx sampai deadline. | Port dan status terakhir. |
+| `runtime_app_crashed` | Process keluar selama start. Satu restart saja sudah dihitung crash. | Exit code, atau keterangan bahwa Docker tidak lagi melaporkannya. |
+| `runtime_app_out_of_memory` | Container keluar dengan `State.OOMKilled` atau event `oom`, atau masih hidup dengan flag itu tetapi tidak pernah menjawab. | Batas memory yang diterapkan. |
+| `runtime_port_conflict` | `PORT` dari environment berbeda dari `container_port`. Menggantikan `invalid_runtime_command` untuk kasus ini. | Kedua nilai. `PORT` yang bukan nomor port tidak diulang, hanya disebut tidak valid. |
+| `runtime_root_directory_invalid` | `root_directory` tidak aman atau tidak menunjuk direktori di dalam repository. | Alasannya, tanpa mengulang path. |
+
+Pesan tidak pernah memuat nilai environment selain nomor port yang valid, token,
+atau path secret, dan tidak memuat output probe, karena sebagian output itu
+ditulis aplikasi. Output aplikasi dikirim terpisah melalui endpoint logs.
+
+Dua kegagalan readiness sengaja tidak memakai code di atas:
+
+- `HEALTHCHECK` image yang `unhealthy`, atau masih `starting` sampai deadline,
+  tetap memakai `runtime_health_check_failed`.
+- Probe yang tidak bisa berjalan memakai `runtime_dependency_failed`, karena
+  kesalahannya ada pada node: `wget` tidak ada di container Caddy, container Caddy
+  mati, atau nama workload tidak ter-resolve dari Caddy.
+
+Kegagalan sebelum route aktif pada fase start, readiness, atau routing juga
+mengirim hingga 100 baris terakhir aplikasi dari stdout dan stderr, sebelum
+candidate dihapus dan sebelum `fail`. Jumlah barisnya mengikuti
+`log_bounds.max_batch_lines` bila lebih kecil, dan seluruh baris melewati redaksi
+serta batas `log_bounds` pada reporter. Kegagalan mengirim log tidak mengubah
+`error_code`. Command yang dibatalkan tidak mengambil log ini.
 
 Completion selalu memakai envelope result. Deployment berhasil mengembalikan request dan limit aktual:
 

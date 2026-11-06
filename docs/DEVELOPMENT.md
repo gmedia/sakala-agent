@@ -5,7 +5,7 @@
 - Rust 1.88 atau lebih baru dengan `rustfmt` dan `clippy`.
 - Cargo.
 - `cargo-audit` bila menjalankan audit lokal.
-- Git, Docker Buildx, dan Railpack hanya untuk integration test runtime opt-in.
+- Git dan Docker Buildx hanya untuk integration test runtime opt-in. Railpack berjalan di image `docker/railpack-sandbox`, yang dibangun oleh smoke test.
 
 Toolchain komponen dideklarasikan di `rust-toolchain.toml`.
 

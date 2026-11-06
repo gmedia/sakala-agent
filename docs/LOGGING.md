@@ -36,7 +36,7 @@ DATABASE_URL=postgres://user:pass@db/app
 DATABASE_URL=[REDACTED]
 ```
 
-Bearer token dan prefix token GitHub umum (`ghp_`, `gho_`, `github_pat_`) juga disamarkan. Redaction ini bersifat defense-in-depth, bukan pengganti desain yang mencegah secret masuk output sejak awal. Jangan log bearer token maupun environment dump.
+Bearer token dan prefix token GitHub umum (`ghp_`, `gho_`, `github_pat_`) juga disamarkan. Untuk `DeployProject`, nilai environment command itu ikut disamarkan pada log, event, dan pesan `fail`, kecuali nilai di bawah 8 karakter dan kata umum seperti `production`. Redaction ini bersifat defense-in-depth, bukan pengganti desain yang mencegah secret masuk output sejak awal. Jangan log bearer token maupun environment dump.
 
 ## Retention Contract Draft
 

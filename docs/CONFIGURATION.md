@@ -23,7 +23,11 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS` | `30` | Interval pemeriksaan batch workload aktif berlabel Sakala. Agent mencatat perubahan state lokal saja sampai kontrak pelaporan health ke API disepakati. |
 | `SAKALA_CADDY_SITES_DIR` | `/var/lib/sakala/caddy/sites` | Folder route host yang dimount ke Caddy. |
 | `SAKALA_CADDY_CONTAINER` | `sakala-caddy` | Container Caddy yang divalidasi dan direload. |
-| `SAKALA_RAILPACK_FRONTEND` | `ghcr.io/railwayapp/railpack-frontend:v0.23.0` | BuildKit frontend; pin sesuai Railpack CLI. |
+| `SAKALA_RAILPACK_FRONTEND` | `ghcr.io/railwayapp/railpack-frontend:v0.23.0` | BuildKit frontend; pin sesuai Railpack di `SAKALA_RAILPACK_IMAGE`. |
+| `SAKALA_RAILPACK_IMAGE` | kosong | Wajib untuk driver `docker`. Image sandbox yang menjalankan Railpack, dipin dengan digest atau image ID. Tag ditolak, dan tanpa nilai ini preflight gagal fatal. Operator membangunnya dari `docker/railpack-sandbox`; langkahnya ada di [Asal image](RAILPACK_STRATEGY.md#asal-image). |
+| `SAKALA_RAILPACK_NETWORK` | `sakala-railpack` | Network sandbox Railpack. Dibuat Agent bila belum ada, tanpa komunikasi antar-container. |
+| `SAKALA_CONTAINER_RUNTIME` | kosong | Runtime OCI untuk workload, misalnya `runsc`, dengan nama yang terdaftar di Docker. Kosong berarti default Docker. Build dan sandbox Railpack tidak terpengaruh. Bila terisi tetapi tidak terdaftar, preflight gagal fatal, dan Agent tidak pernah pindah ke runtime lain. Lihat [gVisor](RUNTIME_HARDENING.md#gvisor). |
+| `SAKALA_CONTAINER_DNS` | kosong | Daftar IP name server untuk workload, dipisah koma, misalnya `1.1.1.1,8.8.8.8`. Agent menulisnya ke `.sakala-resolv.conf` di `SAKALA_RUNTIME_WORKSPACE` dan me-mount-nya sebagai `/etc/resolv.conf` read-only. Wajib di bawah `runsc`; tanpa ini workload tidak bisa me-resolve hostname. |
 | `SAKALA_BUILD_TIMEOUT_SECONDS` | `600` | Hard maximum node untuk fase build image; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_START_TIMEOUT_SECONDS` | `120` | Hard maximum node untuk start container dan health readiness; harus lebih pendek dari command timeout. |
 | `SAKALA_MAX_ACTIVE_CONTAINERS` | `20` | Guard kapasitas workload aktif pada node, bukan kuota plan/user. Redeploy project aktif tetap memperoleh replacement slot. |
@@ -58,7 +62,7 @@ cargo run -p sakala-agent
 
 Jangan menyimpan token issued pada repository atau command history yang dibagikan.
 
-Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
+Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, image sandbox Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
 
 Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
 

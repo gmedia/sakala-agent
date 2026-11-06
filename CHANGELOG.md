@@ -4,6 +4,48 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Security
+
+- Sandbox Railpack tidak punya path host yang bisa ditulis. Hasilnya keluar lewat stdout, sehingga repository tidak bisa mengisi disk node atau meninggalkan file yang gagal dihapus Agent saat inspection. Pemeriksaan plan terhadap image `sakala/project-*` kini membaca JSON, sehingga escape tidak bisa menyembunyikan namanya.
+- Railpack kini berjalan di container sekali pakai, tanpa socket Docker, secret, atau capability. Sebelumnya `railpack info` dan `prepare` berjalan di host, sehingga `mise.toml` di repository bisa mengeksekusi kode sebagai user Agent saat project dibuat, dan symlink file versi bisa membaca file host. `SAKALA_RAILPACK_IMAGE` kini wajib dan harus dipin dengan digest.
+- Process anak tidak lagi mewarisi seluruh environment Agent, melainkan allowlist, sehingga token Agent tidak bisa bocor ke process anak.
+- Build Dockerfile antar-project tidak lagi berbagi layer, cache mount, atau image lokal: `--no-cache`, `--pull`, namespace cache per project, dan frontend bawaan BuildKit yang tidak bisa diganti `# syntax=`. Build ulang naik dari sekitar 2,5 detik menjadi 15 detik pada aplikasi Node kecil. Frontend Railpack mengabaikan kedua flag itu, jadi isolasi build Railpack bersandar pada `secrets-hash`, `cache-key` per project, dan penolakan plan; lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#isolasi-antar-project-saat-build).
+- Satu baris output process dibatasi 64 KiB. Sebelumnya container yang mencetak tanpa newline bisa menghabiskan memory Agent.
+- `bearer` yang diikuti spasi ganda atau delimiter tidak lagi membuat redactor panic, dan token di balik spasi ganda kini ikut diredaksi. Command yang task-nya panic kini dilaporkan `fail`, bukan menunggu lease habis.
+
+Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Container Caddy runtime kini wajib menyediakan `wget`, yang sudah ada pada image `caddy:*-alpine`.
+
+### Added
+
+- `SAKALA_CONTAINER_RUNTIME` menjalankan workload di runtime OCI yang terdaftar di Docker, misalnya `runsc` (gVisor, ADR-014), tanpa memengaruhi build dan sandbox Railpack. Runtime yang tidak terdaftar membuat preflight gagal fatal, dan Agent tidak pernah pindah ke runtime lain. Heartbeat menambah `runtime_dependencies.container_runtime` dan `container_runtime_limits_enforced`. Di Docker rootless, `runsc` butuh `--ignore-cgroups`, dan limit memory, CPU, serta PID tidak berlaku; lihat [Runtime Hardening](docs/RUNTIME_HARDENING.md#gvisor).
+- `SAKALA_CONTAINER_DNS` memberi workload name server lewat `/etc/resolv.conf` read-only, karena DNS bawaan Docker tidak terjangkau dari `runsc` pada network buatan user.
+- `error_code` baru pada `fail`: `runtime_app_not_listening`, `runtime_app_unhealthy`, `runtime_app_crashed`, `runtime_app_out_of_memory`, dan `runtime_port_conflict`, dengan pesan yang aman untuk user dan menyebut port, status, exit code, atau batas memory.
+- `metadata.workloads.crashed_details` dan `metadata.detail_counts.crashed_details` pada heartbeat, batas 50 item, untuk workload yang sedang di-restart Docker atau yang crash berulang (minimal 3 restart dan hidup kurang dari 5 menit), dengan `restart_count` dan `running`. Crash satu kali yang pulih hanya dicatat pada log operator. Keduanya tidak dikirim bila state crash tidak diketahui.
+- Field `error_code` pada completion `HealthCheck`, dan check preflight non-fatal `caddy-http-probe`.
+- Output terakhir aplikasi dilaporkan melalui reporter sebelum candidate dihapus bila start, readiness, atau routing gagal, sehingga deploy gagal tidak lagi berakhir tanpa log.
+- Smoke test opt-in `docker_smoke_test` yang menjalankan executor asli terhadap daemon Docker lokal.
+
+- Event `deployment.analysis.started` (hanya Railpack), `deployment.health.started`, dan `deployment.route.started` pada saat tahapnya benar-benar dimulai.
+- Redaksi nilai environment per command pada log, event, dan pesan `fail`, termasuk log follower dan follower yang dipulihkan setelah Agent restart. Nilai di bawah 8 karakter dan kata umum dikecualikan.
+- Variabel project tersedia saat build sebagai secret BuildKit, otomatis pada Railpack dan lewat `RUN --mount=type=secret` pada Dockerfile, tanpa masuk layer atau history image. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#variabel-saat-build).
+
+- Pembatalan deployment lewat `cancel_requested` pada polling, dengan `fail` `runtime_cancelled`, atau `complete` bila route sudah mulai berpindah.
+- Field `root_directory`, `build_command`, dan `start_command` pada `DeployProject`, serta `root_directory` opsional pada `InspectProject`. `root_directory` divalidasi ulang secara lokal, termasuk symlink yang keluar dari repository, dengan code baru `runtime_root_directory_invalid`.
+
+### Changed
+
+- Pada build Railpack, `deployment.build.started` kini terkirim setelah `railpack prepare`, bukan sebelumnya.
+- `PORT` environment yang berbeda dari `container_port` kini gagal dengan `runtime_port_conflict`, bukan `invalid_runtime_command`.
+- `RestartProject`, `WakeProject`, `RefreshRoute`, dan `restore_route` kini menunggu aplikasi menjawab HTTP hingga `SAKALA_START_TIMEOUT_SECONDS`. `health_attempts * health_interval` kini hanya mengatur lama tunggu `HealthCheck`.
+
+### Fixed
+
+- Pesan kegagalan proses kini menyebut `exit code 1`, bukan format debug Rust `status Some(1)`.
+- Pembatalan saat aktivasi route tidak lagi bisa meninggalkan route yang menunjuk candidate yang sudah dihapus.
+- `Dockerfile` berupa symlink ke luar checkout tidak lagi dibangun.
+- Output proses yang bukan UTF-8 tidak lagi menggagalkan command dengan `runtime_filesystem_failed` dan menghilangkan baris berikutnya. Byte tersebut kini menjadi karakter pengganti.
+- Deployment yang aplikasinya rusak tidak lagi dilaporkan berhasil. Readiness sebelumnya lolos begitu Docker menyebut container `running`, termasuk bila aplikasi salah port atau crash setelah start. Kini route baru aktif setelah probe `wget` dari dalam container Caddy menerima status di bawah 500 dari aplikasi, dalam deadline `start_timeout_seconds`. Redirect tidak pernah keluar dari aplikasi, dan crash menghentikan penantian lebih awal.
+
 ## [0.2.3] - 2026-09-26
 
 ### Fixed

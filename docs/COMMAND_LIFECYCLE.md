@@ -48,7 +48,7 @@ dapat drift dari deployment aktif.
 | `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan. | Bila container sudah tidak ada, route owned Agent tetap dinonaktifkan dan command sukses idempoten. |
 | `SleepProject` | Hapus route dan stop container, tetapi tidak menghapus container maupun image. | Container yang sudah stopped tetap sukses; container yang hilang menghasilkan drift/error karena tidak ada artifact untuk di-wake. |
 | `WakeProject` | Start kembali container hasil sleep, tunggu readiness, lalu restore route dari label domain/port. | Container yang sudah running hanya merevalidasi readiness dan route. |
-| `HealthCheck` | Menginspeksi container managed dan mengembalikan state running, ready, status Docker, serta reason aman. | Read-only. |
+| `HealthCheck` | Menginspeksi container managed dan mem-probe HTTP aplikasinya, lalu mengembalikan state running, ready, status Docker, reason aman, serta `error_code`. | Read-only. |
 | `RefreshRoute` | Menolak container yang tidak ready; kemudian membangun ulang route deterministik dari label domain/port dan menjalankan validate/reload Caddy. | Menulis konten route yang sama secara atomik; aman diulang. |
 | `ReconcileWorkload` | Melaporkan desired/actual state. Mutasi hanya dijalankan bila payload memuat aksi `restart_log_follower`, `cleanup_failed_candidate`, atau `restore_route` secara eksplisit. | Tanpa `actions` bersifat read-only; follower didedup per container, route deterministik, dan candidate hanya boleh berstatus Created/Exited/Dead. |
 | `CleanupRuntime` | Menjalankan target GC yang disetujui: `stale_workspaces`, `stale_images`, dan/atau `stale_routes`. | Wajib `approved: true`; seluruh discovery/deletion dibatasi ownership Sakala dan aman diulang. |
@@ -62,6 +62,8 @@ otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane
 `CleanupRuntime` menolak payload tanpa approval eksplisit, sementara penghapusan
 route memverifikasi marker ownership Sakala beserta deployment ID. Command lama
 tidak boleh menghapus route deployment baru pada project yang sama.
+
+Permintaan batal dari API sampai lewat `cancel_requested` pada polling, dan memakai token yang sama dengan shutdown. Detailnya ada di [Sakala Agent API](AGENT_API.md#pembatalan-command).
 
 Aktivasi route candidate adalah deployment commit point. Cancellation, deadline,
 atau kegagalan reporting sebelum cutover membatalkan deployment dan membersihkan

@@ -48,4 +48,6 @@ menentukan proses refresh credential atau retry command.
 - Dokumentasikan recovery jika command berhenti di tengah eksekusi.
 - Integrasikan desired-state reconciliation dari `sakala-api` sebelum mengaktifkan auto-removal orphan.
 - Rootless Docker mengurangi privilege daemon, tetapi tidak otomatis menjadi sandbox multi-tenant. Sebelum menerima workload publik tidak tepercaya, evaluasi rootless BuildKit pada worker terpisah atau isolated remote builder dengan filesystem, network, cache, dan credential boundary sendiri.
-- Gunakan secret delivery yang tidak menulis value ke build context; Phase 8 hanya mendukung runtime environment.
+- Variabel project sampai ke build hanya sebagai secret BuildKit, tidak lewat build argument atau build context. Lihat [Docker Runtime](DOCKER_RUNTIME.md#variabel-saat-build). Langkah build milik user tetap bisa menulis nilainya ke image.
+- Railpack dan mise menjalankan kode repository saat analisis, jadi keduanya hanya berjalan di [sandbox](RAILPACK_STRATEGY.md#sandbox). Build antar-project [diisolasi](DOCKER_RUNTIME.md#isolasi-antar-project-saat-build), dan process anak tidak mewarisi `SAKALA_*`.
+- Satu baris output process dibatasi 64 KiB, supaya container yang mencetak tanpa newline tidak bisa menghabiskan memory Agent.
