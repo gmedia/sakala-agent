@@ -14,6 +14,7 @@ use crate::{
     CoreError, NodeLifecycle,
     api::ApiClient,
     commands::CommandDispatcher,
+    logs::redactor::ValueRedactor,
     ports::{CommandOutput, RuntimeExecutor, RuntimeReporter},
     reporting::{ApiRuntimeReporter, ApiRuntimeReporterFactory},
     repositories::ApiRepositoryCredentialProvider,
@@ -106,7 +107,7 @@ impl CommandProcessor {
             )
             .await?;
 
-        let (execution_timeout, log_bounds) = match self.command_policy(command) {
+        let (execution_timeout, log_bounds, redactor) = match self.command_policy(command) {
             Ok(policy) => policy,
             Err(error) => {
                 self.client
@@ -115,11 +116,10 @@ impl CommandProcessor {
                 return Err(error.into());
             }
         };
-        let reporter = Arc::new(ApiRuntimeReporter::new(
-            self.client.clone(),
-            command.id,
-            log_bounds,
-        ));
+        let reporter = Arc::new(
+            ApiRuntimeReporter::new(self.client.clone(), command.id, log_bounds)
+                .with_redactor(redactor),
+        );
 
         let deadline_cancellation = cancellation.clone();
         let execution = self
@@ -228,7 +228,11 @@ impl CommandProcessor {
             }
             Err(error) => {
                 self.client
-                    .fail(command.id, error.code(), &error.to_string())
+                    .fail(
+                        command.id,
+                        error.code(),
+                        &reporter.redact(&error.to_string()),
+                    )
                     .await?;
                 warn!(
                     command_id = %command.id,
@@ -247,9 +251,13 @@ impl CommandProcessor {
     fn command_policy(
         &self,
         command: &AgentCommand,
-    ) -> Result<(Duration, LogBounds), crate::ports::RuntimeExecutionError> {
+    ) -> Result<(Duration, LogBounds, ValueRedactor), crate::ports::RuntimeExecutionError> {
         if command.command_type != CommandType::DeployProject {
-            return Ok((self.command_timeout, LogBounds::default()));
+            return Ok((
+                self.command_timeout,
+                LogBounds::default(),
+                ValueRedactor::default(),
+            ));
         }
         let payload = command.deploy_payload().map_err(|error| {
             crate::ports::RuntimeExecutionError::invalid_command(format!(
@@ -268,7 +276,11 @@ impl CommandProcessor {
                 ),
             ));
         }
-        Ok((Duration::from_secs(requested), payload.log_bounds))
+        Ok((
+            Duration::from_secs(requested),
+            payload.log_bounds,
+            ValueRedactor::new(payload.environment.into_values()),
+        ))
     }
 }
 

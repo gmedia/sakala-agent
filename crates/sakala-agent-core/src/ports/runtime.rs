@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
-    DeployProjectPayload, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
-    InspectProjectPayload, LogBounds, ReconcileWorkloadAction, RuntimeCleanupTarget,
+    CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
+    DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
+    RuntimeCleanupTarget,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -11,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::RepositoryCredential;
+use crate::logs::redactor::ValueRedactor;
 
 #[derive(Clone, Debug)]
 pub struct InspectProjectRequest {
@@ -293,7 +295,12 @@ pub trait RuntimeReporter: Send + Sync {
 /// The runtime only receives opaque reporters; API credentials and transport
 /// remain owned by core.
 pub trait RuntimeReporterFactory: Send + Sync {
-    fn reporter(&self, command_id: Uuid, log_bounds: LogBounds) -> Arc<dyn RuntimeReporter>;
+    fn reporter(
+        &self,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+        redactor: ValueRedactor,
+    ) -> Arc<dyn RuntimeReporter>;
 }
 
 #[async_trait]
@@ -321,6 +328,16 @@ pub trait RuntimeExecutor: Send + Sync {
 
     /// Mengambil kesehatan workload aktif tanpa melakukan mutasi runtime.
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
+        Ok(Vec::new())
+    }
+
+    /// Resolves crash details for the workloads of a health snapshot that the
+    /// runtime sees as crashed. Takes the snapshot so a heartbeat keeps to one
+    /// batch listing per interval instead of listing containers again.
+    async fn crashed_workloads(
+        &self,
+        _snapshots: &[RuntimeHealthSnapshot],
+    ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
         Ok(Vec::new())
     }
 
