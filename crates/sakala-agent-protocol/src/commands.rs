@@ -93,6 +93,16 @@ impl AgentCommand {
     }
 }
 
+/// Response of the control-plane polling endpoint.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CommandPoll {
+    pub data: Vec<AgentCommand>,
+    /// Commands of this node the owner asked to cancel. Repeated on every poll
+    /// until they are terminal, and absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancel_requested: Vec<Uuid>,
+}
+
 /// Body sent when an agent completes a command successfully.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct CompleteCommandPayload {

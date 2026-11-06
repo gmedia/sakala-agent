@@ -10,6 +10,9 @@ pub struct InspectProjectPayload {
     pub commit_sha: String,
     #[serde(default)]
     pub repository_access: RepositoryAccess,
+    /// Inspects this directory instead of the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_directory: Option<String>,
 }
 
 /// Stable Sakala metadata plus the raw Railpack result for forward compatibility.

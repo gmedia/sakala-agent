@@ -1,0 +1,43 @@
+{
+  "status": "ready",
+  "hostname": "runtime-01",
+  "runtime_network": "sakala-runtime",
+  "capabilities": ["docker-runtime"],
+  "metadata": {
+    "version": "0.2.3",
+    "protocol_version": 4,
+    "runtime_driver": "docker",
+    "detail_counts": {
+      "unhealthy_details": 2,
+      "crashed_details": 2
+    },
+    "workloads": {
+      "active": 2,
+      "starting": 0,
+      "unhealthy": 2,
+      "stopped": 0,
+      "unhealthy_details": [],
+      "crashed_details": [
+        {
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "exit_code": 137,
+          "oom_killed": true,
+          "finished_at": "2026-11-05T14:28:41Z",
+          "restart_count": 8,
+          "running": false
+        },
+        {
+          "project_id": "11111111-1111-4111-8111-111111111111",
+          "deployment_id": "22222222-2222-4222-8222-222222222222",
+          "exit_code": null,
+          "oom_killed": false,
+          "finished_at": null,
+          "restart_count": 3,
+          "running": true
+        }
+      ]
+    }
+  },
+  "sent_at": "2026-11-05T14:28:50Z"
+}
