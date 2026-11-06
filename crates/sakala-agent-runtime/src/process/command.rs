@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use sakala_agent_core::ports::SecretString;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, BufReader},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
@@ -62,6 +62,11 @@ impl CommandSpec {
     pub fn secret_env(mut self, key: impl Into<String>, value: SecretString) -> Self {
         self.secret_environment.insert(key.into(), value);
         self
+    }
+
+    /// Names of the secret environment variables. The values stay private.
+    pub fn secret_environment_names(&self) -> impl Iterator<Item = &str> {
+        self.secret_environment.keys().map(String::as_str)
     }
 
     #[must_use]
@@ -148,6 +153,11 @@ impl ProcessRunner for TokioProcessRunner {
     ) -> Result<ProcessOutput, RuntimeError> {
         let mut command = Command::new(&spec.program);
         command
+            .env_clear()
+            .envs(
+                std::env::vars_os()
+                    .filter(|(name, _)| name.to_str().is_some_and(inherited_by_children)),
+            )
             .args(&spec.args)
             .envs(&spec.environment)
             .stdin(Stdio::null())
@@ -176,8 +186,8 @@ impl ProcessRunner for TokioProcessRunner {
         let stderr = child.stderr.take().ok_or_else(|| {
             RuntimeError::Dependency(format!("could not capture {} stderr", spec.program))
         })?;
-        let mut stdout = BufReader::new(stdout).lines();
-        let mut stderr = BufReader::new(stderr).lines();
+        let mut stdout = BoundedLines::new(BufReader::new(stdout));
+        let mut stderr = BoundedLines::new(BufReader::new(stderr));
         let mut stdout_done = false;
         let mut stderr_done = false;
         let mut captured_stdout = String::new();
@@ -303,6 +313,101 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Longest line kept from a process. The reporter cuts further to the command's
+/// `max_line_length`; this ceiling only protects the agent's own memory, because a
+/// tenant decides what a followed container prints, newlines included.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Splits output into lines without ever holding more than `MAX_LINE_BYTES` of one.
+/// A longer line is delivered cut at the limit, and its remainder is thrown away.
+///
+/// Output is whatever a process prints. A byte that is not UTF-8 must not fail the
+/// command or lose the lines after it, so it becomes a replacement character.
+///
+/// `next_line` is safe to cancel in a `select!`: everything it has taken from the
+/// reader is already in `self`.
+struct BoundedLines<R> {
+    reader: R,
+    line: Vec<u8>,
+    discarding: bool,
+}
+
+impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            line: Vec::new(),
+            discarding: false,
+        }
+    }
+
+    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok((!self.line.is_empty()).then(|| self.take_line()));
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let content = &available[..newline.unwrap_or(available.len())];
+            let consumed = newline.map_or(available.len(), |position| position + 1);
+            if !self.discarding {
+                let room = MAX_LINE_BYTES - self.line.len();
+                self.line
+                    .extend_from_slice(&content[..content.len().min(room)]);
+            }
+            self.reader.consume(consumed);
+
+            if self.discarding {
+                self.discarding = newline.is_none();
+            } else if newline.is_some() {
+                return Ok(Some(self.take_line()));
+            } else if self.line.len() >= MAX_LINE_BYTES {
+                self.discarding = true;
+                return Ok(Some(self.take_line()));
+            }
+        }
+    }
+
+    fn take_line(&mut self) -> String {
+        let line = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
+        let line = String::from_utf8_lossy(line).into_owned();
+        self.line.clear();
+        line
+    }
+}
+
+/// Whether a child process may inherit a variable from the agent. This is an
+/// allowlist because the agent's environment holds its control-plane token, and
+/// nothing a child runs should be able to read that. `SAKALA_*` never passes, so a
+/// new setting cannot leak by matching a prefix below. Anything a command needs
+/// beyond this is passed explicitly through `CommandSpec`.
+fn inherited_by_children(name: &str) -> bool {
+    const NAMES: [&str; 18] = [
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TMPDIR",
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+    ];
+    const PREFIXES: [&str; 3] = ["DOCKER_", "BUILDX_", "BUILDKIT_"];
+    !name.starts_with("SAKALA_")
+        && (NAMES.contains(&name.to_ascii_uppercase().as_str())
+            || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;

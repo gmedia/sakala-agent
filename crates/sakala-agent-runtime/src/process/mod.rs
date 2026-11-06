@@ -3,8 +3,8 @@ mod command;
 use crate::{RuntimeError, RuntimeReporter};
 
 pub use command::{
-    CommandSpec, NullOutputSink, ProcessOutput, ProcessOutputSink, ProcessRunner, ProcessStream,
-    TokioProcessRunner,
+    CommandSpec, MAX_LINE_BYTES, NullOutputSink, ProcessOutput, ProcessOutputSink, ProcessRunner,
+    ProcessStream, TokioProcessRunner,
 };
 
 use crate::logs::ReporterOutputSink;

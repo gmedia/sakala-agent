@@ -8,13 +8,14 @@ use std::{
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, LogBounds};
+use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     api::ApiClient,
-    logs::redactor::redact_line,
+    logs::redactor::ValueRedactor,
     ports::{CommandOutput, RuntimeExecutionError, RuntimeReporter, RuntimeReporterFactory},
 };
 
@@ -39,12 +40,16 @@ impl ApiRuntimeReporterFactory {
 }
 
 impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
-    fn reporter(&self, command_id: Uuid, log_bounds: LogBounds) -> Arc<dyn RuntimeReporter> {
-        Arc::new(ApiRuntimeReporter::new(
-            self.client.clone(),
-            command_id,
-            log_bounds,
-        ))
+    fn reporter(
+        &self,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+        redactor: ValueRedactor,
+    ) -> Arc<dyn RuntimeReporter> {
+        Arc::new(
+            ApiRuntimeReporter::new(self.client.clone(), command_id, log_bounds)
+                .with_redactor(redactor),
+        )
     }
 }
 
@@ -57,6 +62,7 @@ impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
 /// touching the control plane, which stops container log followers.
 pub struct ApiRuntimeReporter {
     inner: Arc<ReporterInner>,
+    redactor: ValueRedactor,
 }
 
 struct ReporterInner {
@@ -113,7 +119,22 @@ impl ApiRuntimeReporter {
                 deployment_committed: AtomicBool::new(false),
                 committed_output: StdMutex::new(None),
             }),
+            redactor: ValueRedactor::default(),
         }
+    }
+
+    /// Adds the command's environment values to what this reporter hides.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: ValueRedactor) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
+    /// Applies this command's redaction to text reported outside this reporter,
+    /// such as the terminal failure message.
+    #[must_use]
+    pub fn redact(&self, text: &str) -> String {
+        self.redactor.redact(text)
     }
 }
 
@@ -184,7 +205,9 @@ impl ReporterInner {
 
 #[async_trait]
 impl RuntimeReporter for ApiRuntimeReporter {
-    async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+    async fn event(&self, mut event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+        event.message = self.redactor.redact(&event.message);
+        redact_strings(&mut event.metadata, &self.redactor);
         self.inner
             .client
             .event(self.inner.command_id, &event)
@@ -199,7 +222,9 @@ impl RuntimeReporter for ApiRuntimeReporter {
             if let Some(reason) = &state.delivery_stopped {
                 return Err(ReporterInner::stopped_error(reason));
             }
-            let Some(log) = bounded_log(log, self.inner.log_bounds, state.bytes_sent) else {
+            let Some(log) =
+                bounded_log(log, self.inner.log_bounds, state.bytes_sent, &self.redactor)
+            else {
                 return Ok(());
             };
             // The budget is reserved when a line is accepted so the local
@@ -250,12 +275,30 @@ impl RuntimeReporter for ApiRuntimeReporter {
     }
 }
 
-fn bounded_log(mut log: DeploymentLog, bounds: LogBounds, sent: u64) -> Option<DeploymentLog> {
+fn redact_strings(value: &mut Value, redactor: &ValueRedactor) {
+    match value {
+        Value::String(text) => *text = redactor.redact(text),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_strings(item, redactor)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| redact_strings(field, redactor)),
+        _ => {}
+    }
+}
+
+fn bounded_log(
+    mut log: DeploymentLog,
+    bounds: LogBounds,
+    sent: u64,
+    redactor: &ValueRedactor,
+) -> Option<DeploymentLog> {
     // A zero-line batch policy means no log may be emitted.
     if bounds.max_batch_lines == Some(0) {
         return None;
     }
-    log.message = sanitise_line(&redact_line(&log.message));
+    log.message = sanitise_line(&redactor.redact(&log.message));
     truncate_utf8(&mut log.message, bounds.max_line_length);
     if let Some(maximum) = bounds.max_total_bytes {
         if sent >= maximum {
@@ -304,7 +347,47 @@ mod tests {
     use sakala_agent_protocol::{DeploymentLog, LogStream};
     use time::OffsetDateTime;
 
-    use super::{LogBounds, bounded_log};
+    use super::{LogBounds, ValueRedactor, bounded_log as bounded_log_with, redact_strings};
+
+    fn bounded_log(log: DeploymentLog, bounds: LogBounds, sent: u64) -> Option<DeploymentLog> {
+        bounded_log_with(log, bounds, sent, &ValueRedactor::default())
+    }
+
+    #[test]
+    fn a_command_value_is_redacted_before_a_line_is_truncated() {
+        let redactor = ValueRedactor::new(["kL9-unusual-value".to_owned()]);
+        let line = bounded_log_with(
+            log("using kL9-unusual-value"),
+            LogBounds {
+                max_line_length: Some(12),
+                ..LogBounds::default()
+            },
+            0,
+            &redactor,
+        )
+        .expect("line fits");
+
+        assert_eq!(line.message, "using [REDAC");
+    }
+
+    #[test]
+    fn event_metadata_is_redacted_at_any_depth() {
+        let redactor = ValueRedactor::new(["kL9-unusual-value".to_owned()]);
+        let mut metadata = serde_json::json!({
+            "plain": "kL9-unusual-value",
+            "nested": { "list": ["a kL9-unusual-value b", 7] },
+        });
+
+        redact_strings(&mut metadata, &redactor);
+
+        assert_eq!(
+            metadata,
+            serde_json::json!({
+                "plain": "[REDACTED]",
+                "nested": { "list": ["a [REDACTED] b", 7] },
+            })
+        );
+    }
 
     fn log(message: &str) -> DeploymentLog {
         DeploymentLog {
