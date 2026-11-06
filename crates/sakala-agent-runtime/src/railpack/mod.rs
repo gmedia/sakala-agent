@@ -1,3 +1,5 @@
 mod commands;
+mod sandbox;
 
-pub(crate) use commands::{build_command, info_command, prepare_command};
+pub use commands::build_command;
+pub use sandbox::{RailpackSandbox, is_pinned_image};

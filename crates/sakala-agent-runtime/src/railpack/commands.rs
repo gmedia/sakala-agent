@@ -2,27 +2,7 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::CommandSpec;
-
-pub fn info_command(source: &Path, info: &Path) -> CommandSpec {
-    CommandSpec::new("railpack")
-        .arg("info")
-        .arg("--format")
-        .arg("json")
-        .arg("--out")
-        .arg(info.as_os_str())
-        .arg(source.as_os_str())
-}
-
-pub fn prepare_command(source: &Path, plan: &Path, info: &Path) -> CommandSpec {
-    CommandSpec::new("railpack")
-        .arg("prepare")
-        .arg(source.as_os_str())
-        .arg("--plan-out")
-        .arg(plan.as_os_str())
-        .arg("--info-out")
-        .arg(info.as_os_str())
-}
+use crate::{CommandSpec, builders::with_tenant_isolation};
 
 pub fn build_command(
     source: &Path,
@@ -31,15 +11,28 @@ pub fn build_command(
     frontend: &str,
     project_id: Uuid,
     deployment_id: Uuid,
+    secrets_fingerprint: Option<&str>,
 ) -> CommandSpec {
-    CommandSpec::new("docker")
+    let command = CommandSpec::new("docker")
         .arg("buildx")
         .arg("build")
         .arg("--load")
         .arg("--progress")
-        .arg("plain")
+        .arg("plain");
+    let mut command = with_tenant_isolation(command)
         .arg("--build-arg")
         .arg(format!("BUILDKIT_SYNTAX={frontend}"))
+        // Railpack's frontend prefixes its cache mounts with this.
+        .arg("--build-arg")
+        .arg(format!("cache-key={project_id}"));
+    // BuildKit keeps a cached step when only a secret changed. This is how
+    // Railpack's frontend learns that it must not.
+    if let Some(fingerprint) = secrets_fingerprint {
+        command = command
+            .arg("--build-arg")
+            .arg(format!("secrets-hash={fingerprint}"));
+    }
+    command
         .arg("--file")
         .arg(plan.as_os_str())
         .arg("--tag")

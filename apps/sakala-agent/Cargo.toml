@@ -50,6 +50,14 @@ path = "../../tests/connected_command_lifecycle_test.rs"
 name = "connected_report_delivery_test"
 path = "../../tests/connected_report_delivery_test.rs"
 
+[[test]]
+name = "connected_deploy_failure_test"
+path = "../../tests/connected_deploy_failure_test.rs"
+
+[[test]]
+name = "docker_smoke_test"
+path = "../../tests/docker_smoke_test.rs"
+
 [dev-dependencies]
 async-trait.workspace = true
 sakala-agent-core.workspace = true

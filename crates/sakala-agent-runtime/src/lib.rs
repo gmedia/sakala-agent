@@ -9,12 +9,12 @@ pub mod health;
 mod inspections;
 pub mod logs;
 pub mod process;
-mod railpack;
+pub mod railpack;
 pub mod routing;
 mod telemetry;
 pub mod workspace;
 
-pub use config::{DockerRuntimeConfig, TimeoutSafetyConfig};
+pub use config::{DEFAULT_CRASH_STABLE_WINDOW, DockerRuntimeConfig, TimeoutSafetyConfig};
 pub use containers::ResourceSafetyConfig;
 pub use error::RuntimeError;
 pub use executor::{DockerRuntimeExecutor, NoopRuntimeExecutor};

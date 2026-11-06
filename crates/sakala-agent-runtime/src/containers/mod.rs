@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use sakala_agent_protocol::{AppliedRuntimeResources, LogBounds, RuntimeResourceLimits};
+use sakala_agent_protocol::{
+    AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
+};
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
@@ -12,7 +14,7 @@ use sakala_agent_core::ports::{
 mod docker;
 pub(crate) mod limits;
 
-pub use docker::DockerContainerEngine;
+pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
 pub use limits::ResourceSafetyConfig;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +30,9 @@ pub struct RunContainerRequest {
     pub domain: String,
     pub port: u16,
     pub log_bounds: LogBounds,
+    /// Replaces the image's entrypoint and command, for images that have no way
+    /// to take it at build time.
+    pub start_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +61,12 @@ pub trait ContainerEngine: Send + Sync {
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError>;
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError>;
+
+    /// Resolves the crash details of snapshot workloads Docker is restarting.
+    async fn crashed_workloads(
+        &self,
+        snapshots: &[RuntimeHealthSnapshot],
+    ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeError>;
 
     async fn workload(
         &self,
@@ -90,6 +101,20 @@ pub trait ContainerEngine: Send + Sync {
         container: &str,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
+
+    /// Reports the last lines of a candidate that failed before its route went
+    /// live. Returns whether the container had any output to report.
+    async fn report_failure_logs(
+        &self,
+        container: &str,
+        log_bounds: LogBounds,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<bool, RuntimeError>;
+
+    /// Reads a workload's environment values, only so that a log follower rebuilt
+    /// after an Agent restart can keep hiding them. The agent keeps no copy of a
+    /// command's payload, and the result must never be logged.
+    async fn environment_values(&self, container: &str) -> Result<Vec<String>, RuntimeError>;
 
     /// Starts at most one follower for a container. Returns whether a new
     /// follower was registered.

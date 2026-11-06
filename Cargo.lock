@@ -1370,6 +1370,7 @@ name = "sakala-agent-runtime"
 version = "0.2.3"
 dependencies = [
  "async-trait",
+ "base64",
  "nix",
  "sakala-agent-core",
  "sakala-agent-protocol",

@@ -1,5 +1,5 @@
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
@@ -11,6 +11,40 @@ use crate::{RuntimeError, RuntimeReporter};
 use sakala_agent_core::ports::RepositoryCredential;
 
 mod git;
+
+const MAX_ROOT_DIRECTORY_BYTES: usize = 255;
+
+/// Reduces an optional `root_directory` to the directory it names. Empty and `.`
+/// both mean the repository root.
+#[must_use]
+pub fn requested_root_directory(root_directory: Option<&str>) -> Option<&str> {
+    root_directory
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != ".")
+}
+
+/// Rejects what can be judged from the text alone, before any process runs. The
+/// value comes from the control plane, but it is user input and picks a host path,
+/// so the check does not rely on the API's own validation.
+pub fn validate_root_directory(root_directory: &str) -> Result<(), RuntimeError> {
+    let invalid = |reason| Err(RuntimeError::RootDirectoryInvalid { reason });
+    if root_directory.len() > MAX_ROOT_DIRECTORY_BYTES {
+        return invalid("is too long");
+    }
+    if root_directory
+        .chars()
+        .any(|character| character.is_control() || character == '\\')
+    {
+        return invalid("holds characters a path cannot use");
+    }
+    let only_descends = Path::new(root_directory)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+    if !only_descends {
+        return invalid("must not be absolute or contain ..");
+    }
+    Ok(())
+}
 
 pub use git::GitWorkspaceManager;
 
@@ -42,6 +76,31 @@ impl DeploymentWorkspace {
     #[must_use]
     pub fn source(&self) -> &Path {
         &self.source
+    }
+
+    /// Resolves the directory a build works in. Only the checkout can show where
+    /// a symlink leads, so this runs after it, and the resolved path is what gets
+    /// used: nothing follows the link again later.
+    pub async fn build_context(
+        &self,
+        root_directory: Option<&str>,
+    ) -> Result<PathBuf, RuntimeError> {
+        let Some(root_directory) = requested_root_directory(root_directory) else {
+            return Ok(self.source.clone());
+        };
+        validate_root_directory(root_directory)?;
+        let invalid = |reason| RuntimeError::RootDirectoryInvalid { reason };
+        let source = tokio::fs::canonicalize(&self.source).await?;
+        let context = tokio::fs::canonicalize(self.source.join(root_directory))
+            .await
+            .map_err(|_| invalid("does not exist in the repository"))?;
+        if !context.starts_with(&source) {
+            return Err(invalid("leads outside the repository through a symlink"));
+        }
+        if !tokio::fs::metadata(&context).await?.is_dir() {
+            return Err(invalid("is not a directory"));
+        }
+        Ok(context)
     }
 }
 

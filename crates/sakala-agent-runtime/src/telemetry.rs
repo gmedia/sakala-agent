@@ -13,7 +13,33 @@ pub(crate) struct NodeTelemetryCollector {
     workspace_root: PathBuf,
     runtime_network: String,
     caddy_container: String,
+    railpack_image: String,
+    container_runtime: Option<String>,
     dependencies: OnceCell<Value>,
+}
+
+/// Lists the runtimes Docker knows, one per line: the name and then its arguments.
+pub(crate) fn registered_runtimes_command() -> CommandSpec {
+    CommandSpec::new("docker").arg("info").arg("--format").arg(
+        "{{range $name, $runtime := .Runtimes}}{{$name}}{{range $runtime.Args}} {{.}}{{end}}{{println}}{{end}}",
+    )
+}
+
+pub(crate) fn registered_runtime_names(listing: &str) -> Vec<&str> {
+    listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
+}
+
+/// `--ignore-cgroups` is what makes `runsc` start under rootless Docker, and it also
+/// means nothing applies `--memory`, `--cpus`, or `--pids-limit` to the workload. The
+/// control plane and the operator have to be able to see that.
+pub(crate) fn runtime_ignores_cgroups(listing: &str, runtime: &str) -> bool {
+    listing.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next() == Some(runtime) && words.any(|word| word == "--ignore-cgroups")
+    })
 }
 
 impl NodeTelemetryCollector {
@@ -22,12 +48,16 @@ impl NodeTelemetryCollector {
         workspace_root: PathBuf,
         runtime_network: String,
         caddy_container: String,
+        railpack_image: String,
+        container_runtime: Option<String>,
     ) -> Self {
         Self {
             runner,
             workspace_root,
             runtime_network,
             caddy_container,
+            railpack_image,
+            container_runtime,
             dependencies: OnceCell::new(),
         }
     }
@@ -35,7 +65,13 @@ impl NodeTelemetryCollector {
     pub(crate) async fn snapshot(&self) -> NodeTelemetry {
         let dependencies = self
             .dependencies
-            .get_or_init(|| dependency_versions(Arc::clone(&self.runner)))
+            .get_or_init(|| {
+                dependency_versions(
+                    Arc::clone(&self.runner),
+                    &self.railpack_image,
+                    self.container_runtime.as_deref(),
+                )
+            })
             .await
             .clone();
         let runtime_operational = live_runtime_operational(
@@ -43,6 +79,7 @@ impl NodeTelemetryCollector {
             &self.workspace_root,
             &self.runtime_network,
             &self.caddy_container,
+            self.container_runtime.as_deref(),
         )
         .await;
         let memory = read_memory().await;
@@ -75,6 +112,7 @@ async fn live_runtime_operational(
     workspace_root: &std::path::Path,
     runtime_network: &str,
     caddy_container: &str,
+    container_runtime: Option<&str>,
 ) -> bool {
     let docker = command_ready(
         runner,
@@ -102,8 +140,27 @@ async fn live_runtime_operational(
         None,
     );
     let workspace = workspace_writable(workspace_root);
-    let (docker, caddy, network, workspace) = tokio::join!(docker, caddy, network, workspace);
-    docker && caddy && network && workspace
+    let runtime = runtime_registered(runner, container_runtime);
+    let (docker, caddy, network, workspace, runtime) =
+        tokio::join!(docker, caddy, network, workspace, runtime);
+    docker && caddy && network && workspace && runtime
+}
+
+/// A daemon restarted without the runtime's configuration refuses every new workload,
+/// so that has to show in the heartbeat before a deployment finds out.
+async fn runtime_registered(runner: &dyn ProcessRunner, container_runtime: Option<&str>) -> bool {
+    let Some(runtime) = container_runtime else {
+        return true;
+    };
+    runner
+        .run(
+            &registered_runtimes_command().timeout(PROBE_TIMEOUT),
+            &NullOutputSink,
+        )
+        .await
+        .ok()
+        .filter(|output| output.success)
+        .is_some_and(|output| registered_runtime_names(&output.stdout).contains(&runtime))
 }
 
 async fn command_ready(
@@ -135,8 +192,12 @@ async fn workspace_writable(workspace_root: &std::path::Path) -> bool {
     tokio::fs::remove_file(probe).await.is_ok()
 }
 
-async fn dependency_versions(runner: Arc<dyn ProcessRunner>) -> Value {
-    let (git, docker, buildx, railpack) = tokio::join!(
+async fn dependency_versions(
+    runner: Arc<dyn ProcessRunner>,
+    railpack_image: &str,
+    container_runtime: Option<&str>,
+) -> Value {
+    let (git, docker, buildx) = tokio::join!(
         command_version(runner.as_ref(), "git", &["--version"]),
         command_version(
             runner.as_ref(),
@@ -144,9 +205,29 @@ async fn dependency_versions(runner: Arc<dyn ProcessRunner>) -> Value {
             &["version", "--format", "{{.Server.Version}}"]
         ),
         command_version(runner.as_ref(), "docker", &["buildx", "version"]),
-        command_version(runner.as_ref(), "railpack", &["--version"]),
     );
-    json!({ "git": git, "docker": docker, "buildx": buildx, "railpack": railpack })
+    // Railpack runs from this image, so the pinned reference identifies its version.
+    let railpack = (!railpack_image.is_empty()).then_some(railpack_image);
+    let limits_enforced = match container_runtime {
+        Some(runtime) => runner
+            .run(
+                &registered_runtimes_command().timeout(PROBE_TIMEOUT),
+                &NullOutputSink,
+            )
+            .await
+            .ok()
+            .filter(|output| output.success)
+            .map(|output| !runtime_ignores_cgroups(&output.stdout, runtime)),
+        None => None,
+    };
+    json!({
+        "git": git,
+        "docker": docker,
+        "buildx": buildx,
+        "railpack": railpack,
+        "container_runtime": container_runtime,
+        "container_runtime_limits_enforced": limits_enforced,
+    })
 }
 
 async fn command_version(

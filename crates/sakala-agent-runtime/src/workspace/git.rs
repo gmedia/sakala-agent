@@ -164,8 +164,8 @@ impl WorkspaceManager for GitWorkspaceManager {
         let output = self.runner.run(&command, &crate::NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Dependency(format!(
-                "workspace disk inspection exited with status {:?}",
-                output.code
+                "workspace disk inspection failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
         parse_available_disk_bytes(&output.stdout)

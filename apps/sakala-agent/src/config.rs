@@ -107,6 +107,18 @@ struct Cli {
     #[arg(long, env = "SAKALA_RAILPACK_FRONTEND")]
     railpack_frontend: Option<String>,
 
+    #[arg(long, env = "SAKALA_RAILPACK_IMAGE")]
+    railpack_image: Option<String>,
+
+    #[arg(long, env = "SAKALA_RAILPACK_NETWORK")]
+    railpack_network: Option<String>,
+
+    #[arg(long, env = "SAKALA_CONTAINER_RUNTIME")]
+    container_runtime: Option<String>,
+
+    #[arg(long, env = "SAKALA_CONTAINER_DNS")]
+    container_dns: Option<String>,
+
     #[arg(long, env = "SAKALA_BUILD_TIMEOUT_SECONDS")]
     build_timeout_seconds: Option<String>,
 
@@ -208,6 +220,14 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_RAILPACK_FRONTEND",
         cli.railpack_frontend,
     );
+    insert(&mut values, "SAKALA_RAILPACK_IMAGE", cli.railpack_image);
+    insert(&mut values, "SAKALA_RAILPACK_NETWORK", cli.railpack_network);
+    insert(
+        &mut values,
+        "SAKALA_CONTAINER_RUNTIME",
+        cli.container_runtime,
+    );
+    insert(&mut values, "SAKALA_CONTAINER_DNS", cli.container_dns);
     insert(
         &mut values,
         "SAKALA_BUILD_TIMEOUT_SECONDS",
@@ -315,6 +335,10 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 "SAKALA_RAILPACK_FRONTEND",
                 "ghcr.io/railwayapp/railpack-frontend:v0.23.0",
             ),
+            railpack_image: get(values, "SAKALA_RAILPACK_IMAGE", ""),
+            railpack_network: get(values, "SAKALA_RAILPACK_NETWORK", "sakala-railpack"),
+            container_runtime: container_runtime(values)?,
+            container_dns: container_dns(values)?,
             resource_safety,
             timeout_safety: TimeoutSafetyConfig {
                 max_build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
@@ -388,6 +412,46 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
         .map(str::to_owned)
         .collect(),
     }
+}
+
+/// An empty value means unset, which leaves the choice to Docker. Other values become
+/// a process argument, so they are limited to what a runtime name can be.
+fn container_runtime(values: &HashMap<String, String>) -> Result<Option<String>, CoreError> {
+    let Some(name) = values
+        .get("SAKALA_CONTAINER_RUNTIME")
+        .filter(|name| !name.is_empty())
+    else {
+        return Ok(None);
+    };
+    let valid = name.starts_with(|first: char| first.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character));
+    if valid {
+        Ok(Some(name.clone()))
+    } else {
+        Err(CoreError::InvalidConfiguration(
+            "SAKALA_CONTAINER_RUNTIME may only hold letters, digits, '.', '_', and '-', and must start with a letter or digit".to_owned(),
+        ))
+    }
+}
+
+fn container_dns(values: &HashMap<String, String>) -> Result<Vec<std::net::IpAddr>, CoreError> {
+    values
+        .get("SAKALA_CONTAINER_DNS")
+        .map(String::as_str)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|server| !server.is_empty())
+        .map(|server| {
+            server.parse().map_err(|_| {
+                CoreError::InvalidConfiguration(format!(
+                    "SAKALA_CONTAINER_DNS holds {server:?}, which is not an IP address"
+                ))
+            })
+        })
+        .collect()
 }
 
 fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
@@ -473,6 +537,63 @@ mod tests {
             .expect_err("version flag should stop normal command parsing");
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
         assert!(error.to_string().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn the_container_runtime_is_optional_and_cannot_become_another_argument() {
+        let load = |value: &str| {
+            from_values(&HashMap::from([(
+                "SAKALA_CONTAINER_RUNTIME".to_owned(),
+                value.to_owned(),
+            )]))
+        };
+
+        let unset = from_values(&HashMap::new()).expect("config");
+        assert_eq!(unset.docker_runtime.container_runtime, None);
+        assert_eq!(
+            load("").expect("config").docker_runtime.container_runtime,
+            None
+        );
+        assert_eq!(
+            load("runsc")
+                .expect("config")
+                .docker_runtime
+                .container_runtime
+                .as_deref(),
+            Some("runsc")
+        );
+        for invalid in ["--privileged", "run sc", "runsc;id", "../runsc", "-x"] {
+            assert!(load(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn container_dns_takes_only_ip_addresses() {
+        let load = |value: &str| {
+            from_values(&HashMap::from([(
+                "SAKALA_CONTAINER_DNS".to_owned(),
+                value.to_owned(),
+            )]))
+        };
+
+        assert!(
+            from_values(&HashMap::new())
+                .expect("config")
+                .docker_runtime
+                .container_dns
+                .is_empty()
+        );
+        assert_eq!(
+            load("1.1.1.1, 2606:4700:4700::1111")
+                .expect("config")
+                .docker_runtime
+                .container_dns
+                .len(),
+            2
+        );
+        for invalid in ["dns.example.com", "1.1.1.1;id", "1.1.1"] {
+            assert!(load(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
