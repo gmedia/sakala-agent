@@ -344,14 +344,68 @@ pada deployment sungguhan di mesin yang sama: build lewat builder itu selesai, p
 default macet saat mengunduh. Langkah build di builder ini mendapat akses ke network host, jadi
 pakai hanya pada node yang menjalankan repository tepercaya.
 
+## Port dari base image
+
+Dockerfile yang paling sering dipakai mahasiswa berakhir di `FROM nginx:alpine`,
+`nginx:1.27`, atau `httpd:2.4` tanpa `EXPOSE` sendiri. Port 80-nya datang dari `EXPOSE 80`
+di dalam base image, yang tidak terlihat dari Dockerfile. Tanpa port itu, API memakai 3000
+dan deployment gagal dengan `runtime_app_not_listening`.
+
+Karena itu, bila stage terakhir tidak punya `EXPOSE`, `InspectProject` membaca config base
+image dari registry:
+
+1. Agent mengikuti `FROM <alias stage>` mundur sampai stage yang dibangun dari image luar.
+   `scratch` dilewati, begitu juga referensi yang masih berisi `ARG` atau `$` yang tidak
+   bisa dipastikan. `ARG` dengan default dipakai default-nya, sama seperti saat build.
+2. `docker buildx imagetools inspect <ref> --raw` mengambil manifest atau index. Untuk index
+   multi-platform, Agent memilih manifest `linux/<arsitektur node>`, lalu `linux/amd64` bila
+   tidak ada.
+3. `docker buildx imagetools inspect <ref>@<digest> --format '{{json .Image}}'` mengambil
+   config platform itu. Port TCP di `Config.ExposedPorts` menjadi `exposed_ports`, dengan
+   aturan yang sama seperti `EXPOSE`: terurut, tanpa duplikat, paling banyak 32, tanpa
+   `/udp` dan `/sctp`.
+
+Bila Dockerfile punya `EXPOSE` di mana pun pada rantai stage terakhir, termasuk yang tidak
+bisa dipastikan atau yang hanya `/udp`, lookup tidak dijalankan dan port dari Dockerfile
+yang dipakai. BuildKit sebenarnya menggabungkan keduanya, tetapi `FROM nginx` dengan
+`EXPOSE 8080` biasanya berarti nginx sudah dipindah ke 8080, dan port 80 dari base image
+akan membuat API tidak memilih port sama sekali.
+
+`imagetools` bicara langsung ke registry dan tidak memakai Docker daemon, jadi tidak ada
+layer yang ditarik, tidak ada build, dan tidak ada yang dijalankan dari repository.
+Satu `--format` tanpa `--raw` sebenarnya cukup, tetapi buildx lalu mengambil manifest semua
+platform di index, satu request per manifest, jadi belasan request untuk image resmi seperti
+`nginx:alpine`. Docker Hub menghitung setiap request manifest terhadap limit anonim node
+(100 per jam per IP saat diuji), dan limit itu juga dipakai build. Saat diuji, belasan
+lookup dengan cara itu sudah menghabiskan limit dan berakhir dengan `429 Too Many
+Requests`. Dua langkah di atas hanya memakai dua request manifest.
+
+Batasnya, karena referensi datang dari repository yang tidak tepercaya:
+
+| Batas | Nilai |
+| --- | --- |
+| Registry | Hanya `docker.io` (termasuk image `library` tanpa host), `ghcr.io`, `quay.io`, `public.ecr.aws`, `mcr.microsoft.com`, dan `registry.gitlab.com`, dicocokkan persis setelah referensi dinormalkan seperti Docker. Host lain, alamat IP, `localhost`, host dengan port, dan nama seperti `ghcr.io@sha256:...` yang bagi Docker berarti image Docker Hub dilewati tanpa network call. |
+| Credential | `DOCKER_CONFIG` dan `BUILDX_CONFIG` menunjuk direktori kosong mode `0700` yang dibuat untuk satu lookup lalu dihapus. Process tidak mewarisi `DOCKER_*`, `BUILDX_*`, atau `BUILDKIT_*` dari Agent, jadi `DOCKER_AUTH_CONFIG`, credential helper, context, dan builder operator tidak terpakai. Allowlist environment lain (`PATH`, `HOME`, proxy, sertifikat) tetap berlaku. |
+| Waktu | 10 detik untuk seluruh lookup. Di laptop pengujian, satu lookup ke Docker Hub butuh sekitar 5 sampai 7 detik. |
+| Jumlah | Satu referensi per inspection, paling banyak dua request manifest. |
+| Kegagalan | Timeout, registry menolak, rate limit, image tidak ada, atau buildx tidak ada hanya berarti tidak ada port dari base image. Inspection tidak pernah gagal karena lookup ini. |
+| Input | Referensi dibentuk ulang dari komponen yang sudah divalidasi menjadi bentuk lengkap, misalnya `docker.io/library/nginx:alpine`, dan digest dari registry dicek formatnya sebelum dipakai sebagai argumen. |
+
+Bila buildx hanya terpasang di direktori plugin milik user (`~/.docker/cli-plugins` atau
+`$DOCKER_CONFIG/cli-plugins`), config kosong itu memuat `cliPluginsExtraDirs` yang menunjuk
+ke sana. Hanya plugin yang dipakai dari direktori itu.
+
+Registry publik ikut mengetahui image apa yang dicari node, dan isi config-nya dikendalikan
+pemilik image. Agent hanya mengambil nomor port dari config itu.
+
 ## Batas Keamanan MVP
 
 - Repository memakai URL canonical `https://github.com` tanpa credential pada URL. Repository private memakai credential lease sementara melalui `GIT_ASKPASS` dan tidak menaruh token di arguments, remote URL, atau log.
 - Checkout harus memakai full 40-character commit SHA.
 - Tidak ada shell interpolation; executable dan arguments dikirim langsung ke process API.
-- Process anak hanya mewarisi allowlist environment (`PATH`, `HOME`, `DOCKER_*`, `BUILDX_*`, dan sejenisnya). `SAKALA_*`, termasuk token Agent, tidak pernah diwariskan.
+- Process anak hanya mewarisi allowlist environment (`PATH`, `HOME`, `DOCKER_*`, `BUILDX_*`, dan sejenisnya). `SAKALA_*`, termasuk token Agent, tidak pernah diwariskan. Lookup port base image juga tidak mewarisi `DOCKER_*`, `BUILDX_*`, dan `BUILDKIT_*`.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
-- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Agent sendiri tidak memilih port. `InspectProject` melaporkan `exposed_ports` dari `EXPOSE` di Dockerfile, dan API bisa memakainya sebagai `container_port` bila hanya ada satu port dan project tidak mengatur port sendiri. Aplikasi tetap wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
+- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Agent sendiri tidak memilih port. `InspectProject` melaporkan `exposed_ports` dari `EXPOSE` di Dockerfile, atau dari [base image](#port-dari-base-image) bila Dockerfile tidak punya `EXPOSE`, dan API bisa memakainya sebagai `container_port` bila hanya ada satu port dan project tidak mengatur port sendiri. Aplikasi tetap wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
 - Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan `--cap-drop ALL` lalu hanya delapan capability dari allowlist kecil yang dikembalikan. Lihat [Capability workload](#capability-workload).
 - Tidak ada host volume atau Docker socket di aplikasi user.
 - Setiap project berada di bridge network sendiri bersama Caddy, sehingga aplikasi tidak bisa menjangkau aplikasi project lain secara langsung. Lihat [Network per project](#network-per-project).

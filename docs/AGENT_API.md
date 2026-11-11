@@ -503,8 +503,13 @@ ada `EXPOSE`, atau tidak ada port yang bisa dipastikan. Aturannya mengikuti Buil
 
 - Hanya stage terakhir yang dihitung, karena Agent tidak memakai `--target`. Stage
   yang dibangun dari stage sebelumnya (`FROM build`) mewarisi port dan variabelnya.
-  Port yang dideklarasikan image dari registry, misalnya `EXPOSE 80` di dalam image
-  `nginx`, tidak diketahui karena inspection tidak menarik image.
+- Bila stage terakhir, termasuk stage yang menjadi dasarnya, tidak punya `EXPOSE` sama
+  sekali, port diambil dari `Config.ExposedPorts` base image-nya di registry. Contohnya
+  `FROM nginx:alpine` tanpa `EXPOSE` menghasilkan `[80]` karena image nginx
+  mendeklarasikan `EXPOSE 80`. Lookup ini hanya untuk registry publik tertentu, tanpa
+  credential, tanpa menarik image, dan dibatasi 10 detik. Bila gagal atau dilewati,
+  hasilnya `[]`. Begitu Dockerfile punya `EXPOSE`, port base image tidak ditambahkan.
+  Detail dan batasnya ada di [Docker Runtime](DOCKER_RUNTIME.md#port-dari-base-image).
 - `80`, `80/tcp`, dan rentang `8000-8002` dihitung. Port `/udp` dan `/sctp` tidak.
 - `$NAME`, `${NAME}`, `${NAME:-word}`, dan `${NAME:+word}` diisi dari `ARG` dan `ENV`
   di stage itu, dengan yang belakangan menang seperti di BuildKit. `ARG` global perlu

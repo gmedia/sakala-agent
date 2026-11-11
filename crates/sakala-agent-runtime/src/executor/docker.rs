@@ -129,13 +129,14 @@ impl DockerRuntimeExecutor {
                 config.workspace_root,
                 Arc::clone(&runner),
             )),
-            Arc::new(RailpackProjectInspector::new(Arc::new(
-                RailpackSandbox::new(
+            Arc::new(RailpackProjectInspector::new(
+                Arc::new(RailpackSandbox::new(
                     Arc::clone(&runner),
                     config.railpack_image.clone(),
                     config.railpack_network.clone(),
-                ),
-            ))),
+                )),
+                Arc::clone(&runner),
+            )),
             Arc::new(ImageBuildService::new(
                 Arc::clone(&runner),
                 config.railpack_frontend,
