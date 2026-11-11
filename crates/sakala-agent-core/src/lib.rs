@@ -8,6 +8,7 @@ pub mod health;
 pub mod heartbeat;
 pub mod image_gc;
 pub mod logs;
+pub mod networks;
 pub mod node_state;
 pub mod ports;
 pub mod reporting;

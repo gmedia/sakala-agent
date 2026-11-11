@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
 use sakala_agent_core::ports::{
-    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeReconciliationReport, RuntimeStaleImage,
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeNetworkReconciliation,
+    RuntimeReconciliationReport, RuntimeStaleImage,
 };
 
 mod docker;
@@ -18,7 +19,7 @@ pub(crate) mod network;
 
 pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
 pub use limits::ResourceSafetyConfig;
-pub use network::{NetworkReconciliation, project_network_name};
+pub use network::project_network_name;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunContainerRequest {
@@ -110,9 +111,13 @@ pub trait ContainerEngine: Send + Sync {
     /// container, running or stopped, uses it.
     async fn release_network(&self, project_id: Uuid) -> Result<(), RuntimeError>;
 
-    /// Startup only: removes project networks without containers and reconnects
-    /// the router to the rest.
-    async fn reconcile_networks(&self) -> Result<NetworkReconciliation, RuntimeError>;
+    /// Reconnects the router to the project networks it lost and, with
+    /// `remove_unused`, removes the ones no container uses. Removal never
+    /// overlaps a workload start.
+    async fn reconcile_networks(
+        &self,
+        remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeError>;
 
     async fn report_startup_logs(
         &self,

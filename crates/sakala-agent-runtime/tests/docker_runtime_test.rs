@@ -4916,7 +4916,11 @@ async fn startup_recovery_removes_unused_project_networks_and_reconnects_the_rou
         .with_network_users(used, "sakala-app-11111111-a\n")
         .with_network_users(attached, "sakala-caddy\nsakala-app-22222222-b\n");
     runner.project_networks_stdout = format!("{used}\n{attached}\n{empty}\nsakala-project-x\n");
-    runner.router_networks_stdout = format!("sakala-runtime\n{attached}\n");
+    runner.router_networks_stdout = format!("sakala-runtime\n{attached}\n{empty}\n");
+    // The router itself does not keep a network in use.
+    runner.container_networks_stdout = format!(
+        "sakala-app-11111111-a\t{used}\nsakala-app-22222222-b\t{attached}\nsakala-caddy\tsakala-runtime,{attached},{empty}\n"
+    );
     let runner = Arc::new(runner);
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
@@ -4944,6 +4948,101 @@ async fn startup_recovery_removes_unused_project_networks_and_reconnects_the_rou
     assert!(connected(used).is_some());
     assert!(connected(attached).is_none() && connected(empty).is_none());
     assert!(removed("sakala-project-x").is_none());
+}
+
+fn docker_calls(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| command.program == "docker")
+        .map(string_arguments)
+        .collect()
+}
+
+#[tokio::test]
+async fn periodic_reconcile_reattaches_a_recreated_router_without_removing_while_busy() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let a = "sakala-project-11111111-1111-4111-8111-111111111111";
+    let b = "sakala-project-22222222-2222-4222-8222-222222222222";
+    let empty = "sakala-project-33333333-3333-4333-8333-333333333333";
+    let mut runner = FakeRunner::new(true);
+    runner.project_networks_stdout = format!("{a}\n{b}\n{empty}\n");
+    // Compose recreated the router: it is back on the shared network only.
+    runner.router_networks_stdout = "sakala-runtime\n".to_owned();
+    let runner = Arc::new(runner);
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let result = RuntimeExecutor::reconcile_networks(&executor, false)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(result.router_attached, 3);
+    assert_eq!(result.removed, 0);
+    for name in [a, b, empty] {
+        assert!(
+            command_index(&runner, |args| args
+                == ["network", "connect", name, "sakala-caddy"])
+            .is_some(),
+            "{name}"
+        );
+    }
+    let calls = docker_calls(&runner);
+    assert!(
+        !calls
+            .iter()
+            .any(|args| args.first().is_some_and(|arg| arg == "ps")
+                || is_network(args, "rm")
+                || is_network(args, "disconnect")),
+        "nothing is removed while a command runs: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn periodic_reconcile_is_cheap_when_nothing_changed() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let a = "sakala-project-11111111-1111-4111-8111-111111111111";
+    let mut runner = FakeRunner::new(true);
+    runner.project_networks_stdout = format!("{a}\n");
+    runner.router_networks_stdout = format!("sakala-runtime\n{a}\n");
+    runner.container_networks_stdout = format!("sakala-app-11111111-a\t{a}\n");
+    let runner = Arc::new(runner);
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let result = RuntimeExecutor::reconcile_networks(&executor, true)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(result.removed + result.router_attached, 0);
+    let calls = docker_calls(&runner);
+    assert_eq!(
+        calls.len(),
+        3,
+        "network ls, docker ps, router inspect: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn idle_periodic_reconcile_removes_a_network_no_container_uses() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let a = "sakala-project-11111111-1111-4111-8111-111111111111";
+    let empty = "sakala-project-33333333-3333-4333-8333-333333333333";
+    let mut runner = FakeRunner::new(true);
+    runner.project_networks_stdout = format!("{a}\n{empty}\n");
+    runner.router_networks_stdout = format!("sakala-runtime\n{a}\n{empty}\n");
+    runner.container_networks_stdout =
+        format!("sakala-app-11111111-a\t{a}\nsakala-caddy\tsakala-runtime,{a},{empty}\n");
+    let runner = Arc::new(runner);
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let result = RuntimeExecutor::reconcile_networks(&executor, true)
+        .await
+        .expect("reconcile");
+
+    assert_eq!(result.removed, 1);
+    assert!(command_index(&runner, |args| args == ["network", "rm", empty]).is_some());
+    assert!(command_index(&runner, |args| args == ["network", "rm", a]).is_none());
 }
 
 #[tokio::test]
@@ -5246,6 +5345,8 @@ struct FakeRunner {
     /// `docker ps --filter network=<name>` output, by network. Missing means unused.
     network_users: Mutex<HashMap<String, String>>,
     project_networks_stdout: String,
+    /// `docker ps --all --format '{{.Names}}\t{{.Networks}}'` output.
+    container_networks_stdout: String,
     router_networks_stdout: String,
     address_pools_stdout: String,
     network_create_stderr: Option<String>,
@@ -5434,6 +5535,7 @@ impl FakeRunner {
             built_dockerfiles: Mutex::new(Vec::new()),
             network_users: Mutex::new(HashMap::new()),
             project_networks_stdout: String::new(),
+            container_networks_stdout: String::new(),
             router_networks_stdout: String::new(),
             address_pools_stdout: r#"[{"Base":"172.16.0.0/12","Size":24}]"#.to_owned(),
             network_create_stderr: None,
@@ -5942,6 +6044,11 @@ impl FakeRunner {
         {
             let users = self.network_users.lock().expect("network lock");
             return Some(ok(users.get(network).map_or("", String::as_str)));
+        }
+        if args.first().is_some_and(|arg| arg == "ps")
+            && args.iter().any(|arg| arg.contains("{{.Networks}}"))
+        {
+            return Some(ok(&self.container_networks_stdout));
         }
         if args
             .iter()

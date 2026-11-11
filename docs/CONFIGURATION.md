@@ -66,7 +66,7 @@ Jangan menyimpan token issued pada repository atau command history yang dibagika
 
 Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, image sandbox Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
 
-Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Agent menyambungkan container itu ke network setiap project, jadi container Caddy yang dibuat ulang perlu diikuti restart Agent. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
+Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Agent menyambungkan container itu ke network setiap project, dan menyambungkannya lagi dalam 60 detik bila container Caddy dibuat ulang. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
 
 ## Resource Policy Boundary
 

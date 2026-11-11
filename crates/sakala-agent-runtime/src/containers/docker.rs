@@ -7,8 +7,8 @@ use std::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
-    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
-    RuntimeStaleImage, RuntimeWorkload,
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeNetworkReconciliation, RuntimeOrphan,
+    RuntimeReconciliationReport, RuntimeStaleImage, RuntimeWorkload,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
@@ -33,7 +33,7 @@ use crate::{
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
             parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
         },
-        network::{NetworkReconciliation, ProjectNetworks},
+        network::ProjectNetworks,
     },
     logs::ReporterOutputSink,
     process::run_checked,
@@ -693,6 +693,7 @@ impl ContainerEngine for DockerContainerEngine {
         request: &RunContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
+        let _start = self.networks.start_guard().await;
         let network = self.networks.prepare(request.project_id).await?;
         let environment = Self::effective_environment(&request.environment, request.port);
         let env_file = Self::write_env_file(&request.workspace, &environment).await?;
@@ -797,8 +798,11 @@ impl ContainerEngine for DockerContainerEngine {
         self.networks.release(project_id).await.map(|_| ())
     }
 
-    async fn reconcile_networks(&self) -> Result<NetworkReconciliation, RuntimeError> {
-        self.networks.reconcile().await
+    async fn reconcile_networks(
+        &self,
+        remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeError> {
+        self.networks.reconcile(remove_unused).await
     }
 
     async fn report_startup_logs(

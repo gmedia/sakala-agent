@@ -60,17 +60,27 @@ Siklus hidupnya:
   container lain selain Caddy, Caddy diputus dan network dihapus. Container yang
   sedang sleep ikut dihitung, karena `docker start` gagal bila network-nya hilang.
   Kegagalan di langkah ini hanya dicatat di log Agent, tidak menggagalkan command.
-- **Startup.** Berbeda dengan container dan image yang hanya dilaporkan, network
-  milik `SAKALA_AGENT_ID` ini yang tidak dipakai container mana pun langsung dihapus,
-  karena network tidak menyimpan state. Network yang masih dipakai disambungkan lagi
-  ke Caddy.
+- **Startup, lalu setiap 60 detik.** Agent menyambungkan Caddy ke setiap network
+  project milik `SAKALA_AGENT_ID` ini yang belum tersambung. Berbeda dengan container
+  dan image yang hanya dilaporkan, network yang tidak dipakai container mana pun
+  langsung dihapus, karena network tidak menyimpan state.
 
-**Container Caddy yang dibuat ulang saat Agent berjalan kehilangan semua network
-project**, karena Compose hanya menyambungkannya ke `sakala-runtime`. Route project
-yang ada akan 502 sampai Agent restart atau project menerima restart, wake, atau
-`RefreshRoute`. Setelah `docker compose up` yang membuat ulang Caddy, restart Agent.
-Agent sengaja tidak menyambungkan ulang dari health worker, karena kontrak
-`health_snapshot` melarang mutasi runtime.
+Pemeriksaan berkala ini menangani container Caddy yang dibuat ulang saat Agent
+berjalan, misalnya oleh `docker compose up`, pergantian pin image Caddy, atau reboot
+host. Container baru itu hanya tersambung ke `sakala-runtime`, jadi route project
+gagal 502 paling lama sekitar 60 detik sampai Agent menyambungkannya lagi. Operator
+tidak perlu me-restart Agent. Pada smoke test dengan interval 1 detik, kedua project
+kembali terjangkau 1,8 detik setelah Caddy dibuat ulang.
+
+Saat tidak ada perubahan, pemeriksaan ini hanya `docker network ls`, inspect
+container Caddy, dan satu `docker ps`. Log hanya ditulis bila ada network yang
+disambungkan ulang atau dihapus. Penyambungan ulang selalu berjalan. Penghapusan
+dilewati selama ada command aktif, dan juga tidak bisa berjalan bersamaan dengan
+start workload: start memegang lock bersama dari pembuatan network sampai
+`docker run` selesai, sedangkan penghapusan memegang lock eksklusif. Tanpa lock
+itu, network yang baru disiapkan untuk candidate bisa terhapus sebelum candidate
+memakainya. Pemeriksaan ini berjalan dari worker sendiri, bukan dari health worker,
+karena kontrak `health_snapshot` melarang mutasi runtime.
 
 **Kompatibilitas.** Workload dari Agent versi lama tetap berada di `sakala-runtime`
 dan tetap dilayani, karena Caddy tetap tergabung di sana. Redeploy berikutnya
@@ -418,8 +428,9 @@ cargo test -p sakala-agent-runtime --test project_network_smoke_test -- --ignore
 
 Test ini membuktikan Caddy menjangkau dua project dan workload lama di network
 bersama lewat nama, project A gagal menjangkau project B dan workload lama lewat
-nama maupun IP, `StopProject` menghapus network A dan memutus Caddy, serta startup
-menyambungkan ulang Caddy dan menghapus network yang kosong.
+nama maupun IP, worker berkala menyambungkan ulang Caddy yang dibuat ulang,
+`StopProject` menghapus network A dan memutus Caddy, serta startup menyambungkan
+ulang Caddy dan menghapus network yang kosong.
 
 Perilaku Docker dan `wget` diuji sungguhan oleh smoke test opt-in. Test ini menjalankan executor dan reporter asli terhadap daemon lokal, hanya checkout Git dan build image yang diganti, serta hanya membuat dan menghapus resource berawalan `sakala-agent-sm`:
 

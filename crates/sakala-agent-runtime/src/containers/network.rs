@@ -8,8 +8,9 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use sakala_agent_core::ports::RuntimePreflightCheck;
+use sakala_agent_core::ports::{RuntimeNetworkReconciliation, RuntimePreflightCheck};
 use serde::Deserialize;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -36,17 +37,14 @@ pub fn project_network_name(project_id: Uuid) -> String {
     format!("{NETWORK_PREFIX}{project_id}")
 }
 
-/// What startup reconciliation changed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct NetworkReconciliation {
-    pub removed: usize,
-    pub router_attached: usize,
-}
-
 pub(crate) struct ProjectNetworks {
     runner: Arc<dyn ProcessRunner>,
     router: String,
     agent_id: String,
+    /// Held shared from preparing a network until the workload is on it, and
+    /// exclusively while unused networks are removed. Without it, removal could
+    /// take a network a start has just prepared and is about to use.
+    starts: RwLock<()>,
 }
 
 impl ProjectNetworks {
@@ -55,7 +53,13 @@ impl ProjectNetworks {
             runner,
             router,
             agent_id,
+            starts: RwLock::new(()),
         }
+    }
+
+    /// Keep this until the workload has joined the network `prepare` returns.
+    pub(crate) async fn start_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.starts.read().await
     }
 
     /// Creates the project's network when it is missing and connects the router,
@@ -171,11 +175,17 @@ impl ProjectNetworks {
         )))
     }
 
-    /// Runs once at startup, before commands are accepted. Removes this Agent's
-    /// project networks that no container uses, and reconnects the router to the
-    /// others, since a recreated router container keeps only the networks its own
-    /// Compose file names. One network failing does not stop the others.
-    pub(crate) async fn reconcile(&self) -> Result<NetworkReconciliation, RuntimeError> {
+    /// Reconnects the router to this Agent's project networks it is not on,
+    /// since a recreated router container keeps only the networks its own
+    /// Compose file names. With `remove_unused`, first removes the ones no
+    /// container uses. One network failing does not stop the others.
+    ///
+    /// When nothing changed this is one `docker network ls`, one inspect of the
+    /// router, and with `remove_unused` one `docker ps`.
+    pub(crate) async fn reconcile(
+        &self,
+        remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeError> {
         let list = CommandSpec::new("docker")
             .arg("network")
             .arg("ls")
@@ -194,27 +204,50 @@ impl ProjectNetworks {
                 crate::error::describe_exit(listed.code)
             )));
         }
+        let mut owned = listed
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter_map(|name| {
+                let project_id = Uuid::parse_str(name.strip_prefix(NETWORK_PREFIX)?).ok()?;
+                Some((name.to_owned(), project_id))
+            })
+            .collect::<Vec<_>>();
+        if owned.is_empty() {
+            return Ok(RuntimeNetworkReconciliation::default());
+        }
+
+        let mut result = RuntimeNetworkReconciliation::default();
+        if remove_unused {
+            let _exclusive = self.starts.write().await;
+            let used = self.used_networks().await?;
+            let mut kept = Vec::with_capacity(owned.len());
+            for (name, project_id) in owned {
+                if used.contains(&name) {
+                    kept.push((name, project_id));
+                    continue;
+                }
+                match self.release(project_id).await {
+                    Ok(true) => result.removed += 1,
+                    Ok(false) => kept.push((name, project_id)),
+                    Err(error) => {
+                        warn!(network = %name, %error, "project network cleanup failed");
+                        kept.push((name, project_id));
+                    }
+                }
+            }
+            owned = kept;
+        }
+
         let attached = self.router_networks().await;
-        let mut result = NetworkReconciliation::default();
-        for name in listed.stdout.lines().map(str::trim) {
-            let Some(project_id) = name
-                .strip_prefix(NETWORK_PREFIX)
-                .and_then(|id| Uuid::parse_str(id).ok())
-            else {
-                continue;
-            };
-            match self.release(project_id).await {
-                Ok(true) => result.removed += 1,
-                Ok(false) if attached.contains(name) => {}
-                Ok(false) => match self.connect_router(name).await {
-                    Ok(true) => result.router_attached += 1,
-                    Ok(false) => {}
-                    Err(error) => warn!(network = %name, %error, "router reattachment failed"),
-                },
-                Err(error) => warn!(network = %name, %error, "project network cleanup failed"),
+        for (name, _) in owned.iter().filter(|(name, _)| !attached.contains(name)) {
+            match self.connect_router(name).await {
+                Ok(true) => result.router_attached += 1,
+                Ok(false) => {}
+                Err(error) => warn!(network = %name, %error, "router reattachment failed"),
             }
         }
-        if result != NetworkReconciliation::default() {
+        if result != RuntimeNetworkReconciliation::default() {
             info!(
                 removed = result.removed,
                 router_attached = result.router_attached,
@@ -222,6 +255,33 @@ impl ProjectNetworks {
             );
         }
         Ok(result)
+    }
+
+    /// Every network some container other than the router is on, stopped
+    /// containers included.
+    async fn used_networks(&self) -> Result<HashSet<String>, RuntimeError> {
+        let list = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--format")
+            .arg("{{.Names}}\t{{.Networks}}");
+        let listed = self.docker(&list).await?;
+        if !listed.success {
+            return Err(RuntimeError::Container(format!(
+                "container network listing failed with {}",
+                crate::error::describe_exit(listed.code)
+            )));
+        }
+        Ok(listed
+            .stdout
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(name, _)| name.trim() != self.router)
+            .flat_map(|(_, networks)| networks.split(','))
+            .map(str::trim)
+            .filter(|network| !network.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// Returns `false` when the network does not exist.

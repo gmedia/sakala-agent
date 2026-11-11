@@ -9,8 +9,8 @@ use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
     RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
-    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
-    RuntimeReporterFactory, WorkloadLifecycleRequest,
+    RuntimeNetworkReconciliation, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
@@ -1192,7 +1192,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         let mut report = self.reconcile().await?;
         // Unlike containers, a network holds no state, so one without containers
         // is removed here instead of only reported.
-        if let Err(error) = self.containers.reconcile_networks().await {
+        if let Err(error) = self.containers.reconcile_networks(true).await {
             tracing::warn!(%error, "project network reconciliation failed");
         }
         for discovered in report.workloads.clone() {
@@ -1243,6 +1243,16 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             }
         }
         Ok(report)
+    }
+
+    async fn reconcile_networks(
+        &self,
+        remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeExecutionError> {
+        self.containers
+            .reconcile_networks(remove_unused)
+            .await
+            .map_err(Into::into)
     }
 
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeExecutionError> {

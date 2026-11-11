@@ -1,6 +1,7 @@
 //! Proves tenant network isolation against a real Docker daemon: the router reaches
 //! every project by name, a project cannot reach another, and removing a project
-//! takes its network with it.
+//! takes its network with it. A recreated router is reconnected by the periodic
+//! network worker.
 //!
 //! Opt-in, because it needs a daemon and `caddy:2.11.3-alpine` locally:
 //!
@@ -14,7 +15,10 @@
 use std::{collections::BTreeMap, process::Command, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use sakala_agent_core::ports::{RuntimeExecutionError, RuntimeExecutor, WorkloadLifecycleRequest};
+use sakala_agent_core::{
+    ports::{RuntimeExecutionError, RuntimeExecutor, WorkloadLifecycleRequest},
+    scheduler::metrics::SchedulerMetrics,
+};
 use sakala_agent_protocol::{AppliedRuntimeResources, DeploymentEvent, DeploymentLog, LogBounds};
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -183,7 +187,7 @@ impl Drop for Cleanup {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs a local Docker daemon and caddy:2.11.3-alpine"]
 async fn projects_reach_only_the_router_and_leave_no_network_behind() {
     remove_everything();
@@ -337,7 +341,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
     // StopProject through the real executor.
     std::fs::create_dir_all(temp.path().join("builds")).expect("workspace");
     std::fs::create_dir_all(temp.path().join("sites")).expect("route directory");
-    let executor = DockerRuntimeExecutor::with_runner(
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
         DockerRuntimeConfig {
             agent_id: AGENT.to_owned(),
             workspace_root: temp.path().join("builds"),
@@ -348,7 +352,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
             ..DockerRuntimeConfig::default()
         },
         Arc::clone(&runner),
-    );
+    ));
     let preflight = executor.preflight().await.expect("preflight");
     let check = preflight
         .checks
@@ -361,6 +365,48 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
     );
     assert!(!check.fatal);
     assert!(!network_exists("sakala-netiso-project-preflight"));
+
+    // Compose recreates the router while the Agent keeps running: it comes back
+    // on the shared network only, and the periodic worker reconnects it.
+    let url = |project: &Project| format!("http://{}:{PORT}/", project.container());
+    must(&["rm", "-f", "-v", ROUTER]);
+    must(&[
+        "run",
+        "-d",
+        "--name",
+        ROUTER,
+        "--network",
+        SHARED,
+        "--pull=never",
+        IMAGE,
+    ]);
+    println!("router networks after recreation: {}", router_networks());
+    assert!(!fetch(ROUTER, &url(&a)).0 && !fetch(ROUTER, &url(&b)).0);
+    let (stop_worker, worker_shutdown) = tokio::sync::watch::channel(false);
+    let worker = tokio::spawn(sakala_agent_core::networks::worker::run(
+        Arc::clone(&executor) as Arc<dyn RuntimeExecutor>,
+        Duration::from_secs(1),
+        Arc::new(SchedulerMetrics::default()),
+        worker_shutdown,
+    ));
+    let recreated = Instant::now();
+    while !(fetch(ROUTER, &url(&a)).0 && fetch(ROUTER, &url(&b)).0) {
+        assert!(
+            recreated.elapsed() < Duration::from_secs(20),
+            "the worker did not reconnect the router"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    println!(
+        "router -> A and B again {:.1}s after recreation (worker interval 1s); networks: {}",
+        recreated.elapsed().as_secs_f64(),
+        router_networks()
+    );
+    assert_eq!(fetch(ROUTER, &url(&a)).1, "project-a");
+    assert_eq!(fetch(ROUTER, &url(&b)).1, "project-b");
+    assert!(fetch(ROUTER, &format!("http://{LEGACY}:{PORT}/")).0);
+    stop_worker.send(true).expect("worker shutdown");
+    worker.await.expect("worker");
     let lifecycle = |project: &Project| WorkloadLifecycleRequest {
         command_id: Uuid::new_v4(),
         project_id: project.id,
