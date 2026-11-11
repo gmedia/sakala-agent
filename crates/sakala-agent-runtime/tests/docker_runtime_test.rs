@@ -134,7 +134,20 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
         .expect("fake runtime dependencies should be checked");
 
     assert!(!report.has_fatal_failure());
-    assert_eq!(report.checks.len(), 11);
+    assert_eq!(report.checks.len(), 12);
+    let domains = report
+        .checks
+        .iter()
+        .find(|check| check.name == "project-domains")
+        .expect("configured project domains are reported");
+    assert!(domains.ready && !domains.fatal);
+    assert!(
+        domains
+            .detail
+            .contains("run.sakala.localhost, run.staging.sakala.dev, run.sakala.dev"),
+        "{}",
+        domains.detail
+    );
     assert!(
         report
             .checks

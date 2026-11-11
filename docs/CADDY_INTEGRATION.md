@@ -1,6 +1,6 @@
 # Caddy Integration
 
-Agent menulis satu file `<project-id>.Caddyfile` pada `SAKALA_CADDY_SITES_DIR`. Domain hanya diterima bila cocok dengan `*.run.sakala.localhost`, `*.run.staging.sakala.dev`, atau `*.run.sakala.dev`; upstream selalu candidate container terkelola dan port tervalidasi.
+Agent menulis satu file `<project-id>.Caddyfile` pada `SAKALA_CADDY_SITES_DIR`. Domain hanya diterima bila berupa satu label di bawah suffix pada `SAKALA_PROJECT_DOMAIN_SUFFIXES` (default `run.sakala.localhost`, `run.staging.sakala.dev`, dan `run.sakala.dev`; lihat [Domain project](CONFIGURATION.md#domain-project)); upstream selalu candidate container terkelola dan port tervalidasi.
 
 ```txt
 write temporary file
