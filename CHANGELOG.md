@@ -4,6 +4,15 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- Result `InspectProject` kini memuat `exposed_ports`, yaitu port TCP yang dideklarasikan `EXPOSE` di stage terakhir `Dockerfile`, misalnya `[80]` untuk Dockerfile yang berakhir di `nginx:alpine` dengan `EXPOSE 80`. API bisa memakainya sebagai port default bila hanya ada satu port, sehingga aplikasi seperti itu tidak lagi gagal dengan `runtime_app_not_listening` karena Sakala memprobe port 3000. Pembacanya mengikuti aturan BuildKit untuk multi-stage, `ARG` dan `ENV`, komentar, continuation, dan heredoc, dan mengabaikan nilai yang tidak bisa dipastikan. Hasilnya sudah dicocokkan dengan `ExposedPorts` dari build BuildKit sungguhan untuk 24 Dockerfile. Field ini aditif di protocol revision 4; lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v040).
+- Smoke test opt-in `a_real_inspection_reports_the_port_of_an_nginx_dockerfile` menjalankan inspection sungguhan, termasuk sandbox Railpack, atas Dockerfile Node lalu nginx, dan membandingkan hasilnya dengan `ExposedPorts` dari BuildKit.
+
+### Fixed
+
+- Inspection project yang punya `Dockerfile` tidak lagi gagal dengan `runtime_build_failed` saat `railpack info` gagal, misalnya pada repository yang hanya berisi Dockerfile. Build Dockerfile tidak memakai Railpack, jadi preview tetap selesai dengan `railpack: null`, dan output Railpack tetap ada di log. Tanpa Dockerfile, kegagalan Railpack tetap menggagalkan inspection.
+
 ## [0.4.0] - 2026-11-11
 
 ### Security
