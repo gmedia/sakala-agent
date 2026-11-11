@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-11
+
 ### Security
 
 - Sandbox Railpack tidak punya path host yang bisa ditulis. Hasilnya keluar lewat stdout, sehingga repository tidak bisa mengisi disk node atau meninggalkan file yang gagal dihapus Agent saat inspection. Pemeriksaan plan terhadap image `sakala/project-*` kini membaca JSON, sehingga escape tidak bisa menyembunyikan namanya.
@@ -24,11 +26,9 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Field `error_code` pada completion `HealthCheck`, dan check preflight non-fatal `caddy-http-probe`.
 - Output terakhir aplikasi dilaporkan melalui reporter sebelum candidate dihapus bila start, readiness, atau routing gagal, sehingga deploy gagal tidak lagi berakhir tanpa log.
 - Smoke test opt-in `docker_smoke_test` yang menjalankan executor asli terhadap daemon Docker lokal.
-
 - Event `deployment.analysis.started` (hanya Railpack), `deployment.health.started`, dan `deployment.route.started` pada saat tahapnya benar-benar dimulai.
 - Redaksi nilai environment per command pada log, event, dan pesan `fail`, termasuk log follower dan follower yang dipulihkan setelah Agent restart. Nilai di bawah 8 karakter dan kata umum dikecualikan.
 - Variabel project tersedia saat build sebagai secret BuildKit, otomatis pada Railpack dan lewat `RUN --mount=type=secret` pada Dockerfile, tanpa masuk layer atau history image. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#variabel-saat-build).
-
 - Pembatalan deployment lewat `cancel_requested` pada polling, dengan `fail` `runtime_cancelled`, atau `complete` bila route sudah mulai berpindah.
 - Field `root_directory`, `build_command`, dan `start_command` pada `DeployProject`, serta `root_directory` opsional pada `InspectProject`. `root_directory` divalidasi ulang secara lokal, termasuk symlink yang keluar dari repository, dengan code baru `runtime_root_directory_invalid`.
 
@@ -137,7 +137,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/gmedia/sakala-agent/compare/v0.2.0...v0.2.1
