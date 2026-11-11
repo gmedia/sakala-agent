@@ -1266,60 +1266,27 @@ async fn exited_workload_does_not_keep_a_route_alive() {
     assert_eq!(report.stale_routes[0].project_id, project_id);
 }
 
-#[tokio::test]
-async fn approved_image_cleanup_prunes_only_retained_sakala_dangling_images() {
-    let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2MB\n"));
-    let mut config = runtime_config(&temp);
-    config.image_gc_max_age = Duration::from_secs(3_600);
-    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
-
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
-        CleanupRuntimeRequest {
-            command_id: Uuid::new_v4(),
-            approved: true,
-            targets: vec![RuntimeCleanupTarget::StaleImages],
-            cancellation: CancellationToken::new(),
-        },
-        Arc::new(RecordingReporter::default()),
-    )
-    .await
-    .expect("approved cleanup should complete");
-
-    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024 * 1_024);
-    let commands = runner.commands.lock().expect("command lock");
-    let prune = commands
+fn image_removals(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
         .iter()
-        .find(|command| {
+        .filter(|command| {
             command.program == "docker"
                 && command
                     .args
                     .first()
                     .is_some_and(|argument| argument == "image")
-                && command.args.iter().any(|argument| argument == "prune")
+                && command.args.get(1).is_some_and(|argument| argument == "rm")
         })
-        .expect("Sakala-only image prune should run");
-    assert!(
-        prune
-            .args
-            .iter()
-            .any(|argument| argument == "label=dev.sakala.managed=true")
-    );
-    assert!(prune.args.iter().any(|argument| argument == "until=3600s"));
-    assert!(!prune.args.iter().any(|argument| argument == "-a"));
+        .map(|command| string_arguments(command)[2..].to_vec())
+        .collect()
 }
 
-#[tokio::test]
-async fn successful_image_prune_is_not_failed_by_cosmetic_telemetry_format() {
-    let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: unknown\n"));
-    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
-
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
+async fn clean_images(executor: &DockerRuntimeExecutor) -> CommandOutput {
+    RuntimeExecutor::cleanup_runtime(
+        executor,
         CleanupRuntimeRequest {
             command_id: Uuid::new_v4(),
             approved: true,
@@ -1329,22 +1296,64 @@ async fn successful_image_prune_is_not_failed_by_cosmetic_telemetry_format() {
         Arc::new(RecordingReporter::default()),
     )
     .await
-    .expect("successful prune must not fail on cosmetic output parsing");
+    .expect("approved cleanup should complete")
+}
 
-    assert_eq!(output.result["reclaimed_image_bytes"], 0);
+/// Every deployment image keeps its own tag, so none is ever dangling and
+/// `docker image prune` without `-a` removed nothing at all.
+#[tokio::test]
+async fn approved_image_cleanup_removes_old_project_images_but_keeps_active_and_previous() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project = Uuid::new_v4();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("active-container\n")
+            .with_images(&[
+                ("sha256:oldest", project, "2020-01-01T00:00:00Z", 1_000),
+                ("sha256:previous", project, "2020-01-02T00:00:00Z", 2_000),
+                ("sha256:active", project, "2020-01-03T00:00:00Z", 3_000),
+            ])
+            .with_image_users("sha256:active\n"),
+    );
+    let mut config = runtime_config(&temp);
+    config.image_gc_max_age = Duration::from_secs(3_600);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = clean_images(&executor).await;
+
+    assert_eq!(output.result["removed_images"], 1);
+    assert_eq!(output.result["reclaimed_image_bytes"], 1_000);
+    assert_eq!(
+        image_removals(&runner),
+        [[format!("sakala/project-{project}:sha256:oldest-tag")]]
+    );
+    let commands = runner.commands.lock().expect("command lock");
+    let listing = commands
+        .iter()
+        .find(|command| {
+            command.program == "docker" && command.args.iter().any(|argument| argument == "ls")
+        })
+        .expect("image listing");
+    let listing = string_arguments(listing);
+    assert!(listing.contains(&"label=dev.sakala.managed=true".to_owned()));
+    assert!(!listing.iter().any(|argument| argument.contains(".Label")));
+    assert!(!commands.iter().any(|command| {
+        command
+            .args
+            .iter()
+            .any(|argument| argument == "prune" || argument == "--force")
+    }));
 }
 
 #[tokio::test]
-async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
+async fn reconciliation_reports_the_images_cleanup_would_remove_without_removing_them() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
-    let deployment_id = Uuid::new_v4();
-    let runner = Arc::new(
-        FakeRunner::new(true)
-            .with_image_list_output(format!("sha256:stale\t{project_id}\t{deployment_id}\n"))
-            .with_image_prune_output("Total reclaimed space: 1KB\n"),
-    );
-    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:stale", project_id, "2020-01-01T00:00:00Z", 1_024),
+        ("sha256:newest", project_id, "2020-01-02T00:00:00Z", 1_024),
+    ]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
     let report = RuntimeExecutor::reconcile(&executor)
         .await
@@ -1353,21 +1362,21 @@ async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
     assert_eq!(report.stale_images.len(), 1);
     assert_eq!(report.stale_images[0].image_id, "sha256:stale");
     assert_eq!(report.stale_images[0].project_id, Some(project_id));
-    assert_eq!(report.stale_images[0].deployment_id, Some(deployment_id));
     assert_eq!(report.reclaimed_image_bytes, 0);
+    assert!(image_removals(&runner).is_empty());
 }
 
 #[tokio::test]
-async fn reconciliation_does_not_report_recent_dangling_image_as_stale() {
+async fn reconciliation_does_not_report_a_recent_image_as_stale() {
     let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
     let created = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .expect("current time should format");
-    let runner = Arc::new(
-        FakeRunner::new(true)
-            .with_image_list_output("sha256:recent\t\t\n")
-            .with_image_created_output(format!("{created}\n")),
-    );
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:recent", project_id, &created, 1),
+        ("sha256:newest", project_id, &created, 1),
+    ]));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
 
     let report = RuntimeExecutor::reconcile(&executor)
@@ -1380,35 +1389,25 @@ async fn reconciliation_does_not_report_recent_dangling_image_as_stale() {
 #[tokio::test]
 async fn approved_cleanup_runs_only_requested_sakala_targets() {
     let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2KB\n"));
+    let project = Uuid::new_v4();
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:old", project, "2020-01-01T00:00:00Z", 2_048),
+        ("sha256:new", project, "2020-01-02T00:00:00Z", 2_048),
+    ]));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
-        CleanupRuntimeRequest {
-            command_id: Uuid::new_v4(),
-            approved: true,
-            targets: vec![RuntimeCleanupTarget::StaleImages],
-            cancellation: CancellationToken::new(),
-        },
-        Arc::new(RecordingReporter::default()),
-    )
-    .await
-    .expect("approved image cleanup should succeed");
+    let output = clean_images(&executor).await;
 
-    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024);
+    assert_eq!(output.result["reclaimed_image_bytes"], 2_048);
+    assert_eq!(output.result["cleaned_routes"], 0);
+    assert_eq!(output.result["cleaned_workspaces"], 0);
     let commands = runner.commands.lock().expect("command lock");
-    assert!(commands.iter().any(|command| {
+    assert!(!commands.iter().any(|command| {
         command.program == "docker"
-            && command.args.iter().any(|argument| argument == "prune")
             && command
                 .args
-                .iter()
-                .any(|argument| argument == "label=dev.sakala.managed=true")
-    }));
-    assert!(!commands.iter().any(|command| {
-        command.program == "docker" && command.args.iter().any(|argument| argument == "rm")
+                .first()
+                .is_some_and(|argument| argument == "rm")
     }));
 }
 
@@ -2003,12 +2002,15 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     config.image_gc_max_age = Duration::from_secs(1);
     let workspace_root = config.workspace_root.clone();
     let sites_dir = config.caddy_sites_dir.clone();
+    let soak_project = Uuid::new_v4();
     let runner = Arc::new(
         FakeRunner::new(true)
             .with_docker_ps("previous-container\n")
             .with_previous_container_inspection("false\t/previous\n")
-            .with_image_list_output("sha256:stale\t\t\n")
-            .with_image_prune_output("Total reclaimed space: 1KB\n"),
+            .with_images(&[
+                ("sha256:stale", soak_project, "2020-01-01T00:00:00Z", 1_024),
+                ("sha256:newest", soak_project, "2020-01-02T00:00:00Z", 1_024),
+            ]),
     );
     let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
     let memory_before = resident_memory_bytes();
@@ -2258,6 +2260,36 @@ async fn exit_during_start_reports_logs_before_cleanup_and_names_the_exit_code()
         .command_position(is_candidate_removal)
         .expect("candidate removed");
     assert!(captured < removed, "logs must be read before cleanup");
+}
+
+/// What a Railpack Laravel app printed when FrankenPHP, a binary marked
+/// `cap_net_bind_service=ep`, could not be executed. Its old message pointed at
+/// the app, and the API's hint at missing environment variables.
+#[tokio::test]
+async fn a_program_the_kernel_refuses_to_run_is_named_as_such() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["restarting\t1\t126\tfalse\tnone\t268435456\n"])
+            .with_app_output(
+                &["Starting Laravel server ..."],
+                &["/usr/local/bin/docker-php-entrypoint: 9: exec: frankenphp: Operation not permitted"],
+            ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a program that cannot run must not become live");
+
+    assert_eq!(error.code(), "runtime_app_exec_denied");
+    let message = error.to_string();
+    assert!(message.contains("exit code 126"), "{message}");
+    assert!(message.contains("setcap -r"), "{message}");
 }
 
 #[tokio::test]
@@ -4072,6 +4104,41 @@ async fn inspection_runs_railpack_in_the_sandbox_too() {
     assert_eq!(output.result["railpack"]["provider"], "node");
 }
 
+/// Railpack's PHP image runs FrankenPHP, a binary marked
+/// `cap_net_bind_service=ep`, which the kernel refuses to exec when that
+/// capability is outside the bounding set. Only that one capability returns.
+#[tokio::test]
+async fn a_workload_keeps_only_the_capability_that_file_capability_binaries_need() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    let values_of = |flag: &str| {
+        workload
+            .windows(2)
+            .filter(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values_of("--cap-drop"), ["ALL"], "{workload:?}");
+    assert_eq!(values_of("--cap-add"), ["NET_BIND_SERVICE"], "{workload:?}");
+    assert_eq!(
+        values_of("--security-opt"),
+        ["no-new-privileges:true"],
+        "{workload:?}"
+    );
+    assert!(!workload.iter().any(|argument| argument == "--privileged"));
+}
+
 #[tokio::test]
 async fn a_configured_runtime_reaches_only_the_workload_container() {
     let temp = TempDir::new().expect("temp directory should be available");
@@ -4447,6 +4514,7 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
         },
         RuntimeError::AppCrashed { exit_code: Some(3) },
         RuntimeError::AppCrashed { exit_code: None },
+        RuntimeError::AppExecDenied { exit_code: 126 },
         RuntimeError::AppOutOfMemory {
             memory_limit_mb: Some(256),
         },
@@ -4667,9 +4735,9 @@ struct FakeRunner {
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
     fail_previous_stop: bool,
-    image_prune_stdout: String,
     image_list_stdout: String,
-    image_created_stdout: String,
+    image_inspect_stdout: String,
+    image_users_stdout: String,
     follow_delay: Option<Duration>,
     follow_lines: Vec<String>,
     live_caddy: AtomicBool,
@@ -4850,9 +4918,9 @@ impl FakeRunner {
             inspect_delay: None,
             previous_container_inspection: None,
             fail_previous_stop: false,
-            image_prune_stdout: String::new(),
             image_list_stdout: String::new(),
-            image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
+            image_inspect_stdout: String::new(),
+            image_users_stdout: String::new(),
             follow_delay: None,
             follow_lines: Vec::new(),
             live_caddy: AtomicBool::new(true),
@@ -5011,18 +5079,25 @@ impl FakeRunner {
         self
     }
 
-    fn with_image_prune_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_prune_stdout = stdout.into();
+    /// `images` holds `(id, project, created, size)` and is printed the way
+    /// `docker image ls` and `docker image inspect` print it.
+    fn with_images(mut self, images: &[(&str, Uuid, &str, u64)]) -> Self {
+        self.image_list_stdout = images
+            .iter()
+            .map(|(id, project, _, _)| format!("{id}\tsakala/project-{project}\t{id}-tag\n"))
+            .collect();
+        self.image_inspect_stdout = images
+            .iter()
+            .map(|(id, project, created, size)| {
+                format!("{id}\t{project}\t<no value>\t{created}\t{size}\n")
+            })
+            .collect();
         self
     }
 
-    fn with_image_list_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_list_stdout = stdout.into();
-        self
-    }
-
-    fn with_image_created_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_created_stdout = stdout.into();
+    /// Image IDs the host's containers run.
+    fn with_image_users(mut self, stdout: impl Into<String>) -> Self {
+        self.image_users_stdout = stdout.into();
         self
     }
 }
@@ -5273,7 +5348,11 @@ impl ProcessRunner for FakeRunner {
                 .is_some_and(|argument| argument == "image")
             && spec.args.iter().any(|argument| argument == "inspect")
         {
-            &self.image_created_stdout
+            &self.image_inspect_stdout
+        } else if spec.program == "docker"
+            && spec.args.iter().any(|argument| argument == "{{.Image}}")
+        {
+            &self.image_users_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
             if reads_container_env {
@@ -5298,14 +5377,6 @@ impl ProcessRunner for FakeRunner {
             }
         } else if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "events") {
             &self.events_stdout
-        } else if spec.program == "docker"
-            && spec
-                .args
-                .first()
-                .is_some_and(|argument| argument == "image")
-            && spec.args.iter().any(|argument| argument == "prune")
-        {
-            &self.image_prune_stdout
         } else if spec.program == "docker"
             && spec
                 .args

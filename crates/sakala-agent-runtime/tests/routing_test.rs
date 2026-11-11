@@ -10,8 +10,11 @@ use async_trait::async_trait;
 use sakala_agent_core::ports::{RuntimeExecutionError, RuntimeReporter};
 use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
 use sakala_agent_runtime::{
-    RuntimeError,
-    routing::{CaddyFileRouteManager, CaddyReloader, RouteIdentity, RouteManager, RouteSpec},
+    CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, ProcessStream, RuntimeError,
+    routing::{
+        CaddyFileRouteManager, CaddyReloader, DockerExecCaddyReloader, RouteIdentity, RouteManager,
+        RouteSpec,
+    },
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -99,6 +102,13 @@ async fn route_deactivation_refuses_file_not_owned_by_sakala() {
         .expect_err("unmanaged route deletion must be rejected");
 
     assert!(error.to_string().contains("not owned by Sakala"));
+    // The node's own paths stay in the Agent's log.
+    assert!(
+        !error
+            .to_string()
+            .contains(temp.path().to_string_lossy().as_ref()),
+        "{error}"
+    );
     assert!(route_path.exists());
 }
 
@@ -220,6 +230,80 @@ fn route(project_id: Uuid) -> RouteSpec {
         domain: "portfolio.run.sakala.localhost".to_owned(),
         upstream: "sakala-app-project-deployment".to_owned(),
         port: 3000,
+    }
+}
+
+/// What `caddy validate` prints on a node: the shared config path and a warning
+/// that names another tenant's site file.
+const CADDY_OUTPUT: [&str; 2] = [
+    r#"{"level":"info","ts":1762822000.1,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}"#,
+    r#"{"level":"warn","ts":1762822000.2,"msg":"Caddyfile input is not formatted","adapter":"caddyfile","file":"/etc/caddy/sites/0e4f2c1a-other-tenant.Caddyfile","line":3}"#,
+];
+
+struct CaddyRunner {
+    success: bool,
+}
+
+#[async_trait]
+impl ProcessRunner for CaddyRunner {
+    async fn run(
+        &self,
+        _spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        for line in CADDY_OUTPUT {
+            sink.line(ProcessStream::Stderr, line).await?;
+        }
+        Ok(ProcessOutput {
+            success: self.success,
+            code: Some(i32::from(!self.success)),
+            stderr: CADDY_OUTPUT.join("\n"),
+            ..ProcessOutput::default()
+        })
+    }
+}
+
+#[derive(Default)]
+struct RecordingReporter {
+    logs: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl RuntimeReporter for RecordingReporter {
+    async fn event(&self, _event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+        Ok(())
+    }
+
+    async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+        self.logs.lock().expect("log lock").push(log.message);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn caddy_output_never_reaches_the_deployment_log() {
+    for success in [true, false] {
+        let reloader = DockerExecCaddyReloader::new(
+            Arc::new(CaddyRunner { success }),
+            "sakala-caddy".to_owned(),
+        );
+        let reporter = RecordingReporter::default();
+
+        let result = reloader.validate_and_reload(&reporter).await;
+
+        assert!(
+            reporter.logs.lock().expect("log lock").is_empty(),
+            "Caddy's own output describes the shared router"
+        );
+        assert_eq!(result.is_ok(), success);
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert_eq!(error.code(), "runtime_routing_failed");
+            assert!(message.contains("exit code 1"), "{message}");
+            for detail in ["/etc/caddy", "Caddyfile", "other-tenant", "caddy-"] {
+                assert!(!message.contains(detail), "{message}");
+            }
+        }
     }
 }
 

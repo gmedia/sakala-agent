@@ -23,10 +23,15 @@ use sakala_agent_core::{
     api::ApiClient,
     commands::CommandProcessor,
     logs::redactor::ValueRedactor,
-    ports::{RuntimeExecutor, RuntimeReporter, SecretString, WorkloadLifecycleRequest},
+    ports::{
+        CleanupRuntimeRequest, RuntimeExecutor, RuntimeReporter, SecretString,
+        WorkloadLifecycleRequest,
+    },
     reporting::ApiRuntimeReporter,
 };
-use sakala_agent_protocol::{AgentCommand, CrashedWorkloadDetail, DeploymentBuilder, LogBounds};
+use sakala_agent_protocol::{
+    AgentCommand, CrashedWorkloadDetail, DeploymentBuilder, LogBounds, RuntimeCleanupTarget,
+};
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
     ProcessRunner, RuntimeError, TokioProcessRunner,
@@ -40,8 +45,7 @@ use uuid::Uuid;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
 
 const ROUTER_IMAGE: &str = "caddy:2.11.3-alpine";
-/// The Caddy binary holds a file capability that `no-new-privileges` refuses to
-/// execute, so the apps run on Node, under the same options a real app gets.
+/// The apps run on Node, under the same options a real app gets.
 const APP_IMAGE: &str = "node:24-alpine";
 const NETWORK: &str = "sakala-agent-sm-net";
 const ROUTER: &str = "sakala-agent-sm-caddy";
@@ -1543,24 +1547,7 @@ async fn a_real_repository_deploys_with_railpack_in_the_sandbox() {
     Cleanup::remove_everything();
     start_router();
     let image = build_sandbox_image();
-    // Downloads inside the default BuildKit stall on some machines.
-    docker(&[
-        "buildx",
-        "create",
-        "--name",
-        HOST_NETWORK_BUILDER,
-        "--driver",
-        "docker-container",
-        "--driver-opt",
-        "network=host",
-    ]);
-    docker(&[
-        "buildx",
-        "inspect",
-        "--bootstrap",
-        "--builder",
-        HOST_NETWORK_BUILDER,
-    ]);
+    start_host_network_builder();
     let commit = String::from_utf8_lossy(
         &Command::new("git")
             .args([
@@ -1629,6 +1616,364 @@ async fn a_real_repository_deploys_with_railpack_in_the_sandbox() {
     harness.executor.shutdown().await.expect("shutdown");
 }
 
+/// Laravel at a fixed commit, built by Railpack and started by Railpack's own
+/// `/start-container.sh`, which ends in FrankenPHP. The FrankenPHP binary carries
+/// the file capability `cap_net_bind_service=ep`, and the kernel refuses to exec
+/// such a binary when the capability is missing from the bounding set, so with
+/// `--cap-drop ALL` alone every Laravel app exited 126 with
+/// `exec: frankenphp: Operation not permitted`.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, network access, and moby/buildkit:buildx-stable-1"]
+async fn a_laravel_app_boots_with_the_railpack_start_command() {
+    const REPOSITORY: &str = "https://github.com/laravel/laravel.git";
+    const COMMIT: &str = "def7ce14811161f3c689a71ca8abc1369da44bd6";
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let image = build_sandbox_image();
+    start_host_network_builder();
+
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start_with(&temp, &image, Some(HOST_NETWORK_BUILDER)).await;
+    harness.runner.use_real_git();
+    let run = harness
+        .run_payload(
+            "laravel",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            512,
+            json!({
+                "APP_KEY": "base64:2fl+Ktvkfl+Fuz4Qp/A75G2RTiWVA/ZoKZvp6fiiM10=",
+                "APP_ENV": "production",
+                "LOG_CHANNEL": "stderr",
+                "DB_CONNECTION": "sqlite",
+                "SESSION_DRIVER": "file",
+                "CACHE_STORE": "file",
+                "RAILPACK_SKIP_MIGRATIONS": "true",
+            }),
+            json!({
+                "repository_url": REPOSITORY,
+                "commit_sha": COMMIT,
+                "builder": "auto",
+                "timeouts": {
+                    "build_timeout_seconds": 590,
+                    "start_timeout_seconds": 90,
+                    "command_timeout_seconds": 800
+                },
+            }),
+            CancellationToken::new(),
+        )
+        .await;
+    println!("elapsed: {:.1} s", run.elapsed.as_secs_f64());
+    println!("stages: {:?}", run.stages);
+    if let Some(failure) = &run.failure {
+        for line in run.logs.iter().rev().take(40).rev() {
+            println!("log: {line}");
+        }
+        panic!("deployment failed: {failure}");
+    }
+    let (status, _) = harness.crash_state_of(&run).await;
+    println!("container status: {status}");
+    assert!(status.starts_with("Up"), "{status}");
+
+    let container = docker(&[
+        "ps",
+        "--filter",
+        &format!("label=dev.sakala.project-id={}", run.project_id),
+        "--format",
+        "{{.Names}}",
+    ])
+    .trim()
+    .to_owned();
+    let capabilities = docker(&[
+        "inspect",
+        "--format",
+        "{{json .HostConfig.CapAdd}} {{json .HostConfig.CapDrop}} {{json .HostConfig.SecurityOpt}}",
+        &container,
+    ]);
+    println!("container options: {}", capabilities.trim());
+    // Evidence only: read the capability from the image's own file.
+    let frankenphp = Command::new("docker")
+        .args([
+            "exec",
+            &container,
+            "sh",
+            "-c",
+            "getcap \"$(command -v frankenphp)\" 2>&1 || echo getcap unavailable",
+        ])
+        .output()
+        .expect("docker");
+    println!(
+        "frankenphp file capability: {}",
+        String::from_utf8_lossy(&frankenphp.stdout).trim()
+    );
+    // Laravel's own health route, through the router as a visitor would reach it.
+    let health = docker(&[
+        "exec",
+        ROUTER,
+        "wget",
+        "-q",
+        "-O-",
+        &format!("http://{container}:3000/up"),
+    ]);
+    assert!(health.contains("Application up"), "{health}");
+    assert_no_platform_details(&run, &temp);
+    harness.executor.shutdown().await.expect("shutdown");
+}
+
+/// A static site through Railpack's staticfile provider, which serves it with a
+/// Caddy binary of its own.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, network access, and moby/buildkit:buildx-stable-1"]
+async fn a_static_site_deploys_with_railpack() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let image = build_sandbox_image();
+    start_host_network_builder();
+
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start_with(&temp, &image, Some(HOST_NETWORK_BUILDER)).await;
+    harness.runner.use_real_build(vec![(
+        "index.html".to_owned(),
+        "<h1>static site served</h1>\n".to_owned(),
+    )]);
+    let run = harness
+        .run_custom(
+            "static",
+            json!({
+                "builder": "railpack",
+                "timeouts": {
+                    "build_timeout_seconds": 590,
+                    "start_timeout_seconds": 60,
+                    "command_timeout_seconds": 800
+                },
+            }),
+            CancellationToken::new(),
+        )
+        .await;
+    println!("elapsed: {:.1} s", run.elapsed.as_secs_f64());
+    if let Some(failure) = &run.failure {
+        for line in run.logs.iter().rev().take(40).rev() {
+            println!("log: {line}");
+        }
+        panic!("deployment failed: {failure}");
+    }
+    let container = docker(&[
+        "ps",
+        "--filter",
+        &format!("label=dev.sakala.project-id={}", run.project_id),
+        "--format",
+        "{{.Names}}",
+    ])
+    .trim()
+    .to_owned();
+    let page = docker(&[
+        "exec",
+        ROUTER,
+        "wget",
+        "-q",
+        "-O-",
+        &format!("http://{container}:3000/"),
+    ]);
+    assert!(page.contains("static site served"), "{page}");
+    assert_no_platform_details(&run, &temp);
+    harness.executor.shutdown().await.expect("shutdown");
+}
+
+/// What the deployment's own log must not carry: the shared router's output and
+/// the node's paths.
+fn assert_no_platform_details(run: &Deployment, temp: &TempDir) {
+    let caddy = run
+        .logs
+        .iter()
+        .filter(|line| line.starts_with("[caddy-"))
+        .collect::<Vec<_>>();
+    assert!(
+        caddy.is_empty(),
+        "router output reached the tenant: {caddy:?}"
+    );
+    let node_path = temp.path().to_string_lossy();
+    if let Some(at) = run.sent.find(node_path.as_ref()) {
+        let start = run.sent[..at]
+            .char_indices()
+            .rev()
+            .nth(200)
+            .map_or(0, |(index, _)| index);
+        let end = (at + node_path.len() + 200).min(run.sent.len());
+        let end = (end..=run.sent.len())
+            .find(|index| run.sent.is_char_boundary(*index))
+            .unwrap_or(run.sent.len());
+        panic!(
+            "a node path reached the control plane: {}",
+            &run.sent[start..end]
+        );
+    }
+}
+
+/// Image GC against the real daemon. Each deployment image keeps its own tag, so
+/// none becomes dangling, and the old `docker image prune` without `-a` removed
+/// nothing; the old listing format did not even parse.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon and node:24-alpine"]
+async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    // GC acts on every Sakala image on the daemon, so it runs only where the
+    // test owns all of them.
+    let foreign = docker(&[
+        "image",
+        "ls",
+        "--filter",
+        "label=dev.sakala.managed=true",
+        "--format",
+        "{{.Repository}}",
+    ]);
+    assert!(
+        foreign.trim().is_empty(),
+        "refusing to run: this daemon holds Sakala images the test does not own: {foreign}"
+    );
+    let project = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    let commit = |name: &str, labels: &str| {
+        let source = format!("{PREFIX}-gc-source");
+        docker(&[
+            "create",
+            "--name",
+            &source,
+            "--pull=never",
+            APP_IMAGE,
+            "true",
+        ]);
+        let image = format!("{PREFIX}/{name}");
+        docker(&["commit", "--change", labels, &source, &image]);
+        docker(&["rm", "-f", "-v", &source]);
+        // Distinct creation times, which decide what "previous" means.
+        std::thread::sleep(Duration::from_millis(1_100));
+        image
+    };
+    let owned = |project: Uuid, deployment: &str| {
+        format!(
+            "LABEL dev.sakala.managed=true dev.sakala.project-id={project} dev.sakala.deployment-id={}",
+            Uuid::new_v4()
+                .to_string()
+                .replace(&Uuid::nil().to_string()[..8], deployment)
+        )
+    };
+    let oldest = commit(&format!("project-{project}:oldest"), &owned(project, "1"));
+    let previous = commit(&format!("project-{project}:previous"), &owned(project, "2"));
+    let active = commit(&format!("project-{project}:active"), &owned(project, "3"));
+    let abandoned = commit(
+        &format!("project-{project}:abandoned"),
+        &owned(project, "4"),
+    );
+    let other_old = commit(&format!("project-{other}:old"), &owned(other, "5"));
+    let other_newest = commit(&format!("project-{other}:newest"), &owned(other, "6"));
+    let unmanaged = commit("unmanaged:latest", "LABEL dev.example=1");
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &format!("{PREFIX}-gc-active"),
+        &active,
+        "sleep",
+        "300",
+    ]);
+
+    let temp = TempDir::new().expect("temp directory");
+    let config = DockerRuntimeConfig {
+        agent_id: format!("{PREFIX}-agent"),
+        workspace_root: temp.path().join("builds"),
+        caddy_sites_dir: temp.path().join("sites"),
+        image_gc_max_age: Duration::ZERO,
+        ..DockerRuntimeConfig::default()
+    };
+    std::fs::create_dir_all(&config.workspace_root).expect("workspace");
+    std::fs::create_dir_all(&config.caddy_sites_dir).expect("sites");
+    let executor = DockerRuntimeExecutor::with_runner(
+        config,
+        Arc::new(TokioProcessRunner::new(Duration::from_secs(60))),
+    );
+    let report = executor.reconcile().await.expect("reconcile");
+    let mut reported = report
+        .stale_images
+        .iter()
+        .map(|image| image.image_id.clone())
+        .collect::<Vec<_>>();
+    reported.sort();
+    let id_of = |image: &str| {
+        docker(&["image", "inspect", "--format", "{{.Id}}", image])
+            .trim()
+            .to_owned()
+    };
+    let mut expected = [&oldest, &abandoned, &other_old]
+        .iter()
+        .map(|image| id_of(image))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(reported, expected, "reconcile reports what cleanup removes");
+
+    let (server, _requests) = recording_api().await;
+    let client = ApiClient::new(server.uri(), "smoke", "test-agent-token").expect("client");
+    let output = executor
+        .cleanup_runtime(
+            CleanupRuntimeRequest {
+                command_id: Uuid::new_v4(),
+                approved: true,
+                targets: vec![RuntimeCleanupTarget::StaleImages],
+                cancellation: CancellationToken::new(),
+            },
+            Arc::new(ApiRuntimeReporter::new(
+                client,
+                Uuid::new_v4(),
+                LogBounds::default(),
+            )),
+        )
+        .await
+        .expect("cleanup");
+    println!("cleanup result: {}", output.result);
+    assert_eq!(output.result["removed_images"], 3);
+
+    let exists = |image: &str| {
+        Command::new("docker")
+            .args(["image", "inspect", image])
+            .output()
+            .expect("docker")
+            .status
+            .success()
+    };
+    for image in [&oldest, &abandoned, &other_old] {
+        assert!(!exists(image), "{image} should have been removed");
+    }
+    for image in [&previous, &active, &other_newest, &unmanaged] {
+        assert!(exists(image), "{image} must be kept");
+    }
+}
+
+/// Downloads inside the default BuildKit stall on some machines.
+fn start_host_network_builder() {
+    docker(&[
+        "buildx",
+        "create",
+        "--name",
+        HOST_NETWORK_BUILDER,
+        "--driver",
+        "docker-container",
+        "--driver-opt",
+        "network=host",
+    ]);
+    docker(&[
+        "buildx",
+        "inspect",
+        "--bootstrap",
+        "--builder",
+        HOST_NETWORK_BUILDER,
+    ]);
+}
+
 async fn recording_api() -> (MockServer, Arc<Mutex<Vec<(String, Value)>>>) {
     let server = MockServer::start().await;
     let requests: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
@@ -1687,7 +2032,7 @@ impl Deployment {
             Some(failure) => println!("fail body: {failure}"),
             None => println!("completed"),
         }
-        for line in self.logs.iter().filter(|line| !line.starts_with("[caddy-")) {
+        for line in &self.logs {
             println!("log: {line}");
         }
     }

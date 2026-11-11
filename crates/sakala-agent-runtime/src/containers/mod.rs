@@ -12,6 +12,7 @@ use sakala_agent_core::ports::{
 };
 
 mod docker;
+pub(crate) mod images;
 pub(crate) mod limits;
 
 pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
@@ -103,13 +104,13 @@ pub trait ContainerEngine: Send + Sync {
     ) -> Result<(), RuntimeError>;
 
     /// Reports the last lines of a candidate that failed before its route went
-    /// live. Returns whether the container had any output to report.
+    /// live, and returns what they showed.
     async fn report_failure_logs(
         &self,
         container: &str,
         log_bounds: LogBounds,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<bool, RuntimeError>;
+    ) -> Result<FailureOutput, RuntimeError>;
 
     /// Reads a workload's environment values, only so that a log follower rebuilt
     /// after an Agent restart can keep hiding them. The agent keeps no copy of a
@@ -132,7 +133,8 @@ pub trait ContainerEngine: Send + Sync {
     /// partial cleanup without replacing the primary deployment error.
     async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
 
-    /// Inventories dangling Sakala-managed images before any deletion runs.
+    /// Lists the Sakala images that [`Self::cleanup_stale_images`] would remove,
+    /// without removing anything.
     async fn detect_stale_images(
         &self,
         _max_age: std::time::Duration,
@@ -140,12 +142,33 @@ pub trait ContainerEngine: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Reclaims only dangling images explicitly labeled as Sakala-managed.
-    /// Docker itself refuses images referenced by any container.
-    async fn cleanup_stale_images(&self, max_age: std::time::Duration)
-    -> Result<u64, RuntimeError>;
+    /// Removes old images of Sakala projects. Per project it keeps every image a
+    /// container uses, the previous deployment's image, and anything younger
+    /// than `max_age`. Docker itself still refuses an image a container uses.
+    async fn cleanup_stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<ImageCleanup, RuntimeError>;
 
     async fn shutdown(&self);
+}
+
+/// What one image GC run removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCleanup {
+    pub removed_images: u64,
+    /// Docker's sizes of the removed images added up. Layers shared with images
+    /// that remain are counted too, so this is an upper bound.
+    pub reclaimed_bytes: u64,
+}
+
+/// What the last output of a failed candidate showed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FailureOutput {
+    /// The container wrote anything at all.
+    pub had_output: bool,
+    /// A shell or runc reported that the kernel refused to execute a program.
+    pub exec_denied: bool,
 }
 
 #[must_use]

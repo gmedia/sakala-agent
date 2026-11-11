@@ -54,6 +54,9 @@ impl WorkspaceManager for GitWorkspaceManager {
                     "git-init",
                     CommandSpec::new("git")
                         .arg("init")
+                        // Without it Git prints the node's workspace path to
+                        // the deployment log.
+                        .arg("--quiet")
                         .arg("--initial-branch=sakala")
                         .arg(workspace.source().as_os_str())
                         .cancellation(cancellation.clone()),
@@ -311,10 +314,12 @@ mod tests {
         git(&origin, &["add", "README.md"]);
         git(&origin, &["commit", "-m", "fixture"]);
         let commit_sha = git_output(&origin, &["rev-parse", "HEAD"]);
+        let builds = temp.path().join("builds");
         let manager = GitWorkspaceManager::new(
-            temp.path().join("builds"),
+            builds.clone(),
             Arc::new(TokioProcessRunner::new(Duration::from_secs(10))),
         );
+        let reporter = RecordingReporter::default();
 
         let workspace = manager
             .checkout(
@@ -324,11 +329,17 @@ mod tests {
                     commit_sha: commit_sha.clone(),
                     credential: None,
                 },
-                &NoopReporter,
+                &reporter,
                 CancellationToken::new(),
             )
             .await
             .expect("real local repository checkout should succeed");
+
+        // The repository URL is the tenant's own; the workspace path is the node's.
+        let builds = builds.display().to_string();
+        let logs = reporter.logs.lock().expect("log lock");
+        assert!(!logs.iter().any(|line| line.contains(&builds)), "{logs:?}");
+        drop(logs);
 
         assert_eq!(
             git_output(workspace.source(), &["rev-parse", "HEAD"]),
@@ -485,6 +496,29 @@ mod tests {
     }
 
     struct NoopReporter;
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        logs: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl RuntimeReporter for RecordingReporter {
+        async fn event(
+            &self,
+            _event: DeploymentEvent,
+        ) -> Result<(), sakala_agent_core::ports::RuntimeExecutionError> {
+            Ok(())
+        }
+
+        async fn log(
+            &self,
+            log: DeploymentLog,
+        ) -> Result<(), sakala_agent_core::ports::RuntimeExecutionError> {
+            self.logs.lock().expect("log lock").push(log.message);
+            Ok(())
+        }
+    }
 
     fn git(directory: &std::path::Path, arguments: &[&str]) {
         let output = std::process::Command::new("git")

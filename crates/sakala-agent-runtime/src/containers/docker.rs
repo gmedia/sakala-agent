@@ -25,7 +25,14 @@ use uuid::Uuid;
 use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
-    containers::{ContainerEngine, ManagedWorkload, ResourceSafetyConfig, RunContainerRequest},
+    containers::{
+        ContainerEngine, FailureOutput, ImageCleanup, ManagedWorkload, ResourceSafetyConfig,
+        RunContainerRequest,
+        images::{
+            CONTAINER_IMAGE_FORMAT, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT, StaleImage,
+            parse_image_inspect, parse_image_list, select_stale_images,
+        },
+    },
     logs::ReporterOutputSink,
     process::run_checked,
 };
@@ -116,6 +123,85 @@ pub struct DockerContainerEngine {
 }
 
 impl DockerContainerEngine {
+    /// What image GC may remove now. See [`super::images`] for the rules.
+    async fn stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<StaleImage>, RuntimeError> {
+        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
+            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
+        })?;
+        let list = CommandSpec::new("docker")
+            .arg("image")
+            .arg("ls")
+            .arg("--no-trunc")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(IMAGE_LIST_FORMAT);
+        let listed = parse_image_list(&self.read_docker(&list, "Sakala image listing").await?);
+        if listed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inspect = CommandSpec::new("docker")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg(IMAGE_INSPECT_FORMAT);
+        for image in &listed {
+            inspect = inspect.arg(&image.id);
+        }
+        let inspected = parse_image_inspect(
+            &self
+                .read_docker(&inspect, "Sakala image inspection")
+                .await?,
+        )?;
+
+        // Every container counts, Sakala's or not, stopped or running.
+        let containers = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--quiet")
+            .arg("--no-trunc");
+        let container_ids = self.read_docker(&containers, "container listing").await?;
+        let mut in_use = HashSet::new();
+        if !container_ids.trim().is_empty() {
+            let mut images = CommandSpec::new("docker")
+                .arg("container")
+                .arg("inspect")
+                .arg("--format")
+                .arg(CONTAINER_IMAGE_FORMAT);
+            for id in container_ids.split_whitespace() {
+                images = images.arg(id);
+            }
+            in_use.extend(
+                self.read_docker(&images, "container image inspection")
+                    .await?
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        Ok(select_stale_images(
+            &listed,
+            &inspected,
+            &in_use,
+            OffsetDateTime::now_utc(),
+            minimum_age,
+        ))
+    }
+
+    async fn read_docker(&self, command: &CommandSpec, what: &str) -> Result<String, RuntimeError> {
+        let output = self.runner.run(command, &NullOutputSink).await?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(RuntimeError::Container(format!(
+                "{what} failed with {}",
+                crate::error::describe_exit(output.code)
+            )))
+        }
+    }
+
     #[must_use]
     pub fn new(
         runner: Arc<dyn ProcessRunner>,
@@ -576,6 +662,16 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("no-new-privileges:true")
             .arg("--cap-drop")
             .arg("ALL")
+            // FrankenPHP, Caddy, and other images ship binaries marked
+            // `cap_net_bind_service=ep`. The kernel refuses to exec such a file
+            // with EPERM when the capability is missing from the bounding set
+            // (`bprm_caps_from_vfs_caps` in security/commoncap.c), so every
+            // Railpack PHP app exited 126 at start. Keeping only this one grants
+            // nothing new: Docker sets `net.ipv4.ip_unprivileged_port_start=0` in
+            // the container's own network namespace, and `no-new-privileges`
+            // still keeps a non-root process from gaining it through the file.
+            .arg("--cap-add")
+            .arg("NET_BIND_SERVICE")
             .arg("--memory")
             .arg(format!("{}m", request.resources.memory_mb))
             .arg("--memory-swap")
@@ -655,14 +751,14 @@ impl ContainerEngine for DockerContainerEngine {
         container: &str,
         log_bounds: LogBounds,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<bool, RuntimeError> {
+    ) -> Result<FailureOutput, RuntimeError> {
         let tail = log_bounds
             .max_batch_lines
             .map_or(STARTUP_LOG_TAIL_LINES, |lines| {
                 lines.min(STARTUP_LOG_TAIL_LINES)
             });
         if tail == 0 {
-            return Ok(false);
+            return Ok(FailureOutput::default());
         }
         let command = CommandSpec::new("docker")
             .arg("logs")
@@ -671,7 +767,11 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(container)
             .timeout(FAILURE_LOG_TIMEOUT);
         let output = run_checked(self.runner.as_ref(), &command, "runtime", reporter).await?;
-        Ok(!output.stdout.trim().is_empty() || !output.stderr.trim().is_empty())
+        Ok(FailureOutput {
+            had_output: !output.stdout.trim().is_empty() || !output.stderr.trim().is_empty(),
+            exec_denied: crate::error::reports_exec_denied(&output.stdout)
+                || crate::error::reports_exec_denied(&output.stderr),
+        })
     }
 
     async fn environment_values(&self, container: &str) -> Result<Vec<String>, RuntimeError> {
@@ -850,87 +950,48 @@ impl ContainerEngine for DockerContainerEngine {
         &self,
         max_age: std::time::Duration,
     ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("image")
-            .arg("ls")
-            .arg("--filter")
-            .arg("dangling=true")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg("{{.ID}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "Sakala stale image inspection failed with {}",
-                crate::error::describe_exit(output.code)
-            )));
-        }
-        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
-            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
-        })?;
-        let now = OffsetDateTime::now_utc();
-        let mut stale = Vec::new();
-        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            let image_id = fields.first().copied().unwrap_or_default().to_owned();
-            let inspect = CommandSpec::new("docker")
-                .arg("image")
-                .arg("inspect")
-                .arg("--format")
-                .arg("{{.Created}}")
-                .arg(&image_id);
-            let inspected = self.runner.run(&inspect, &NullOutputSink).await?;
-            if !inspected.success {
-                return Err(RuntimeError::Container(format!(
-                    "Sakala image age inspection failed with {}",
-                    crate::error::describe_exit(inspected.code)
-                )));
-            }
-            let created =
-                OffsetDateTime::parse(inspected.stdout.trim(), &Rfc3339).map_err(|error| {
-                    RuntimeError::Container(format!(
-                        "Docker returned an invalid image creation timestamp: {error}"
-                    ))
-                })?;
-            if now - created < minimum_age {
-                continue;
-            }
-            stale.push(RuntimeStaleImage {
-                image_id,
-                project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
-                deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
-            });
-        }
-        Ok(stale)
+        Ok(self
+            .stale_images(max_age)
+            .await?
+            .into_iter()
+            .map(|image| RuntimeStaleImage {
+                image_id: image.id,
+                project_id: Some(image.project_id),
+                deployment_id: image.deployment_id,
+            })
+            .collect())
     }
 
     async fn cleanup_stale_images(
         &self,
         max_age: std::time::Duration,
-    ) -> Result<u64, RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("image")
-            .arg("prune")
-            .arg("--force")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--filter")
-            .arg(format!("until={}s", max_age.as_secs()));
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "Sakala image GC failed with {}",
-                crate::error::describe_exit(output.code)
-            )));
-        }
-        match parse_reclaimed_bytes(&output.stdout) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) => {
-                tracing::warn!(%error, "Docker image prune succeeded but reclaimed-space telemetry was not parseable");
-                Ok(0)
+    ) -> Result<ImageCleanup, RuntimeError> {
+        let mut cleanup = ImageCleanup::default();
+        for image in self.stale_images(max_age).await? {
+            // Without `--force`, Docker refuses an image a container started
+            // using after the selection, so a race keeps the image.
+            let mut command = CommandSpec::new("docker").arg("image").arg("rm");
+            if image.references.is_empty() {
+                command = command.arg(&image.id);
+            } else {
+                for reference in &image.references {
+                    command = command.arg(reference);
+                }
+            }
+            match self.runner.run(&command, &NullOutputSink).await {
+                Ok(output) if output.success => {
+                    cleanup.removed_images += 1;
+                    cleanup.reclaimed_bytes += image.size_bytes;
+                }
+                Ok(output) => warn!(
+                    image = %image.id,
+                    status = %crate::error::describe_exit(output.code),
+                    "Docker kept a stale Sakala image"
+                ),
+                Err(error) => warn!(image = %image.id, %error, "stale Sakala image removal failed"),
             }
         }
+        Ok(cleanup)
     }
 
     async fn shutdown(&self) {
@@ -951,42 +1012,6 @@ fn parse_optional_label(value: Option<&str>) -> Option<u64> {
     value
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse().ok())
-}
-
-fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
-    let Some(value) = output
-        .lines()
-        .find_map(|line| line.strip_prefix("Total reclaimed space: "))
-    else {
-        return Ok(0);
-    };
-    let value = value.trim();
-    let split = value
-        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .unwrap_or(value.len());
-    let number = value[..split].parse::<f64>().map_err(|_| {
-        RuntimeError::Container(
-            "Docker image GC returned an invalid reclaimed-space value".to_owned(),
-        )
-    })?;
-    let multiplier = match value[split..].trim().to_ascii_lowercase().as_str() {
-        "b" | "bytes" | "" => 1,
-        "kb" | "kib" => 1_024,
-        "mb" | "mib" => 1_024 * 1_024,
-        "gb" | "gib" => 1_024 * 1_024 * 1_024,
-        _ => {
-            return Err(RuntimeError::Container(
-                "Docker image GC returned an unknown reclaimed-space unit".to_owned(),
-            ));
-        }
-    };
-    let bytes = number * multiplier as f64;
-    if !bytes.is_finite() || bytes.is_sign_negative() || bytes > u64::MAX as f64 {
-        return Err(RuntimeError::Container(
-            "Docker image GC reclaimed-space value overflowed".to_owned(),
-        ));
-    }
-    Ok(bytes.round() as u64)
 }
 
 async fn run_container_command(
@@ -1223,10 +1248,10 @@ fn health_state(status: &str) -> (bool, Option<String>) {
 }
 
 #[cfg(test)]
-mod reclaimed_space_tests {
+mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use super::{DockerContainerEngine, new_restarts, parse_reclaimed_bytes};
+    use super::{DockerContainerEngine, new_restarts};
 
     #[test]
     fn each_new_restart_is_logged_once() {
@@ -1244,22 +1269,6 @@ mod reclaimed_space_tests {
         assert_eq!(new_restarts(&mut logged, at("a", 1)), ["a"]);
         assert!(new_restarts(&mut logged, Vec::new()).is_empty());
         assert!(logged.is_empty(), "a removed container is forgotten");
-    }
-
-    #[test]
-    fn parses_decimal_and_compact_docker_sizes() {
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 16.43 MB\n").expect("decimal MB"),
-            (16.43_f64 * 1_048_576_f64).round() as u64
-        );
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 1.84kB\n").expect("compact kB"),
-            (1.84_f64 * 1_024_f64).round() as u64
-        );
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 0B\n").expect("zero bytes"),
-            0
-        );
     }
 
     #[test]

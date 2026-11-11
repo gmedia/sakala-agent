@@ -30,8 +30,8 @@ use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
-        ContainerEngine, DockerContainerEngine, ManagedWorkload, RunContainerRequest,
-        container_name, image_name,
+        ContainerEngine, DockerContainerEngine, FailureOutput, ManagedWorkload,
+        RunContainerRequest, container_name, image_name,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -346,7 +346,7 @@ impl DockerRuntimeExecutor {
             Arc::clone(&reporter),
         );
         tokio::pin!(deployment);
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
             result = &mut deployment => result,
             () = request.cancellation.cancelled() => {
@@ -370,8 +370,10 @@ impl DockerRuntimeExecutor {
             && candidate_started.load(Ordering::Acquire)
             && !matches!(result, Err(RuntimeError::Cancelled))
         {
-            self.report_candidate_output(&container, payload.log_bounds, reporter.as_ref())
+            let output = self
+                .report_candidate_output(&container, payload.log_bounds, reporter.as_ref())
                 .await;
+            result = result.map_err(|error| error.refine_crash(output.exec_denied));
         }
         if failed_before_cutover
             && let Err(error) = self.containers.cleanup_candidate(&container, &image).await
@@ -382,12 +384,18 @@ impl DockerRuntimeExecutor {
                 )))
                 .await;
         }
+        // The path is the node's, so it stays in the Agent's own log.
         if let Err(error) = self.workspace.cleanup(&workspace).await {
+            tracing::warn!(
+                workspace = %workspace.root().display(),
+                %error,
+                "deployment workspace cleanup failed"
+            );
             let _ = reporter
-                .log(system_log(format!(
-                    "workspace cleanup warning for {}: {error}",
-                    workspace.root().display()
-                )))
+                .log(system_log(
+                    "The build files of this deployment could not be fully removed from the server. This does not affect the deployment."
+                        .to_owned(),
+                ))
                 .await;
         }
 
@@ -404,30 +412,33 @@ impl DockerRuntimeExecutor {
         Ok(CommandOutput::with_result(completion))
     }
 
-    /// Best effort by design: nothing here may replace the deployment's own error.
+    /// Best effort by design: nothing here may replace the deployment's own error,
+    /// though what the output shows may refine it.
     async fn report_candidate_output(
         &self,
         container: &str,
         log_bounds: LogBounds,
         reporter: &dyn RuntimeReporter,
-    ) {
+    ) -> FailureOutput {
         let _ = reporter
             .log(system_log(
                 "Last application output before the failed start was removed:".to_owned(),
             ))
             .await;
-        match self
+        let output = match self
             .containers
             .report_failure_logs(container, log_bounds, reporter)
             .await
         {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = reporter
-                    .log(system_log(
-                        "The application wrote no output before it failed.".to_owned(),
-                    ))
-                    .await;
+            Ok(output) => {
+                if !output.had_output {
+                    let _ = reporter
+                        .log(system_log(
+                            "The application wrote no output before it failed.".to_owned(),
+                        ))
+                        .await;
+                }
+                output
             }
             Err(error) => {
                 let _ = reporter
@@ -435,11 +446,13 @@ impl DockerRuntimeExecutor {
                         "application output could not be collected: {error}"
                     )))
                     .await;
+                FailureOutput::default()
             }
-        }
+        };
         if let Err(error) = reporter.flush().await {
             tracing::warn!(%error, "failed start output could not be fully delivered");
         }
+        output
     }
 
     async fn ensure_workspace_capacity(&self) -> Result<(), RuntimeError> {
@@ -1304,6 +1317,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .into());
         }
         let mut cleaned_workspaces = 0;
+        let mut removed_images = 0;
         let mut reclaimed_image_bytes = 0;
         let mut cleaned_routes = 0;
         for target in request.targets {
@@ -1318,10 +1332,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                         .await?;
                 }
                 RuntimeCleanupTarget::StaleImages => {
-                    reclaimed_image_bytes += self
+                    let images = self
                         .containers
                         .cleanup_stale_images(self.image_gc_max_age)
                         .await?;
+                    removed_images += images.removed_images;
+                    reclaimed_image_bytes += images.reclaimed_bytes;
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
                     let discovered = self.containers.detect_orphans().await?;
@@ -1337,6 +1353,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             "approved": true,
             "cleaned_workspaces": cleaned_workspaces,
             "cleaned_routes": cleaned_routes,
+            "removed_images": removed_images,
             "reclaimed_image_bytes": reclaimed_image_bytes,
         })))
     }
