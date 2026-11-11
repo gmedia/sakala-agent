@@ -154,20 +154,36 @@ pub trait ContainerEngine: Send + Sync {
     /// without removing anything.
     async fn detect_stale_images(
         &self,
-        _max_age: std::time::Duration,
+        _retention: ImageRetention,
     ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
         Ok(Vec::new())
     }
 
-    /// Removes old images of Sakala projects. Per project it keeps every image a
-    /// container uses, the previous deployment's image, and anything younger
-    /// than `max_age`. Docker itself still refuses an image a container uses.
+    /// Removes old images of Sakala projects. Per project with a container it
+    /// keeps every image a container uses, the previous deployment's image, and
+    /// anything younger than `retention.max_age`. A project without containers
+    /// keeps only images younger than `retention.orphaned_grace`. Docker itself
+    /// still refuses an image a container uses.
     async fn cleanup_stale_images(
         &self,
-        max_age: std::time::Duration,
+        retention: ImageRetention,
     ) -> Result<ImageCleanup, RuntimeError>;
 
+    /// Removes every image of one project that no container uses, whatever its
+    /// age. Called once the containers of a deleted project are gone.
+    async fn remove_project_images(&self, project_id: Uuid) -> Result<ImageCleanup, RuntimeError>;
+
     async fn shutdown(&self);
+}
+
+/// How long image GC keeps the images of Sakala projects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageRetention {
+    /// A project that still has a container keeps every image younger than this.
+    pub max_age: std::time::Duration,
+    /// A project without any container keeps only images younger than this,
+    /// counted from when the image was built.
+    pub orphaned_grace: std::time::Duration,
 }
 
 /// What one image GC run removed.

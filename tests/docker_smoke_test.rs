@@ -1850,7 +1850,7 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
             APP_IMAGE,
             "true",
         ]);
-        let image = format!("{PREFIX}/{name}");
+        let image = name.to_owned();
         docker(&["commit", "--change", labels, &source, &image]);
         docker(&["rm", "-f", "-v", &source]);
         // Distinct creation times, which decide what "previous" means.
@@ -1865,16 +1865,31 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
                 .replace(&Uuid::nil().to_string()[..8], deployment)
         )
     };
-    let oldest = commit(&format!("project-{project}:oldest"), &owned(project, "1"));
-    let previous = commit(&format!("project-{project}:previous"), &owned(project, "2"));
-    let active = commit(&format!("project-{project}:active"), &owned(project, "3"));
+    let oldest = commit(
+        &format!("sakala/project-{project}:{PREFIX}-oldest"),
+        &owned(project, "1"),
+    );
+    let previous = commit(
+        &format!("sakala/project-{project}:{PREFIX}-previous"),
+        &owned(project, "2"),
+    );
+    let active = commit(
+        &format!("sakala/project-{project}:{PREFIX}-active"),
+        &owned(project, "3"),
+    );
     let abandoned = commit(
-        &format!("project-{project}:abandoned"),
+        &format!("sakala/project-{project}:{PREFIX}-abandoned"),
         &owned(project, "4"),
     );
-    let other_old = commit(&format!("project-{other}:old"), &owned(other, "5"));
-    let other_newest = commit(&format!("project-{other}:newest"), &owned(other, "6"));
-    let unmanaged = commit("unmanaged:latest", "LABEL dev.example=1");
+    let other_old = commit(
+        &format!("sakala/project-{other}:{PREFIX}-old"),
+        &owned(other, "5"),
+    );
+    let other_newest = commit(
+        &format!("sakala/project-{other}:{PREFIX}-newest"),
+        &owned(other, "6"),
+    );
+    let unmanaged = commit(&format!("{PREFIX}/unmanaged:latest"), "LABEL dev.example=1");
     docker(&[
         "run",
         "-d",
@@ -1891,6 +1906,8 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
         workspace_root: temp.path().join("builds"),
         caddy_sites_dir: temp.path().join("sites"),
         image_gc_max_age: Duration::ZERO,
+        // `other` has no container, and its images are younger than this.
+        orphaned_image_grace: Duration::from_secs(3_600),
         ..DockerRuntimeConfig::default()
     };
     std::fs::create_dir_all(&config.workspace_root).expect("workspace");
@@ -1911,7 +1928,7 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
             .trim()
             .to_owned()
     };
-    let mut expected = [&oldest, &abandoned, &other_old]
+    let mut expected = [&oldest, &abandoned]
         .iter()
         .map(|image| id_of(image))
         .collect::<Vec<_>>();
@@ -1937,7 +1954,7 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
         .await
         .expect("cleanup");
     println!("cleanup result: {}", output.result);
-    assert_eq!(output.result["removed_images"], 3);
+    assert_eq!(output.result["removed_images"], 2);
 
     let exists = |image: &str| {
         Command::new("docker")
@@ -1947,12 +1964,241 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
             .status
             .success()
     };
-    for image in [&oldest, &abandoned, &other_old] {
+    for image in [&oldest, &abandoned] {
         assert!(!exists(image), "{image} should have been removed");
     }
-    for image in [&previous, &active, &other_newest, &unmanaged] {
+    for image in [&previous, &active, &other_old, &other_newest, &unmanaged] {
         assert!(exists(image), "{image} must be kept");
     }
+}
+
+/// Containers and helper images of the project-removal smoke test start with
+/// this. Its deployment images are `sakala/project-<random id>:sakala-imgfix-*`,
+/// which no other work on the daemon can share.
+const IMGFIX: &str = "sakala-imgfix";
+
+/// Removes only what the project-removal smoke test created.
+struct ImgfixCleanup {
+    projects: Vec<Uuid>,
+}
+
+impl ImgfixCleanup {
+    fn run(&self) {
+        let list = |args: &[&str]| {
+            Command::new("docker")
+                .args(args)
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let filter = format!("name=^/{IMGFIX}-");
+        for name in list(&["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"]).lines() {
+            assert!(
+                name.starts_with(&format!("{IMGFIX}-")),
+                "refusing to remove {name}"
+            );
+            Command::new("docker")
+                .args(["rm", "-f", "-v", name])
+                .output()
+                .ok();
+        }
+        for image in list(&["images", "--format", "{{.Repository}}:{{.Tag}}"]).lines() {
+            let ours = image.starts_with(&format!("{IMGFIX}/"))
+                || self.projects.iter().any(|project| {
+                    image.starts_with(&format!("sakala/project-{project}:{IMGFIX}-"))
+                });
+            if ours {
+                Command::new("docker")
+                    .args(["image", "rm", "-f", image])
+                    .output()
+                    .ok();
+            }
+        }
+    }
+}
+
+impl Drop for ImgfixCleanup {
+    fn drop(&mut self) {
+        self.run();
+    }
+}
+
+/// Deleting a project used to leave its last images on the node for good.
+/// The API now asks for `remove_images` on that stop; the other project, and
+/// every image outside `sakala/project-<id>`, must stay.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon and node:24-alpine"]
+async fn deleting_a_project_removes_its_images_and_leaves_the_other_project_alone() {
+    let deleted = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let orphan = Uuid::new_v4();
+    let cleanup = ImgfixCleanup {
+        projects: vec![deleted, kept, orphan],
+    };
+    cleanup.run();
+    let commit = |image: &str, labels: &str| {
+        let source = format!("{IMGFIX}-source");
+        docker(&[
+            "create",
+            "--name",
+            &source,
+            "--pull=never",
+            APP_IMAGE,
+            "true",
+        ]);
+        docker(&["commit", "--change", labels, &source, image]);
+        docker(&["rm", "-f", "-v", &source]);
+        image.to_owned()
+    };
+    let owned = |project: Uuid| {
+        format!(
+            "LABEL dev.sakala.managed=true dev.sakala.project-id={project} dev.sakala.deployment-id={}",
+            Uuid::new_v4()
+        )
+    };
+    let deployment = |project: Uuid, tag: &str| format!("sakala/project-{project}:{IMGFIX}-{tag}");
+    let deleted_previous = commit(&deployment(deleted, "previous"), &owned(deleted));
+    let deleted_active = commit(&deployment(deleted, "active"), &owned(deleted));
+    let kept_previous = commit(&deployment(kept, "previous"), &owned(kept));
+    let kept_active = commit(&deployment(kept, "active"), &owned(kept));
+    // Labelled like the deleted project, but named elsewhere or not managed.
+    let foreign_name = commit(&format!("{IMGFIX}/retagged:latest"), &owned(deleted));
+    let unmanaged = commit(
+        &format!("{IMGFIX}/unmanaged:latest"),
+        &format!("LABEL dev.sakala.project-id={deleted}"),
+    );
+    let deleted_deployment = Uuid::new_v4();
+    let workload = |name: &str, project: Uuid, deployment: Uuid, image: &str| {
+        docker(&[
+            "run",
+            "-d",
+            "--name",
+            &format!("{IMGFIX}-{name}"),
+            "--label",
+            "dev.sakala.managed=true",
+            "--label",
+            &format!("dev.sakala.project-id={project}"),
+            "--label",
+            &format!("dev.sakala.deployment-id={deployment}"),
+            "--label",
+            "dev.sakala.domain=imgfix.test",
+            "--label",
+            "dev.sakala.port=3000",
+            image,
+            "sleep",
+            "300",
+        ]);
+    };
+    workload("deleted", deleted, deleted_deployment, &deleted_active);
+    workload("kept", kept, Uuid::new_v4(), &kept_active);
+
+    let temp = TempDir::new().expect("temp directory");
+    let config = DockerRuntimeConfig {
+        agent_id: format!("{IMGFIX}-agent"),
+        workspace_root: temp.path().join("builds"),
+        caddy_sites_dir: temp.path().join("sites"),
+        orphaned_image_grace: Duration::from_secs(1),
+        ..DockerRuntimeConfig::default()
+    };
+    std::fs::create_dir_all(&config.workspace_root).expect("workspace");
+    std::fs::create_dir_all(&config.caddy_sites_dir).expect("sites");
+    let executor = DockerRuntimeExecutor::with_runner(
+        config,
+        Arc::new(TokioProcessRunner::new(Duration::from_secs(60))),
+    );
+    let (server, _requests) = recording_api().await;
+    let client = ApiClient::new(server.uri(), "smoke", "test-agent-token").expect("client");
+    let reporter = Arc::new(ApiRuntimeReporter::new(
+        client,
+        Uuid::new_v4(),
+        LogBounds::default(),
+    ));
+    let exists = |reference: &str| {
+        Command::new("docker")
+            .args(["image", "inspect", reference])
+            .output()
+            .expect("docker")
+            .status
+            .success()
+    };
+    let container_exists = |name: &str| {
+        Command::new("docker")
+            .args(["container", "inspect", &format!("{IMGFIX}-{name}")])
+            .output()
+            .expect("docker")
+            .status
+            .success()
+    };
+
+    let output = executor
+        .stop_project(
+            WorkloadLifecycleRequest {
+                command_id: Uuid::new_v4(),
+                project_id: deleted,
+                deployment_id: deleted_deployment,
+                remove_images: true,
+                cancellation: CancellationToken::new(),
+            },
+            reporter,
+        )
+        .await
+        .expect("stop of the deleted project");
+    println!("stop result: {}", output.result);
+
+    assert_eq!(output.result["status"], "stopped");
+    assert_eq!(output.result["removed_images"], 2);
+    assert!(!container_exists("deleted"));
+    for image in [&deleted_previous, &deleted_active] {
+        assert!(!exists(image), "{image} should have been removed");
+    }
+    for image in [&kept_previous, &kept_active, &foreign_name, &unmanaged] {
+        assert!(exists(image), "{image} must be kept");
+    }
+    assert!(container_exists("kept"));
+
+    // The periodic GC removes a project with no container once its images pass
+    // the grace period. It acts on every Sakala image of the daemon, so it only
+    // runs where the test owns all of them.
+    let orphan_image = commit(&deployment(orphan, "only"), &owned(orphan));
+    let managed = docker(&[
+        "image",
+        "ls",
+        "--filter",
+        "label=dev.sakala.managed=true",
+        "--format",
+        "{{.Repository}}:{{.Tag}}",
+    ]);
+    let foreign = managed
+        .lines()
+        .filter(|image| {
+            !image.starts_with(&format!("{IMGFIX}/"))
+                && ![kept, orphan]
+                    .iter()
+                    .any(|project| image.starts_with(&format!("sakala/project-{project}:")))
+        })
+        .collect::<Vec<_>>();
+    if !foreign.is_empty() {
+        println!("skipping the periodic GC part: foreign Sakala images {foreign:?}");
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(1_500));
+    let collected = executor
+        .collect_stale_images()
+        .await
+        .expect("periodic image GC");
+    println!(
+        "periodic GC removed {} image(s), {} bytes",
+        collected.removed_images, collected.reclaimed_bytes
+    );
+    assert_eq!(collected.removed_images, 1);
+    assert!(
+        !exists(&orphan_image),
+        "{orphan_image} should have been removed"
+    );
+    for image in [&kept_previous, &kept_active, &foreign_name, &unmanaged] {
+        assert!(exists(image), "{image} must be kept");
+    }
+    drop(cleanup);
 }
 
 /// Downloads inside the default BuildKit stall on some machines.
@@ -2072,6 +2318,7 @@ impl Deployment {
             command_id: Uuid::new_v4(),
             project_id: self.project_id,
             deployment_id: self.deployment_id,
+            remove_images: false,
             cancellation: CancellationToken::new(),
         }
     }
@@ -2540,7 +2787,9 @@ impl Cleanup {
             quiet(&["rm", "-f", "-v", name]);
         }
         for image in list(&["images", "--format", "{{.Repository}}:{{.Tag}}"]).lines() {
-            if image.starts_with("sakala-agent-sm/") {
+            let deployment_named =
+                image.starts_with("sakala/project-") && image.contains(":sakala-agent-sm-");
+            if image.starts_with("sakala-agent-sm/") || deployment_named {
                 quiet(&["image", "rm", "-f", image]);
             }
         }

@@ -26,11 +26,12 @@ use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
     containers::{
-        ContainerEngine, FailureOutput, ImageCleanup, ManagedWorkload, ResourceSafetyConfig,
-        RunContainerRequest,
+        ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ManagedWorkload,
+        ResourceSafetyConfig, RunContainerRequest,
         images::{
-            CONTAINER_IMAGE_FORMAT, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT, StaleImage,
-            parse_image_inspect, parse_image_list, select_stale_images,
+            CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT,
+            InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
+            parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
         },
         network::{NetworkReconciliation, ProjectNetworks},
     },
@@ -127,22 +128,50 @@ impl DockerContainerEngine {
     /// What image GC may remove now. See [`super::images`] for the rules.
     async fn stale_images(
         &self,
-        max_age: std::time::Duration,
+        retention: ImageRetention,
     ) -> Result<Vec<StaleImage>, RuntimeError> {
-        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
-            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
-        })?;
-        let list = CommandSpec::new("docker")
+        let duration = |value: std::time::Duration| {
+            time::Duration::try_from(value).map_err(|_| {
+                RuntimeError::Configuration("image GC retention is too large".to_owned())
+            })
+        };
+        let retention = Retention {
+            min_age: duration(retention.max_age)?,
+            orphaned_grace: duration(retention.orphaned_grace)?,
+        };
+        let Some((listed, inspected, usage)) = self.image_inventory(None).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(select_stale_images(
+            &listed,
+            &inspected,
+            &usage,
+            OffsetDateTime::now_utc(),
+            retention,
+        ))
+    }
+
+    /// Managed images, of one project or all, with what containers use.
+    /// `None` when there is no such image.
+    async fn image_inventory(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<(Vec<ListedImage>, Vec<InspectedImage>, ContainerUsage)>, RuntimeError> {
+        let mut list = CommandSpec::new("docker")
             .arg("image")
             .arg("ls")
             .arg("--no-trunc")
             .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg(IMAGE_LIST_FORMAT);
+            .arg(format!("label={MANAGED_LABEL}"));
+        if let Some(project_id) = project_id {
+            list = list
+                .arg("--filter")
+                .arg(format!("label=dev.sakala.project-id={project_id}"));
+        }
+        let list = list.arg("--format").arg(IMAGE_LIST_FORMAT);
         let listed = parse_image_list(&self.read_docker(&list, "Sakala image listing").await?);
         if listed.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let mut inspect = CommandSpec::new("docker")
             .arg("image")
@@ -165,7 +194,7 @@ impl DockerContainerEngine {
             .arg("--quiet")
             .arg("--no-trunc");
         let container_ids = self.read_docker(&containers, "container listing").await?;
-        let mut in_use = HashSet::new();
+        let mut usage = ContainerUsage::default();
         if !container_ids.trim().is_empty() {
             let mut images = CommandSpec::new("docker")
                 .arg("container")
@@ -175,20 +204,45 @@ impl DockerContainerEngine {
             for id in container_ids.split_whitespace() {
                 images = images.arg(id);
             }
-            in_use.extend(
-                self.read_docker(&images, "container image inspection")
-                    .await?
-                    .split_whitespace()
-                    .map(str::to_owned),
+            usage = parse_container_usage(
+                &self
+                    .read_docker(&images, "container image inspection")
+                    .await?,
             );
         }
-        Ok(select_stale_images(
-            &listed,
-            &inspected,
-            &in_use,
-            OffsetDateTime::now_utc(),
-            minimum_age,
-        ))
+        Ok(Some((listed, inspected, usage)))
+    }
+
+    /// Removes each image by its names. Without `--force`, Docker refuses an
+    /// image a container started using after the selection, so a race keeps
+    /// the image. A failure is logged and the rest are still attempted.
+    async fn remove_images(&self, images: Vec<StaleImage>) -> ImageCleanup {
+        let mut cleanup = ImageCleanup::default();
+        for image in images {
+            let mut command = CommandSpec::new("docker").arg("image").arg("rm");
+            for reference in &image.references {
+                command = command.arg(reference);
+            }
+            match self.runner.run(&command, &NullOutputSink).await {
+                Ok(output) if output.success => {
+                    cleanup.removed_images += 1;
+                    cleanup.reclaimed_bytes += image.size_bytes;
+                }
+                Ok(output) => warn!(
+                    image = %image.id,
+                    project_id = %image.project_id,
+                    status = %crate::error::describe_exit(output.code),
+                    "Docker kept a Sakala image"
+                ),
+                Err(error) => warn!(
+                    image = %image.id,
+                    project_id = %image.project_id,
+                    %error,
+                    "Sakala image removal failed"
+                ),
+            }
+        }
+        cleanup
     }
 
     async fn read_docker(&self, command: &CommandSpec, what: &str) -> Result<String, RuntimeError> {
@@ -964,10 +1018,10 @@ impl ContainerEngine for DockerContainerEngine {
 
     async fn detect_stale_images(
         &self,
-        max_age: std::time::Duration,
+        retention: ImageRetention,
     ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
         Ok(self
-            .stale_images(max_age)
+            .stale_images(retention)
             .await?
             .into_iter()
             .map(|image| RuntimeStaleImage {
@@ -980,34 +1034,18 @@ impl ContainerEngine for DockerContainerEngine {
 
     async fn cleanup_stale_images(
         &self,
-        max_age: std::time::Duration,
+        retention: ImageRetention,
     ) -> Result<ImageCleanup, RuntimeError> {
-        let mut cleanup = ImageCleanup::default();
-        for image in self.stale_images(max_age).await? {
-            // Without `--force`, Docker refuses an image a container started
-            // using after the selection, so a race keeps the image.
-            let mut command = CommandSpec::new("docker").arg("image").arg("rm");
-            if image.references.is_empty() {
-                command = command.arg(&image.id);
-            } else {
-                for reference in &image.references {
-                    command = command.arg(reference);
-                }
-            }
-            match self.runner.run(&command, &NullOutputSink).await {
-                Ok(output) if output.success => {
-                    cleanup.removed_images += 1;
-                    cleanup.reclaimed_bytes += image.size_bytes;
-                }
-                Ok(output) => warn!(
-                    image = %image.id,
-                    status = %crate::error::describe_exit(output.code),
-                    "Docker kept a stale Sakala image"
-                ),
-                Err(error) => warn!(image = %image.id, %error, "stale Sakala image removal failed"),
-            }
-        }
-        Ok(cleanup)
+        let images = self.stale_images(retention).await?;
+        Ok(self.remove_images(images).await)
+    }
+
+    async fn remove_project_images(&self, project_id: Uuid) -> Result<ImageCleanup, RuntimeError> {
+        let Some((listed, inspected, usage)) = self.image_inventory(Some(project_id)).await? else {
+            return Ok(ImageCleanup::default());
+        };
+        let images = select_project_images(&listed, &inspected, &usage, project_id);
+        Ok(self.remove_images(images).await)
     }
 
     async fn shutdown(&self) {

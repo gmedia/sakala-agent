@@ -8,9 +8,9 @@ use sakala_agent_core::logs::redactor::ValueRedactor;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
-    RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimePreflightCheck,
-    RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory,
-    WorkloadLifecycleRequest,
+    RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
+    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReporter,
+    RuntimeReporterFactory, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
@@ -30,8 +30,8 @@ use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
-        ContainerEngine, DockerContainerEngine, FailureOutput, ManagedWorkload,
-        RunContainerRequest, container_name, image_name,
+        ContainerEngine, DockerContainerEngine, FailureOutput, ImageCleanup, ImageRetention,
+        ManagedWorkload, RunContainerRequest, container_name, image_name,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -60,7 +60,7 @@ pub struct DockerRuntimeExecutor {
     container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
     workspace_gc_max_age: std::time::Duration,
-    image_gc_max_age: std::time::Duration,
+    image_retention: ImageRetention,
     min_workspace_free_bytes: u64,
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
@@ -113,7 +113,10 @@ impl DockerRuntimeExecutor {
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let workspace_gc_max_age = config.workspace_gc_max_age;
-        let image_gc_max_age = config.image_gc_max_age;
+        let image_retention = ImageRetention {
+            max_age: config.image_gc_max_age,
+            orphaned_grace: config.orphaned_image_grace,
+        };
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let health_check_window = config.health_interval * config.health_attempts;
         let router_container = config.caddy_container.clone();
@@ -164,7 +167,7 @@ impl DockerRuntimeExecutor {
             health_check_window,
             max_concurrent_builds,
             workspace_gc_max_age,
-            image_gc_max_age,
+            image_retention,
             min_workspace_free_bytes,
             preflight,
         )
@@ -183,7 +186,7 @@ impl DockerRuntimeExecutor {
         health_check_window: std::time::Duration,
         max_concurrent_builds: usize,
         workspace_gc_max_age: std::time::Duration,
-        image_gc_max_age: std::time::Duration,
+        image_retention: ImageRetention,
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
     ) -> Self {
@@ -208,7 +211,7 @@ impl DockerRuntimeExecutor {
             container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
             workspace_gc_max_age,
-            image_gc_max_age,
+            image_retention,
             min_workspace_free_bytes,
             preflight,
             telemetry,
@@ -787,9 +790,12 @@ impl DockerRuntimeExecutor {
                     )
                     .await?;
                 self.release_network(request.project_id).await;
-                return Ok(CommandOutput::with_result(
-                    json!({ "status": "already_stopped" }),
-                ));
+                let mut result = json!({ "status": "already_stopped" });
+                if request.remove_images {
+                    self.remove_project_images(request.project_id, &mut result, reporter.as_ref())
+                        .await?;
+                }
+                return Ok(CommandOutput::with_result(result));
             }
             return Err(RuntimeError::WorkloadNotFound);
         };
@@ -807,6 +813,7 @@ impl DockerRuntimeExecutor {
             self.containers.remove(&workload).await?;
             self.release_network(workload.project_id).await;
         }
+        let remove_images = remove && request.remove_images;
         let event_type = if remove {
             "workload.stop.completed"
         } else {
@@ -815,7 +822,9 @@ impl DockerRuntimeExecutor {
         emit_event(
             reporter.as_ref(),
             event_type,
-            if remove {
+            if remove_images {
+                "Workload stopped and container removed; project images are removed next."
+            } else if remove {
                 "Workload stopped and container removed; image is retained."
             } else {
                 "Workload stopped for sleep; container and image are retained."
@@ -823,9 +832,41 @@ impl DockerRuntimeExecutor {
             json!({ "project_id": workload.project_id, "deployment_id": workload.deployment_id }),
         )
         .await?;
-        Ok(CommandOutput::with_result(
-            json!({ "status": if remove { "stopped" } else { "sleeping" } }),
-        ))
+        let mut result = json!({ "status": if remove { "stopped" } else { "sleeping" } });
+        if remove_images {
+            self.remove_project_images(workload.project_id, &mut result, reporter.as_ref())
+                .await?;
+        }
+        Ok(CommandOutput::with_result(result))
+    }
+
+    /// Removes the images of a deleted project once its container is gone, and
+    /// adds the counts to the stop result. The stop itself already happened, so
+    /// a Docker failure here becomes an event and is left to the periodic image
+    /// GC instead of failing the command.
+    async fn remove_project_images(
+        &self,
+        project_id: Uuid,
+        result: &mut serde_json::Value,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        let cleanup = match self.containers.remove_project_images(project_id).await {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                tracing::warn!(%project_id, %error, "project image removal failed");
+                emit_event(
+                    reporter,
+                    "workload.images.retained",
+                    "Project images could not be removed now; image GC removes them later.",
+                    json!({ "project_id": project_id }),
+                )
+                .await?;
+                ImageCleanup::default()
+            }
+        };
+        result["removed_images"] = json!(cleanup.removed_images);
+        result["reclaimed_image_bytes"] = json!(cleanup.reclaimed_bytes);
+        Ok(())
     }
 
     async fn run_wake(
@@ -1135,7 +1176,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         report.stale_routes = self.routes.discover_stale_routes(&known_routes).await?;
         report.stale_images = self
             .containers
-            .detect_stale_images(self.image_gc_max_age)
+            .detect_stale_images(self.image_retention)
             .await?;
         report.cleaned_workspaces = self
             .workspace
@@ -1334,6 +1375,17 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         })))
     }
 
+    async fn collect_stale_images(&self) -> Result<RuntimeImageCleanup, RuntimeExecutionError> {
+        let cleanup = self
+            .containers
+            .cleanup_stale_images(self.image_retention)
+            .await?;
+        Ok(RuntimeImageCleanup {
+            removed_images: cleanup.removed_images,
+            reclaimed_bytes: cleanup.reclaimed_bytes,
+        })
+    }
+
     async fn cleanup_runtime(
         &self,
         request: CleanupRuntimeRequest,
@@ -1363,7 +1415,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 RuntimeCleanupTarget::StaleImages => {
                     let images = self
                         .containers
-                        .cleanup_stale_images(self.image_gc_max_age)
+                        .cleanup_stale_images(self.image_retention)
                         .await?;
                     removed_images += images.removed_images;
                     reclaimed_image_bytes += images.reclaimed_bytes;

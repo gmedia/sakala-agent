@@ -365,6 +365,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
         command_id: Uuid::new_v4(),
         project_id: project.id,
         deployment_id: project.deployment,
+        remove_images: false,
         cancellation: CancellationToken::new(),
     };
     let output = executor

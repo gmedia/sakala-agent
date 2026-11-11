@@ -42,6 +42,15 @@ pub struct CleanupRuntimePayload {
     pub targets: Vec<RuntimeCleanupTarget>,
 }
 
+/// Optional payload of `StopProject`. An empty object keeps the images.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StopProjectPayload {
+    /// Set by the control plane when the project was deleted: after its
+    /// containers are gone, every image of the project is removed too.
+    #[serde(default)]
+    pub remove_images: bool,
+}
+
 /// Operation requested by the control plane for execution on a runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -91,6 +100,14 @@ impl AgentCommand {
     pub fn cleanup_runtime_payload(&self) -> Result<CleanupRuntimePayload, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
     }
+
+    /// A missing or `null` payload reads as an empty object.
+    pub fn stop_project_payload(&self) -> Result<StopProjectPayload, serde_json::Error> {
+        if self.payload.is_null() {
+            return Ok(StopProjectPayload::default());
+        }
+        serde_json::from_value(self.payload.clone())
+    }
 }
 
 /// Response of the control-plane polling endpoint.
@@ -108,4 +125,45 @@ pub struct CommandPoll {
 pub struct CompleteCommandPayload {
     #[serde(default)]
     pub result: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn stop(payload: Value) -> AgentCommand {
+        AgentCommand {
+            id: Uuid::nil(),
+            command_type: CommandType::StopProject,
+            status: CommandStatus::Pending,
+            project_id: Some(Uuid::nil()),
+            deployment_id: Some(Uuid::nil()),
+            payload,
+        }
+    }
+
+    #[test]
+    fn stop_keeps_images_unless_the_control_plane_asks_otherwise() {
+        for payload in [json!({}), Value::Null, json!({ "remove_images": false })] {
+            assert!(
+                !stop(payload)
+                    .stop_project_payload()
+                    .expect("payload")
+                    .remove_images
+            );
+        }
+        assert!(
+            stop(json!({ "remove_images": true }))
+                .stop_project_payload()
+                .expect("payload")
+                .remove_images
+        );
+        assert!(
+            stop(json!({ "remove_images": "yes" }))
+                .stop_project_payload()
+                .is_err()
+        );
+    }
 }

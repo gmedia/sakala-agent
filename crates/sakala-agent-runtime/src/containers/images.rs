@@ -4,7 +4,12 @@
 //! dangling and `docker image prune` without `-a` never removes it. Selection
 //! therefore works on tagged images, per project, and keeps what a project still
 //! needs: every image a container uses, the image of the deployment before the
-//! active one, and anything younger than the retention age.
+//! active one, and anything younger than the retention age. A project without
+//! any container needs none of its images once they are older than a grace
+//! period, which is how images of a deleted project leave the node.
+//!
+//! Only an image labelled with a valid project whose every name is
+//! `sakala/project-<that project>:<tag>` is ever chosen.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -19,8 +24,10 @@ pub(crate) const IMAGE_LIST_FORMAT: &str = "{{.ID}}\t{{.Repository}}\t{{.Tag}}";
 /// `docker image ls` has no field for labels, so they come from inspect. A
 /// missing label prints `<no value>`.
 pub(crate) const IMAGE_INSPECT_FORMAT: &str = "{{.Id}}\t{{index .Config.Labels \"dev.sakala.project-id\"}}\t{{index .Config.Labels \"dev.sakala.deployment-id\"}}\t{{.Created}}\t{{.Size}}";
-/// The image ID a container runs, whatever tag it was started with.
-pub(crate) const CONTAINER_IMAGE_FORMAT: &str = "{{.Image}}";
+/// The image ID a container runs, whatever tag it was started with, and the
+/// project the container belongs to. A missing label prints `<no value>`.
+pub(crate) const CONTAINER_IMAGE_FORMAT: &str =
+    "{{.Image}}\t{{index .Config.Labels \"dev.sakala.project-id\"}}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ListedImage {
@@ -46,6 +53,29 @@ pub(crate) struct StaleImage {
     pub deployment_id: Option<Uuid>,
     /// Docker's size for the whole image, shared layers included.
     pub size_bytes: u64,
+}
+
+/// What the host's containers hold on to, Sakala's or not, in any state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContainerUsage {
+    /// Image IDs some container was created from.
+    pub images: HashSet<String>,
+    /// Projects that still have at least one container.
+    pub projects: HashSet<Uuid>,
+}
+
+pub(crate) fn parse_container_usage(stdout: &str) -> ContainerUsage {
+    let mut usage = ContainerUsage::default();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let mut fields = line.split('\t').map(str::trim);
+        if let Some(image) = fields.next().filter(|image| !image.is_empty()) {
+            usage.images.insert(image.to_owned());
+        }
+        if let Some(project) = fields.next().and_then(|value| Uuid::parse_str(value).ok()) {
+            usage.projects.insert(project);
+        }
+    }
+    usage
 }
 
 pub(crate) fn parse_image_list(stdout: &str) -> Vec<ListedImage> {
@@ -99,16 +129,29 @@ pub(crate) fn parse_image_inspect(stdout: &str) -> Result<Vec<InspectedImage>, R
         .collect()
 }
 
-/// Per project, keeps every image a container uses, the newest image older than
-/// the newest one in use (the previous deployment, for rollback), or the newest
-/// image when no container uses any, plus everything younger than `min_age`.
-/// An image without a valid project label is never chosen.
+/// How long images are kept, by whether their project still has a container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Retention {
+    /// A project with containers keeps every image younger than this.
+    pub min_age: Duration,
+    /// A project without containers keeps only images younger than this.
+    pub orphaned_grace: Duration,
+}
+
+/// Per project with a container, keeps every image a container uses, the newest
+/// image older than the newest one in use (the previous deployment, for
+/// rollback), or the newest image when no container uses any, plus everything
+/// younger than `min_age`.
+///
+/// A project with no container at all, and none of whose images a container
+/// uses, keeps only what is younger than `orphaned_grace`: its newest image
+/// goes too, since nothing will roll back to it.
 pub(crate) fn select_stale_images(
     listed: &[ListedImage],
     inspected: &[InspectedImage],
-    in_use: &HashSet<String>,
+    usage: &ContainerUsage,
     now: OffsetDateTime,
-    min_age: Duration,
+    retention: Retention,
 ) -> Vec<StaleImage> {
     let mut projects: BTreeMap<Uuid, Vec<&InspectedImage>> = BTreeMap::new();
     for image in inspected {
@@ -116,6 +159,7 @@ pub(crate) fn select_stale_images(
             projects.entry(project_id).or_default().push(image);
         }
     }
+    let in_use = &usage.images;
     let mut stale = Vec::new();
     for (project_id, mut images) in projects {
         images.sort_by(|left, right| {
@@ -124,39 +168,76 @@ pub(crate) fn select_stale_images(
                 .cmp(&left.created)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let newest_in_use = images
-            .iter()
-            .find(|image| in_use.contains(&image.id))
-            .map(|image| image.created);
-        let previous = images
-            .iter()
-            .find(|image| {
-                !in_use.contains(&image.id)
-                    && newest_in_use.is_none_or(|active| image.created < active)
-            })
-            .map(|image| image.id.clone());
+        let orphaned = !usage.projects.contains(&project_id)
+            && !images.iter().any(|image| in_use.contains(&image.id));
+        let (previous, min_age) = if orphaned {
+            (None, retention.orphaned_grace)
+        } else {
+            let newest_in_use = images
+                .iter()
+                .find(|image| in_use.contains(&image.id))
+                .map(|image| image.created);
+            let previous = images
+                .iter()
+                .find(|image| {
+                    !in_use.contains(&image.id)
+                        && newest_in_use.is_none_or(|active| image.created < active)
+                })
+                .map(|image| image.id.clone());
+            (previous, retention.min_age)
+        };
         for image in images {
             let kept = in_use.contains(&image.id)
                 || previous.as_deref() == Some(image.id.as_str())
                 || now - image.created < min_age;
-            if kept {
-                continue;
+            if !kept {
+                stale.extend(stale_image(listed, image, project_id));
             }
-            let references = listed
-                .iter()
-                .find(|listed| listed.id == image.id)
-                .map(|listed| listed.references.clone())
-                .unwrap_or_default();
-            stale.push(StaleImage {
-                id: image.id.clone(),
-                references,
-                project_id,
-                deployment_id: image.deployment_id,
-                size_bytes: image.size_bytes,
-            });
         }
     }
     stale
+}
+
+/// Every image of one project that no container uses, whatever its age. For a
+/// project that was deleted, after its containers were removed.
+pub(crate) fn select_project_images(
+    listed: &[ListedImage],
+    inspected: &[InspectedImage],
+    usage: &ContainerUsage,
+    project_id: Uuid,
+) -> Vec<StaleImage> {
+    inspected
+        .iter()
+        .filter(|image| image.project_id == Some(project_id))
+        .filter(|image| !usage.images.contains(&image.id))
+        .filter_map(|image| stale_image(listed, image, project_id))
+        .collect()
+}
+
+/// `None` unless every name of the image is `sakala/project-<project_id>:<tag>`,
+/// so an image someone tagged elsewhere, or a dangling one, is never removed.
+fn stale_image(
+    listed: &[ListedImage],
+    image: &InspectedImage,
+    project_id: Uuid,
+) -> Option<StaleImage> {
+    let prefix = format!("sakala/project-{project_id}:");
+    let references = listed
+        .iter()
+        .find(|listed| listed.id == image.id)
+        .map(|listed| listed.references.clone())
+        .unwrap_or_default();
+    let owned = !references.is_empty()
+        && references
+            .iter()
+            .all(|reference| reference.len() > prefix.len() && reference.starts_with(&prefix));
+    owned.then(|| StaleImage {
+        id: image.id.clone(),
+        references,
+        project_id,
+        deployment_id: image.deployment_id,
+        size_bytes: image.size_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -208,17 +289,52 @@ mod tests {
         }
     }
 
-    fn listed(ids: &[&str]) -> Vec<ListedImage> {
-        ids.iter()
-            .map(|id| ListedImage {
-                id: (*id).to_owned(),
-                references: vec![format!("sakala/project-x:{id}")],
+    /// Names every image the way a deployment does.
+    fn listed(inspected: &[InspectedImage]) -> Vec<ListedImage> {
+        inspected
+            .iter()
+            .map(|image| ListedImage {
+                id: image.id.clone(),
+                references: vec![format!(
+                    "sakala/project-{}:{}",
+                    image
+                        .project_id
+                        .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                    image.id
+                )],
             })
             .collect()
     }
 
+    fn usage(images: &[&str], projects: &[&str]) -> ContainerUsage {
+        ContainerUsage {
+            images: images.iter().map(|id| (*id).to_owned()).collect(),
+            projects: projects
+                .iter()
+                .map(|id| Uuid::parse_str(id).expect("uuid"))
+                .collect(),
+        }
+    }
+
+    const RETENTION: Retention = Retention {
+        min_age: Duration::days(7),
+        orphaned_grace: Duration::days(1),
+    };
+
     fn chosen(stale: &[StaleImage]) -> Vec<&str> {
         stale.iter().map(|image| image.id.as_str()).collect()
+    }
+
+    #[test]
+    fn reads_the_image_and_project_of_every_container() {
+        let usage = parse_container_usage(&format!(
+            "sha256:a\t{PROJECT}\nsha256:b\t<no value>\nsha256:c\t\nsha256:d\n\n"
+        ));
+        assert_eq!(usage.images.len(), 4);
+        assert_eq!(
+            usage.projects,
+            HashSet::from([Uuid::parse_str(PROJECT).expect("uuid")])
+        );
     }
 
     #[test]
@@ -232,20 +348,19 @@ mod tests {
             image("other-newest", OTHER, "2026-01-02T00:00:00Z"),
             image("unowned", "not-a-uuid", "2020-01-01T00:00:00Z"),
         ];
-        let ids = inspected
-            .iter()
-            .map(|image| image.id.as_str())
-            .collect::<Vec<_>>();
-        let in_use = HashSet::from(["active".to_owned()]);
+        // OTHER still has a container, just not on any of these images.
         let stale = select_stale_images(
-            &listed(&ids),
+            &listed(&inspected),
             &inspected,
-            &in_use,
+            &usage(&["active", "sha256:elsewhere"], &[OTHER]),
             at("2026-02-01T00:00:00Z"),
-            Duration::days(7),
+            RETENTION,
         );
         assert_eq!(chosen(&stale), ["failed-later", "oldest", "other-old"]);
-        assert_eq!(stale[1].references, ["sakala/project-x:oldest"]);
+        assert_eq!(
+            stale[1].references,
+            [format!("sakala/project-{PROJECT}:oldest")]
+        );
     }
 
     #[test]
@@ -256,11 +371,11 @@ mod tests {
             image("newest", PROJECT, "2026-01-31T00:00:00Z"),
         ];
         let stale = select_stale_images(
-            &listed(&["old", "recent", "newest"]),
+            &listed(&inspected),
             &inspected,
-            &HashSet::new(),
+            &usage(&[], &[PROJECT]),
             at("2026-02-01T00:00:00Z"),
-            Duration::days(7),
+            RETENTION,
         );
         assert_eq!(chosen(&stale), ["old"]);
     }
@@ -271,14 +386,123 @@ mod tests {
             image("a", PROJECT, "2026-01-01T00:00:00Z"),
             image("b", PROJECT, "2026-01-02T00:00:00Z"),
         ];
-        let in_use = HashSet::from(["a".to_owned(), "b".to_owned()]);
         let stale = select_stale_images(
-            &listed(&["a", "b"]),
+            &listed(&inspected),
             &inspected,
-            &in_use,
+            &usage(&["a", "b"], &[]),
             at("2027-01-01T00:00:00Z"),
-            Duration::ZERO,
+            Retention {
+                min_age: Duration::ZERO,
+                orphaned_grace: Duration::ZERO,
+            },
         );
         assert!(stale.is_empty());
+    }
+
+    /// A deleted project leaves no container behind, so the active-and-previous
+    /// rule would keep its last two images forever.
+    #[test]
+    fn a_project_without_containers_loses_every_image_past_the_grace_period() {
+        let inspected = [
+            image("gone-old", PROJECT, "2026-01-01T00:00:00Z"),
+            image("gone-newest", PROJECT, "2026-01-30T00:00:00Z"),
+            image("gone-fresh", PROJECT, "2026-01-31T12:00:00Z"),
+            image("kept-old", OTHER, "2026-01-01T00:00:00Z"),
+            image("kept-newest", OTHER, "2026-01-02T00:00:00Z"),
+        ];
+        let stale = select_stale_images(
+            &listed(&inspected),
+            &inspected,
+            &usage(&[], &[OTHER]),
+            at("2026-02-01T00:00:00Z"),
+            RETENTION,
+        );
+        // OTHER keeps its newest image as the previous deployment.
+        assert_eq!(chosen(&stale), ["gone-newest", "gone-old", "kept-old"]);
+    }
+
+    #[test]
+    fn a_container_on_any_image_of_the_project_keeps_the_normal_rule() {
+        let inspected = [
+            image("previous", PROJECT, "2026-01-01T00:00:00Z"),
+            image("held", PROJECT, "2026-01-02T00:00:00Z"),
+        ];
+        // Started by hand, without Sakala's labels. As an orphan the project
+        // would lose `previous`; with a container it is kept for rollback.
+        let stale = select_stale_images(
+            &listed(&inspected),
+            &inspected,
+            &usage(&["held"], &[]),
+            at("2026-02-01T00:00:00Z"),
+            RETENTION,
+        );
+        assert!(stale.is_empty(), "{:?}", chosen(&stale));
+    }
+
+    #[test]
+    fn an_image_with_a_name_outside_the_project_repository_is_never_chosen() {
+        let inspected = [
+            image("retagged", PROJECT, "2026-01-01T00:00:00Z"),
+            image("dangling", PROJECT, "2026-01-01T00:00:00Z"),
+            image("foreign", PROJECT, "2026-01-01T00:00:00Z"),
+            image("wrong-project", PROJECT, "2026-01-01T00:00:00Z"),
+            image("owned", PROJECT, "2026-01-01T00:00:00Z"),
+        ];
+        let own = |tag: &str| format!("sakala/project-{PROJECT}:{tag}");
+        let listed = vec![
+            ListedImage {
+                id: "retagged".to_owned(),
+                references: vec![own("a"), "registry.example/app:latest".to_owned()],
+            },
+            ListedImage {
+                id: "dangling".to_owned(),
+                references: Vec::new(),
+            },
+            ListedImage {
+                id: "foreign".to_owned(),
+                references: vec!["sakala-imgfix/project:latest".to_owned()],
+            },
+            ListedImage {
+                id: "wrong-project".to_owned(),
+                references: vec![format!("sakala/project-{OTHER}:a")],
+            },
+            ListedImage {
+                id: "owned".to_owned(),
+                references: vec![own("a"), own("b")],
+            },
+        ];
+        let everything = select_stale_images(
+            &listed,
+            &inspected,
+            &usage(&[], &[]),
+            at("2026-02-01T00:00:00Z"),
+            RETENTION,
+        );
+        assert_eq!(chosen(&everything), ["owned"]);
+        let project = select_project_images(
+            &listed,
+            &inspected,
+            &usage(&[], &[]),
+            Uuid::parse_str(PROJECT).expect("uuid"),
+        );
+        assert_eq!(chosen(&project), ["owned"]);
+        assert_eq!(project[0].references, [own("a"), own("b")]);
+    }
+
+    #[test]
+    fn removing_a_project_takes_all_its_images_but_those_a_container_uses() {
+        let inspected = [
+            image("fresh", PROJECT, "2026-01-31T23:59:00Z"),
+            image("old", PROJECT, "2026-01-01T00:00:00Z"),
+            image("held", PROJECT, "2026-01-01T00:00:00Z"),
+            image("other", OTHER, "2026-01-01T00:00:00Z"),
+        ];
+        let stale = select_project_images(
+            &listed(&inspected),
+            &inspected,
+            &usage(&["held"], &[]),
+            Uuid::parse_str(PROJECT).expect("uuid"),
+        );
+        assert_eq!(chosen(&stale), ["fresh", "old"]);
     }
 }

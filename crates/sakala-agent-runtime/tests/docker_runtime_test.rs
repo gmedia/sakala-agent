@@ -1355,10 +1355,14 @@ async fn approved_image_cleanup_removes_old_project_images_but_keeps_active_and_
 async fn reconciliation_reports_the_images_cleanup_would_remove_without_removing_them() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
-    let runner = Arc::new(FakeRunner::new(true).with_images(&[
-        ("sha256:stale", project_id, "2020-01-01T00:00:00Z", 1_024),
-        ("sha256:newest", project_id, "2020-01-02T00:00:00Z", 1_024),
-    ]));
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_images(&[
+                ("sha256:stale", project_id, "2020-01-01T00:00:00Z", 1_024),
+                ("sha256:newest", project_id, "2020-01-02T00:00:00Z", 1_024),
+            ])
+            .with_project_container(project_id),
+    );
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
     let report = RuntimeExecutor::reconcile(&executor)
@@ -1396,10 +1400,14 @@ async fn reconciliation_does_not_report_a_recent_image_as_stale() {
 async fn approved_cleanup_runs_only_requested_sakala_targets() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project = Uuid::new_v4();
-    let runner = Arc::new(FakeRunner::new(true).with_images(&[
-        ("sha256:old", project, "2020-01-01T00:00:00Z", 2_048),
-        ("sha256:new", project, "2020-01-02T00:00:00Z", 2_048),
-    ]));
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_images(&[
+                ("sha256:old", project, "2020-01-01T00:00:00Z", 2_048),
+                ("sha256:new", project, "2020-01-02T00:00:00Z", 2_048),
+            ])
+            .with_project_container(project),
+    );
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
     let output = clean_images(&executor).await;
@@ -1799,6 +1807,137 @@ async fn stop_removes_workload_container_but_not_its_image() {
     }));
 }
 
+fn position(runner: &FakeRunner, matches: impl Fn(&[String]) -> bool) -> Option<usize> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(|command| command.program == "docker" && matches(&string_arguments(command)))
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current time should format")
+}
+
+/// The control plane sets `remove_images` when the project was deleted. Without
+/// it the active and previous images stayed on the node forever.
+#[tokio::test]
+async fn stopping_a_deleted_project_removes_all_its_images_after_the_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut request = lifecycle_request();
+    request.remove_images = true;
+    let project = request.project_id;
+    let other = Uuid::new_v4();
+    let fresh = now_rfc3339();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup("stopping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n")
+            .with_images(&[
+                ("sha256:active", project, "2020-01-02T00:00:00Z", 3_000),
+                ("sha256:fresh", project, &fresh, 2_000),
+                ("sha256:other", other, "2020-01-01T00:00:00Z", 1),
+            ]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::stop_project(&executor, request, reporter)
+        .await
+        .expect("stop should remove the workload and the images");
+
+    assert_eq!(output.result["status"], "stopped");
+    assert_eq!(output.result["removed_images"], 2);
+    assert_eq!(output.result["reclaimed_image_bytes"], 5_000);
+    assert_eq!(
+        image_removals(&runner),
+        [
+            [format!("sakala/project-{project}:sha256:active-tag")],
+            [format!("sakala/project-{project}:sha256:fresh-tag")],
+        ]
+    );
+    let container_removed = position(&runner, |args| {
+        args.first().is_some_and(|argument| argument == "rm")
+    })
+    .expect("container removal");
+    let first_image_removed = position(&runner, |args| {
+        args.first().is_some_and(|argument| argument == "image")
+            && args.get(1).is_some_and(|argument| argument == "rm")
+    })
+    .expect("image removal");
+    assert!(container_removed < first_image_removed);
+    assert!(
+        position(&runner, |args| {
+            args.get(1).is_some_and(|argument| argument == "ls")
+                && args.contains(&format!("label=dev.sakala.project-id={project}"))
+        })
+        .is_some(),
+        "the listing is narrowed to the deleted project"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_delete_stop_still_removes_images_left_behind() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut request = lifecycle_request();
+    request.remove_images = true;
+    let project = request.project_id;
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[(
+        "sha256:left",
+        project,
+        "2020-01-01T00:00:00Z",
+        7,
+    )]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output =
+        RuntimeExecutor::stop_project(&executor, request, Arc::new(RecordingReporter::default()))
+            .await
+            .expect("stop should be idempotent when the workload is absent");
+
+    assert_eq!(output.result["status"], "already_stopped");
+    assert_eq!(output.result["removed_images"], 1);
+    assert_eq!(
+        image_removals(&runner),
+        [[format!("sakala/project-{project}:sha256:left-tag")]]
+    );
+}
+
+#[tokio::test]
+async fn image_gc_removes_every_image_of_a_project_without_containers_past_the_grace() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let orphan = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let fresh = now_rfc3339();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_images(&[
+                ("sha256:gone-old", orphan, "2020-01-01T00:00:00Z", 10),
+                ("sha256:gone-newest", orphan, "2020-01-02T00:00:00Z", 20),
+                ("sha256:too-fresh", orphan, &fresh, 30),
+                ("sha256:kept-previous", kept, "2020-01-01T00:00:00Z", 40),
+            ])
+            .with_project_container(kept),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let cleanup = RuntimeExecutor::collect_stale_images(&executor)
+        .await
+        .expect("image GC should run");
+
+    assert_eq!(cleanup.removed_images, 2);
+    assert_eq!(cleanup.reclaimed_bytes, 30);
+    assert_eq!(
+        image_removals(&runner),
+        [
+            [format!("sakala/project-{orphan}:sha256:gone-newest-tag")],
+            [format!("sakala/project-{orphan}:sha256:gone-old-tag")],
+        ]
+    );
+}
+
 #[tokio::test]
 async fn stop_missing_workload_removes_stale_owned_route_idempotently() {
     let temp = TempDir::new().expect("temp directory should be available");
@@ -2016,7 +2155,8 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
             .with_images(&[
                 ("sha256:stale", soak_project, "2020-01-01T00:00:00Z", 1_024),
                 ("sha256:newest", soak_project, "2020-01-02T00:00:00Z", 1_024),
-            ]),
+            ])
+            .with_image_users(format!("sha256:running\t{soak_project}\n")),
     );
     let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
     let memory_before = resident_memory_bytes();
@@ -4980,6 +5120,7 @@ fn lifecycle_request() -> WorkloadLifecycleRequest {
         project_id: Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID"),
         deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
             .expect("deployment UUID"),
+        remove_images: false,
         cancellation: CancellationToken::new(),
     }
 }
@@ -5458,10 +5599,18 @@ impl FakeRunner {
         self
     }
 
-    /// Image IDs the host's containers run.
+    /// What `docker container inspect` prints for the host's containers: the
+    /// image ID each runs and, after a tab, its project label.
     fn with_image_users(mut self, stdout: impl Into<String>) -> Self {
         self.image_users_stdout = stdout.into();
         self
+    }
+
+    /// One container of `project` on an image outside the listing, so the
+    /// project is not orphaned and keeps the active-and-previous rule.
+    fn with_project_container(self, project: Uuid) -> Self {
+        self.with_docker_ps("project-container\n")
+            .with_image_users(format!("sha256:elsewhere\t{project}\n"))
     }
 }
 
@@ -5716,7 +5865,10 @@ impl ProcessRunner for FakeRunner {
         {
             &self.image_inspect_stdout
         } else if spec.program == "docker"
-            && spec.args.iter().any(|argument| argument == "{{.Image}}")
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().starts_with("{{.Image}}"))
         {
             &self.image_users_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")

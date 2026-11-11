@@ -88,6 +88,8 @@ pub struct DockerRuntimeConfig {
     pub workspace_root: PathBuf,
     pub workspace_gc_max_age: Duration,
     pub image_gc_max_age: Duration,
+    /// Images of a project without any container are removed once older than this.
+    pub orphaned_image_grace: Duration,
     pub min_workspace_free_bytes: u64,
     pub runtime_network: String,
     pub caddy_sites_dir: PathBuf,
@@ -127,6 +129,7 @@ impl Default for DockerRuntimeConfig {
             workspace_root: PathBuf::from("/var/lib/sakala/builds"),
             workspace_gc_max_age: Duration::from_secs(86_400),
             image_gc_max_age: Duration::from_secs(604_800),
+            orphaned_image_grace: Duration::from_secs(86_400),
             min_workspace_free_bytes: 1_024 * 1_024 * 1_024,
             runtime_network: "sakala-runtime".to_owned(),
             caddy_sites_dir: PathBuf::from("/var/lib/sakala/caddy/sites"),
