@@ -26,6 +26,7 @@ pub struct CommandSpec {
     pub timeout: Option<Duration>,
     pub timeout_disabled: bool,
     pub cancellation: Option<CancellationToken>,
+    inherits_tool_environment: bool,
 }
 
 impl CommandSpec {
@@ -39,6 +40,7 @@ impl CommandSpec {
             timeout: None,
             timeout_disabled: false,
             cancellation: None,
+            inherits_tool_environment: true,
         }
     }
 
@@ -85,6 +87,20 @@ impl CommandSpec {
     pub fn cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = Some(cancellation);
         self
+    }
+
+    /// Keeps the agent's `DOCKER_*`, `BUILDX_*`, and `BUILDKIT_*` variables from the
+    /// child, so it cannot pick up `DOCKER_AUTH_CONFIG`, a context, or a builder the
+    /// operator set. Whatever it needs from those has to be passed with [`Self::env`].
+    #[must_use]
+    pub fn without_tool_environment(mut self) -> Self {
+        self.inherits_tool_environment = false;
+        self
+    }
+
+    #[must_use]
+    pub fn inherits_tool_environment(&self) -> bool {
+        self.inherits_tool_environment
     }
 }
 
@@ -154,10 +170,10 @@ impl ProcessRunner for TokioProcessRunner {
         let mut command = Command::new(&spec.program);
         command
             .env_clear()
-            .envs(
-                std::env::vars_os()
-                    .filter(|(name, _)| name.to_str().is_some_and(inherited_by_children)),
-            )
+            .envs(std::env::vars_os().filter(|(name, _)| {
+                name.to_str()
+                    .is_some_and(|name| inherited_by_children(name, spec.inherits_tool_environment))
+            }))
             .args(&spec.args)
             .envs(&spec.environment)
             .stdin(Stdio::null())
@@ -382,8 +398,9 @@ impl<R: AsyncBufRead + Unpin> BoundedLines<R> {
 /// allowlist because the agent's environment holds its control-plane token, and
 /// nothing a child runs should be able to read that. `SAKALA_*` never passes, so a
 /// new setting cannot leak by matching a prefix below. Anything a command needs
-/// beyond this is passed explicitly through `CommandSpec`.
-fn inherited_by_children(name: &str) -> bool {
+/// beyond this is passed explicitly through `CommandSpec`. The tool prefixes pass
+/// only when `tools` is set.
+fn inherited_by_children(name: &str, tools: bool) -> bool {
     const NAMES: [&str; 18] = [
         "PATH",
         "HOME",
@@ -407,7 +424,7 @@ fn inherited_by_children(name: &str) -> bool {
     const PREFIXES: [&str; 3] = ["DOCKER_", "BUILDX_", "BUILDKIT_"];
     !name.starts_with("SAKALA_")
         && (NAMES.contains(&name.to_ascii_uppercase().as_str())
-            || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            || (tools && PREFIXES.iter().any(|prefix| name.starts_with(prefix))))
 }
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;

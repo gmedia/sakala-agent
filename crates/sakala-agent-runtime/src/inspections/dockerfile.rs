@@ -1,4 +1,5 @@
-//! Reads the TCP ports that the final stage of a Dockerfile declares with `EXPOSE`.
+//! Reads the TCP ports that the final stage of a Dockerfile declares with `EXPOSE`,
+//! and which registry image that stage is built on.
 //!
 //! No maintained Rust crate parses Dockerfiles well enough for this. `dockerfile-parser`
 //! is archived, and `dockerfile-parser-rs` rejects a whole file over one `HEALTHCHECK`,
@@ -12,8 +13,21 @@ use std::collections::{BTreeSet, HashMap};
 /// More entries than this cannot change what the API does with the list.
 const MAX_PORTS: usize = 32;
 
-/// Returns the TCP ports the final stage exposes, sorted and without duplicates.
-pub fn exposed_tcp_ports(contents: &str) -> Vec<u16> {
+/// What a Dockerfile says about the ports of the image it builds.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DockerfilePorts {
+    /// TCP ports the final stage exposes, sorted and without duplicates.
+    pub ports: Vec<u16>,
+    /// The registry image under the final stage, following `FROM <stage>` back to
+    /// the first stage built on something else, as written after variable
+    /// substitution. Set only when no stage in that chain has an `EXPOSE`, because
+    /// only then do the image's own ports decide. `None` for `scratch` and for a
+    /// reference with a variable this reader cannot resolve.
+    pub base_image: Option<String>,
+}
+
+/// Reads the final stage of `contents`.
+pub fn read(contents: &str) -> DockerfilePorts {
     let contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
     let escape = escape_directive(contents);
     // A name missing from these maps has no value this reader can know.
@@ -45,7 +59,10 @@ pub fn exposed_tcp_ports(contents: &str) -> Vec<u16> {
 
     stages
         .pop()
-        .map(|stage| stage.ports.into_iter().take(MAX_PORTS).collect())
+        .map(|stage| DockerfilePorts {
+            base_image: stage.base.filter(|_| !stage.declares_expose),
+            ports: stage.ports.into_iter().take(MAX_PORTS).collect(),
+        })
         .unwrap_or_default()
 }
 
@@ -62,6 +79,10 @@ struct Stage {
     /// `ARG` and `ENV` values together: BuildKit lets the later of the two win.
     variables: HashMap<String, String>,
     ports: BTreeSet<u16>,
+    /// Whether this stage, or one it is built on, has an `EXPOSE`, resolvable or not.
+    declares_expose: bool,
+    /// The registry image at the bottom of the chain, when it is known.
+    base: Option<String>,
 }
 
 impl Stage {
@@ -73,11 +94,10 @@ impl Stage {
     ) -> Self {
         let words = split_words(arguments, escape);
         let mut words = words.iter().filter(|word| !word.starts_with("--"));
-        let image = words.next().map(|raw| {
-            expand(raw, escape, &|key| global_args.get(key).cloned())
-                .unwrap_or_else(|| raw.clone())
-                .to_ascii_lowercase()
-        });
+        let raw = words.next();
+        let expanded =
+            raw.and_then(|raw| expand(raw, escape, &|key| global_args.get(key).cloned()));
+        let image = raw.map(|raw| expanded.as_ref().unwrap_or(raw).to_ascii_lowercase());
         let name = match (words.next(), words.next()) {
             (Some(keyword), Some(name)) if keyword.eq_ignore_ascii_case("as") => {
                 Some(name.to_ascii_lowercase())
@@ -85,17 +105,29 @@ impl Stage {
             _ => None,
         };
 
-        // A stage built on an earlier one inherits its variables and exposed ports;
-        // what an image from a registry declares is unknown here.
+        // A stage built on an earlier one inherits its variables, exposed ports, and
+        // base image. Anything else is an image from a registry, unless it is
+        // `scratch` or still holds a variable nobody could resolve.
         let parent = image.and_then(|image| {
             earlier
                 .iter()
                 .rev()
                 .find(|stage| stage.name.as_deref() == Some(image.as_str()))
         });
-        Self {
-            name,
-            ..parent.cloned().unwrap_or_default()
+        match parent {
+            Some(parent) => Self {
+                name,
+                ..parent.clone()
+            },
+            None => Self {
+                name,
+                base: expanded.filter(|image| {
+                    !image.is_empty()
+                        && !image.contains('$')
+                        && !image.eq_ignore_ascii_case("scratch")
+                }),
+                ..Self::default()
+            },
         }
     }
 
@@ -158,6 +190,7 @@ impl Stage {
     }
 
     fn expose(&mut self, arguments: &str, escape: char) {
+        self.declares_expose = true;
         for word in split_words(arguments, escape) {
             let Some(expanded) = expand(&word, escape, &|key| self.lookup(key)) else {
                 continue;
@@ -176,7 +209,7 @@ impl Stage {
 
 /// Ports of one `EXPOSE` item: `80`, `80/tcp`, or a range such as `8000-8010/tcp`.
 /// UDP and SCTP ports are left out, because Sakala routes HTTP.
-fn tcp_ports(spec: &str) -> Vec<u16> {
+pub fn tcp_ports(spec: &str) -> Vec<u16> {
     let (ports, protocol) = spec.split_once('/').unwrap_or((spec, "tcp"));
     if !protocol.eq_ignore_ascii_case("tcp") {
         return Vec::new();
@@ -448,10 +481,14 @@ fn braced(body: &str, escape: char, lookup: &dyn Fn(&str) -> Option<String>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::exposed_tcp_ports;
+    use super::read;
 
     fn ports(dockerfile: &str) -> Vec<u16> {
-        exposed_tcp_ports(dockerfile)
+        read(dockerfile).ports
+    }
+
+    fn base(dockerfile: &str) -> Option<String> {
+        read(dockerfile).base_image
     }
 
     #[test]
@@ -653,5 +690,88 @@ EXPOSE 80
         assert!(ports("").is_empty());
         assert!(ports("EXPOSE 80\n").is_empty());
         assert!(ports("ARG X=1\n").is_empty());
+    }
+
+    #[test]
+    fn the_base_image_is_reported_when_the_final_stage_exposes_nothing() {
+        assert_eq!(
+            base("FROM nginx:alpine\nCOPY . /usr/share/nginx/html\n").as_deref(),
+            Some("nginx:alpine")
+        );
+        let dockerfile = "\
+FROM node:22 AS build
+EXPOSE 3000
+RUN npm run build
+FROM --platform=linux/amd64 httpd:2.4-alpine
+COPY --from=build /app/dist /usr/local/apache2/htdocs
+";
+        assert_eq!(base(dockerfile).as_deref(), Some("httpd:2.4-alpine"));
+        assert!(ports(dockerfile).is_empty());
+    }
+
+    #[test]
+    fn the_base_image_keeps_the_case_of_its_tag() {
+        assert_eq!(
+            base("FROM example/app:Release-1\n").as_deref(),
+            Some("example/app:Release-1")
+        );
+    }
+
+    #[test]
+    fn a_chain_of_stages_leads_back_to_the_registry_image() {
+        let dockerfile = "\
+FROM nginx:1.27 AS Base
+RUN echo base
+FROM base AS assets
+COPY . /usr/share/nginx/html
+FROM ASSETS
+";
+        assert_eq!(base(dockerfile).as_deref(), Some("nginx:1.27"));
+        // A name that only a later stage takes is an image, as in BuildKit.
+        assert_eq!(
+            base("FROM web\nFROM nginx AS web\nFROM node:22 AS other\nFROM web\n").as_deref(),
+            Some("nginx")
+        );
+    }
+
+    #[test]
+    fn an_expose_anywhere_in_the_chain_means_the_dockerfile_decides() {
+        assert_eq!(base("FROM nginx:alpine\nEXPOSE 8080\n"), None);
+        assert_eq!(
+            base("FROM nginx:alpine AS web\nEXPOSE 8080\nFROM web\n"),
+            None
+        );
+        // Even one this reader cannot resolve, or one that is not TCP.
+        assert_eq!(base("FROM nginx:alpine\nEXPOSE $PORT\n"), None);
+        assert_eq!(base("FROM nginx:alpine\nEXPOSE 53/udp\n"), None);
+        // An EXPOSE in an unrelated stage does not count.
+        assert_eq!(
+            base("FROM node:22 AS build\nEXPOSE 3000\nFROM nginx\n").as_deref(),
+            Some("nginx")
+        );
+    }
+
+    #[test]
+    fn scratch_and_unresolved_references_have_no_base_image() {
+        assert_eq!(base("FROM scratch\n"), None);
+        assert_eq!(base("FROM SCRATCH AS out\nFROM out\n"), None);
+        assert_eq!(base("FROM nginx:${VERSION}\n"), None);
+        assert_eq!(base("ARG VERSION\nFROM nginx:${VERSION}\n"), None);
+        assert_eq!(base("FROM $BASE_IMAGE\n"), None);
+        assert_eq!(base("FROM nginx:$1\n"), None);
+        assert_eq!(base("FROM\n"), None);
+        assert_eq!(base(""), None);
+    }
+
+    #[test]
+    fn a_global_arg_with_a_default_resolves_the_base_image() {
+        assert_eq!(
+            base("ARG NGINX=1.27-alpine\nFROM nginx:${NGINX}\n").as_deref(),
+            Some("nginx:1.27-alpine")
+        );
+        assert_eq!(
+            base("FROM ${IMAGE:-httpd:2.4}\n").as_deref(),
+            Some("httpd:2.4")
+        );
     }
 }

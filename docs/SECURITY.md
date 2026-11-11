@@ -22,6 +22,7 @@ Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh r
 - Output subprocess diredaksi per baris, dikirim dalam batch terbatas (100 baris/512 KiB per request) dengan `Idempotency-Key`, dan capture internal dibatasi 1 MiB per stream.
 - Build dan command memiliki deadline terpisah. Timeout atau pembatalan mematikan process group agar subprocess tidak tertinggal.
 - Startup melakukan detection-only reconciliation terhadap container managed yang berhenti atau kehilangan identity label. Agent tidak menghapus orphan otomatis tanpa desired state dari control plane.
+- Inspection project dengan Dockerfile tanpa `EXPOSE` membaca `Config.ExposedPorts` base image dari registry, tanpa menarik image atau build. Lookup hanya ke `docker.io`, `ghcr.io`, `quay.io`, `public.ecr.aws`, `mcr.microsoft.com`, dan `registry.gitlab.com`; host lain, alamat IP, `localhost`, dan host dengan port dilewati tanpa network call. Lookup memakai `DOCKER_CONFIG` kosong sekali pakai dan tidak mewarisi `DOCKER_*`, `BUILDX_*`, atau `BUILDKIT_*`, jadi credential registry node maupun tenant tidak pernah terpakai. Batasnya 10 detik, satu referensi per inspection, dan kegagalan hanya berarti tidak ada port. Lihat [Docker Runtime](DOCKER_RUNTIME.md#port-dari-base-image).
 - Node menolak project baru saat guard `SAKALA_MAX_ACTIVE_CONTAINERS` tercapai, tetapi kuota user/workspace tetap ditentukan API.
 
 ## Klasifikasi Kegagalan Repository
