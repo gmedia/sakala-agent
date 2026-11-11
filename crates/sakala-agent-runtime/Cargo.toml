@@ -12,7 +12,7 @@ repository.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
 nix = { version = "0.31.3", features = ["signal", "process"] }
-sakala-agent-core = { version = "0.2.3", path = "../sakala-agent-core" }
+sakala-agent-core = { version = "0.3.0", path = "../sakala-agent-core" }
 sakala-agent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
