@@ -40,6 +40,8 @@ pub struct AppConfig {
     pub runtime_driver: RuntimeDriver,
     pub docker_runtime: DockerRuntimeConfig,
     pub runtime_health_interval: Duration,
+    /// How often the image GC removes stale Sakala images.
+    pub image_gc_interval: Duration,
     pub log_level: String,
 }
 
@@ -91,6 +93,12 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS")]
     image_gc_max_age_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS")]
+    orphaned_image_grace_seconds: Option<String>,
+
+    #[arg(long, env = "SAKALA_IMAGE_GC_INTERVAL_SECONDS")]
+    image_gc_interval_seconds: Option<String>,
 
     #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
     runtime_health_interval_seconds: Option<String>,
@@ -205,6 +213,16 @@ pub fn load() -> Result<AppConfig, CoreError> {
     );
     insert(
         &mut values,
+        "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS",
+        cli.orphaned_image_grace_seconds,
+    );
+    insert(
+        &mut values,
+        "SAKALA_IMAGE_GC_INTERVAL_SECONDS",
+        cli.image_gc_interval_seconds,
+    );
+    insert(
+        &mut values,
         "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
         cli.runtime_health_interval_seconds,
     );
@@ -306,6 +324,17 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         )));
     }
 
+    // A deploy builds its image before it creates the container, so an image
+    // younger than one command can still be about to run.
+    let orphaned_image_grace_seconds =
+        positive_u64(values, "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS", 86_400)?;
+    if orphaned_image_grace_seconds < agent.command_timeout_seconds {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS ({orphaned_image_grace_seconds}) must be at least SAKALA_COMMAND_TIMEOUT_SECONDS ({})",
+            agent.command_timeout_seconds
+        )));
+    }
+
     Ok(AppConfig {
         docker_runtime: DockerRuntimeConfig {
             agent_id: agent.agent_id.clone(),
@@ -321,6 +350,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
                 604_800,
             )?),
+            orphaned_image_grace: std::time::Duration::from_secs(orphaned_image_grace_seconds),
             min_workspace_free_bytes,
             runtime_network: agent.runtime_network.clone(),
             caddy_sites_dir: get(
@@ -353,6 +383,11 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             values,
             "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
             30,
+        )?),
+        image_gc_interval: Duration::from_secs(positive_u64(
+            values,
+            "SAKALA_IMAGE_GC_INTERVAL_SECONDS",
+            3_600,
         )?),
         agent,
         runtime_driver,
@@ -608,6 +643,11 @@ mod tests {
         assert_eq!(config.agent.max_concurrent_commands, 4);
         assert_eq!(config.docker_runtime.max_concurrent_builds, 1);
         assert_eq!(config.runtime_health_interval, Duration::from_secs(30));
+        assert_eq!(config.image_gc_interval, Duration::from_secs(3_600));
+        assert_eq!(
+            config.docker_runtime.orphaned_image_grace,
+            Duration::from_secs(86_400)
+        );
         assert_eq!(
             config.docker_runtime.min_workspace_free_bytes,
             1_024 * 1_024 * 1_024
@@ -676,6 +716,47 @@ mod tests {
         let config = from_values(&values).expect("concurrency limits should be valid");
         assert_eq!(config.agent.max_concurrent_commands, 6);
         assert_eq!(config.docker_runtime.max_concurrent_builds, 2);
+    }
+
+    #[test]
+    fn configures_the_image_gc_interval_and_orphaned_image_grace() {
+        let values = HashMap::from([
+            (
+                "SAKALA_IMAGE_GC_INTERVAL_SECONDS".to_owned(),
+                "600".to_owned(),
+            ),
+            (
+                "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS".to_owned(),
+                "7200".to_owned(),
+            ),
+        ]);
+        let config = from_values(&values).expect("image GC settings should be valid");
+        assert_eq!(config.image_gc_interval, Duration::from_secs(600));
+        assert_eq!(
+            config.docker_runtime.orphaned_image_grace,
+            Duration::from_secs(7_200)
+        );
+
+        for (key, value, message) in [
+            ("SAKALA_IMAGE_GC_INTERVAL_SECONDS", "0", "greater than zero"),
+            (
+                "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS",
+                "0",
+                "greater than zero",
+            ),
+            (
+                "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS",
+                "60",
+                "at least SAKALA_COMMAND_TIMEOUT_SECONDS",
+            ),
+        ] {
+            let values = HashMap::from([(key.to_owned(), value.to_owned())]);
+            let error = from_values(&values).expect_err("invalid image GC setting");
+            assert!(
+                error.to_string().contains(message),
+                "{key}={value}: {error}"
+            );
+        }
     }
 
     #[test]

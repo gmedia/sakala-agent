@@ -114,6 +114,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         config.runtime_health_interval,
         shutdown_rx.clone(),
     ));
+    let image_gc_task = tokio::spawn(sakala_agent_core::image_gc::worker::run(
+        Arc::clone(&runtime),
+        config.image_gc_interval,
+        Arc::clone(&scheduler_metrics),
+        shutdown_rx.clone(),
+    ));
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
         config.agent.clone(),
         client.clone(),
@@ -152,6 +158,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     runtime_health_task
         .await
         .context("runtime health worker task failed")?;
+    image_gc_task.await.context("image GC worker task failed")?;
     runtime
         .shutdown()
         .await

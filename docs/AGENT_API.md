@@ -178,7 +178,28 @@ Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
 
 Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
 mengirim nama Docker, domain, port, command shell, atau credential pada payload
-lifecycle. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
+lifecycle.
+
+Satu-satunya pengecualian adalah `StopProject` untuk project yang dihapus. Payload-nya
+boleh membawa `remove_images: true` (boolean, opsional, default `false`):
+
+```json
+{
+  "type": "StopProject",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": { "remove_images": true }
+}
+```
+
+Setelah container dihapus, Agent menghapus semua image `sakala/project-<project_id>`
+yang tidak dipakai container mana pun, berapa pun umurnya. Result menambah
+`removed_images` dan `reclaimed_image_bytes` dengan arti yang sama seperti pada
+`CleanupRuntime`. Bila Docker gagal di tahap ini, stop tetap sukses, Agent mengirim
+event `workload.images.retained`, dan image GC menghapusnya kemudian. Payload `{}`
+atau `null` tetap mempertahankan image, dan nilai yang bukan boolean ditolak dengan
+`invalid_runtime_command`. Agent versi lama mengabaikan field ini, jadi image project
+tersebut baru hilang lewat image GC. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
 refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
 
 `DrainNode` dan `ResumeNode` adalah command node-level. Keduanya memakai
@@ -416,14 +437,24 @@ Agent menolak `approved: false` dan target kosong. Workspace dibatasi direktori
 UUID owned Agent, sedangkan route harus memiliki nama UUID serta marker ownership
 yang cocok sebelum dihapus dan Caddy di-reload.
 
-Image hanya dipilih bila berlabel `dev.sakala.managed=true` dan punya label
-`dev.sakala.project-id` yang valid. Per project, Agent mempertahankan setiap image yang
-dipakai container mana pun (berjalan atau berhenti), image deployment sebelumnya
-(image terbaru yang lebih tua dari image aktif terbaru, atau image terbaru bila tidak
-ada yang aktif), dan semua image yang lebih muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`.
+Image hanya dipilih bila berlabel `dev.sakala.managed=true`, punya label
+`dev.sakala.project-id` yang valid, dan semua namanya `sakala/project-<project_id>:<tag>`.
+Image dangling atau yang di-tag ulang dengan nama lain tidak pernah dipilih.
+
+Per project yang masih punya container (berlabel project itu, atau memakai salah satu
+image-nya), Agent mempertahankan setiap image yang dipakai container mana pun (berjalan
+atau berhenti), image deployment sebelumnya (image terbaru yang lebih tua dari image
+aktif terbaru, atau image terbaru bila tidak ada yang aktif), dan semua image yang lebih
+muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`. Project tanpa container sama sekali, misalnya
+project yang sudah dihapus, hanya mempertahankan image yang lebih muda dari
+`SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam, dihitung dari waktu image dibuat);
+image terbarunya ikut dihapus karena tidak ada yang akan di-rollback.
+
 Sisanya dihapus dengan `docker image rm` tanpa `--force`, jadi Docker tetap menolak
-image yang mulai dipakai container setelah pemilihan. `startup_reconciliation.stale_images`
-pada heartbeat memuat daftar yang sama, tanpa menghapus apa pun.
+image yang mulai dipakai container setelah pemilihan. Selain lewat command ini, Agent
+menjalankan aturan yang sama sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS`, kecuali
+saat ada command aktif. `startup_reconciliation.stale_images` pada heartbeat memuat
+daftar yang sama, tanpa menghapus apa pun.
 
 Result menambah `removed_images`, jumlah image yang terhapus. `reclaimed_image_bytes`
 adalah jumlah ukuran image itu menurut Docker, termasuk layer yang masih dipakai image

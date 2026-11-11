@@ -43,13 +43,21 @@ Image ditag berdasarkan project, commit, dan deployment. Image dan container dib
 Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
 Railpack. Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
 menjadi dangling, dan `docker image prune` tanpa `-a` tidak menghapus apa pun. Karena
-itu GC memilih per project: image yang dipakai container mana pun, image deployment
-sebelumnya untuk rollback, dan image yang lebih muda dari
-`SAKALA_IMAGE_GC_MAX_AGE_SECONDS` (default tujuh hari) selalu dipertahankan, sisanya
-dihapus dengan `docker image rm` tanpa `--force`. Image tanpa label project yang valid
-tidak pernah dipilih. Startup reconciliation hanya melaporkan kandidat; penghapusan baru
-dijalankan oleh command `CleanupRuntime` yang membawa `approved: true`. Aturan lengkapnya
-ada di [Sakala Agent API](AGENT_API.md#approved-runtime-cleanup).
+itu GC memilih per project. Project yang masih punya container mempertahankan image
+yang dipakai container mana pun, image deployment sebelumnya untuk rollback, dan image
+yang lebih muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` (default tujuh hari). Project
+tanpa container sama sekali, misalnya project yang sudah dihapus, hanya mempertahankan
+image yang lebih muda dari `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam).
+Sisanya dihapus dengan `docker image rm` tanpa `--force`. Hanya image berlabel
+`dev.sakala.managed=true` dengan project yang valid, dan yang semua namanya
+`sakala/project-<project>:<tag>`, yang pernah dipilih.
+
+GC ini berjalan sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS` (default satu jam),
+dan dilewati selama ada command aktif. Command `CleanupRuntime` dengan `approved: true`
+menjalankan aturan yang sama sekali jalan, dan startup reconciliation hanya melaporkan
+kandidatnya. `StopProject` dengan `remove_images: true`, yang dikirim API saat project
+dihapus, langsung menghapus semua image project itu setelah container-nya hilang. Aturan
+lengkapnya ada di [Sakala Agent API](AGENT_API.md#approved-runtime-cleanup).
 
 Versi sebelumnya membaca label dengan `{{.Label "..."}}` pada `docker image ls`, yang
 ditolak Docker (`can't evaluate field Label in type *formatter.imageContext`), sehingga

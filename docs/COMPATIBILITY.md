@@ -99,6 +99,15 @@ pinned command types, `Claimed -> Running` on first report, report
 sanitisation limits) are documented in
 [Sakala Agent API](AGENT_API.md#semantik-control-plane-yang-diandalkan-agent).
 
+## Revision 4 additions after v0.3.0
+
+Still revision 4. The Agent accepts the field below before the API sends it, so
+either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `StopProject` payload field `remove_images` | Honoured. | Optional boolean. The API should send `true` only on the stop it creates when a project is deleted (`DeleteProjectAction`, which today sends `{}`). The stop result then adds `removed_images` and `reclaimed_image_bytes`. An older Agent ignores the field; without it, the periodic image GC removes a deleted project's images once they are older than `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS`. |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.
