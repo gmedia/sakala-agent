@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-11
+
 ### Security
 
 - Setiap project kini berjalan di bridge network sendiri, `sakala-project-<project-id>`, bukan di `sakala-runtime` bersama semua project. Sebelumnya aplikasi satu tenant bisa membuka koneksi langsung ke aplikasi tenant lain tanpa melewati Caddy. Agent menyambungkan container Caddy ke network project sebelum probe dan route, dan memutusnya serta menghapus network saat container terakhir project hilang. Saat startup dan setiap 60 detik, Agent menyambungkan ulang Caddy yang kehilangan network project, misalnya karena container-nya dibuat ulang, dan menghapus network kosong ketika tidak ada command aktif. Workload dari Agent lama tetap dilayani di `sakala-runtime` sampai redeploy berikutnya. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#network-per-project).
@@ -156,7 +158,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/gmedia/sakala-agent/compare/v0.2.1...v0.2.2
