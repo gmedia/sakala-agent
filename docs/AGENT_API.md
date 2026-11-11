@@ -413,9 +413,21 @@ diaudit dan tidak tersirat dari heartbeat:
 ```
 
 Agent menolak `approved: false` dan target kosong. Workspace dibatasi direktori
-UUID owned Agent, image memakai label `dev.sakala.managed=true` dan hanya
-dangling image yang melewati umur minimum, sedangkan route harus memiliki nama
-UUID serta marker ownership yang cocok sebelum dihapus dan Caddy di-reload.
+UUID owned Agent, sedangkan route harus memiliki nama UUID serta marker ownership
+yang cocok sebelum dihapus dan Caddy di-reload.
+
+Image hanya dipilih bila berlabel `dev.sakala.managed=true` dan punya label
+`dev.sakala.project-id` yang valid. Per project, Agent mempertahankan setiap image yang
+dipakai container mana pun (berjalan atau berhenti), image deployment sebelumnya
+(image terbaru yang lebih tua dari image aktif terbaru, atau image terbaru bila tidak
+ada yang aktif), dan semua image yang lebih muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`.
+Sisanya dihapus dengan `docker image rm` tanpa `--force`, jadi Docker tetap menolak
+image yang mulai dipakai container setelah pemilihan. `startup_reconciliation.stale_images`
+pada heartbeat memuat daftar yang sama, tanpa menghapus apa pun.
+
+Result menambah `removed_images`, jumlah image yang terhapus. `reclaimed_image_bytes`
+adalah jumlah ukuran image itu menurut Docker, termasuk layer yang masih dipakai image
+lain, jadi angka ini batas atas ruang disk yang kembali.
 
 ## Project Inspection Command
 
@@ -813,13 +825,38 @@ di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh te
 | `runtime_app_not_listening` | Sampai deadline start tidak ada yang menjawab pada port. Termasuk aplikasi yang hanya listen di `127.0.0.1`. | Port, lama menunggu, dan kewajiban listen di `0.0.0.0:$PORT`. |
 | `runtime_app_unhealthy` | Aplikasi hanya menjawab 5xx sampai deadline. | Port dan status terakhir. |
 | `runtime_app_crashed` | Process keluar selama start. Satu restart saja sudah dihitung crash. | Exit code, atau keterangan bahwa Docker tidak lagi melaporkannya. |
+| `runtime_app_exec_denied` | Kernel menolak menjalankan program di image dengan `Operation not permitted`: exit code 126 dari shell, atau 255 dari runc, disertai baris itu di output terakhir aplikasi. Di container Sakala penyebabnya file capability selain `NET_BIND_SERVICE`, satu-satunya capability yang dipertahankan. | Exit code, `NET_BIND_SERVICE`, dan saran `setcap -r` atau image lain. Tidak menyebut environment variable. |
 | `runtime_app_out_of_memory` | Container keluar dengan `State.OOMKilled` atau event `oom`, atau masih hidup dengan flag itu tetapi tidak pernah menjawab. | Batas memory yang diterapkan. |
 | `runtime_port_conflict` | `PORT` dari environment berbeda dari `container_port`. Menggantikan `invalid_runtime_command` untuk kasus ini. | Kedua nilai. `PORT` yang bukan nomor port tidak diulang, hanya disebut tidak valid. |
 | `runtime_root_directory_invalid` | `root_directory` tidak aman atau tidak menunjuk direktori di dalam repository. | Alasannya, tanpa mengulang path. |
 
+`runtime_app_exec_denied` dideteksi dari output aplikasi sendiri, jadi aplikasi bisa
+memicunya dengan mencetak baris yang sama. Akibatnya hanya pesan untuk deployment itu
+sendiri yang berubah. Code ini belum dikenal classifier API saat ditulis; saran
+pemetaannya: kategori start, bisa diperbaiki user, dengan hint bahwa program di image
+meminta capability Linux yang tidak diberikan Sakala, tanpa menyebut environment variable.
+
 Pesan tidak pernah memuat nilai environment selain nomor port yang valid, token,
 atau path secret, dan tidak memuat output probe, karena sebagian output itu
 ditulis aplikasi. Output aplikasi dikirim terpisah melalui endpoint logs.
+
+### Kegagalan registry atau jaringan saat build
+
+`runtime_registry_unavailable` dikirim saat build gagal menarik image karena registry
+atau jaringan tidak menjawab, misalnya DNS gagal (`server misbehaving`), `i/o timeout`,
+TLS handshake timeout, koneksi diputus, rate limit `429 Too Many Requests`, atau 502,
+503, dan 504. Kegagalan apa pun saat menarik image Railpack sendiri
+(`ghcr.io/railwayapp/railpack-*`) juga masuk ke sini, karena image itu milik platform.
+Ini gangguan platform, bukan repository, jadi API sebaiknya menyarankan deploy ulang.
+Classifier API sudah memetakan prefix `runtime_registry` ke kategori node sebagai
+gangguan platform.
+
+Yang tetap `runtime_build_failed`: image yang tidak ada (`not found`), image privat atau
+salah nama (`pull access denied`), host registry yang tidak ada (`no such host`), dan
+kegagalan jaringan di langkah build milik repository seperti `RUN curl` atau `npm
+install`. Semua itu bisa diperbaiki di repository. Pesan code ini hanya menyebut tahap
+dan exit code, tanpa nama registry atau image; detailnya ada di log build. Agent membaca
+1 MiB pertama stderr build, tempat penarikan image terjadi.
 
 Dua kegagalan readiness sengaja tidak memakai code di atas:
 

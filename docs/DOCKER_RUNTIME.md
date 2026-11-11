@@ -41,12 +41,20 @@ Image ditag berdasarkan project, commit, dan deployment. Image dan container dib
 - `dev.sakala.agent-id=<agent-id>`
 
 Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
-Railpack. Image aktif dilindungi oleh referensi container. Image deployment
-sebelumnya dipertahankan minimal selama `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`
-(default tujuh hari) dan baru eligible saat dangling; cleanup tetap dibatasi
-label ownership Sakala dan tidak memakai `docker image prune -a`. Startup
-reconciliation hanya melaporkan kandidat; prune baru dijalankan oleh command
-`CleanupRuntime` yang membawa `approved: true`.
+Railpack. Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
+menjadi dangling, dan `docker image prune` tanpa `-a` tidak menghapus apa pun. Karena
+itu GC memilih per project: image yang dipakai container mana pun, image deployment
+sebelumnya untuk rollback, dan image yang lebih muda dari
+`SAKALA_IMAGE_GC_MAX_AGE_SECONDS` (default tujuh hari) selalu dipertahankan, sisanya
+dihapus dengan `docker image rm` tanpa `--force`. Image tanpa label project yang valid
+tidak pernah dipilih. Startup reconciliation hanya melaporkan kandidat; penghapusan baru
+dijalankan oleh command `CleanupRuntime` yang membawa `approved: true`. Aturan lengkapnya
+ada di [Sakala Agent API](AGENT_API.md#approved-runtime-cleanup).
+
+Versi sebelumnya membaca label dengan `{{.Label "..."}}` pada `docker image ls`, yang
+ditolak Docker (`can't evaluate field Label in type *formatter.imageContext`), sehingga
+deteksi gagal dan tidak ada image yang pernah dihapus. Label kini dibaca lewat
+`docker image inspect`.
 
 ## Readiness
 
@@ -243,11 +251,59 @@ pakai hanya pada node yang menjalankan repository tepercaya.
 - Process anak hanya mewarisi allowlist environment (`PATH`, `HOME`, `DOCKER_*`, `BUILDX_*`, dan sejenisnya). `SAKALA_*`, termasuk token Agent, tidak pernah diwariskan.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
 - Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Tidak ada deteksi port otomatis: aplikasi wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
-- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability.
+- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability kecuali `NET_BIND_SERVICE`. Lihat [Capability workload](#capability-workload).
 - Tidak ada host volume atau Docker socket di aplikasi user.
 - Caddy dan aplikasi user tidak menerima Docker socket.
 
 Ini belum merupakan multi-tenant sandbox. Docker daemon access tetap privileged; pilot harus memakai node khusus dan workload terkontrol.
+
+## Capability workload
+
+Workload berjalan dengan `--cap-drop ALL --cap-add NET_BIND_SERVICE` dan
+`--security-opt no-new-privileges:true`.
+
+`NET_BIND_SERVICE` dipertahankan karena image seperti FrankenPHP (image PHP Railpack)
+dan Caddy membawa biner bertanda file capability `cap_net_bind_service=ep`. Smoke test
+membacanya langsung dari image Laravel hasil Railpack:
+`/usr/local/bin/frankenphp cap_net_bind_service=ep`. Bit `e` membuat kernel memperlakukan
+biner itu sebagai *capability-dumb*, dan saat exec kernel mewajibkan seluruh file
+permitted capability benar-benar didapat. Bila capability itu tidak ada di bounding set,
+`execve` gagal dengan `EPERM` (`bprm_caps_from_vfs_caps` di `security/commoncap.c`,
+Linux v6.18 baris 634-647, dan bagian "Safety checking for capability-dumb binaries" di
+capabilities(7)). `--cap-drop ALL` mengosongkan bounding set, sehingga setiap aplikasi
+Laravel hasil Railpack keluar dengan exit code 126 dan
+`exec: frankenphp: Operation not permitted`.
+
+`no-new-privileges` bukan penyebabnya dan tetap dipasang. Dengan flag itu kernel hanya
+membuang capability yang akan didapat dari file (`cap_bprm_creds_from_file`, baris
+940-951) tanpa menggagalkan exec. Terukur pada Docker 29.9.3 dengan `caddy:2.11.3-alpine`:
+
+| Opsi | Hasil exec biner Caddy |
+| --- | --- |
+| tanpa opsi, atau hanya `no-new-privileges` | Berjalan |
+| `--cap-drop ALL`, dengan atau tanpa `no-new-privileges` | Gagal, `operation not permitted` |
+| `no-new-privileges --cap-drop ALL --cap-add NET_BIND_SERVICE`, user root | Berjalan, `CapEff` 0x400 |
+| sama, user 65534 | Berjalan, `CapEff` 0, capability hanya ada di bounding set |
+
+Capability ini tidak menambah kemampuan yang berarti. Docker memasang
+`net.ipv4.ip_unprivileged_port_start=0` di network namespace container, jadi proses tanpa
+capability pun sudah bisa listen di port 80 di namespace itu, dan namespace itu milik
+container sendiri. Aplikasi tetap listen di `$PORT`.
+
+Biner yang meminta capability lain, misalnya `cap_net_raw`, tetap gagal dengan
+`runtime_app_exec_denied`. Solusinya `setcap -r` di image atau image lain, bukan
+menambah capability.
+
+## Log deployment
+
+Log yang dikirim ke control plane hanya berisi output build dan aplikasi milik
+deployment itu, serta pesan sistem yang aman untuk user, semuanya melalui redaction.
+Output `caddy validate` dan `caddy reload` tidak ikut, karena menggambarkan router
+bersama: path config, log Caddy sendiri, dan peringatan untuk semua site di node,
+termasuk milik tenant lain. Output itu masuk log Agent, dan bila Caddy menolak config
+deployment gagal dengan `runtime_routing_failed` tanpa menyebut path. Path workspace
+dan path file route juga hanya tercatat di log Agent; `git init` dijalankan dengan
+`--quiet` karena pesannya memuat path workspace.
 
 ## Payload
 
