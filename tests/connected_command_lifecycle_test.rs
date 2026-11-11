@@ -68,6 +68,65 @@ async fn failed_api_polling_respects_interval_without_retry_storm() {
     assert!((2..=3).contains(&polls), "unexpected poll count: {polls}");
 }
 
+/// A panic must end the command with a failure, or its deployment hangs until the
+/// lease expires. This goes through the real poller, not only its bookkeeping.
+#[tokio::test]
+async fn a_command_whose_task_panics_is_failed_instead_of_hanging() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/commands"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [command_fixture()]
+        })))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/agent/v1/commands"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": [] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/fail")))
+        .and(body_partial_json(json!({
+            "error_code": "runtime_execution_failed"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut values = HashMap::new();
+    values.insert("SAKALA_AGENT_MODE".to_owned(), "connected".to_owned());
+    values.insert(
+        "SAKALA_AGENT_TOKEN".to_owned(),
+        "test-agent-token".to_owned(),
+    );
+    values.insert("SAKALA_AGENT_ID".to_owned(), "runtime-01".to_owned());
+    values.insert("SAKALA_API_URL".to_owned(), server.uri());
+    values.insert("SAKALA_POLL_INTERVAL_SECONDS".to_owned(), "1".to_owned());
+    values.insert("SAKALA_SHUTDOWN_GRACE_SECONDS".to_owned(), "1".to_owned());
+    let config = AgentConfig::from_values(&values).expect("connected config should be valid");
+    let client = ApiClient::from_config(&config).expect("test client should be valid");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(scheduler::poller::run(
+        config,
+        Some(client),
+        Arc::new(PanickingRuntimeExecutor),
+        Arc::new(NodeLifecycle::new()),
+        Arc::new(scheduler::metrics::SchedulerMetrics::default()),
+        shutdown_rx,
+    ));
+
+    sleep(std::time::Duration::from_millis(2_500)).await;
+    shutdown_tx
+        .send(true)
+        .expect("poller should still be running");
+    task.await.expect("the poller must survive the panic");
+}
+
 #[tokio::test]
 async fn claim_conflict_skips_runtime_execution_and_terminal_reporting() {
     let server = MockServer::start().await;
@@ -171,7 +230,8 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
     let commands = client
         .poll_commands()
         .await
-        .expect("Laravel resource envelope should deserialize");
+        .expect("Laravel resource envelope should deserialize")
+        .data;
 
     assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].command_type, CommandType::DeployProject);
@@ -552,6 +612,19 @@ impl RuntimeExecutor for SlowRuntimeExecutor {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         sleep(std::time::Duration::from_secs(60)).await;
         Ok(CommandOutput::empty())
+    }
+}
+
+struct PanickingRuntimeExecutor;
+
+#[async_trait]
+impl RuntimeExecutor for PanickingRuntimeExecutor {
+    async fn deploy_project(
+        &self,
+        _request: DeployProjectRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        panic!("simulated panic inside a command task");
     }
 }
 

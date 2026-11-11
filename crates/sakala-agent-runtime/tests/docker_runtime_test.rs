@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     sync::{
         Arc, Mutex,
@@ -9,8 +9,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use sakala_agent_core::{
     commands::CommandDispatcher,
+    logs::redactor::ValueRedactor,
     ports::{
         CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
         ReconcileWorkloadRequest, RepositoryCredential, RuntimeExecutionError, RuntimeExecutor,
@@ -18,8 +20,9 @@ use sakala_agent_core::{
     },
 };
 use sakala_agent_protocol::{
-    AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog, DesiredWorkloadState,
-    LogBounds, ReconcileWorkloadAction, RuntimeCleanupTarget,
+    AgentCommand, CommandStatus, CommandType, CrashedWorkloadDetail, DeploymentEvent,
+    DeploymentLog, DesiredWorkloadState, LogBounds, LogStream, ReconcileWorkloadAction,
+    RuntimeCleanupTarget,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -27,6 +30,7 @@ use sakala_agent_runtime::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -130,7 +134,20 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
         .expect("fake runtime dependencies should be checked");
 
     assert!(!report.has_fatal_failure());
-    assert_eq!(report.checks.len(), 9);
+    assert_eq!(report.checks.len(), 10);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "railpack-sandbox" && check.fatal && check.ready)
+    );
+    assert!(!report.checks.iter().any(|check| check.name == "railpack"));
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "caddy-http-probe" && !check.fatal)
+    );
     assert!(report.checks.iter().any(|check| check.name == "git"));
     assert!(
         report
@@ -210,7 +227,6 @@ async fn preflight_reports_each_missing_runtime_dependency_as_fatal() {
         ("git", None, "git"),
         ("docker", Some("version"), "docker"),
         ("docker", Some("buildx"), "docker-buildx"),
-        ("railpack", None, "railpack"),
     ] {
         let temp = TempDir::new().expect("temp directory should be available");
         let runner = Arc::new(UnavailableDependencyRunner {
@@ -326,7 +342,7 @@ async fn private_inspection_uses_the_same_ephemeral_credential_path() {
     assert_eq!(output.result["package_manager"], "pnpm");
     let commands = runner.commands.lock().expect("command lock");
     assert!(commands.iter().any(|command| {
-        command.program == "railpack" && command.args.iter().any(|argument| argument == "info")
+        is_sandbox(command) && command.args.iter().any(|argument| argument == "info")
     }));
     assert!(!format!("{commands:?}").contains("ghs_inspection_token"));
 }
@@ -726,7 +742,7 @@ async fn auto_builder_falls_back_to_railpack_when_dockerfile_is_absent() {
 
     let commands = runner.commands.lock().expect("command lock");
     assert!(commands.iter().any(|command| {
-        command.program == "railpack" && command.args.iter().any(|argument| argument == "prepare")
+        is_sandbox(command) && command.args.iter().any(|argument| argument == "prepare")
     }));
     assert!(commands.iter().any(|command| {
         command.program == "docker"
@@ -760,12 +776,12 @@ async fn project_preview_uses_railpack_info_without_preparing_or_building() {
 
     let commands = runner.commands.lock().expect("command lock");
     assert!(commands.iter().any(|command| {
-        command.program == "railpack"
+        is_sandbox(command)
             && command.args.iter().any(|argument| argument == "info")
             && command.args.iter().any(|argument| argument == "json")
     }));
     assert!(!commands.iter().any(|command| {
-        command.program == "railpack" && command.args.iter().any(|argument| argument == "prepare")
+        is_sandbox(command) && command.args.iter().any(|argument| argument == "prepare")
     }));
     assert!(!commands.iter().any(|command| {
         command.program == "docker" && command.args.iter().any(|argument| argument == "buildx")
@@ -1250,60 +1266,27 @@ async fn exited_workload_does_not_keep_a_route_alive() {
     assert_eq!(report.stale_routes[0].project_id, project_id);
 }
 
-#[tokio::test]
-async fn approved_image_cleanup_prunes_only_retained_sakala_dangling_images() {
-    let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2MB\n"));
-    let mut config = runtime_config(&temp);
-    config.image_gc_max_age = Duration::from_secs(3_600);
-    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
-
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
-        CleanupRuntimeRequest {
-            command_id: Uuid::new_v4(),
-            approved: true,
-            targets: vec![RuntimeCleanupTarget::StaleImages],
-            cancellation: CancellationToken::new(),
-        },
-        Arc::new(RecordingReporter::default()),
-    )
-    .await
-    .expect("approved cleanup should complete");
-
-    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024 * 1_024);
-    let commands = runner.commands.lock().expect("command lock");
-    let prune = commands
+fn image_removals(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
         .iter()
-        .find(|command| {
+        .filter(|command| {
             command.program == "docker"
                 && command
                     .args
                     .first()
                     .is_some_and(|argument| argument == "image")
-                && command.args.iter().any(|argument| argument == "prune")
+                && command.args.get(1).is_some_and(|argument| argument == "rm")
         })
-        .expect("Sakala-only image prune should run");
-    assert!(
-        prune
-            .args
-            .iter()
-            .any(|argument| argument == "label=dev.sakala.managed=true")
-    );
-    assert!(prune.args.iter().any(|argument| argument == "until=3600s"));
-    assert!(!prune.args.iter().any(|argument| argument == "-a"));
+        .map(|command| string_arguments(command)[2..].to_vec())
+        .collect()
 }
 
-#[tokio::test]
-async fn successful_image_prune_is_not_failed_by_cosmetic_telemetry_format() {
-    let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: unknown\n"));
-    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
-
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
+async fn clean_images(executor: &DockerRuntimeExecutor) -> CommandOutput {
+    RuntimeExecutor::cleanup_runtime(
+        executor,
         CleanupRuntimeRequest {
             command_id: Uuid::new_v4(),
             approved: true,
@@ -1313,22 +1296,64 @@ async fn successful_image_prune_is_not_failed_by_cosmetic_telemetry_format() {
         Arc::new(RecordingReporter::default()),
     )
     .await
-    .expect("successful prune must not fail on cosmetic output parsing");
+    .expect("approved cleanup should complete")
+}
 
-    assert_eq!(output.result["reclaimed_image_bytes"], 0);
+/// Every deployment image keeps its own tag, so none is ever dangling and
+/// `docker image prune` without `-a` removed nothing at all.
+#[tokio::test]
+async fn approved_image_cleanup_removes_old_project_images_but_keeps_active_and_previous() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project = Uuid::new_v4();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("active-container\n")
+            .with_images(&[
+                ("sha256:oldest", project, "2020-01-01T00:00:00Z", 1_000),
+                ("sha256:previous", project, "2020-01-02T00:00:00Z", 2_000),
+                ("sha256:active", project, "2020-01-03T00:00:00Z", 3_000),
+            ])
+            .with_image_users("sha256:active\n"),
+    );
+    let mut config = runtime_config(&temp);
+    config.image_gc_max_age = Duration::from_secs(3_600);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = clean_images(&executor).await;
+
+    assert_eq!(output.result["removed_images"], 1);
+    assert_eq!(output.result["reclaimed_image_bytes"], 1_000);
+    assert_eq!(
+        image_removals(&runner),
+        [[format!("sakala/project-{project}:sha256:oldest-tag")]]
+    );
+    let commands = runner.commands.lock().expect("command lock");
+    let listing = commands
+        .iter()
+        .find(|command| {
+            command.program == "docker" && command.args.iter().any(|argument| argument == "ls")
+        })
+        .expect("image listing");
+    let listing = string_arguments(listing);
+    assert!(listing.contains(&"label=dev.sakala.managed=true".to_owned()));
+    assert!(!listing.iter().any(|argument| argument.contains(".Label")));
+    assert!(!commands.iter().any(|command| {
+        command
+            .args
+            .iter()
+            .any(|argument| argument == "prune" || argument == "--force")
+    }));
 }
 
 #[tokio::test]
-async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
+async fn reconciliation_reports_the_images_cleanup_would_remove_without_removing_them() {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
-    let deployment_id = Uuid::new_v4();
-    let runner = Arc::new(
-        FakeRunner::new(true)
-            .with_image_list_output(format!("sha256:stale\t{project_id}\t{deployment_id}\n"))
-            .with_image_prune_output("Total reclaimed space: 1KB\n"),
-    );
-    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:stale", project_id, "2020-01-01T00:00:00Z", 1_024),
+        ("sha256:newest", project_id, "2020-01-02T00:00:00Z", 1_024),
+    ]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
     let report = RuntimeExecutor::reconcile(&executor)
         .await
@@ -1337,21 +1362,21 @@ async fn reconciliation_reports_stale_images_before_sakala_only_prune() {
     assert_eq!(report.stale_images.len(), 1);
     assert_eq!(report.stale_images[0].image_id, "sha256:stale");
     assert_eq!(report.stale_images[0].project_id, Some(project_id));
-    assert_eq!(report.stale_images[0].deployment_id, Some(deployment_id));
     assert_eq!(report.reclaimed_image_bytes, 0);
+    assert!(image_removals(&runner).is_empty());
 }
 
 #[tokio::test]
-async fn reconciliation_does_not_report_recent_dangling_image_as_stale() {
+async fn reconciliation_does_not_report_a_recent_image_as_stale() {
     let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
     let created = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .expect("current time should format");
-    let runner = Arc::new(
-        FakeRunner::new(true)
-            .with_image_list_output("sha256:recent\t\t\n")
-            .with_image_created_output(format!("{created}\n")),
-    );
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:recent", project_id, &created, 1),
+        ("sha256:newest", project_id, &created, 1),
+    ]));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
 
     let report = RuntimeExecutor::reconcile(&executor)
@@ -1364,35 +1389,25 @@ async fn reconciliation_does_not_report_recent_dangling_image_as_stale() {
 #[tokio::test]
 async fn approved_cleanup_runs_only_requested_sakala_targets() {
     let temp = TempDir::new().expect("temp directory should be available");
-    let runner =
-        Arc::new(FakeRunner::new(true).with_image_prune_output("Total reclaimed space: 2KB\n"));
+    let project = Uuid::new_v4();
+    let runner = Arc::new(FakeRunner::new(true).with_images(&[
+        ("sha256:old", project, "2020-01-01T00:00:00Z", 2_048),
+        ("sha256:new", project, "2020-01-02T00:00:00Z", 2_048),
+    ]));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
 
-    let output = RuntimeExecutor::cleanup_runtime(
-        &executor,
-        CleanupRuntimeRequest {
-            command_id: Uuid::new_v4(),
-            approved: true,
-            targets: vec![RuntimeCleanupTarget::StaleImages],
-            cancellation: CancellationToken::new(),
-        },
-        Arc::new(RecordingReporter::default()),
-    )
-    .await
-    .expect("approved image cleanup should succeed");
+    let output = clean_images(&executor).await;
 
-    assert_eq!(output.result["reclaimed_image_bytes"], 2 * 1_024);
+    assert_eq!(output.result["reclaimed_image_bytes"], 2_048);
+    assert_eq!(output.result["cleaned_routes"], 0);
+    assert_eq!(output.result["cleaned_workspaces"], 0);
     let commands = runner.commands.lock().expect("command lock");
-    assert!(commands.iter().any(|command| {
+    assert!(!commands.iter().any(|command| {
         command.program == "docker"
-            && command.args.iter().any(|argument| argument == "prune")
             && command
                 .args
-                .iter()
-                .any(|argument| argument == "label=dev.sakala.managed=true")
-    }));
-    assert!(!commands.iter().any(|command| {
-        command.program == "docker" && command.args.iter().any(|argument| argument == "rm")
+                .first()
+                .is_some_and(|argument| argument == "rm")
     }));
 }
 
@@ -1987,12 +2002,15 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     config.image_gc_max_age = Duration::from_secs(1);
     let workspace_root = config.workspace_root.clone();
     let sites_dir = config.caddy_sites_dir.clone();
+    let soak_project = Uuid::new_v4();
     let runner = Arc::new(
         FakeRunner::new(true)
             .with_docker_ps("previous-container\n")
             .with_previous_container_inspection("false\t/previous\n")
-            .with_image_list_output("sha256:stale\t\t\n")
-            .with_image_prune_output("Total reclaimed space: 1KB\n"),
+            .with_images(&[
+                ("sha256:stale", soak_project, "2020-01-01T00:00:00Z", 1_024),
+                ("sha256:newest", soak_project, "2020-01-02T00:00:00Z", 1_024),
+            ]),
     );
     let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
     let memory_before = resident_memory_bytes();
@@ -2082,6 +2100,2445 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     }
 }
 
+#[tokio::test]
+async fn app_listening_on_the_wrong_port_fails_as_not_listening() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[(1, REFUSED_PROBE_STDERR)]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(executor, &deploy_with_start_timeout(1), reporter)
+        .await
+        .expect_err("an app that never answers must not become live");
+
+    assert_eq!(error.code(), "runtime_app_not_listening");
+    let message = error.to_string();
+    assert!(message.contains("port 3000"), "{message}");
+    assert!(message.contains("waiting 1 seconds"), "{message}");
+    assert!(message.contains("0.0.0.0:$PORT"), "{message}");
+    assert!(!route.exists(), "a route must not point at the failed app");
+}
+
+#[tokio::test]
+async fn app_that_starts_listening_late_passes_within_the_deadline() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[
+        (1, REFUSED_PROBE_STDERR),
+        (1, REFUSED_PROBE_STDERR),
+        (0, OK_PROBE_STDERR),
+    ]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(executor, &deploy_with_start_timeout(5), reporter)
+        .await
+        .expect("a slow boot within the deadline is healthy");
+
+    assert_eq!(runner.count_commands(is_probe), 3);
+    assert!(route.exists());
+}
+
+#[tokio::test]
+async fn root_returning_404_passes_because_the_app_answers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[(1, NOT_FOUND_PROBE_STDERR)]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(executor, &deploy_with_start_timeout(1), reporter)
+        .await
+        .expect("any status below 500 means the app answers");
+
+    assert_eq!(runner.count_commands(is_probe), 1);
+    assert!(route.exists());
+}
+
+#[tokio::test]
+async fn root_returning_500_fails_as_unhealthy_with_the_last_status() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_probe_results(&[(1, SERVER_ERROR_PROBE_STDERR)]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(executor, &deploy_with_start_timeout(1), reporter)
+        .await
+        .expect_err("an app answering only 5xx must not become live");
+
+    assert_eq!(error.code(), "runtime_app_unhealthy");
+    let message = error.to_string();
+    assert!(message.contains("port 3000"), "{message}");
+    assert!(message.contains("HTTP 500"), "{message}");
+    assert!(!route.exists());
+    assert!(
+        runner.count_commands(is_probe) > 1,
+        "a 5xx during boot must be retried until the deadline"
+    );
+}
+
+#[tokio::test]
+async fn redirect_is_judged_by_the_first_response_and_stays_on_the_app() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[(1, REDIRECT_PROBE_STDERR)]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(executor, &deploy_with_start_timeout(1), reporter)
+        .await
+        .expect("a redirect is an answer");
+
+    let commands = runner.commands.lock().expect("command lock");
+    let probe = commands
+        .iter()
+        .find(|command| is_probe(command))
+        .expect("probe");
+    let arguments = probe
+        .args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let host = "sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993:3000";
+    assert!(
+        arguments.contains(&format!("http_proxy=http://{host}")),
+        "proxy mode keeps every redirect on the app's connection: {arguments:?}"
+    );
+    assert!(arguments.windows(2).any(|pair| pair == ["-Y", "on"]));
+    assert!(arguments.contains(&"--spider".to_owned()));
+    assert_eq!(arguments.last(), Some(&format!("http://{host}/")));
+    assert!(arguments.iter().any(|argument| argument == "sakala-caddy"));
+}
+
+#[tokio::test]
+async fn exit_during_start_reports_logs_before_cleanup_and_names_the_exit_code() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["restarting\t2\t3\tfalse\tnone\t268435456\n"])
+            .with_app_output(&["booting"], &["Error: cannot find module"]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let started = std::time::Instant::now();
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("a crashing app must not become live");
+
+    assert_eq!(error.code(), "runtime_app_crashed");
+    assert!(error.to_string().contains("exit code 3"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "a crash must stop the wait early"
+    );
+    assert_eq!(runner.count_commands(is_probe), 0);
+    assert!(!route.exists());
+
+    let logs = reporter.logs.lock().expect("log lock");
+    let line = |text: &str| {
+        logs.iter()
+            .find(|log| log.message == format!("[runtime] {text}"))
+            .unwrap_or_else(|| panic!("{text} should be reported"))
+    };
+    assert_eq!(line("booting").stream, LogStream::Stdout);
+    assert_eq!(line("Error: cannot find module").stream, LogStream::Stderr);
+    let captured = runner.command_position(is_app_logs).expect("logs read");
+    let removed = runner
+        .command_position(is_candidate_removal)
+        .expect("candidate removed");
+    assert!(captured < removed, "logs must be read before cleanup");
+}
+
+/// What a Railpack Laravel app printed when FrankenPHP, a binary marked
+/// `cap_net_bind_service=ep`, could not be executed. Its old message pointed at
+/// the app, and the API's hint at missing environment variables.
+#[tokio::test]
+async fn a_program_the_kernel_refuses_to_run_is_named_as_such() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["restarting\t1\t126\tfalse\tnone\t268435456\n"])
+            .with_app_output(
+                &["Starting Laravel server ..."],
+                &["/usr/local/bin/docker-php-entrypoint: 9: exec: frankenphp: Operation not permitted"],
+            ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a program that cannot run must not become live");
+
+    assert_eq!(error.code(), "runtime_app_exec_denied");
+    let message = error.to_string();
+    assert!(message.contains("exit code 126"), "{message}");
+    assert!(message.contains("setcap -r"), "{message}");
+}
+
+#[tokio::test]
+async fn crash_seen_between_restarts_reads_the_exit_code_from_history() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            // Docker resets the exit code as soon as the restart succeeds.
+            .with_inspect_states(&["running\t1\t0\tfalse\tnone\t268435456\n"])
+            .with_events("die\t7\ndie\t3\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a restart during start is a crash");
+
+    assert_eq!(error.code(), "runtime_app_crashed");
+    assert!(error.to_string().contains("exit code 3"), "{error}");
+}
+
+#[tokio::test]
+async fn crash_without_any_exit_history_still_says_it_crashed() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true).with_inspect_states(&["running\t1\t0\tfalse\tnone\t268435456\n"]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a restart during start is a crash");
+
+    assert_eq!(error.code(), "runtime_app_crashed");
+    assert!(error.to_string().contains("no longer reports"), "{error}");
+}
+
+#[tokio::test]
+async fn oom_flag_fails_with_the_applied_memory_limit() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["restarting\t1\t137\ttrue\tnone\t268435456\n"])
+            .with_app_output(&["allocating"], &[]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("an OOM-killed app must not become live");
+
+    assert_eq!(error.code(), "runtime_app_out_of_memory");
+    assert!(error.to_string().contains("256 MB"), "{error}");
+    assert!(
+        reported_messages(&reporter)
+            .iter()
+            .any(|message| message == "[runtime] allocating")
+    );
+}
+
+#[tokio::test]
+async fn oom_between_restarts_is_read_from_history() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            // Docker was seen reporting exit 137 before the OOM flag was set.
+            .with_inspect_states(&["restarting\t1\t137\tfalse\tnone\t268435456\n"])
+            .with_events("oom\t<no value>\ndie\t137\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an OOM-killed app must not become live");
+
+    assert_eq!(error.code(), "runtime_app_out_of_memory");
+}
+
+#[tokio::test]
+async fn app_surviving_a_worker_oom_stays_healthy_while_it_answers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true).with_inspect_states(&["running\t0\t0\ttrue\tnone\t268435456\n"]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_start_timeout(1),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("the app answers, so it is healthy");
+}
+
+#[tokio::test]
+async fn running_app_killed_by_oom_that_never_answers_reports_out_of_memory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["running\t0\t0\ttrue\tnone\t268435456\n"])
+            .with_probe_results(&[(1, REFUSED_PROBE_STDERR)]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(1),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the app never answered");
+
+    assert_eq!(error.code(), "runtime_app_out_of_memory");
+}
+
+#[tokio::test]
+async fn declared_healthcheck_is_honoured_before_probing() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_inspect_states(&[
+        "running\t0\t0\tfalse\tstarting\t268435456\n",
+        "running\t0\t0\tfalse\thealthy\t268435456\n",
+    ]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("starting keeps waiting and healthy goes on to the probe");
+
+    assert_eq!(runner.count_commands(is_probe), 1);
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["running\t0\t0\tfalse\tunhealthy\t268435456\n"]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an unhealthy HEALTHCHECK fails");
+
+    assert_eq!(error.code(), "runtime_health_check_failed");
+    assert!(error.to_string().contains("HEALTHCHECK"), "{error}");
+    assert_eq!(runner.count_commands(is_probe), 0);
+}
+
+#[tokio::test]
+async fn a_router_that_cannot_probe_is_not_blamed_on_the_app() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[(
+        127,
+        "OCI runtime exec failed: exec failed: unable to start container process: exec: \"wget\": executable file not found in $PATH\n",
+    )]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("readiness cannot be proven without the probe");
+
+    assert_eq!(error.code(), "runtime_dependency_failed");
+    assert!(error.to_string().contains("wget"), "{error}");
+    assert_eq!(
+        runner.count_commands(is_probe),
+        1,
+        "this cannot heal itself"
+    );
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_probe_results(&[(1, BAD_ADDRESS_PROBE_STDERR)]));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(1),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an unresolvable workload cannot be probed");
+
+    assert_eq!(error.code(), "runtime_dependency_failed");
+    assert!(error.to_string().contains("runtime network"), "{error}");
+}
+
+#[tokio::test]
+async fn failed_routing_still_reports_the_candidate_output_before_cleanup() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_failed_caddy_validate()
+            .with_app_output(&["listening on 3000"], &[]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect_err("an invalid route must fail the deployment");
+
+    assert_eq!(error.code(), "runtime_routing_failed");
+    assert!(
+        reported_messages(&reporter)
+            .iter()
+            .any(|message| message == "[runtime] listening on 3000")
+    );
+    let captured = runner.command_position(is_app_logs).expect("logs read");
+    let removed = runner
+        .command_position(is_candidate_removal)
+        .expect("candidate removed");
+    assert!(captured < removed);
+}
+
+#[tokio::test]
+async fn failed_build_has_no_container_to_read_logs_from() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(BuildFailingRunner {
+        inner: FakeRunner::new(true),
+    });
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect_err("the build fails");
+
+    assert_eq!(error.code(), "runtime_build_failed");
+    assert_eq!(runner.inner.count_commands(is_app_logs), 0);
+    assert!(
+        !reported_messages(&reporter)
+            .iter()
+            .any(|message| message.contains("Last application output")),
+    );
+}
+
+#[tokio::test]
+async fn cancelled_start_skips_log_capture_and_still_cleans_up() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_inspect_delay(Duration::from_secs(60)));
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let cancellation = CancellationToken::new();
+    let command = deploy_command("auto");
+    let task = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &command,
+                    Arc::new(RecordingReporter::default()),
+                    cancellation,
+                )
+                .await
+        }
+    });
+    for _ in 0..200 {
+        let inspecting = runner.count_commands(|spec| {
+            spec.args
+                .first()
+                .is_some_and(|argument| argument == "inspect")
+        }) > 0;
+        if inspecting {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cancellation.cancel();
+
+    let error = task
+        .await
+        .expect("task should join")
+        .expect_err("cancelled start fails");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert_eq!(runner.count_commands(is_app_logs), 0);
+    assert!(runner.command_position(is_candidate_removal).is_some());
+}
+
+#[tokio::test]
+async fn log_capture_failure_does_not_mask_the_original_error() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true).with_inspect_states(&["restarting\t2\t3\tfalse\tnone\t268435456\n"]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_start_timeout(5),
+        Arc::new(RejectingLogReporter),
+    )
+    .await
+    .expect_err("the deployment failed");
+
+    assert_eq!(error.code(), "runtime_app_crashed");
+    assert!(runner.command_position(is_candidate_removal).is_some());
+}
+
+#[tokio::test]
+async fn log_capture_respects_the_batch_bound_and_says_when_there_is_no_output() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_inspect_states(&["restarting\t2\t3\tfalse\tnone\t268435456\n"])
+            .with_app_output(&[], &[]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = deploy_with_start_timeout(5);
+    command.payload["log_bounds"] = json!({ "max_batch_lines": 7 });
+
+    dispatch(executor, &command, Arc::clone(&reporter))
+        .await
+        .expect_err("the deployment failed");
+
+    let commands = runner.commands.lock().expect("command lock");
+    let logs = commands
+        .iter()
+        .find(|command| is_app_logs(command))
+        .expect("logs read");
+    assert!(logs.args.windows(2).any(|pair| pair == ["--tail", "7"]));
+    assert!(
+        reported_messages(&reporter)
+            .iter()
+            .any(|message| message.contains("no output"))
+    );
+}
+
+#[tokio::test]
+async fn explicit_health_check_shares_the_http_readiness_semantics() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let workload = "running\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n";
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(workload)
+            .with_probe_results(&[(1, SERVER_ERROR_PROBE_STDERR)]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::health_check(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("health check reports without failing the command");
+
+    assert_eq!(output.result["running"], true);
+    assert_eq!(output.result["ready"], false);
+    assert_eq!(output.result["error_code"], "runtime_app_unhealthy");
+    assert!(
+        output.result["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("HTTP 500"))
+    );
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(workload)
+            .with_probe_results(&[(1, NOT_FOUND_PROBE_STDERR)]),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::health_check(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("health check completes");
+
+    assert_eq!(output.result["ready"], true);
+    assert!(output.result["reason"].is_null());
+    assert!(output.result["error_code"].is_null());
+    let commands = runner.commands.lock().expect("command lock");
+    let probe = commands
+        .iter()
+        .find(|command| is_probe(command))
+        .expect("probe");
+    assert_eq!(
+        probe.args.last().expect("url").to_string_lossy(),
+        "http://sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993:3000/",
+        "the probe must use the name the route uses, not the container id"
+    );
+}
+
+const CRASHED_PROJECT: &str = "ff66ed4a-6303-4be6-8ef4-63c28b112680";
+const CRASHED_DEPLOYMENT: &str = "4f1f21ef-730d-42d5-a46d-d965353cb993";
+
+fn listed(id: &str, status: &str) -> String {
+    format!("{id}\t{status}\t{CRASHED_PROJECT}\t{CRASHED_DEPLOYMENT}\n")
+}
+
+fn seconds_ago(seconds: i64) -> String {
+    (OffsetDateTime::now_utc() - time::Duration::seconds(seconds))
+        .format(&Rfc3339)
+        .expect("timestamp formats")
+}
+
+/// One `docker inspect` line, in the order the crash report asks for.
+fn crash_state(
+    id: &str,
+    status: &str,
+    restarts: u32,
+    exit_code: i32,
+    oom: bool,
+    up_seconds: i64,
+) -> String {
+    format!(
+        "{id}aaaaaaaa\t{status}\t{restarts}\t{exit_code}\t{oom}\t{}\t{}\n",
+        seconds_ago(up_seconds),
+        seconds_ago(up_seconds + 1),
+    )
+}
+
+async fn crashes_reported(runner: Arc<FakeRunner>, temp: &TempDir) -> Vec<CrashedWorkloadDetail> {
+    crashes_with_config(runner, runtime_config(temp)).await
+}
+
+async fn crashes_with_config(
+    runner: Arc<FakeRunner>,
+    config: DockerRuntimeConfig,
+) -> Vec<CrashedWorkloadDetail> {
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    let snapshots = RuntimeExecutor::health_snapshot(&executor)
+        .await
+        .expect("snapshot");
+    RuntimeExecutor::crashed_workloads(&executor, &snapshots)
+        .await
+        .expect("crash details")
+}
+
+fn is_crash_inspect(spec: &CommandSpec) -> bool {
+    spec.args
+        .iter()
+        .any(|argument| argument.to_string_lossy().contains("{{.Id}}"))
+}
+
+fn is_events(spec: &CommandSpec) -> bool {
+    spec.args
+        .first()
+        .is_some_and(|argument| argument == "events")
+}
+
+#[tokio::test]
+async fn restarting_workload_is_crashed_with_the_state_docker_still_holds() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("oomed123", "Restarting (137) 5 seconds ago"))
+            .with_crash_inspect(
+                "oomed123aaaaaaaa\trestarting\t3\t137\ttrue\t2026-11-05T14:28:30.5Z\t2026-11-05T14:28:41.612483825Z\n",
+            ),
+    );
+
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].project_id.to_string(), CRASHED_PROJECT);
+    assert_eq!(crashed[0].deployment_id.to_string(), CRASHED_DEPLOYMENT);
+    assert_eq!(crashed[0].exit_code, Some(137));
+    assert!(crashed[0].oom_killed);
+    assert_eq!(
+        serde_json::to_value(&crashed[0]).expect("detail")["finished_at"],
+        "2026-11-05T14:28:41Z",
+        "whole seconds in RFC 3339"
+    );
+    assert_eq!(runner.count_commands(is_events), 0, "nothing was missing");
+}
+
+#[tokio::test]
+async fn slow_crash_loop_stays_crashed_between_crashes_with_its_last_exit() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("slowloop", "Up 3 seconds"))
+            // Docker reports exit 0 for a running container whatever the last exit was.
+            .with_crash_inspect(crash_state("slowloop", "running", 4, 0, false, 3))
+            .with_events("slowloopaaaaaaaa\tdie\t7\nslowloopaaaaaaaa\tdie\t3\n"),
+    );
+
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].exit_code, Some(3), "the last exit wins");
+    assert!(!crashed[0].oom_killed);
+    assert!(crashed[0].finished_at.is_some(), "Docker keeps FinishedAt");
+}
+
+#[tokio::test]
+async fn running_workload_without_exit_history_never_claims_exit_zero() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("slowloop", "Up 3 seconds"))
+            .with_crash_inspect(crash_state("slowloop", "running", 3, 0, false, 3)),
+    );
+
+    let crashed = crashes_reported(runner, &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].exit_code, None);
+    assert!(!crashed[0].oom_killed);
+}
+
+#[tokio::test]
+async fn oom_describes_the_last_exit_and_not_the_current_run() {
+    // Killed for memory on its last exit: Docker has already cleared the flag.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("oomed123", "Up 3 seconds"))
+            .with_crash_inspect(crash_state("oomed123", "running", 3, 0, false, 3))
+            .with_events("oomed123aaaaaaaa\toom\t<no value>\noomed123aaaaaaaa\tdie\t137\n"),
+    );
+    let crashed = crashes_reported(runner, &temp).await;
+    assert_eq!(crashed[0].exit_code, Some(137));
+    assert!(crashed[0].oom_killed);
+
+    // An earlier OOM, then a plain exit, then a worker killed in this run.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("mixed123", "Up 3 seconds"))
+            .with_crash_inspect(crash_state("mixed123", "running", 3, 0, true, 3))
+            .with_events(concat!(
+                "mixed123aaaaaaaa\toom\t<no value>\n",
+                "mixed123aaaaaaaa\tdie\t137\n",
+                "mixed123aaaaaaaa\tdie\t1\n",
+                "mixed123aaaaaaaa\toom\t<no value>\n",
+            )),
+    );
+    let crashed = crashes_reported(runner, &temp).await;
+    assert_eq!(crashed[0].exit_code, Some(1));
+    assert!(!crashed[0].oom_killed);
+
+    // Docker was seen reporting exit 137 before setting the flag.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("racing12", "Restarting (137) 1 second ago"))
+            .with_crash_inspect(crash_state("racing12", "restarting", 1, 137, false, 3))
+            .with_events("racing12aaaaaaaa\toom\t<no value>\nracing12aaaaaaaa\tdie\t137\n"),
+    );
+    let crashed = crashes_reported(runner, &temp).await;
+    assert_eq!(crashed[0].exit_code, Some(137));
+    assert!(crashed[0].oom_killed);
+}
+
+#[tokio::test]
+async fn crash_loop_clears_after_the_stable_window() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let row = listed("oneoff12", "Up 20 seconds");
+    let state = crash_state("oneoff12", "running", 3, 0, false, 20);
+
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(row.clone())
+            .with_crash_inspect(state.clone()),
+    );
+    let inside = crashes_reported(runner, &temp).await;
+    assert_eq!(inside.len(), 1, "inside the default window");
+
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(row)
+            .with_crash_inspect(state),
+    );
+    let mut config = runtime_config(&temp);
+    config.crash_stable_window = Duration::from_secs(10);
+    let outside = crashes_with_config(runner.clone(), config).await;
+    assert!(outside.is_empty(), "{outside:?}");
+    assert_eq!(runner.count_commands(is_events), 0);
+}
+
+#[tokio::test]
+async fn an_app_that_recovered_from_one_or_two_crashes_is_not_reported() {
+    for restarts in [1, 2] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(
+            FakeRunner::new(true)
+                .with_docker_ps(listed("killed12", "Up 2 seconds"))
+                .with_crash_inspect(crash_state("killed12", "running", restarts, 0, false, 2)),
+        );
+
+        let crashed = crashes_reported(runner.clone(), &temp).await;
+
+        assert!(crashed.is_empty(), "{restarts} restarts: {crashed:?}");
+        assert_eq!(runner.count_commands(is_events), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_crash_loop_is_reported_from_its_third_restart_with_its_restart_count() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("looping1", "Up 2 seconds"))
+            .with_crash_inspect(crash_state("looping1", "running", 3, 0, false, 2)),
+    );
+
+    let crashed = crashes_reported(runner, &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].restart_count, 3);
+    assert!(crashed[0].running, "a process is up between two crashes");
+}
+
+#[tokio::test]
+async fn a_first_crash_is_reported_while_docker_shows_it_is_not_running() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("first123", "Restarting (1) 1 second ago"))
+            .with_crash_inspect(crash_state("first123", "restarting", 1, 1, false, 1)),
+    );
+
+    let crashed = crashes_reported(runner, &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].exit_code, Some(1));
+    assert_eq!(crashed[0].restart_count, 1);
+    assert!(!crashed[0].running);
+}
+
+#[tokio::test]
+async fn a_docker_failure_reaches_the_user_as_an_exit_code() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(UnavailableDependencyRunner {
+        program: "docker",
+        required_argument: Some("ps"),
+    });
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let error = dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("Docker fails");
+
+    let message = error.to_string();
+    assert!(message.contains("exit code 127"), "{message}");
+    assert!(!message.contains("Some("), "{message}");
+}
+
+#[tokio::test]
+async fn default_stable_window_is_five_minutes() {
+    assert_eq!(
+        DockerRuntimeConfig::default().crash_stable_window,
+        Duration::from_secs(300)
+    );
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("stable12", "Up 6 minutes"))
+            .with_crash_inspect(crash_state("stable12", "running", 9, 0, false, 360)),
+    );
+    let crashed = crashes_reported(runner, &temp).await;
+    assert!(crashed.is_empty(), "{crashed:?}");
+}
+
+#[tokio::test]
+async fn restarted_or_woken_workload_is_not_a_crash() {
+    // Real Docker resets RestartCount to 0 on `docker restart` and `docker start`,
+    // and StartedAt is recent in both cases.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("woken123", "Up 1 second"))
+            .with_crash_inspect(crash_state("woken123", "running", 0, 0, false, 1)),
+    );
+
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+
+    assert!(crashed.is_empty(), "{crashed:?}");
+    assert_eq!(runner.count_commands(is_events), 0);
+}
+
+#[tokio::test]
+async fn stopped_workload_is_not_a_crash_even_after_earlier_restarts() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("slept789", "Up 1 second"))
+            // The listing raced a sleep, so inspect already shows it stopped.
+            .with_crash_inspect(crash_state("slept789", "exited", 3, 137, false, 1)),
+    );
+
+    let crashed = crashes_reported(runner, &temp).await;
+
+    assert!(crashed.is_empty(), "{crashed:?}");
+}
+
+#[tokio::test]
+async fn crash_report_uses_one_batched_inspect_and_one_batched_history_query() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let rows = format!(
+        "{}{}{}",
+        listed("first123", "Up 3 seconds"),
+        listed("second45", "Up 2 minutes"),
+        listed("third678", "Up 2 seconds"),
+    );
+    let states = format!(
+        "{}{}{}",
+        crash_state("first123", "running", 3, 0, false, 3),
+        crash_state("second45", "running", 0, 0, false, 120),
+        crash_state("third678", "running", 4, 0, false, 2),
+    );
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(rows)
+            .with_crash_inspect(states)
+            .with_events("first123aaaaaaaa\tdie\t1\nthird678aaaaaaaa\tdie\t2\n"),
+    );
+
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+
+    assert_eq!(
+        crashed
+            .iter()
+            .map(|detail| detail.exit_code)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(2)]
+    );
+    assert_eq!(runner.count_commands(is_crash_inspect), 1);
+    assert_eq!(runner.count_commands(is_events), 1);
+    let commands = runner.commands.lock().expect("command lock");
+    let inspect = commands
+        .iter()
+        .find(|spec| is_crash_inspect(spec))
+        .expect("inspect");
+    for id in ["first123", "second45", "third678"] {
+        assert!(inspect.args.iter().any(|argument| argument == id), "{id}");
+    }
+    let events = commands
+        .iter()
+        .find(|spec| is_events(spec))
+        .expect("events");
+    let filters = events
+        .args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert!(filters.contains(&"container=first123aaaaaaaa".to_owned()));
+    assert!(filters.contains(&"container=third678aaaaaaaa".to_owned()));
+    assert!(
+        !filters.contains(&"container=second45aaaaaaaa".to_owned()),
+        "a stable workload needs no history: {filters:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_healthy_node_runs_no_history_query_and_an_empty_node_runs_no_query() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed("fresh456", "Up 2 minutes"))
+            .with_crash_inspect(crash_state("fresh456", "running", 0, 0, false, 120)),
+    );
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+    assert!(crashed.is_empty(), "{crashed:?}");
+    assert_eq!(runner.count_commands(is_crash_inspect), 1);
+    assert_eq!(runner.count_commands(is_events), 0);
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let crashed = crashes_reported(runner.clone(), &temp).await;
+    assert!(crashed.is_empty(), "{crashed:?}");
+    assert_eq!(runner.count_commands(is_crash_inspect), 0);
+}
+
+fn event_types(reporter: &RecordingReporter) -> Vec<String> {
+    reporter
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .map(|event| event.event_type.clone())
+        .filter(|event_type| event_type.starts_with("deployment."))
+        .filter(|event_type| !event_type.ends_with(".resolved"))
+        .collect()
+}
+
+#[tokio::test]
+async fn dockerfile_deployment_reports_its_stages_in_the_order_they_happen() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor =
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), Arc::new(FakeRunner::new(true)));
+
+    dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    assert_eq!(
+        event_types(&reporter),
+        [
+            "deployment.checkout.started",
+            "deployment.build.started",
+            "deployment.container.started",
+            "deployment.health.started",
+            "deployment.route.started",
+            "deployment.runtime.ready",
+        ],
+        "a Dockerfile deployment has no analysis step"
+    );
+}
+
+#[tokio::test]
+async fn railpack_deployment_reports_analysis_before_the_build() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor =
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), Arc::new(FakeRunner::new(false)));
+
+    dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    assert_eq!(
+        event_types(&reporter),
+        [
+            "deployment.checkout.started",
+            "deployment.analysis.started",
+            "deployment.build.started",
+            "deployment.container.started",
+            "deployment.health.started",
+            "deployment.route.started",
+            "deployment.runtime.ready",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_readiness_never_reports_that_routing_started() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_probe_results(&[(1, REFUSED_PROBE_STDERR)]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    dispatch(
+        executor,
+        &deploy_with_start_timeout(1),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("the app never answers");
+
+    let stages = event_types(&reporter);
+    assert_eq!(
+        stages.last().map(String::as_str),
+        Some("deployment.health.started")
+    );
+}
+
+const BUILD_SECRET: &str = "kL9-unusual-build-value";
+
+fn deploy_with_build_environment(builder: &str) -> AgentCommand {
+    let mut command = deploy_command(builder);
+    command.payload["environment"] = json!({
+        "EMPTY_VALUE": "",
+        "LD_PRELOAD": BUILD_SECRET,
+        "PORT": "3000",
+        "RAILPACK_NODE_VERSION": "22",
+        "VITE_API_URL": BUILD_SECRET,
+    });
+    command
+}
+
+fn string_arguments(spec: &CommandSpec) -> Vec<String> {
+    spec.args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn find_command(runner: &FakeRunner, matches: impl Fn(&CommandSpec) -> bool) -> CommandSpec {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .find(|spec| matches(spec))
+        .cloned()
+        .expect("command should run")
+}
+
+fn is_buildx_build(spec: &CommandSpec) -> bool {
+    spec.args.iter().any(|argument| argument == "buildx")
+        && spec.args.iter().any(|argument| argument == "build")
+}
+
+#[tokio::test]
+async fn dockerfile_build_receives_project_variables_only_as_buildkit_secrets() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_build_environment("dockerfile"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let build = find_command(&runner, is_buildx_build);
+    let arguments = string_arguments(&build);
+    for secret in [
+        "id=LD_PRELOAD,env=SAKALA_BUILD_SECRET_0",
+        "id=RAILPACK_NODE_VERSION,env=SAKALA_BUILD_SECRET_1",
+        "id=VITE_API_URL,env=SAKALA_BUILD_SECRET_2",
+    ] {
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--secret", secret]),
+            "{arguments:?}"
+        );
+    }
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains(BUILD_SECRET))
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.starts_with("id=PORT")
+                || argument.starts_with("id=EMPTY_VALUE")),
+        "{arguments:?}"
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.starts_with("VITE_API_URL=")
+                || argument.starts_with("LD_PRELOAD=")),
+        "a build argument stays in the image history: {arguments:?}"
+    );
+    let names = build.secret_environment_names().collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "SAKALA_BUILD_SECRET_0",
+            "SAKALA_BUILD_SECRET_1",
+            "SAKALA_BUILD_SECRET_2"
+        ],
+        "a project variable name must never reach a host process's environment"
+    );
+    assert!(
+        !format!("{build:?}").contains(BUILD_SECRET),
+        "debug output hides values"
+    );
+}
+
+#[tokio::test]
+async fn railpack_learns_names_without_values_and_gets_values_through_buildkit() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_build_environment("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let prepare = find_command(&runner, is_sandbox);
+    let arguments = string_arguments(&prepare);
+    assert!(arguments.windows(2).any(|pair| {
+        pair[0] == "--env" && pair[1] == "VITE_API_URL=provided-by-buildkit-secret"
+    }));
+    assert!(
+        arguments.windows(2).any(|pair| {
+            pair[0] == "--env" && pair[1] == "LD_PRELOAD=provided-by-buildkit-secret"
+        })
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--env", "RAILPACK_NODE_VERSION"]),
+        "Railpack's own settings need their real value: {arguments:?}"
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains(BUILD_SECRET))
+    );
+    assert_eq!(
+        prepare.secret_environment_names().collect::<Vec<_>>(),
+        ["RAILPACK_NODE_VERSION"],
+        "only Railpack's own settings reach its environment under their own name"
+    );
+
+    let build = find_command(&runner, is_buildx_build);
+    let arguments = string_arguments(&build);
+    assert!(arguments.windows(2).any(|pair| {
+        pair[0] == "--secret" && pair[1] == "id=VITE_API_URL,env=SAKALA_BUILD_SECRET_2"
+    }));
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument.starts_with("secrets-hash=")),
+        "a changed value must invalidate cached steps: {arguments:?}"
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains(BUILD_SECRET))
+    );
+}
+
+#[tokio::test]
+async fn secrets_fingerprint_follows_the_values_and_hides_them() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let deploy = |value: &'static str| {
+        let executor = Arc::clone(&executor);
+        async move {
+            let mut command = deploy_command("railpack");
+            command.payload["environment"] = json!({ "VITE_API_URL": value });
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &command,
+                    Arc::new(RecordingReporter::default()),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("deployment completes");
+        }
+    };
+
+    deploy("first-long-value").await;
+    deploy("first-long-value").await;
+    deploy("second-long-value").await;
+
+    let fingerprints = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|spec| is_buildx_build(spec))
+        .flat_map(string_arguments)
+        .filter(|argument| argument.starts_with("secrets-hash="))
+        .collect::<Vec<_>>();
+    assert_eq!(fingerprints.len(), 3);
+    assert_eq!(
+        fingerprints[0], fingerprints[1],
+        "same values keep the cache"
+    );
+    assert_ne!(
+        fingerprints[1], fingerprints[2],
+        "changed values invalidate it"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_without_variables_adds_no_build_flags() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = deploy_command("railpack");
+    command.payload["environment"] = json!({});
+
+    dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("deployment completes");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(!build.iter().any(|argument| argument == "--secret"));
+    assert!(
+        !build
+            .iter()
+            .any(|argument| argument.starts_with("secrets-hash="))
+    );
+    let prepare = find_command(&runner, is_sandbox);
+    let arguments = string_arguments(&prepare);
+    let railpack = arguments
+        .iter()
+        .position(|argument| argument == "railpack")
+        .expect("railpack");
+    assert!(
+        !arguments[railpack..]
+            .iter()
+            .any(|argument| argument == "--env")
+    );
+    assert_eq!(prepare.secret_environment_names().count(), 0);
+}
+
+fn managed_workload_row() -> String {
+    format!(
+        "running\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\t{}\t\t\t\n",
+        "b3c8cb55-3bc8-4725-a004-e69d9917d40b"
+    )
+}
+
+#[tokio::test]
+async fn a_recovered_log_follower_keeps_redacting_the_workload_environment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "running\tUp 1 minute\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(managed_workload_row())
+            .with_container_env(format!(
+                "[\"PATH=/usr/local/sbin:/usr/bin\",\"PORT=3000\",\"VITE_API_URL={BUILD_SECRET}\"]\n"
+            )),
+    );
+    let factory = Arc::new(RecordingReporterFactory::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    RuntimeExecutor::recover(&executor, Some(factory.clone()))
+        .await
+        .expect("recovery completes");
+
+    let redactors = factory.redactors.lock().expect("factory lock");
+    assert_eq!(redactors.len(), 1);
+    assert_eq!(
+        redactors[0].redact(&format!("using {BUILD_SECRET}")),
+        "using [REDACTED]"
+    );
+    assert_eq!(
+        redactors[0].redact("PATH=/usr/local/sbin:/usr/bin"),
+        "PATH=/usr/local/sbin:/usr/bin",
+        "the image's own PATH is not a secret"
+    );
+}
+
+#[tokio::test]
+async fn a_follower_still_starts_when_the_environment_cannot_be_read() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(
+                "running\tUp 1 minute\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\n",
+            )
+            .with_workload_lookup(managed_workload_row())
+            .with_failed_env_inspect(),
+    );
+    let factory = Arc::new(RecordingReporterFactory::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let report = RuntimeExecutor::recover(&executor, Some(factory.clone()))
+        .await
+        .expect("recovery completes");
+
+    assert_eq!(report.reattached_log_followers, 1);
+    assert_eq!(
+        factory.redactors.lock().expect("factory lock")[0].redact("TOKEN=abc"),
+        "TOKEN=[REDACTED]",
+        "key-name redaction still applies"
+    );
+}
+
+fn deploy_with_config(builder: &str, config: serde_json::Value) -> AgentCommand {
+    let mut command = deploy_command(builder);
+    for (key, value) in config.as_object().expect("config object") {
+        command.payload[key] = value.clone();
+    }
+    command
+}
+
+async fn deploy_outcome(
+    runner: Arc<FakeRunner>,
+    temp: &TempDir,
+    command: &AgentCommand,
+    reporter: Arc<RecordingReporter>,
+) -> Result<CommandOutput, RuntimeExecutionError> {
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(temp), runner);
+    dispatch(executor, command, reporter).await
+}
+
+/// The positional context comes right after the labels. Secrets follow it.
+fn build_context(arguments: &[String]) -> &str {
+    let label = arguments
+        .iter()
+        .position(|argument| argument.starts_with("dev.sakala.deployment-id="))
+        .expect("deployment label");
+    &arguments[label + 1]
+}
+
+fn is_docker_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && !is_sandbox(spec)
+}
+
+#[tokio::test]
+async fn payload_without_build_config_builds_the_repository_root_as_before() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("an old payload still deploys");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(build_context(&build).ends_with("/source"), "{build:?}");
+    let built = runner.built_dockerfiles.lock().expect("dockerfile lock");
+    assert!(built[0].contains("FROM scratch"), "{built:?}");
+    assert!(!built[0].contains("apps-web"), "{built:?}");
+    let run = string_arguments(&find_command(&runner, is_docker_run));
+    assert!(
+        !run.iter().any(|argument| argument == "--entrypoint"),
+        "{run:?}"
+    );
+    assert!(
+        run.last().expect("image").starts_with("sakala/project-"),
+        "{run:?}"
+    );
+}
+
+#[tokio::test]
+async fn dockerfile_build_uses_the_root_directory_as_its_context() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/web/" }));
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        build_context(&build).ends_with("/source/apps/web"),
+        "{build:?}"
+    );
+    let built = runner.built_dockerfiles.lock().expect("dockerfile lock");
+    assert!(built[0].contains("# apps-web"), "{built:?}");
+    assert!(
+        built[0].starts_with("# Sakala fixed the build frontend"),
+        "a repository must not choose its frontend: {built:?}"
+    );
+}
+
+#[tokio::test]
+async fn railpack_build_uses_the_root_directory_for_both_steps() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/web" }));
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let prepare = find_command(&runner, is_sandbox);
+    assert!(sandbox_mount(&prepare, "/app").ends_with("/source/apps/web"));
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        build_context(&build).ends_with("/source/apps/web"),
+        "{build:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_symlink_that_stays_in_the_repository_is_a_valid_root_directory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let command = deploy_with_config("auto", json!({ "root_directory": "link-in" }));
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        build_context(&build).ends_with("/source/apps/web"),
+        "the resolved path is what gets used: {build:?}"
+    );
+}
+
+#[tokio::test]
+async fn malicious_root_directory_is_refused_before_any_process_runs() {
+    for root_directory in [
+        "../outside",
+        "apps/../../outside",
+        "..",
+        "/etc",
+        "//etc",
+        "apps\\web",
+        "apps\u{0}web",
+        "apps\nweb",
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let command = deploy_with_config("auto", json!({ "root_directory": root_directory }));
+
+        let error = deploy_outcome(
+            runner.clone(),
+            &temp,
+            &command,
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("must be refused");
+
+        assert_eq!(
+            error.code(),
+            "runtime_root_directory_invalid",
+            "{root_directory:?}"
+        );
+        assert!(
+            runner.commands.lock().expect("command lock").is_empty(),
+            "{root_directory:?}"
+        );
+    }
+    let too_long = "a/".repeat(200);
+    let temp = TempDir::new().expect("temp directory should be available");
+    let error = deploy_outcome(
+        Arc::new(FakeRunner::new(true)),
+        &temp,
+        &deploy_with_config("auto", json!({ "root_directory": too_long })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("must be refused");
+    assert_eq!(error.code(), "runtime_root_directory_invalid");
+}
+
+#[tokio::test]
+async fn root_directory_escaping_through_a_symlink_never_reaches_a_build() {
+    for (root_directory, reason) in [
+        ("link-out", "outside the repository"),
+        ("link-out/ssl", "outside the repository"),
+        ("does/not/exist", "does not exist"),
+        ("a-file", "not a directory"),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let config = runtime_config(&temp);
+        let workspace = config
+            .workspace_root
+            .join("b3c8cb55-3bc8-4725-a004-e69d9917d40b");
+        let runner = Arc::new(FakeRunner::new(true));
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+        let command = deploy_with_config("auto", json!({ "root_directory": root_directory }));
+
+        let error = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(
+            error.code(),
+            "runtime_root_directory_invalid",
+            "{root_directory}"
+        );
+        assert!(error.to_string().contains(reason), "{error}");
+        assert!(!error.to_string().contains("/etc"), "{error}");
+        assert_eq!(
+            runner.count_commands(is_buildx_build),
+            0,
+            "{root_directory}"
+        );
+        assert!(!workspace.exists(), "the checkout must be cleaned up");
+    }
+}
+
+#[tokio::test]
+async fn a_dockerfile_symlink_to_a_host_file_is_not_built() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/evil" }));
+
+    let error = deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("must be refused");
+
+    assert_eq!(error.code(), "runtime_build_failed");
+    assert!(
+        error.to_string().contains("outside the repository"),
+        "{error}"
+    );
+    assert_eq!(runner.count_commands(is_buildx_build), 0);
+}
+
+#[tokio::test]
+async fn railpack_receives_commands_through_its_settings_and_never_in_arguments() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let command = deploy_with_config(
+        "railpack",
+        json!({ "build_command": "pnpm build:web", "start_command": "node server.js" }),
+    );
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let prepare = find_command(&runner, is_sandbox);
+    let arguments = string_arguments(&prepare);
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--env", "RAILPACK_BUILD_CMD"])
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--env", "RAILPACK_START_CMD"])
+    );
+    assert!(
+        prepare
+            .secret_environment_names()
+            .any(|name| name == "RAILPACK_BUILD_CMD"),
+        "the value reaches Railpack through its environment"
+    );
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        build
+            .iter()
+            .any(|argument| argument.starts_with("id=RAILPACK_BUILD_CMD,env="))
+    );
+    for argument in arguments.iter().chain(&build) {
+        assert!(!argument.contains("pnpm build:web"), "{argument}");
+        assert!(!argument.contains("node server.js"), "{argument}");
+    }
+    let run = string_arguments(&find_command(&runner, is_docker_run));
+    assert!(
+        !run.iter().any(|argument| argument == "--entrypoint"),
+        "a Railpack image already starts with the command: {run:?}"
+    );
+}
+
+#[tokio::test]
+async fn dockerfile_start_command_runs_in_the_container_and_build_command_is_reported_unused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config(
+        "auto",
+        json!({ "build_command": "make web", "start_command": "node server.js --port $PORT" }),
+    );
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let run = find_command(&runner, is_docker_run);
+    assert_eq!(run.program, "docker", "never a shell on the host");
+    let arguments = string_arguments(&run);
+    let image = arguments
+        .iter()
+        .position(|argument| argument.starts_with("sakala/project-"))
+        .expect("image");
+    assert_eq!(
+        &arguments[image + 1..],
+        ["-c", "node server.js --port $PORT"]
+    );
+    assert!(
+        arguments[..image]
+            .windows(2)
+            .any(|pair| pair == ["--entrypoint", "sh"]),
+        "the image's entrypoint must not wrap the command: {arguments:?}"
+    );
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        !build.iter().any(|argument| argument.contains("make web")),
+        "{build:?}"
+    );
+    assert!(
+        reported_messages(&reporter)
+            .iter()
+            .any(|message| message.contains("build_command was not used")),
+    );
+}
+
+#[tokio::test]
+async fn an_empty_command_or_root_directory_means_not_set() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config(
+        "auto",
+        json!({ "build_command": "  ", "start_command": "", "root_directory": "." }),
+    );
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let run = string_arguments(&find_command(&runner, is_docker_run));
+    assert!(
+        !run.iter().any(|argument| argument == "--entrypoint"),
+        "{run:?}"
+    );
+    assert!(
+        !reported_messages(&reporter)
+            .iter()
+            .any(|message| message.contains("build_command")),
+    );
+}
+
+#[tokio::test]
+async fn multi_line_commands_are_refused() {
+    for field in ["build_command", "start_command"] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let command = deploy_with_config("auto", json!({ field: "ok\nrm -rf /" }));
+
+        let error = deploy_outcome(
+            runner.clone(),
+            &temp,
+            &command,
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("must be refused");
+
+        assert_eq!(error.code(), "invalid_runtime_command");
+        assert!(error.to_string().contains(field), "{error}");
+        assert!(runner.commands.lock().expect("command lock").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn inspection_looks_at_the_requested_root_directory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = inspect_command();
+    command.payload["root_directory"] = json!("apps/web");
+
+    let output = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("inspection completes");
+
+    let info = find_command(&runner, is_sandbox);
+    assert!(sandbox_mount(&info, "/app").ends_with("/source/apps/web"));
+    let manifests = output.result["manifests"].as_array().expect("manifests");
+    assert!(manifests.iter().any(|manifest| manifest == "package.json"));
+    assert!(
+        !manifests
+            .iter()
+            .any(|manifest| manifest == "pnpm-lock.yaml"),
+        "the lockfile is at the repository root: {manifests:?}"
+    );
+    assert_eq!(output.result["dockerfile_found"], true);
+}
+
+#[tokio::test]
+async fn inspection_refuses_a_root_directory_outside_the_repository() {
+    for (root_directory, processes_run) in [("../outside", false), ("link-out", true)] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let config = runtime_config(&temp);
+        let workspace = config
+            .workspace_root
+            .join("b3c8cb55-3bc8-4725-a004-e69d9917d40b");
+        let runner = Arc::new(FakeRunner::new(true));
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+        let mut command = inspect_command();
+        command.payload["root_directory"] = json!(root_directory);
+
+        let error = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+            .await
+            .expect_err("must be refused");
+
+        assert_eq!(error.code(), "runtime_root_directory_invalid");
+        assert_eq!(
+            !runner.commands.lock().expect("command lock").is_empty(),
+            processes_run
+        );
+        assert_eq!(runner.count_commands(is_sandbox), 0);
+        assert!(!workspace.exists());
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_route_activation_lets_it_finish_instead_of_breaking_the_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_validate_delay(Duration::from_millis(300)));
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
+    let cancellation = CancellationToken::new();
+    let task = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        let cancellation = cancellation.clone();
+        async move {
+            let command = deploy_command("auto");
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &command,
+                    Arc::new(RecordingReporter::default()),
+                    cancellation,
+                )
+                .await
+        }
+    });
+    for _ in 0..400 {
+        if runner.count_commands(|spec| spec.args.iter().any(|argument| argument == "validate")) > 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cancellation.cancel();
+
+    task.await
+        .expect("task should join")
+        .expect("an activation in progress finishes");
+
+    assert!(route.exists());
+    assert_eq!(
+        runner.count_commands(is_candidate_removal),
+        0,
+        "the candidate now serves the route"
+    );
+}
+
+/// Runs `df` for real, because the failure is what `df` does with a missing path.
+struct RealDfRunner {
+    inner: FakeRunner,
+}
+
+#[async_trait]
+impl ProcessRunner for RealDfRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if spec.program == "df" {
+            return sakala_agent_runtime::TokioProcessRunner::default()
+                .run(spec, sink)
+                .await;
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
+#[tokio::test]
+async fn preflight_passes_on_a_fresh_node_without_a_workspace_directory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = DockerRuntimeConfig {
+        workspace_root: temp.path().join("not/created/yet/builds"),
+        ..runtime_config(&temp)
+    };
+    let workspace_root = config.workspace_root.clone();
+    let executor = DockerRuntimeExecutor::with_runner(
+        config,
+        Arc::new(RealDfRunner {
+            inner: FakeRunner::new(true),
+        }),
+    );
+
+    let report = RuntimeExecutor::preflight(&executor)
+        .await
+        .expect("preflight should return a report");
+
+    let disk = report
+        .checks
+        .iter()
+        .find(|check| check.name == "workspace-disk")
+        .expect("disk check");
+    assert!(disk.ready, "{}", disk.detail);
+    assert!(!report.has_fatal_failure(), "{:?}", report.checks);
+    assert!(workspace_root.is_dir());
+}
+
+#[tokio::test]
+async fn railpack_only_ever_runs_in_the_locked_down_sandbox() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = deploy_command("railpack");
+    command.payload["environment"] = json!({ "API_SECRET_VALUE": BUILD_SECRET });
+
+    dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("deployment completes");
+
+    assert_eq!(
+        runner.count_commands(|spec| spec.program == "railpack"),
+        0,
+        "Railpack must never run on the host"
+    );
+    let sandbox = find_command(&runner, is_sandbox);
+    let arguments = string_arguments(&sandbox);
+    for pair in [
+        ["--cap-drop", "ALL"],
+        ["--security-opt", "no-new-privileges:true"],
+        ["--user", "65534:65534"],
+        ["--memory", "512m"],
+        ["--memory-swap", "512m"],
+        ["--pids-limit", "256"],
+        ["--network", "sakala-railpack"],
+    ] {
+        assert!(
+            arguments.windows(2).any(|found| found == pair),
+            "{pair:?}: {arguments:?}"
+        );
+    }
+    assert!(arguments.iter().any(|argument| argument == "--read-only"));
+    assert!(arguments.iter().any(|argument| argument == "--rm"));
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument.ends_with(",dst=/app,readonly")),
+        "{arguments:?}"
+    );
+    assert_eq!(
+        arguments
+            .iter()
+            .filter(|argument| *argument == "--mount")
+            .count(),
+        1,
+        "the read-only source is the only host path: {arguments:?}"
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains("docker.sock")
+                || argument.contains("SAKALA_AGENT")
+                || argument.contains(BUILD_SECRET)),
+        "{arguments:?}"
+    );
+    assert_eq!(
+        sandbox.secret_environment_names().count(),
+        0,
+        "no project value enters unless it is one of Railpack's own settings"
+    );
+}
+
+#[tokio::test]
+async fn inspection_runs_railpack_in_the_sandbox_too() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = dispatch(
+        executor,
+        &inspect_command(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("inspection completes");
+
+    assert_eq!(runner.count_commands(|spec| spec.program == "railpack"), 0);
+    assert_eq!(runner.count_commands(is_sandbox), 1);
+    assert_eq!(output.result["railpack"]["provider"], "node");
+}
+
+/// Railpack's PHP image runs FrankenPHP, a binary marked
+/// `cap_net_bind_service=ep`, which the kernel refuses to exec when that
+/// capability is outside the bounding set. Only that one capability returns.
+#[tokio::test]
+async fn a_workload_keeps_only_the_capability_that_file_capability_binaries_need() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    let values_of = |flag: &str| {
+        workload
+            .windows(2)
+            .filter(|pair| pair[0] == flag)
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values_of("--cap-drop"), ["ALL"], "{workload:?}");
+    assert_eq!(values_of("--cap-add"), ["NET_BIND_SERVICE"], "{workload:?}");
+    assert_eq!(
+        values_of("--security-opt"),
+        ["no-new-privileges:true"],
+        "{workload:?}"
+    );
+    assert!(!workload.iter().any(|argument| argument == "--privileged"));
+}
+
+#[tokio::test]
+async fn a_configured_runtime_reaches_only_the_workload_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    assert!(
+        workload
+            .windows(2)
+            .any(|pair| pair == ["--runtime", "runsc"]),
+        "{workload:?}"
+    );
+    for pair in [
+        ["--cap-drop", "ALL"],
+        ["--security-opt", "no-new-privileges:true"],
+    ] {
+        assert!(
+            workload.windows(2).any(|found| found == pair),
+            "{workload:?}"
+        );
+    }
+    assert!(workload.iter().any(|argument| argument == "--memory"));
+    assert!(workload.iter().any(|argument| argument == "--pids-limit"));
+    assert!(workload.iter().any(|argument| argument == "--cpus"));
+    for other in [
+        find_command(&runner, is_sandbox),
+        find_command(&runner, is_buildx_build),
+    ] {
+        assert!(
+            !string_arguments(&other)
+                .iter()
+                .any(|argument| argument == "--runtime"),
+            "{other:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_a_configured_runtime_docker_chooses() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    assert!(!workload.iter().any(|argument| argument == "--runtime"));
+    let report = RuntimeExecutor::preflight(&DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner,
+    ))
+    .await
+    .expect("report");
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.name == "container-runtime")
+    );
+}
+
+#[tokio::test]
+async fn a_workload_the_runtime_refuses_fails_without_trying_another_runtime() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_failed_workload_run());
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the deployment must fail");
+
+    let attempts = runner.count_commands(is_workload_run);
+    assert_eq!(attempts, 1, "there is exactly one attempt");
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    assert!(
+        workload
+            .windows(2)
+            .any(|pair| pair == ["--runtime", "runsc"])
+    );
+}
+
+#[tokio::test]
+async fn preflight_is_fatal_when_the_configured_runtime_is_not_registered() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let report = RuntimeExecutor::preflight(&executor).await.expect("report");
+
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "container-runtime")
+        .expect("the check runs when a runtime is configured");
+    assert!(check.fatal && !check.ready);
+    assert!(check.detail.contains("runsc"), "{}", check.detail);
+    assert!(check.detail.contains("runc"), "{}", check.detail);
+    assert!(check.detail.contains("daemon.json"), "{}", check.detail);
+    assert!(report.has_fatal_failure());
+}
+
+#[tokio::test]
+async fn preflight_passes_and_telemetry_reports_a_registered_runtime() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_registered_runtime("runsc"));
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    fs::create_dir_all(&config.workspace_root).expect("workspace should be available");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let report = RuntimeExecutor::preflight(&executor).await.expect("report");
+    assert!(!report.has_fatal_failure(), "{:?}", report.checks);
+
+    let telemetry = RuntimeExecutor::node_telemetry(&executor)
+        .await
+        .expect("telemetry");
+    assert_eq!(telemetry.runtime_dependencies["container_runtime"], "runsc");
+    assert_eq!(telemetry.runtime_operational, Some(true));
+}
+
+#[tokio::test]
+async fn a_runtime_that_ignores_cgroups_is_reported_but_does_not_stop_the_node() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_registered_runtime("runsc --ignore-cgroups"));
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    fs::create_dir_all(&config.workspace_root).expect("workspace should be available");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let report = RuntimeExecutor::preflight(&executor).await.expect("report");
+    assert!(!report.has_fatal_failure(), "{:?}", report.checks);
+    let limits = report
+        .checks
+        .iter()
+        .find(|check| check.name == "container-runtime-limits")
+        .expect("limits check");
+    assert!(!limits.ready && !limits.fatal);
+    assert!(limits.detail.contains("not enforced"), "{}", limits.detail);
+    let dns = report
+        .checks
+        .iter()
+        .find(|check| check.name == "container-dns")
+        .expect("dns check");
+    assert!(!dns.ready && !dns.fatal);
+
+    let telemetry = RuntimeExecutor::node_telemetry(&executor)
+        .await
+        .expect("telemetry");
+    assert_eq!(
+        telemetry.runtime_dependencies["container_runtime_limits_enforced"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn configured_name_servers_reach_the_workload_through_a_read_only_file() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let config = DockerRuntimeConfig {
+        container_dns: vec!["1.1.1.1".parse().expect("address")],
+        ..runtime_config(&temp)
+    };
+    let root = config.workspace_root.clone();
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let file = root.join(".sakala-resolv.conf");
+    assert_eq!(
+        fs::read_to_string(&file).expect("resolv.conf"),
+        "nameserver 1.1.1.1\n"
+    );
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    let mount = format!(
+        "type=bind,src={},dst=/etc/resolv.conf,readonly",
+        file.display()
+    );
+    assert!(workload.contains(&mount), "{workload:?}");
+    for other in [
+        find_command(&runner, is_sandbox),
+        find_command(&runner, is_buildx_build),
+    ] {
+        assert!(
+            !string_arguments(&other)
+                .iter()
+                .any(|argument| argument.contains("resolv.conf")),
+            "{other:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn heartbeat_turns_not_operational_when_the_runtime_disappears() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        ..runtime_config(&temp)
+    };
+    fs::create_dir_all(&config.workspace_root).expect("workspace should be available");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let telemetry = RuntimeExecutor::node_telemetry(&executor)
+        .await
+        .expect("telemetry");
+
+    assert_eq!(telemetry.runtime_operational, Some(false));
+}
+
+#[tokio::test]
+async fn an_unreadable_result_from_the_sandbox_is_refused() {
+    for stdout in ["root:x:0:0:root\n", "bm90IGpzb24=\n"] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(false).with_sandbox_stdout(stdout));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+        let error = dispatch(
+            executor,
+            &inspect_command(),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("an unreadable report must be refused");
+
+        assert!(error.to_string().contains("unreadable"), "{error}");
+        assert!(!error.to_string().contains("root:x"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn an_unpinned_or_missing_sandbox_image_is_refused() {
+    for image in ["", "sakala-railpack:latest"] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(false));
+        let config = DockerRuntimeConfig {
+            railpack_image: image.to_owned(),
+            ..runtime_config(&temp)
+        };
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+        let report = RuntimeExecutor::preflight(&executor).await.expect("report");
+        assert!(report.has_fatal_failure(), "{image:?}");
+
+        let error = dispatch(
+            executor,
+            &inspect_command(),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("must be refused");
+        assert_eq!(error.code(), "runtime_dependency_failed", "{image:?}");
+        assert_eq!(
+            runner.count_commands(|spec| {
+                spec.args.first().is_some_and(|argument| argument == "run")
+            }),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_plan_naming_another_projects_image_is_refused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_sandbox_plan(
+        r#"{"steps":[{"inputs":[{"image":"\u0073akala/project-11111111:abc"}]}]}"#,
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("must be refused");
+
+    assert_eq!(error.code(), "runtime_build_failed");
+    assert_eq!(runner.count_commands(is_buildx_build), 0);
+}
+
+#[tokio::test]
+async fn builds_never_reuse_anything_from_another_project() {
+    for (builder, dockerfile) in [("dockerfile", true), ("railpack", false)] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(dockerfile));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+        dispatch(
+            executor,
+            &deploy_command(builder),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect("deployment completes");
+
+        let build = string_arguments(&find_command(&runner, is_buildx_build));
+        assert!(
+            build.iter().any(|argument| argument == "--no-cache"),
+            "{build:?}"
+        );
+        assert!(
+            build.iter().any(|argument| argument == "--pull"),
+            "{build:?}"
+        );
+        let namespace = if dockerfile {
+            "BUILDKIT_CACHE_MOUNT_NS=ff66ed4a-6303-4be6-8ef4-63c28b112680"
+        } else {
+            "cache-key=ff66ed4a-6303-4be6-8ef4-63c28b112680"
+        };
+        assert!(
+            build.iter().any(|argument| argument == namespace),
+            "{build:?}"
+        );
+    }
+}
+
+#[test]
+fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../examples/failures/deploy-failures.json"
+    ))
+    .expect("failure fixture should be JSON");
+    let errors = [
+        RuntimeError::AppNotListening {
+            port: 3000,
+            waited_seconds: 120,
+        },
+        RuntimeError::AppUnhealthy {
+            port: 3000,
+            status: 500,
+            waited_seconds: 120,
+        },
+        RuntimeError::AppCrashed { exit_code: Some(3) },
+        RuntimeError::AppCrashed { exit_code: None },
+        RuntimeError::AppExecDenied { exit_code: 126 },
+        RuntimeError::AppOutOfMemory {
+            memory_limit_mb: Some(256),
+        },
+        RuntimeError::PortConflict {
+            environment_port: Some(8080),
+            container_port: 3000,
+        },
+        RuntimeError::PortConflict {
+            environment_port: None,
+            container_port: 3000,
+        },
+    ];
+    let expected = fixture.as_array().expect("fixture is a list");
+    assert_eq!(expected.len(), errors.len());
+    for (error, expected) in errors.iter().zip(expected) {
+        assert_eq!(expected["error_code"], error.code());
+        assert_eq!(expected["error_message"], error.to_string());
+        assert!(
+            error.to_string().chars().count() <= 1_000,
+            "fits the fail body"
+        );
+    }
+}
+
 async fn dispatch<R>(
     executor: DockerRuntimeExecutor,
     command: &AgentCommand,
@@ -2095,8 +4552,11 @@ where
         .await
 }
 
+const SANDBOX_IMAGE: &str = "sakala-railpack@sha256:0123456789abcdef";
+
 fn runtime_config(temp: &TempDir) -> DockerRuntimeConfig {
     DockerRuntimeConfig {
+        railpack_image: SANDBOX_IMAGE.to_owned(),
         workspace_root: temp.path().join("builds"),
         caddy_sites_dir: temp.path().join("sites"),
         health_attempts: 1,
@@ -2180,6 +4640,91 @@ fn lifecycle_request() -> WorkloadLifecycleRequest {
     }
 }
 
+// `docker inspect` output: status, restarts, exit code, OOM flag, HEALTHCHECK, memory bytes.
+const RUNNING_STATE: &str = "running\t0\t0\tfalse\tnone\t268435456\n";
+// Captured from `wget` in caddy:2.11.3-alpine (BusyBox v1.37.0) against real servers.
+const OK_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.3:3000)\n  HTTP/1.1 200 OK\n  Content-Length: 4\n  \nremote file exists\n";
+const NOT_FOUND_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.4:3000)\n  HTTP/1.1 404 Not Found\nwget: server returned error: HTTP/1.1 404 Not Found\n";
+const SERVER_ERROR_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.5:3000)\n  HTTP/1.1 500 Internal Server Error\nwget: server returned error: HTTP/1.1 500 Internal Server Error\n";
+const REFUSED_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.3:3000)\nwget: can't connect to remote host (172.25.0.3): Connection refused\n";
+const REDIRECT_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.9:3000)\n  HTTP/1.1 302 Found\n  Location: http://outside.invalid/x\n  HTTP/1.1 302 Found\n  Location: http://outside.invalid/x\nwget: too many redirections\n";
+const BAD_ADDRESS_PROBE_STDERR: &str = "wget: bad address 'app:3000'\n";
+
+fn is_sandbox(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && spec.args.iter().any(|argument| argument == SANDBOX_IMAGE)
+}
+
+/// Host path mounted at `target` in the sandbox.
+fn sandbox_mount(spec: &CommandSpec, target: &str) -> String {
+    spec.args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .find_map(|argument| {
+            let rest = argument.strip_prefix("type=bind,src=")?;
+            let (source, destination) = rest.split_once(",dst=")?;
+            destination
+                .split(',')
+                .next()
+                .is_some_and(|value| value == target)
+                .then(|| source.to_owned())
+        })
+        .expect("sandbox mount")
+}
+
+/// The `docker run` of a workload, as opposed to the Railpack sandbox.
+fn is_workload_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && !is_sandbox(spec)
+}
+
+fn is_probe(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "exec")
+        && spec.args.iter().any(|argument| argument == "wget")
+        && !spec.args.iter().any(|argument| argument == "--help")
+}
+
+fn is_app_logs(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "logs")
+        && !spec.args.iter().any(|argument| argument == "--follow")
+}
+
+fn is_candidate_removal(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "rm")
+        && spec.args.iter().any(|argument| argument == "--force")
+}
+
+fn deploy_with_start_timeout(seconds: u64) -> AgentCommand {
+    let mut command = deploy_command("auto");
+    command.payload["timeouts"] = json!({
+        "build_timeout_seconds": 5,
+        "start_timeout_seconds": seconds,
+        "command_timeout_seconds": 10
+    });
+    command
+}
+
+fn route_file(config: &DockerRuntimeConfig) -> std::path::PathBuf {
+    config
+        .caddy_sites_dir
+        .join("ff66ed4a-6303-4be6-8ef4-63c28b112680.Caddyfile")
+}
+
+fn reported_messages(reporter: &RecordingReporter) -> Vec<String> {
+    reporter
+        .logs
+        .lock()
+        .expect("log lock")
+        .iter()
+        .map(|log| log.message.clone())
+        .collect()
+}
+
 struct FakeRunner {
     dockerfile: bool,
     commands: Mutex<Vec<CommandSpec>>,
@@ -2190,14 +4735,29 @@ struct FakeRunner {
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
     fail_previous_stop: bool,
-    image_prune_stdout: String,
     image_list_stdout: String,
-    image_created_stdout: String,
+    image_inspect_stdout: String,
+    image_users_stdout: String,
     follow_delay: Option<Duration>,
     follow_lines: Vec<String>,
     live_caddy: AtomicBool,
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
+    inspect_states: Mutex<VecDeque<String>>,
+    probe_results: Mutex<VecDeque<(i32, String)>>,
+    app_stdout: Vec<String>,
+    app_stderr: Vec<String>,
+    events_stdout: String,
+    crash_inspect_stdout: String,
+    fail_caddy_validate: bool,
+    container_env_stdout: String,
+    env_inspect_fails: bool,
+    validate_delay: Option<Duration>,
+    sandbox_plan: String,
+    sandbox_stdout: Option<String>,
+    registered_runtimes: String,
+    fail_workload_run: bool,
+    built_dockerfiles: Mutex<Vec<String>>,
 }
 
 struct AdmissionRunner {
@@ -2267,6 +4827,34 @@ impl ProcessRunner for AdmissionRunner {
     }
 }
 
+struct BuildFailingRunner {
+    inner: FakeRunner,
+}
+
+#[async_trait]
+impl ProcessRunner for BuildFailingRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if spec.args.iter().any(|argument| argument == "buildx") {
+            self.inner
+                .commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated build failure".to_owned(),
+            });
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
 struct FailingGitRunner;
 
 struct UnavailableDependencyRunner {
@@ -2330,15 +4918,120 @@ impl FakeRunner {
             inspect_delay: None,
             previous_container_inspection: None,
             fail_previous_stop: false,
-            image_prune_stdout: String::new(),
             image_list_stdout: String::new(),
-            image_created_stdout: "2020-01-01T00:00:00Z\n".to_owned(),
+            image_inspect_stdout: String::new(),
+            image_users_stdout: String::new(),
             follow_delay: None,
             follow_lines: Vec::new(),
             live_caddy: AtomicBool::new(true),
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
+            inspect_states: Mutex::new(VecDeque::new()),
+            probe_results: Mutex::new(VecDeque::new()),
+            app_stdout: vec!["application listening".to_owned()],
+            app_stderr: Vec::new(),
+            events_stdout: String::new(),
+            crash_inspect_stdout: String::new(),
+            fail_caddy_validate: false,
+            container_env_stdout: "[]\n".to_owned(),
+            env_inspect_fails: false,
+            validate_delay: None,
+            sandbox_plan: r#"{"steps":[]}"#.to_owned(),
+            sandbox_stdout: None,
+            registered_runtimes: "io.containerd.runc.v2\nrunc\n".to_owned(),
+            fail_workload_run: false,
+            built_dockerfiles: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Container states `docker inspect` reports, in order. The last one repeats.
+    fn with_inspect_states(self, states: &[&str]) -> Self {
+        *self.inspect_states.lock().expect("state lock") =
+            states.iter().map(|state| (*state).to_owned()).collect();
+        self
+    }
+
+    /// `wget` results, in order, as exit code and stderr. The last one repeats.
+    fn with_probe_results(self, results: &[(i32, &str)]) -> Self {
+        *self.probe_results.lock().expect("probe lock") = results
+            .iter()
+            .map(|(code, stderr)| (*code, (*stderr).to_owned()))
+            .collect();
+        self
+    }
+
+    fn with_app_output(mut self, stdout: &[&str], stderr: &[&str]) -> Self {
+        self.app_stdout = stdout.iter().map(|line| (*line).to_owned()).collect();
+        self.app_stderr = stderr.iter().map(|line| (*line).to_owned()).collect();
+        self
+    }
+
+    fn with_events(mut self, stdout: impl Into<String>) -> Self {
+        self.events_stdout = stdout.into();
+        self
+    }
+
+    fn with_crash_inspect(mut self, stdout: impl Into<String>) -> Self {
+        self.crash_inspect_stdout = stdout.into();
+        self
+    }
+
+    fn with_sandbox_plan(mut self, plan: &str) -> Self {
+        self.sandbox_plan = plan.to_owned();
+        self
+    }
+
+    fn with_registered_runtime(mut self, name: &str) -> Self {
+        self.registered_runtimes.push_str(name);
+        self.registered_runtimes.push('\n');
+        self
+    }
+
+    fn with_failed_workload_run(mut self) -> Self {
+        self.fail_workload_run = true;
+        self
+    }
+
+    fn with_sandbox_stdout(mut self, stdout: &str) -> Self {
+        self.sandbox_stdout = Some(stdout.to_owned());
+        self
+    }
+
+    fn with_validate_delay(mut self, delay: Duration) -> Self {
+        self.validate_delay = Some(delay);
+        self
+    }
+
+    fn with_container_env(mut self, stdout: impl Into<String>) -> Self {
+        self.container_env_stdout = stdout.into();
+        self
+    }
+
+    fn with_failed_env_inspect(mut self) -> Self {
+        self.env_inspect_fails = true;
+        self
+    }
+
+    fn with_failed_caddy_validate(mut self) -> Self {
+        self.fail_caddy_validate = true;
+        self
+    }
+
+    fn command_position(&self, matches: impl Fn(&CommandSpec) -> bool) -> Option<usize> {
+        self.commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .position(matches)
+    }
+
+    fn count_commands(&self, matches: impl Fn(&CommandSpec) -> bool) -> usize {
+        self.commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .filter(|command| matches(command))
+            .count()
     }
 
     fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
@@ -2386,18 +5079,25 @@ impl FakeRunner {
         self
     }
 
-    fn with_image_prune_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_prune_stdout = stdout.into();
+    /// `images` holds `(id, project, created, size)` and is printed the way
+    /// `docker image ls` and `docker image inspect` print it.
+    fn with_images(mut self, images: &[(&str, Uuid, &str, u64)]) -> Self {
+        self.image_list_stdout = images
+            .iter()
+            .map(|(id, project, _, _)| format!("{id}\tsakala/project-{project}\t{id}-tag\n"))
+            .collect();
+        self.image_inspect_stdout = images
+            .iter()
+            .map(|(id, project, created, size)| {
+                format!("{id}\t{project}\t<no value>\t{created}\t{size}\n")
+            })
+            .collect();
         self
     }
 
-    fn with_image_list_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_list_stdout = stdout.into();
-        self
-    }
-
-    fn with_image_created_output(mut self, stdout: impl Into<String>) -> Self {
-        self.image_created_stdout = stdout.into();
+    /// Image IDs the host's containers run.
+    fn with_image_users(mut self, stdout: impl Into<String>) -> Self {
+        self.image_users_stdout = stdout.into();
         self
     }
 }
@@ -2493,23 +5193,132 @@ impl ProcessRunner for FakeRunner {
                 "APP_URL=\n",
             )
             .expect("fake env example should be created");
+
+            // A monorepo, with the ways a root directory can go wrong.
+            let source = std::path::Path::new(source);
+            let app = source.join("apps/web");
+            fs::create_dir_all(&app).expect("fake app directory");
+            fs::write(app.join("package.json"), "{}\n").expect("fake app manifest");
+            if self.dockerfile {
+                fs::write(
+                    app.join("Dockerfile"),
+                    "# syntax=evil/frontend\nFROM scratch\n# apps-web\n",
+                )
+                .expect("fake app Dockerfile");
+            }
+            fs::write(source.join("a-file"), "not a directory\n").expect("fake file");
+            std::os::unix::fs::symlink("/etc", source.join("link-out")).expect("escaping symlink");
+            std::os::unix::fs::symlink("apps/web", source.join("link-in")).expect("inner symlink");
+            let evil = source.join("apps/evil");
+            fs::create_dir_all(&evil).expect("fake evil directory");
+            std::os::unix::fs::symlink("/etc/hostname", evil.join("Dockerfile"))
+                .expect("escaping Dockerfile");
         }
 
-        if spec.program == "railpack" && spec.args.iter().any(|argument| argument == "info") {
-            let output_index = spec
+        if is_buildx_build(spec)
+            && let Some(position) = spec.args.iter().position(|argument| argument == "--file")
+            && let Ok(content) = fs::read_to_string(&spec.args[position + 1])
+        {
+            self.built_dockerfiles
+                .lock()
+                .expect("dockerfile lock")
+                .push(content);
+        }
+        if is_sandbox(spec) {
+            let result = if spec.args.iter().any(|argument| argument == "prepare") {
+                self.sandbox_plan.as_str()
+            } else {
+                r#"{"provider":"node","version":"22"}"#
+            };
+            return Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout: self
+                    .sandbox_stdout
+                    .clone()
+                    .unwrap_or_else(|| BASE64_STANDARD.encode(result)),
+                stderr: String::new(),
+            });
+        }
+
+        if self.fail_workload_run && is_workload_run(spec) {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(125),
+                stdout: String::new(),
+                stderr: "docker: unknown or invalid runtime name: runsc".to_owned(),
+            });
+        }
+        if is_probe(spec) {
+            let (code, stderr) = {
+                let mut results = self.probe_results.lock().expect("probe lock");
+                if results.len() > 1 {
+                    results.pop_front().expect("probe result")
+                } else {
+                    results
+                        .front()
+                        .cloned()
+                        .unwrap_or((0, OK_PROBE_STDERR.to_owned()))
+                }
+            };
+            return Ok(ProcessOutput {
+                success: code == 0,
+                code: Some(code),
+                stdout: String::new(),
+                stderr,
+            });
+        }
+        if let Some(delay) = self.validate_delay
+            && spec.args.iter().any(|argument| argument == "validate")
+        {
+            tokio::time::sleep(delay).await;
+        }
+        if self.fail_caddy_validate && spec.args.iter().any(|argument| argument == "validate") {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated invalid Caddyfile".to_owned(),
+            });
+        }
+        if is_app_logs(spec) {
+            for line in &self.app_stdout {
+                sink.line(ProcessStream::Stdout, line).await?;
+            }
+            for line in &self.app_stderr {
+                sink.line(ProcessStream::Stderr, line).await?;
+            }
+            return Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout: self.app_stdout.join("\n"),
+                stderr: self.app_stderr.join("\n"),
+            });
+        }
+
+        let reads_container_env = spec
+            .args
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains(".Config.Env"));
+        if reads_container_env && self.env_inspect_fails {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated inspect failure".to_owned(),
+            });
+        }
+
+        let scripted_state;
+        let stdout = if spec.program == "docker"
+            && spec.args.first().is_some_and(|arg| arg == "info")
+            && spec
                 .args
                 .iter()
-                .position(|argument| argument == "--out")
-                .expect("railpack info should define an output path");
-            fs::write(
-                &spec.args[output_index + 1],
-                r#"{"provider":"node","version":"22"}"#,
-            )
-            .expect("fake Railpack info should be written");
-        }
-
-        let stdout = if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "ps")
+                .any(|argument| argument.to_string_lossy().contains(".Runtimes"))
         {
+            self.registered_runtimes.as_str()
+        } else if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "ps") {
             if spec
                 .args
                 .iter()
@@ -2539,18 +5348,35 @@ impl ProcessRunner for FakeRunner {
                 .is_some_and(|argument| argument == "image")
             && spec.args.iter().any(|argument| argument == "inspect")
         {
-            &self.image_created_stdout
+            &self.image_inspect_stdout
+        } else if spec.program == "docker"
+            && spec.args.iter().any(|argument| argument == "{{.Image}}")
+        {
+            &self.image_users_stdout
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "inspect")
         {
-            "running\n"
-        } else if spec.program == "docker"
-            && spec
+            if reads_container_env {
+                &self.container_env_stdout
+            } else if spec
                 .args
-                .first()
-                .is_some_and(|argument| argument == "image")
-            && spec.args.iter().any(|argument| argument == "prune")
-        {
-            &self.image_prune_stdout
+                .iter()
+                .any(|argument| argument.to_string_lossy().contains("{{.Id}}"))
+            {
+                &self.crash_inspect_stdout
+            } else {
+                let mut states = self.inspect_states.lock().expect("state lock");
+                scripted_state = if states.len() > 1 {
+                    states.pop_front().expect("scripted state")
+                } else {
+                    states
+                        .front()
+                        .cloned()
+                        .unwrap_or_else(|| RUNNING_STATE.to_owned())
+                };
+                &scripted_state
+            }
+        } else if spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "events") {
+            &self.events_stdout
         } else if spec.program == "docker"
             && spec
                 .args
@@ -2590,10 +5416,17 @@ struct RecordingReporter {
 struct RecordingReporterFactory {
     created: AtomicUsize,
     reporters: Mutex<Vec<(Uuid, LogBounds, Arc<RecordingReporter>)>>,
+    redactors: Mutex<Vec<ValueRedactor>>,
 }
 
 impl RuntimeReporterFactory for RecordingReporterFactory {
-    fn reporter(&self, command_id: Uuid, log_bounds: LogBounds) -> Arc<dyn RuntimeReporter> {
+    fn reporter(
+        &self,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+        redactor: ValueRedactor,
+    ) -> Arc<dyn RuntimeReporter> {
+        self.redactors.lock().expect("factory lock").push(redactor);
         self.created.fetch_add(1, Ordering::SeqCst);
         let reporter = Arc::new(RecordingReporter::default());
         self.reporters.lock().expect("factory lock").push((
@@ -2627,6 +5460,27 @@ impl RuntimeReporter for RecordingReporter {
 
     fn committed_output(&self) -> Option<CommandOutput> {
         self.committed_output.lock().expect("commit lock").clone()
+    }
+}
+
+struct RejectingLogReporter;
+
+#[async_trait]
+impl RuntimeReporter for RejectingLogReporter {
+    async fn event(&self, _event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+        Ok(())
+    }
+
+    async fn log(&self, _log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+        Err(RuntimeExecutionError::reporting(
+            "log delivery stopped: control-plane rejected report with HTTP 422",
+        ))
+    }
+
+    async fn flush(&self) -> Result<(), RuntimeExecutionError> {
+        Err(RuntimeExecutionError::reporting(
+            "log delivery stopped: control-plane rejected report with HTTP 422",
+        ))
     }
 }
 

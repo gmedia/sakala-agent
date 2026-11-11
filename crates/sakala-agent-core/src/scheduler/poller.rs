@@ -35,7 +35,24 @@ pub async fn run(
         CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));
 
     'polling: loop {
-        executions.reap_completed();
+        let panicked = executions.reap_completed();
+        if let Some(client) = &client {
+            // Nothing else will end these commands, so the deployment would hang
+            // until its lease expires. Their runtime artifacts stay for orphan
+            // detection to report.
+            for command_id in panicked {
+                if let Err(error) = client
+                    .fail(
+                        command_id,
+                        "runtime_execution_failed",
+                        "the agent stopped working on this command because of an internal error",
+                    )
+                    .await
+                {
+                    warn!(%command_id, %error, "could not report a command whose task panicked");
+                }
+            }
+        }
         if node_lifecycle.state() == NodeLifecycleState::Draining && executions.len() == 0 {
             node_lifecycle.set(NodeLifecycleState::Drained);
             info!("node drain completed; workload command processing is paused");
@@ -44,8 +61,11 @@ pub async fn run(
         if let (Some(client), Some(handler)) = (&client, &handler) {
             metrics.begin_poll();
             match client.poll_commands().await {
-                Ok(commands) => {
-                    for command in commands {
+                Ok(poll) => {
+                    // Before the commands: a full or draining node still has to
+                    // be able to stop the work it is running.
+                    executions.cancel_requested(&poll.cancel_requested);
+                    for command in poll.data {
                         if command.status != CommandStatus::Pending {
                             warn!(
                                 command_id = %command.id,
@@ -197,7 +217,20 @@ impl CommandExecutions {
         true
     }
 
-    fn reap_completed(&mut self) {
+    /// The same ID is repeated on every poll until its command is terminal, and
+    /// an ID this node is not running is ignored.
+    fn cancel_requested(&self, command_ids: &[Uuid]) {
+        for task in self.task_metadata.values() {
+            if command_ids.contains(&task.command_id) && !task.cancellation.is_cancelled() {
+                info!(command_id = %task.command_id, "control plane requested cancellation");
+                task.cancellation.cancel();
+            }
+        }
+    }
+
+    /// Returns the commands whose task ended without reaching its terminal report.
+    fn reap_completed(&mut self) -> Vec<Uuid> {
+        let mut panicked = Vec::new();
         while let Some(result) = self.tasks.try_join_next() {
             match result {
                 Ok((command_id, project_id)) => {
@@ -208,12 +241,14 @@ impl CommandExecutions {
                 }
                 Err(error) => {
                     if let Some(task) = self.task_metadata.remove(&error.id()) {
+                        panicked.push(task.command_id);
                         self.release_metadata(task);
                     }
                     warn!(%error, "command task terminated unexpectedly");
                 }
             }
         }
+        panicked
     }
 
     fn release_task(&mut self, command_id: Uuid) {
@@ -413,6 +448,62 @@ mod tests {
         assert!(second_cancellation.is_cancelled());
         assert_eq!(executions.len(), 0);
         assert!(executions.active_projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panicked_task_is_returned_so_its_command_can_be_failed() {
+        let mut executions = CommandExecutions::new(
+            1,
+            Arc::new(crate::scheduler::metrics::SchedulerMetrics::default()),
+        );
+        let panicking = command(Some(Uuid::new_v4()));
+        let command_id = panicking.id;
+        assert!(
+            executions.try_start(panicking, CancellationToken::new(), async {
+                panic!("simulated reporting panic");
+            })
+        );
+
+        let mut panicked = Vec::new();
+        for _ in 0..100 {
+            panicked = executions.reap_completed();
+            if !panicked.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(panicked, [command_id]);
+        assert_eq!(executions.active_heavy, 0, "its slot is free again");
+    }
+
+    #[tokio::test]
+    async fn cancel_requested_only_touches_the_listed_running_command() {
+        let mut executions = CommandExecutions::new(
+            2,
+            Arc::new(crate::scheduler::metrics::SchedulerMetrics::default()),
+        );
+        let listed = command(Some(Uuid::new_v4()));
+        let other = command(Some(Uuid::new_v4()));
+        let listed_id = listed.id;
+        let listed_token = CancellationToken::new();
+        let other_token = CancellationToken::new();
+        for (command, token) in [(listed, listed_token.clone()), (other, other_token.clone())] {
+            assert!(executions.try_start(command, token.clone(), async move {
+                token.cancelled().await;
+            }));
+        }
+
+        executions.cancel_requested(&[]);
+        executions.cancel_requested(&[Uuid::new_v4()]);
+        assert!(!listed_token.is_cancelled());
+
+        executions.cancel_requested(&[listed_id]);
+        executions.cancel_requested(&[listed_id]);
+        assert!(listed_token.is_cancelled());
+        assert!(!other_token.is_cancelled());
+        other_token.cancel();
+        executions.wait_for_tasks().await;
     }
 
     #[tokio::test]

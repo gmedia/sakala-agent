@@ -25,7 +25,8 @@ Untuk pilot yang memakai implementasi sekarang:
 1. jalankan `sakala-caddy` dari `sakala-infra`;
 2. mount `SAKALA_CADDY_SITES_DIR` ke `/etc/caddy/sites` secara read-only;
 3. hubungkan Caddy dan workload ke `sakala-runtime`;
-4. nonaktifkan Caddy host atau pastikan tidak bind pada port edge yang sama.
+4. nonaktifkan Caddy host atau pastikan tidak bind pada port edge yang sama;
+5. pakai image Caddy yang menyediakan `wget`, seperti `caddy:*-alpine`, karena probe readiness berjalan di dalam container ini. Lihat [Docker Runtime](DOCKER_RUNTIME.md#readiness).
 
 Caddy host juga dapat dipertahankan sebagai outer edge statis:
 

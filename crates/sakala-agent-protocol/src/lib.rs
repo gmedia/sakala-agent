@@ -17,15 +17,15 @@ pub mod repositories;
 pub mod status;
 
 pub use commands::{
-    AgentCommand, CleanupRuntimePayload, CommandType, CompleteCommandPayload, DesiredWorkloadState,
-    ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
+    AgentCommand, CleanupRuntimePayload, CommandPoll, CommandType, CompleteCommandPayload,
+    DesiredWorkloadState, ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
     FinalizationDeferredReason, LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
-pub use heartbeat::HeartbeatPayload;
+pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload};
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};

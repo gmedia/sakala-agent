@@ -1,4 +1,4 @@
-use sakala_agent_protocol::{DeploymentLog, LogStream};
+use sakala_agent_protocol::{DeploymentEvent, DeploymentEventLevel, DeploymentLog, LogStream};
 use time::OffsetDateTime;
 
 use async_trait::async_trait;
@@ -6,6 +6,24 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::{ProcessOutputSink, ProcessStream, RuntimeError, RuntimeReporter};
+
+pub(crate) async fn emit_event(
+    reporter: &dyn RuntimeReporter,
+    event_type: &str,
+    message: &str,
+    metadata: serde_json::Value,
+) -> Result<(), RuntimeError> {
+    reporter
+        .event(DeploymentEvent {
+            event_type: event_type.to_owned(),
+            level: DeploymentEventLevel::Info,
+            message: message.to_owned(),
+            metadata,
+            occurred_at: OffsetDateTime::now_utc(),
+        })
+        .await
+        .map_err(Into::into)
+}
 
 pub struct ReporterOutputSink<'a> {
     reporter: &'a dyn RuntimeReporter,
@@ -65,10 +83,8 @@ impl ProcessOutputSink for ReporterOutputSink<'_> {
 mod tests {
     use std::sync::Mutex;
 
-    use sakala_agent_core::ports::{CommandOutput, RuntimeExecutionError};
-    use sakala_agent_protocol::DeploymentEvent;
-
     use super::*;
+    use sakala_agent_core::ports::{CommandOutput, RuntimeExecutionError};
 
     #[derive(Default)]
     struct RecordingReporter {

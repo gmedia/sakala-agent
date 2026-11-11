@@ -6,32 +6,27 @@ use serde_json::Value;
 use tokio::fs;
 
 use crate::{
-    ProcessRunner, RuntimeError, RuntimeReporter,
-    process::run_checked,
-    railpack::info_command,
-    workspace::{DeploymentWorkspace, RepositorySource},
+    RuntimeError, RuntimeReporter, railpack::RailpackSandbox, workspace::RepositorySource,
 };
-
-const MAX_RAILPACK_INFO_BYTES: u64 = 1024 * 1024;
 
 #[async_trait]
 pub trait ProjectInspector: Send + Sync {
     async fn inspect(
         &self,
-        workspace: &DeploymentWorkspace,
+        context: &Path,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
     ) -> Result<ProjectInspection, RuntimeError>;
 }
 
 pub struct RailpackProjectInspector {
-    runner: Arc<dyn ProcessRunner>,
+    sandbox: Arc<RailpackSandbox>,
 }
 
 impl RailpackProjectInspector {
     #[must_use]
-    pub fn new(runner: Arc<dyn ProcessRunner>) -> Self {
-        Self { runner }
+    pub fn new(sandbox: Arc<RailpackSandbox>) -> Self {
+        Self { sandbox }
     }
 }
 
@@ -39,31 +34,16 @@ impl RailpackProjectInspector {
 impl ProjectInspector for RailpackProjectInspector {
     async fn inspect(
         &self,
-        workspace: &DeploymentWorkspace,
+        context: &Path,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
     ) -> Result<ProjectInspection, RuntimeError> {
-        let info_path = workspace.root().join("railpack-info.json");
-        run_checked(
-            self.runner.as_ref(),
-            &info_command(workspace.source(), &info_path),
-            "railpack-info",
-            reporter,
-        )
-        .await?;
-
-        let metadata = fs::metadata(&info_path).await?;
-        if metadata.len() > MAX_RAILPACK_INFO_BYTES {
-            return Err(RuntimeError::Execution(format!(
-                "Railpack info exceeded the {} byte safety limit",
-                MAX_RAILPACK_INFO_BYTES
-            )));
-        }
-        let railpack: Value =
-            serde_json::from_slice(&fs::read(&info_path).await?).map_err(|error| {
-                RuntimeError::Execution(format!("invalid Railpack info JSON: {error}"))
-            })?;
-        let manifests = detected_manifests(workspace.source()).await?;
+        let info = self.sandbox.info(context, reporter).await?;
+        // The parse error is not reported: the report is attacker-controlled.
+        let railpack: Value = serde_json::from_slice(&info).map_err(|_| {
+            RuntimeError::Execution("Railpack produced an unreadable report".to_owned())
+        })?;
+        let manifests = detected_manifests(context).await?;
 
         Ok(ProjectInspection {
             repository_url: source.repository_url.clone(),
@@ -110,7 +90,8 @@ async fn detected_manifests(source: &Path) -> Result<Vec<String>, RuntimeError> 
 
     let mut manifests = Vec::new();
     for candidate in CANDIDATES {
-        if fs::try_exists(source.join(candidate)).await? {
+        // Only the presence of a name is read here, so a symlink cannot leak.
+        if fs::symlink_metadata(source.join(candidate)).await.is_ok() {
             manifests.push((*candidate).to_owned());
         }
     }

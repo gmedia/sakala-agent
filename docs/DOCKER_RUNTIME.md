@@ -11,12 +11,17 @@ validate command
 -> enforce build deadline
 -> docker buildx build --load
 -> docker run candidate pada sakala-runtime
--> basic Docker health/running check
+-> deployment.health.started: tunggu state Docker, lalu probe HTTP dari dalam container Caddy
+-> deployment.route.started
 -> tulis route Caddy secara atomik
 -> validate dan reload Caddy
 -> ambil startup logs
 -> hapus container deployment sebelumnya
 ```
+
+Bila start, readiness, atau routing gagal, Agent lebih dulu mengirim baris terakhir
+output aplikasi, baru menghapus candidate. Tanpa langkah itu output aplikasi hilang
+bersama container, sehingga user tidak punya petunjuk untuk memperbaiki deploy-nya.
 
 Startup agent juga menjalankan scan orphan secara detection-only. Detail guard Phase 9 ada di [Runtime hardening](RUNTIME_HARDENING.md).
 
@@ -36,25 +41,269 @@ Image ditag berdasarkan project, commit, dan deployment. Image dan container dib
 - `dev.sakala.agent-id=<agent-id>`
 
 Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
-Railpack. Image aktif dilindungi oleh referensi container. Image deployment
-sebelumnya dipertahankan minimal selama `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`
-(default tujuh hari) dan baru eligible saat dangling; cleanup tetap dibatasi
-label ownership Sakala dan tidak memakai `docker image prune -a`. Startup
-reconciliation hanya melaporkan kandidat; prune baru dijalankan oleh command
-`CleanupRuntime` yang membawa `approved: true`.
+Railpack. Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
+menjadi dangling, dan `docker image prune` tanpa `-a` tidak menghapus apa pun. Karena
+itu GC memilih per project: image yang dipakai container mana pun, image deployment
+sebelumnya untuk rollback, dan image yang lebih muda dari
+`SAKALA_IMAGE_GC_MAX_AGE_SECONDS` (default tujuh hari) selalu dipertahankan, sisanya
+dihapus dengan `docker image rm` tanpa `--force`. Image tanpa label project yang valid
+tidak pernah dipilih. Startup reconciliation hanya melaporkan kandidat; penghapusan baru
+dijalankan oleh command `CleanupRuntime` yang membawa `approved: true`. Aturan lengkapnya
+ada di [Sakala Agent API](AGENT_API.md#approved-runtime-cleanup).
+
+Versi sebelumnya membaca label dengan `{{.Label "..."}}` pada `docker image ls`, yang
+ditolak Docker (`can't evaluate field Label in type *formatter.imageContext`), sehingga
+deteksi gagal dan tidak ada image yang pernah dihapus. Label kini dibaca lewat
+`docker image inspect`.
+
+## Readiness
+
+Container `running` belum berarti aplikasinya melayani request. Karena itu
+readiness punya dua tahap, yang diulang sampai `start_timeout_seconds` habis:
+
+1. **State Docker.** `restarting`, `exited`, `dead`, atau restart count yang naik
+   berarti aplikasi crash, dan penantian langsung berhenti. `HEALTHCHECK` image
+   ikut dihormati: `unhealthy` langsung gagal, `starting` terus ditunggu.
+2. **Probe HTTP** ke `http://<container>:<port>/`. Status di bawah 500 berarti
+   sehat, termasuk 404 atau halaman login, karena tujuannya memastikan aplikasi
+   menjawab, bukan menilai halamannya. Status 5xx terus dicoba sampai deadline,
+   karena aplikasi bisa membalas 503 selama boot.
+
+Agent menjalankan probe dengan `docker exec <caddy_container> wget`, bukan dari
+host. Binary host tidak bisa menjangkau IP container pada rootless Docker, dan
+jalur ini sama dengan jalur yang nanti dipakai route.
+
+**Container Caddy runtime wajib menyediakan `wget`.** Image `caddy:*-alpine`
+menyertakan BusyBox `wget`. Kalau tidak ada, deployment gagal dengan
+`runtime_dependency_failed`, dan preflight mencatat warning non-fatal
+`caddy-http-probe` saat startup. Preflight sengaja tidak fatal supaya Agent tetap
+bisa start lebih dulu daripada Caddy.
+
+Perilaku BusyBox `wget` v1.37.0 yang menentukan desain ini, diverifikasi pada
+`caddy:2.11.3-alpine`:
+
+- Exit code-nya 1 untuk 4xx, 5xx, koneksi ditolak, DNS gagal, dan redirect yang
+  terlalu panjang. Hanya stderr yang membedakannya, jadi Agent membaca baris status
+  pertama dari `--server-response`.
+- Redirect selalu diikuti dan tidak ada flag untuk mematikannya. Tanpa pencegahan,
+  aplikasi user bisa membuat container Caddy mengambil alamat apa pun lewat header
+  `Location`. Agent karena itu memakai mode proxy (`-Y on` dengan `http_proxy` yang
+  menunjuk aplikasi itu sendiri), sehingga semua request dalam rantai redirect tetap
+  masuk ke koneksi aplikasi. Penilaian hanya memakai jawaban pertama.
+- Konsekuensi mode proxy: request line berbentuk absolut (`GET http://<container>:<port>/
+  HTTP/1.1`). Server HTTP wajib menerimanya menurut RFC 9112, dan Node maupun Caddy
+  terbukti menerimanya. Aplikasi yang merutekan dari `req.url` mentah bisa membalas
+  404, yang tetap dihitung sehat.
+
+Probe tidak menilai aplikasi saat ia tidak bisa berjalan. Kegagalan seperti `wget`
+hilang, Caddy mati, atau nama container tidak ter-resolve dilaporkan sebagai
+`runtime_dependency_failed`.
+
+Di bawah `--restart unless-stopped`, crash terlihat sebagai `restarting`, dan Docker
+mengosongkan exit code serta flag OOM begitu restart berhasil. Karena itu, untuk
+crash yang tertangkap di antara dua restart, Agent membaca `docker events` sebagai
+sumber exit code dan event `oom`. Bila riwayat itu pun kosong, pesan menyatakan exit
+code tidak lagi dilaporkan Docker.
+
+Daftar `error_code` dan pesannya ada di
+[Sakala Agent API](AGENT_API.md#kegagalan-yang-disebabkan-aplikasi).
+
+Command `RestartProject`, `WakeProject`, `RefreshRoute`, dan aksi `restore_route`
+memakai probe yang sama dengan deadline `SAKALA_START_TIMEOUT_SECONDS`, karena
+payload-nya tidak membawa deadline sendiri. `HealthCheck` juga memakai probe yang
+sama, tetapi hanya menunggu 10 detik, karena ia bertanya tentang keadaan sekarang,
+dan melaporkan hasilnya pada field `ready`, `reason`, dan `error_code`.
+
+## Konfigurasi build dari project
+
+Bagian ini boleh dipakai untuk dokumentasi user.
+
+**Root directory.** Sakala membangun dari folder ini, bukan dari root repository. Harus
+path relatif di dalam repository. Pada project dengan Dockerfile, `Dockerfile` dicari di
+folder itu.
+
+**Build command.** Hanya berlaku untuk project tanpa Dockerfile. Pada project dengan
+Dockerfile, langkah build ditentukan oleh Dockerfile itu sendiri, jadi perintah ini
+diabaikan dan log build menyebutkannya.
+
+**Start command.** Berlaku untuk keduanya. Pada project dengan Dockerfile, perintah ini
+menggantikan `ENTRYPOINT` dan `CMD` image, dan dijalankan dengan `sh -c` di dalam
+container, jadi image-nya harus punya `sh`. Image `scratch` dan distroless gagal start.
+
+Semua perintah ini hanya berjalan di dalam build atau container, tidak pernah di shell
+host. Agent tidak memakai `sh -c` di host; argumen dikirim terstruktur ke Docker.
+
+## Isolasi antar-project saat build
+
+Semua project pada satu node memakai BuildKit yang sama, jadi tanpa pembatasan satu project bisa memakai hasil project lain. Ketiga jalur ini terbukti nyata pada BuildKit asli:
+
+| Jalur | Bukti tanpa isolasi | Isolasi | Bukti dengan isolasi |
+| --- | --- | --- | --- |
+| Layer ter-cache | Dockerfile yang sama dengan secret berbeda menghasilkan image berisi secret project pertama. BuildKit tidak menghitung nilai secret dalam cache key. | `--no-cache` | Tiap image berisi secret-nya sendiri. |
+| Cache mount | `RUN --mount=type=cache,id=x` pada project kedua membaca isi project pertama. | `BUILDKIT_CACHE_MOUNT_NS=<project>`, ditambah `--no-cache` yang membuat cache mount terlihat kosong selama build itu | Cache mount kosong di tiap build, dan `ARG BUILDKIT_CACHE_MOUNT_NS` di Dockerfile tidak mengubahnya. |
+| Image lokal | `FROM` atau `COPY --from` image project lain di node ini berhasil dan bisa membaca isinya. | `--pull` | Gagal resolve, karena image itu hanya ada di node ini. |
+
+Baris `# syntax=` bisa memilih frontend yang mengabaikan semua flag di atas, jadi Agent membangun salinan Dockerfile dengan komentar biasa di baris pertama. BuildKit berhenti mencari directive pada komentar pertama, sehingga `# syntax=` di repository tidak berpengaruh dan frontend bawaan yang dipakai. Directive `# escape=` tetap dipertahankan. Frontend eksternal yang dipin lewat `BUILDKIT_SYNTAX` sudah dicoba dan ditolak, karena di bawahnya `--pull` tidak berlaku dan `FROM` tetap bisa membaca image lokal project lain.
+
+Biayanya terukur pada `heroku/node-js-getting-started`, dengan builder host network:
+
+| Build Dockerfile dengan `npm ci` | Cache biasa | Dengan isolasi |
+| --- | --- | --- |
+| Tanpa perubahan | 2,5 detik | 15,4 detik |
+| Kode berubah | 2,2 detik | 14,2 detik |
+
+Build dengan isolasi selalu memasang ulang dependensi, dan cache mount tidak membantu karena `--no-cache` membuatnya terlihat kosong. Per-project builder akan mempertahankan cache, tetapi butuh satu container BuildKit privileged per project, jadi belum dipilih.
+
+Railpack berbeda, karena frontend Railpack v0.23.0 mengabaikan `--no-cache` dan `--pull`. Build pertama butuh 64,4 detik, dan build ulang setelah kode berubah butuh 4,2 detik dengan flag isolasi maupun 4,4 detik tanpa flag. Jadi flag itu tidak mengisolasi apa pun di jalur ini, dan isolasinya datang dari tiga hal lain:
+
+- `secrets-hash`, sidik jari ber-key dari nilai secret, membuat langkah yang memakai secret tidak berbagi layer. Smoke test `railpack_projects_keep_their_own_secrets` membuktikan tiap image memegang secret-nya sendiri.
+- `cache-key=<project>` memisahkan cache mount. Ini baru dibaca dari source frontend dan belum diuji terpisah.
+- Plan yang menyebut image `sakala/project-*` ditolak, karena `--pull` tidak berlaku.
+
+Langkah dengan konteks, plan, dan sidik jari secret yang identik tetap berbagi layer antar-project. Isinya berasal dari input yang sama, jadi project lain hanya bisa memakainya bila sudah memiliki source yang sama.
+
+## Pembatalan
+
+Saat API meminta batal, Agent membatalkan token command itu. Melepas future process
+mematikan process group-nya, termasuk klien `docker buildx`, dan BuildKit menghentikan
+langkah build yang sedang berjalan saat kliennya hilang. Candidate, image, dan workspace
+lalu dihapus. Setelah aktivasi route dimulai, pembatalan tidak lagi menghentikan
+deployment, karena route lama sudah mulai digantikan.
+
+## Variabel saat build
+
+Semua variabel project, kecuali `PORT` dan yang kosong, tersedia saat build sebagai
+secret BuildKit. Nilainya tidak masuk layer atau history image, kecuali langkah
+build sendiri menulisnya ke sana. Teks berikut boleh dipakai untuk dokumentasi user.
+
+**Tanpa Dockerfile (Railpack).** Semua variabel otomatis tersedia sebagai environment
+variable pada setiap langkah build. `VITE_API_URL` atau `NEXT_PUBLIC_API_URL` bekerja
+tanpa pengaturan tambahan. Mengubah nilainya membangun ulang langkah yang memakainya.
+
+**Dengan Dockerfile.** `ARG` tidak diisi, karena nilainya akan tersimpan di history
+image dan bisa dibaca siapa pun yang punya image-nya. Minta variabelnya secara
+eksplisit pada langkah yang membutuhkan:
+
+```dockerfile
+RUN --mount=type=secret,id=VITE_API_URL,env=VITE_API_URL npm run build
+```
+
+Nilainya juga tersedia sebagai file `/run/secrets/VITE_API_URL` bila hanya memakai
+`--mount=type=secret,id=VITE_API_URL`. Pada Dockerfile, mengubah nilai variabel tidak
+otomatis membangun ulang langkah yang sudah ter-cache. Perubahan kode sebelum langkah
+itu akan membangunnya ulang.
+
+**Yang tetap harus diperhatikan user.** Variabel yang dimasukkan framework ke hasil
+build, seperti `VITE_*` dan `NEXT_PUBLIC_*`, akan terbaca oleh siapa pun yang membuka
+aplikasinya, jadi jangan menaruh secret di sana. Secret pada langkah build juga bisa
+tersimpan bila perintahnya menulisnya ke file. Log build yang mencetak nilainya
+diredaksi, selama nilainya 8 karakter atau lebih dan bukan kata umum.
+
+Detail implementasi:
+
+- Agent tidak memakai `--build-arg` untuk variabel project, dan nilai tidak pernah
+  ada di process argument.
+- Nilai sampai ke `docker buildx` lewat environment bernama `SAKALA_BUILD_SECRET_<n>`,
+  bukan nama variabel project. Nama seperti `LD_PRELOAD` atau `DOCKER_HOST` tidak boleh
+  sampai ke environment process di host.
+- `railpack prepare`, yang berjalan di [sandbox](RAILPACK_STRATEGY.md#sandbox), hanya
+  menerima nama dengan nilai pengganti, karena nama itu yang ditulis ke plan. Pengecualiannya pengaturan `RAILPACK_*` milik Railpack sendiri, yang
+  membutuhkan nilai asli, seperti `RAILPACK_NODE_VERSION`.
+- `secrets-hash` untuk Railpack adalah sidik jari ber-key acak per process Agent,
+  bukan hash polos, supaya nilai lemah tidak bisa ditebak dari process argument.
+  Setelah Agent restart, langkah ter-cache dibangun ulang satu kali.
+
+Jalur Dockerfile diverifikasi dengan BuildKit asli oleh smoke test. Jalur Railpack
+diverifikasi end-to-end pada `heroku/node-js-getting-started` oleh smoke test.
+
+## Download macet di dalam build
+
+Pada satu laptop WSL2, build Railpack gagal di `mise install-into caddy` karena download
+di dalam BuildKit timeout. Yang terukur, dengan mengunduh arsip rilis Caddy dari GitHub:
+
+| Jalur | Hasil |
+| --- | --- |
+| `docker buildx build`, network default | Timeout, 2 dari 2. Request kecil berhasil. |
+| `docker buildx build --network host` | Berhasil, 12 detik. |
+| `docker run`, bridge MTU 1500 | Berhasil, 2 dari 2. |
+| `docker run`, bridge MTU 1280 | Timeout, 2 dari 2. |
+
+Dugaan PMTU black hole belum terbukti, dan data ini tidak mendukungnya: default route
+laptop itu lewat interface ber-MTU 1500, bukan `eth0` yang 1280, dan menurunkan MTU bridge
+malah membuat download macet. Jadi jangan menurunkan `mtu` Docker sebagai perbaikan tanpa
+mengukurnya. Penyebabnya belum diketahui.
+
+Agent sengaja tidak menyediakan pilihan `--network host`. Menurut source Railpack v0.23.0,
+frontend-nya tidak membaca mode network, jadi flag itu kemungkinan besar tidak berpengaruh
+pada build Railpack, yang justru bermasalah di sini. Pada build Dockerfile flag itu memberi
+langkah build milik user akses ke network host, termasuk loopback. Operator yang butuh jalan
+keluar dapat memilih builder lain lewat `BUILDX_BUILDER`, yang diwarisi process `docker`,
+misalnya builder `docker-container` dengan `--driver-opt network=host`. Jalur ini sudah terbukti
+pada deployment sungguhan di mesin yang sama: build lewat builder itu selesai, padahal builder
+default macet saat mengunduh. Langkah build di builder ini mendapat akses ke network host, jadi
+pakai hanya pada node yang menjalankan repository tepercaya.
 
 ## Batas Keamanan MVP
 
 - Repository memakai URL canonical `https://github.com` tanpa credential pada URL. Repository private memakai credential lease sementara melalui `GIT_ASKPASS` dan tidak menaruh token di arguments, remote URL, atau log.
 - Checkout harus memakai full 40-character commit SHA.
 - Tidak ada shell interpolation; executable dan arguments dikirim langsung ke process API.
+- Process anak hanya mewarisi allowlist environment (`PATH`, `HOME`, `DOCKER_*`, `BUILDX_*`, dan sejenisnya). `SAKALA_*`, termasuk token Agent, tidak pernah diwariskan.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
-- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak, bukan dimenangkan salah satu.
-- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability.
+- Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Tidak ada deteksi port otomatis: aplikasi wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
+- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability kecuali `NET_BIND_SERVICE`. Lihat [Capability workload](#capability-workload).
 - Tidak ada host volume atau Docker socket di aplikasi user.
 - Caddy dan aplikasi user tidak menerima Docker socket.
 
 Ini belum merupakan multi-tenant sandbox. Docker daemon access tetap privileged; pilot harus memakai node khusus dan workload terkontrol.
+
+## Capability workload
+
+Workload berjalan dengan `--cap-drop ALL --cap-add NET_BIND_SERVICE` dan
+`--security-opt no-new-privileges:true`.
+
+`NET_BIND_SERVICE` dipertahankan karena image seperti FrankenPHP (image PHP Railpack)
+dan Caddy membawa biner bertanda file capability `cap_net_bind_service=ep`. Smoke test
+membacanya langsung dari image Laravel hasil Railpack:
+`/usr/local/bin/frankenphp cap_net_bind_service=ep`. Bit `e` membuat kernel memperlakukan
+biner itu sebagai *capability-dumb*, dan saat exec kernel mewajibkan seluruh file
+permitted capability benar-benar didapat. Bila capability itu tidak ada di bounding set,
+`execve` gagal dengan `EPERM` (`bprm_caps_from_vfs_caps` di `security/commoncap.c`,
+Linux v6.18 baris 634-647, dan bagian "Safety checking for capability-dumb binaries" di
+capabilities(7)). `--cap-drop ALL` mengosongkan bounding set, sehingga setiap aplikasi
+Laravel hasil Railpack keluar dengan exit code 126 dan
+`exec: frankenphp: Operation not permitted`.
+
+`no-new-privileges` bukan penyebabnya dan tetap dipasang. Dengan flag itu kernel hanya
+membuang capability yang akan didapat dari file (`cap_bprm_creds_from_file`, baris
+940-951) tanpa menggagalkan exec. Terukur pada Docker 29.9.3 dengan `caddy:2.11.3-alpine`:
+
+| Opsi | Hasil exec biner Caddy |
+| --- | --- |
+| tanpa opsi, atau hanya `no-new-privileges` | Berjalan |
+| `--cap-drop ALL`, dengan atau tanpa `no-new-privileges` | Gagal, `operation not permitted` |
+| `no-new-privileges --cap-drop ALL --cap-add NET_BIND_SERVICE`, user root | Berjalan, `CapEff` 0x400 |
+| sama, user 65534 | Berjalan, `CapEff` 0, capability hanya ada di bounding set |
+
+Capability ini tidak menambah kemampuan yang berarti. Docker memasang
+`net.ipv4.ip_unprivileged_port_start=0` di network namespace container, jadi proses tanpa
+capability pun sudah bisa listen di port 80 di namespace itu, dan namespace itu milik
+container sendiri. Aplikasi tetap listen di `$PORT`.
+
+Biner yang meminta capability lain, misalnya `cap_net_raw`, tetap gagal dengan
+`runtime_app_exec_denied`. Solusinya `setcap -r` di image atau image lain, bukan
+menambah capability.
+
+## Log deployment
+
+Log yang dikirim ke control plane hanya berisi output build dan aplikasi milik
+deployment itu, serta pesan sistem yang aman untuk user, semuanya melalui redaction.
+Output `caddy validate` dan `caddy reload` tidak ikut, karena menggambarkan router
+bersama: path config, log Caddy sendiri, dan peringatan untuk semua site di node,
+termasuk milik tenant lain. Output itu masuk log Agent, dan bila Caddy menolak config
+deployment gagal dengan `runtime_routing_failed` tanpa menyebut path. Path workspace
+dan path file route juga hanya tercatat di log Agent; `git init` dijalankan dengan
+`--quiet` karena pesannya memuat path workspace.
 
 ## Payload
 
@@ -67,3 +316,9 @@ Kegagalan cepat saat menghentikan atau menghapus container deployment sebelumnya
 ## Verifikasi
 
 Test default memakai fake process runner dan tidak menyentuh daemon. Integration test nyata perlu dijalankan secara opt-in pada node disposable dengan `sakala-api` yang mendukung protocol revision 4.
+
+Perilaku Docker dan `wget` diuji sungguhan oleh smoke test opt-in. Test ini menjalankan executor dan reporter asli terhadap daemon lokal, hanya checkout Git dan build image yang diganti, serta hanya membuat dan menghapus resource berawalan `sakala-agent-sm`:
+
+```bash
+cargo test -p sakala-agent --test docker_smoke_test -- --ignored --nocapture
+```

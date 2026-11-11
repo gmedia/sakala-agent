@@ -63,7 +63,7 @@ Implementasi adapter operasi host untuk port `RuntimeExecutor` milik core. `Noop
 WorkspaceManager -> checkout dan cleanup source workspace
 ImageBuilder     -> Dockerfile/Railpack image build
 ContainerEngine  -> container lifecycle dan startup logs
-HealthChecker    -> readiness container
+HealthChecker    -> readiness: state Docker dan probe HTTP aplikasi
 RouteManager     -> route activation dan rollback
 ```
 
@@ -76,7 +76,7 @@ builders/   Dockerfile, Railpack, dan BuildKit commands
 inspections/ Railpack info dan scanner metadata Sakala
 containers/ Docker container lifecycle, environment, limits, cleanup
 routing/    Caddy file transaction dan reload transport
-health/     Docker readiness inspection
+health/     Docker state dan HTTP readiness probe
 logs/       process output reporting adapter
 process/    structured subprocess runner
 ```

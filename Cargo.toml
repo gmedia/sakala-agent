@@ -37,3 +37,7 @@ sakala-agent-runtime = { path = "crates/sakala-agent-runtime" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# async_trait marks the boxed future it generates #[must_use], and clippy 1.99 flags that.
+double_must_use = "allow"

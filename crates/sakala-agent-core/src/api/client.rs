@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url, header::ACCEPT};
 use sakala_agent_protocol::{
-    AgentCommand, CommandStatus, CompleteCommandPayload, DeploymentEvent, DeploymentLog,
+    CommandPoll, CommandStatus, CompleteCommandPayload, DeploymentEvent, DeploymentLog,
     HeartbeatPayload, NodeLifecyclePayload,
 };
 use serde::{Deserialize, Serialize};
@@ -107,16 +107,14 @@ impl ApiClient {
         self
     }
 
-    pub async fn poll_commands(&self) -> Result<Vec<AgentCommand>, CoreError> {
+    pub async fn poll_commands(&self) -> Result<CommandPoll, CoreError> {
         let response = self
             .request(Method::GET, endpoints::COMMANDS)
             .send()
             .await?
             .error_for_status()?;
 
-        let envelope = response.json::<ApiEnvelope<Vec<AgentCommand>>>().await?;
-
-        Ok(envelope.data)
+        Ok(response.json::<CommandPoll>().await?)
     }
 
     pub async fn heartbeat(&self, payload: &HeartbeatPayload) -> Result<(), CoreError> {
@@ -367,7 +365,7 @@ impl ApiClient {
             .is_ok_and(|expected| acknowledgement.accepted_count != expected)
         {
             return Err(CoreError::InvalidReportAcknowledgement(format!(
-                "acknowledgement accepted {} of {item_count} items: {acknowledgement:?}",
+                "acknowledgement accepted {} of {item_count} items",
                 acknowledgement.accepted_count
             )));
         }
@@ -375,7 +373,11 @@ impl ApiClient {
             || acknowledgement.last_sequence < acknowledgement.first_sequence
         {
             return Err(CoreError::InvalidReportAcknowledgement(format!(
-                "acknowledgement counters are inconsistent: {acknowledgement:?}"
+                "acknowledgement counters are inconsistent: {} duplicates of {} items, sequence {} to {}",
+                acknowledgement.duplicate_count,
+                acknowledgement.accepted_count,
+                acknowledgement.first_sequence,
+                acknowledgement.last_sequence
             )));
         }
         if acknowledgement.duplicate_count > 0 {

@@ -95,9 +95,9 @@ async fn remove_route(
         if !content.starts_with(legacy_prefix.as_bytes())
             && !content.starts_with(current_prefix.as_bytes())
         {
+            tracing::warn!(route = %path.display(), "refusing to delete a route Sakala does not own");
             return Err(RuntimeError::Routing(format!(
-                "refusing to delete route {} because it is not owned by Sakala",
-                path.display()
+                "refusing to delete the route of project {project_id} because it is not owned by Sakala"
             )));
         }
         if let Some(deployment_id) = identity.deployment_id {

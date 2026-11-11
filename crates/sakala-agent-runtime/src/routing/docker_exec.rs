@@ -2,10 +2,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use tracing::{debug, warn};
+
 use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
-    process::run_checked, routing::CaddyReloader,
+    routing::CaddyReloader,
 };
+
+/// Caddy output kept for the operator when validation or reload fails.
+const OPERATOR_OUTPUT_LINES: usize = 20;
 
 pub struct DockerExecCaddyReloader {
     runner: Arc<dyn ProcessRunner>,
@@ -33,18 +38,38 @@ impl DockerExecCaddyReloader {
 
 #[async_trait]
 impl CaddyReloader for DockerExecCaddyReloader {
+    /// Caddy's output describes the shared router: its config path, its own
+    /// log lines, and warnings about every site on the node, other tenants'
+    /// included. It goes to the Agent's own log, never to the deployment's.
     async fn validate_and_reload(
         &self,
-        reporter: &dyn RuntimeReporter,
+        _reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         for action in ["validate", "reload"] {
-            run_checked(
-                self.runner.as_ref(),
-                &self.command(action),
-                &format!("caddy-{action}"),
-                reporter,
-            )
-            .await?;
+            let output = self
+                .runner
+                .run(&self.command(action), &NullOutputSink)
+                .await?;
+            if !output.success {
+                let lines = output
+                    .stdout
+                    .lines()
+                    .chain(output.stderr.lines())
+                    .collect::<Vec<_>>();
+                let tail = lines[lines.len().saturating_sub(OPERATOR_OUTPUT_LINES)..].join("\n");
+                warn!(
+                    container = %self.container,
+                    action,
+                    status = %crate::error::describe_exit(output.code),
+                    output = %tail,
+                    "Caddy refused the route configuration"
+                );
+                return Err(RuntimeError::Routing(format!(
+                    "the router could not {action} the route configuration ({})",
+                    crate::error::describe_exit(output.code)
+                )));
+            }
+            debug!(container = %self.container, action, "Caddy accepted the route configuration");
         }
         Ok(())
     }

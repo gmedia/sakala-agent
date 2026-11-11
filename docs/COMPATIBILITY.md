@@ -46,6 +46,54 @@ older API answers them compatibly. `sakala-api` gates admitted revisions through
 | Claim response carrying the materialised command resource | **Not adopted**, recorded here. | The Agent keeps the polled record as the payload source. Using the claim body for secret materialisation would move payload trust to a second code path without a current need; revisit when the API stops materialising `environment` on poll. |
 | `NodeStatus::busy` | Not emitted. | Reserved in the enum; capacity pressure is reported through `execution`/`workloads` instead. |
 
+## Revision 4 additions in the next release
+
+These changes stay within protocol revision 4 and do not require raising
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS`. Deploy `sakala-api` first, so that it
+can read the new values before an Agent starts sending them. An older API stores
+the new `error_code` values as ordinary strings and ignores the new heartbeat
+fields, so this order is about what users see, not about rejected requests.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `error_code` values `runtime_app_not_listening`, `runtime_app_unhealthy`, `runtime_app_crashed`, `runtime_app_out_of_memory`, `runtime_port_conflict` | Sent on `fail`. | Additive. `runtime_port_conflict` replaces `invalid_runtime_command` for a `PORT` that disagrees with `container_port`. |
+| `metadata.workloads.crashed_details` and `metadata.detail_counts.crashed_details` | Sent on heartbeat, bound 50. | Optional for the API. Both keys are omitted when the crash state is unknown, and a heartbeat without them must not change any status. Shape in [Sakala Agent API](AGENT_API.md#heartbeat-payload). |
+| `HealthCheck` completion field `error_code` | Sent, `null` when ready. | Additive. `ready` now also requires the app to answer HTTP. |
+| Application output before `fail` | Sent on the existing logs endpoint. | No new endpoint or field. |
+| `cancel_requested` on `GET /commands` | Honoured. | Optional, treated as `[]` when absent. Cancelled work reports `fail` with `runtime_cancelled`; work past the route cutover reports `complete`. |
+| `DeployProject` fields `root_directory`, `build_command`, `start_command` | Honoured. | Optional. A payload without them behaves as before. An older Agent ignores them and auto-detects. |
+| `InspectProject` field `root_directory` | Honoured when sent. | Optional. The API does not send it yet, so inspection stays at the repository root until it does. |
+| `error_code` value `runtime_root_directory_invalid` | Sent on `fail`. | Additive. The API needs to classify it as user-fixable, like `runtime_port_conflict`. |
+| Events `deployment.analysis.started`, `deployment.health.started`, `deployment.route.started` | Sent. | Additive. An API that does not map them stores them on the timeline without changing status. On Railpack builds, `deployment.build.started` now follows analysis instead of preceding it. |
+
+To show the new stages, the API needs this mapping in
+`DeploymentStatus::fromAgentEventType`: `deployment.analysis.started` to `Analyzing`,
+`deployment.health.started` to `HealthChecking`, and `deployment.route.started` to
+`Routing`. `deployment.runtime.ready` must stop mapping to `Routing`. `order()` must
+also rank `HealthChecking` before `Routing`, because the Agent checks health first
+and transitions are forward-only: with the current order, `route.started` would be
+ignored.
+
+Host requirement: `SAKALA_RAILPACK_IMAGE` must name the sandbox image by digest, or
+the docker driver refuses to start. The Railpack CLI no longer has to be on the host.
+`metadata.runtime_dependencies.railpack` now reports that image reference.
+
+Additive: `metadata.runtime_dependencies.container_runtime` names the runtime the node
+was configured with, or is `null` for Docker's default.
+`metadata.runtime_dependencies.container_runtime_limits_enforced` is `false` when that
+runtime runs with `--ignore-cgroups`, which means `applied_resources` is what was asked
+for and not what is enforced. It is `null` without a configured runtime, or when Docker
+could not be asked.
+
+Host requirement: the runtime Caddy container must provide `wget`. The readiness
+probe runs inside it, and `caddy:*-alpine` images include BusyBox `wget`. Without
+it every deployment fails with `runtime_dependency_failed`, and preflight logs a
+non-fatal `caddy-http-probe` warning at startup.
+
+Behaviour change for operators: a deployment that used to report success while
+its app was broken now fails. That includes an app that ignores `$PORT` or listens
+only on `127.0.0.1`, which is the purpose of the change.
+
 Control-plane semantics the Agent relies on (lease expiry, offline detection,
 pinned command types, `Claimed -> Running` on first report, report
 sanitisation limits) are documented in

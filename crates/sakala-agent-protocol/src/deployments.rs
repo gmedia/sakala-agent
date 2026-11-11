@@ -82,6 +82,16 @@ pub struct DeployProjectPayload {
     pub timeouts: RuntimeTimeoutLimits,
     #[serde(default)]
     pub log_bounds: LogBounds,
+    /// Replaces the detected build command. Runs only inside the build, and only
+    /// a Railpack build can use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+    /// Replaces the image's start command. Runs only inside the container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
+    /// Build context relative to the repository root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_directory: Option<String>,
 }
 
 const fn default_container_port() -> u16 {

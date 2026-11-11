@@ -77,9 +77,10 @@ SAKALA_RUNTIME_WORKSPACE=/var/lib/sakala/builds
 SAKALA_CADDY_SITES_DIR=/absolute/path/to/sakala-infra/caddy/sites
 SAKALA_CADDY_CONTAINER=sakala-caddy
 SAKALA_RAILPACK_FRONTEND=ghcr.io/railwayapp/railpack-frontend:v0.23.0
+SAKALA_RAILPACK_IMAGE=sha256:<image ID dari docker/railpack-sandbox>
 ```
 
-Host harus menyediakan Git, Docker Buildx, Railpack CLI dengan versi yang sesuai frontend, Caddy container dari `sakala-infra`, serta permission runtime yang telah direview. Caddy binary yang terpasang langsung pada host belum digunakan oleh adapter MVP. Lihat [operating modes](docs/OPERATING_MODES.md), [Docker runtime](docs/DOCKER_RUNTIME.md), [runtime hardening](docs/RUNTIME_HARDENING.md), dan [strategi Railpack](docs/RAILPACK_STRATEGY.md).
+Host harus menyediakan Git, Docker Buildx, image sandbox Railpack yang dipin dengan digest, Caddy container dari `sakala-infra`, serta permission runtime yang telah direview. Caddy binary yang terpasang langsung pada host belum digunakan oleh adapter MVP. Lihat [operating modes](docs/OPERATING_MODES.md), [Docker runtime](docs/DOCKER_RUNTIME.md), [runtime hardening](docs/RUNTIME_HARDENING.md), dan [strategi Railpack](docs/RAILPACK_STRATEGY.md).
 
 Create-project preview memakai command `InspectProject`: agent menjalankan scanner ringan dan `railpack info`, kemudian mengembalikan metadata tanpa menjalankan `railpack prepare`, build image, container, atau routing. Deployment baru berjalan setelah command `DeployProject` dibuat.
 

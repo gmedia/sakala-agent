@@ -1,7 +1,8 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -9,7 +10,9 @@ use sakala_agent_core::ports::{
     RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
     RuntimeStaleImage, RuntimeWorkload,
 };
-use sakala_agent_protocol::{AppliedRuntimeResources, RuntimeResourceLimits};
+use sakala_agent_protocol::{
+    AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs::{self, OpenOptions},
@@ -22,7 +25,14 @@ use uuid::Uuid;
 use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
-    containers::{ContainerEngine, ManagedWorkload, ResourceSafetyConfig, RunContainerRequest},
+    containers::{
+        ContainerEngine, FailureOutput, ImageCleanup, ManagedWorkload, ResourceSafetyConfig,
+        RunContainerRequest,
+        images::{
+            CONTAINER_IMAGE_FORMAT, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT, StaleImage,
+            parse_image_inspect, parse_image_list, select_stale_images,
+        },
+    },
     logs::ReporterOutputSink,
     process::run_checked,
 };
@@ -36,6 +46,67 @@ const COMMAND_ID_LABEL: &str = "dev.sakala.command-id";
 const LOG_MAX_LINE_LABEL: &str = "dev.sakala.log-max-line-length";
 const LOG_MAX_BATCH_LABEL: &str = "dev.sakala.log-max-batch-lines";
 const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
+const STARTUP_LOG_TAIL_LINES: u64 = 100;
+const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(10);
+const CRASH_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
+const EXIT_EVENTS_TIMEOUT: Duration = Duration::from_secs(1);
+/// From this many restarts, a running workload counts as crash-looping rather than
+/// as an app that crashed once and recovered.
+const CRASH_LOOP_MIN_RESTARTS: u32 = 3;
+const ENVIRONMENT_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Set by the image or by Sakala itself, and common in ordinary log text.
+const NON_SECRET_ENVIRONMENT_KEYS: [&str; 3] = ["PATH", "HOME", "PORT"];
+const CRASH_STATE_FORMAT: &str = "{{.Id}}\t{{.State.Status}}\t{{.RestartCount}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}";
+const EXIT_EVENTS_FORMAT: &str = "{{.Actor.ID}}\t{{.Action}}\t{{.Actor.Attributes.exitCode}}";
+/// Exit code of a SIGKILL, which is what the kernel OOM killer sends.
+const SIGKILL_EXIT_CODE: i32 = 137;
+
+/// The name servers workloads use instead of Docker's embedded DNS. The file outlives
+/// every workspace, because Docker reads it again whenever a container restarts.
+pub struct ContainerDns {
+    path: std::path::PathBuf,
+    content: String,
+}
+
+impl ContainerDns {
+    /// `None` when there are no name servers, which leaves DNS to Docker.
+    #[must_use]
+    pub fn new(workspace_root: &Path, servers: Vec<std::net::IpAddr>) -> Option<Self> {
+        (!servers.is_empty()).then(|| Self {
+            path: workspace_root.join(".sakala-resolv.conf"),
+            content: servers
+                .iter()
+                .map(|server| format!("nameserver {server}\n"))
+                .collect(),
+        })
+    }
+
+    /// Written through a rename, so a container starting now never reads half a file.
+    async fn ensure_mount(&self) -> Result<std::ffi::OsString, RuntimeError> {
+        if fs::read_to_string(&self.path).await.ok().as_deref() != Some(self.content.as_str()) {
+            let partial = self.path.with_extension(format!("{}", Uuid::new_v4()));
+            fs::write(&partial, &self.content).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o644)).await?;
+            }
+            fs::rename(&partial, &self.path).await?;
+        }
+        let mut mount = std::ffi::OsString::from("type=bind,src=");
+        mount.push(&self.path);
+        mount.push(",dst=/etc/resolv.conf,readonly");
+        Ok(mount)
+    }
+}
+
+/// What a node adds to every workload it starts, as opposed to what a command asks for.
+#[derive(Default)]
+pub struct WorkloadIsolation {
+    pub container_runtime: Option<String>,
+    pub container_dns: Option<ContainerDns>,
+}
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
@@ -43,10 +114,94 @@ pub struct DockerContainerEngine {
     resource_safety: ResourceSafetyConfig,
     max_active_containers: u32,
     agent_id: String,
+    crash_stable_window: Duration,
+    container_runtime: Option<String>,
+    container_dns: Option<ContainerDns>,
+    /// Restarts already written to the operator log, by container.
+    logged_restarts: Mutex<HashMap<String, u32>>,
     log_followers: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl DockerContainerEngine {
+    /// What image GC may remove now. See [`super::images`] for the rules.
+    async fn stale_images(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<Vec<StaleImage>, RuntimeError> {
+        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
+            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
+        })?;
+        let list = CommandSpec::new("docker")
+            .arg("image")
+            .arg("ls")
+            .arg("--no-trunc")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(IMAGE_LIST_FORMAT);
+        let listed = parse_image_list(&self.read_docker(&list, "Sakala image listing").await?);
+        if listed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut inspect = CommandSpec::new("docker")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg(IMAGE_INSPECT_FORMAT);
+        for image in &listed {
+            inspect = inspect.arg(&image.id);
+        }
+        let inspected = parse_image_inspect(
+            &self
+                .read_docker(&inspect, "Sakala image inspection")
+                .await?,
+        )?;
+
+        // Every container counts, Sakala's or not, stopped or running.
+        let containers = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--quiet")
+            .arg("--no-trunc");
+        let container_ids = self.read_docker(&containers, "container listing").await?;
+        let mut in_use = HashSet::new();
+        if !container_ids.trim().is_empty() {
+            let mut images = CommandSpec::new("docker")
+                .arg("container")
+                .arg("inspect")
+                .arg("--format")
+                .arg(CONTAINER_IMAGE_FORMAT);
+            for id in container_ids.split_whitespace() {
+                images = images.arg(id);
+            }
+            in_use.extend(
+                self.read_docker(&images, "container image inspection")
+                    .await?
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        Ok(select_stale_images(
+            &listed,
+            &inspected,
+            &in_use,
+            OffsetDateTime::now_utc(),
+            minimum_age,
+        ))
+    }
+
+    async fn read_docker(&self, command: &CommandSpec, what: &str) -> Result<String, RuntimeError> {
+        let output = self.runner.run(command, &NullOutputSink).await?;
+        if output.success {
+            Ok(output.stdout)
+        } else {
+            Err(RuntimeError::Container(format!(
+                "{what} failed with {}",
+                crate::error::describe_exit(output.code)
+            )))
+        }
+    }
+
     #[must_use]
     pub fn new(
         runner: Arc<dyn ProcessRunner>,
@@ -54,6 +209,8 @@ impl DockerContainerEngine {
         resource_safety: ResourceSafetyConfig,
         max_active_containers: u32,
         agent_id: String,
+        crash_stable_window: Duration,
+        isolation: WorkloadIsolation,
     ) -> Self {
         Self {
             runner,
@@ -61,6 +218,10 @@ impl DockerContainerEngine {
             resource_safety,
             max_active_containers,
             agent_id,
+            crash_stable_window,
+            container_runtime: isolation.container_runtime,
+            container_dns: isolation.container_dns,
+            logged_restarts: Mutex::new(HashMap::new()),
             log_followers: Mutex::new(HashMap::new()),
         }
     }
@@ -127,8 +288,8 @@ impl ContainerEngine for DockerContainerEngine {
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
-                "docker capacity inspection exited with status {:?}",
-                output.code
+                "docker capacity inspection failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
 
@@ -163,8 +324,8 @@ impl ContainerEngine for DockerContainerEngine {
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
-                "docker orphan inspection exited with status {:?}",
-                output.code
+                "docker orphan inspection failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
 
@@ -236,8 +397,8 @@ impl ContainerEngine for DockerContainerEngine {
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
-                "docker health inspection exited with status {:?}",
-                output.code
+                "docker health inspection failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
 
@@ -269,6 +430,88 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(snapshots)
     }
 
+    /// A workload counts as crashed while Docker is restarting it, and while it
+    /// is crash-looping: restarted at least `CRASH_LOOP_MIN_RESTARTS` times and up
+    /// for less than `crash_stable_window`. An app that crashed once and answers
+    /// again is not reported, only logged for the operator, or the UI would say it
+    /// is down while it serves. Docker resets `RestartCount` on `docker restart`
+    /// and `docker start`, so a restart or wake through the agent never counts. An
+    /// `exited` container is left out on purpose: `docker stop`, `docker kill`, and
+    /// a sleep all end there with any exit code, so it cannot be told apart.
+    async fn crashed_workloads(
+        &self,
+        snapshots: &[RuntimeHealthSnapshot],
+    ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeError> {
+        let listed = snapshots
+            .iter()
+            .filter(|snapshot| {
+                let status = snapshot.workload.status.to_ascii_lowercase();
+                status.starts_with("up") || status.starts_with("restarting")
+            })
+            .collect::<Vec<_>>();
+        if listed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut command = CommandSpec::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg(CRASH_STATE_FORMAT)
+            .timeout(CRASH_INSPECT_TIMEOUT);
+        for snapshot in &listed {
+            command = command.arg(&snapshot.workload.container_id);
+        }
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        // `docker inspect` exits non-zero when one of several containers is gone
+        // but still prints the others, and a container removed since the listing
+        // is simply not crashed anymore.
+        if !output.success
+            && output.stdout.trim().is_empty()
+            && !output.stderr.to_ascii_lowercase().contains("no such")
+        {
+            return Err(RuntimeError::Container(format!(
+                "docker crash inspection failed with {}",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+
+        let states = listed
+            .iter()
+            .filter_map(|snapshot| {
+                let state = output
+                    .stdout
+                    .lines()
+                    .filter_map(CrashState::parse)
+                    .find(|state| state.id.starts_with(&snapshot.workload.container_id))?;
+                Some((*snapshot, state))
+            })
+            .collect::<Vec<_>>();
+        self.log_new_restarts(&states);
+
+        let now = OffsetDateTime::now_utc();
+        let crashed = states
+            .into_iter()
+            .filter(|(_, state)| state.is_crashed(now, self.crash_stable_window))
+            .collect::<Vec<_>>();
+        let last_exits = self.last_exits(&crashed).await;
+
+        Ok(crashed
+            .iter()
+            .map(|(snapshot, state)| {
+                let last_exit = last_exits.get(&state.id);
+                CrashedWorkloadDetail {
+                    project_id: snapshot.workload.project_id,
+                    deployment_id: snapshot.workload.deployment_id,
+                    exit_code: state.exit_code(last_exit),
+                    oom_killed: state.oom_killed(last_exit),
+                    finished_at: state.finished_at,
+                    restart_count: state.restart_count,
+                    running: state.running,
+                }
+            })
+            .collect())
+    }
+
     async fn workload(
         &self,
         project_id: Uuid,
@@ -288,8 +531,8 @@ impl ContainerEngine for DockerContainerEngine {
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
-                "docker workload lookup exited with status {:?}",
-                output.code
+                "docker workload lookup failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
         let Some(line) = output.stdout.lines().find(|line| !line.trim().is_empty()) else {
@@ -401,13 +644,34 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--name")
             .arg(&request.name)
             .arg("--network")
-            .arg(&self.runtime_network)
+            .arg(&self.runtime_network);
+        // Docker refuses an unknown runtime, and the failure stays a failure: a
+        // workload must not end up on a weaker runtime than the node promises.
+        if let Some(container_runtime) = &self.container_runtime {
+            command = command.arg("--runtime").arg(container_runtime);
+        }
+        if let Some(container_dns) = &self.container_dns {
+            command = command
+                .arg("--mount")
+                .arg(container_dns.ensure_mount().await?);
+        }
+        command = command
             .arg("--restart")
             .arg("unless-stopped")
             .arg("--security-opt")
             .arg("no-new-privileges:true")
             .arg("--cap-drop")
             .arg("ALL")
+            // FrankenPHP, Caddy, and other images ship binaries marked
+            // `cap_net_bind_service=ep`. The kernel refuses to exec such a file
+            // with EPERM when the capability is missing from the bounding set
+            // (`bprm_caps_from_vfs_caps` in security/commoncap.c), so every
+            // Railpack PHP app exited 126 at start. Keeping only this one grants
+            // nothing new: Docker sets `net.ipv4.ip_unprivileged_port_start=0` in
+            // the container's own network namespace, and `no-new-privileges`
+            // still keeps a non-root process from gaining it through the file.
+            .arg("--cap-add")
+            .arg("NET_BIND_SERVICE")
             .arg("--memory")
             .arg(format!("{}m", request.resources.memory_mb))
             .arg("--memory-swap")
@@ -447,7 +711,15 @@ impl ContainerEngine for DockerContainerEngine {
         if let Some(env_file) = &env_file {
             command = command.arg("--env-file").arg(env_file.as_os_str());
         }
+        // The command runs in the container's own `sh`, never in one on the host.
+        // An image without `sh` fails to start, which readiness reports as a crash.
+        if request.start_command.is_some() {
+            command = command.arg("--entrypoint").arg("sh");
+        }
         command = command.arg(&request.image);
+        if let Some(start_command) = &request.start_command {
+            command = command.arg("-c").arg(start_command);
+        }
 
         let result = run_checked(self.runner.as_ref(), &command, "docker-run", reporter).await;
         if let Some(env_file) = env_file {
@@ -467,11 +739,66 @@ impl ContainerEngine for DockerContainerEngine {
         let command = CommandSpec::new("docker")
             .arg("logs")
             .arg("--tail")
-            .arg("100")
+            .arg(STARTUP_LOG_TAIL_LINES.to_string())
             .arg(container);
         run_checked(self.runner.as_ref(), &command, "runtime", reporter)
             .await
             .map(|_| ())
+    }
+
+    async fn report_failure_logs(
+        &self,
+        container: &str,
+        log_bounds: LogBounds,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<FailureOutput, RuntimeError> {
+        let tail = log_bounds
+            .max_batch_lines
+            .map_or(STARTUP_LOG_TAIL_LINES, |lines| {
+                lines.min(STARTUP_LOG_TAIL_LINES)
+            });
+        if tail == 0 {
+            return Ok(FailureOutput::default());
+        }
+        let command = CommandSpec::new("docker")
+            .arg("logs")
+            .arg("--tail")
+            .arg(tail.to_string())
+            .arg(container)
+            .timeout(FAILURE_LOG_TIMEOUT);
+        let output = run_checked(self.runner.as_ref(), &command, "runtime", reporter).await?;
+        Ok(FailureOutput {
+            had_output: !output.stdout.trim().is_empty() || !output.stderr.trim().is_empty(),
+            exec_denied: crate::error::reports_exec_denied(&output.stdout)
+                || crate::error::reports_exec_denied(&output.stderr),
+        })
+    }
+
+    async fn environment_values(&self, container: &str) -> Result<Vec<String>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{json .Config.Env}}")
+            .arg(container)
+            .timeout(ENVIRONMENT_INSPECT_TIMEOUT);
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker environment inspection failed with {}",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+        // The parse error is not reported: it could quote part of the output.
+        let entries: Vec<String> = serde_json::from_str(output.stdout.trim()).map_err(|_| {
+            RuntimeError::Container("docker returned an unreadable environment".to_owned())
+        })?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| {
+                let (key, value) = entry.split_once('=')?;
+                (!NON_SECRET_ENVIRONMENT_KEYS.contains(&key)).then(|| value.to_owned())
+            })
+            .collect())
     }
 
     fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool {
@@ -530,8 +857,8 @@ impl ContainerEngine for DockerContainerEngine {
         let output = self.runner.run(&list, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
-                "docker-list-previous exited with status {:?}",
-                output.code
+                "docker-list-previous failed with {}",
+                crate::error::describe_exit(output.code)
             )));
         }
 
@@ -544,8 +871,8 @@ impl ContainerEngine for DockerContainerEngine {
             let inspected_name = self.runner.run(&inspect, &NullOutputSink).await?;
             if !inspected_name.success {
                 return Err(RuntimeError::Container(format!(
-                    "docker-inspect-previous exited with status {:?}",
-                    inspected_name.code
+                    "docker-inspect-previous failed with {}",
+                    crate::error::describe_exit(inspected_name.code)
                 )));
             }
             let mut fields = inspected_name.stdout.trim().split('\t');
@@ -602,9 +929,10 @@ impl ContainerEngine for DockerContainerEngine {
         ] {
             match self.runner.run(&command, &NullOutputSink).await {
                 Ok(output) if output.success => {}
-                Ok(output) => {
-                    failures.push(format!("{artifact} exited with status {:?}", output.code))
-                }
+                Ok(output) => failures.push(format!(
+                    "{artifact} failed with {}",
+                    crate::error::describe_exit(output.code)
+                )),
                 Err(error) => failures.push(format!("{artifact}: {error}")),
             }
         }
@@ -622,87 +950,48 @@ impl ContainerEngine for DockerContainerEngine {
         &self,
         max_age: std::time::Duration,
     ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("image")
-            .arg("ls")
-            .arg("--filter")
-            .arg("dangling=true")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg("{{.ID}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "Sakala stale image inspection exited with status {:?}",
-                output.code
-            )));
-        }
-        let minimum_age = time::Duration::try_from(max_age).map_err(|_| {
-            RuntimeError::Configuration("image GC maximum age is too large".to_owned())
-        })?;
-        let now = OffsetDateTime::now_utc();
-        let mut stale = Vec::new();
-        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            let image_id = fields.first().copied().unwrap_or_default().to_owned();
-            let inspect = CommandSpec::new("docker")
-                .arg("image")
-                .arg("inspect")
-                .arg("--format")
-                .arg("{{.Created}}")
-                .arg(&image_id);
-            let inspected = self.runner.run(&inspect, &NullOutputSink).await?;
-            if !inspected.success {
-                return Err(RuntimeError::Container(format!(
-                    "Sakala image age inspection exited with status {:?}",
-                    inspected.code
-                )));
-            }
-            let created =
-                OffsetDateTime::parse(inspected.stdout.trim(), &Rfc3339).map_err(|error| {
-                    RuntimeError::Container(format!(
-                        "Docker returned an invalid image creation timestamp: {error}"
-                    ))
-                })?;
-            if now - created < minimum_age {
-                continue;
-            }
-            stale.push(RuntimeStaleImage {
-                image_id,
-                project_id: fields.get(1).and_then(|value| Uuid::parse_str(value).ok()),
-                deployment_id: fields.get(2).and_then(|value| Uuid::parse_str(value).ok()),
-            });
-        }
-        Ok(stale)
+        Ok(self
+            .stale_images(max_age)
+            .await?
+            .into_iter()
+            .map(|image| RuntimeStaleImage {
+                image_id: image.id,
+                project_id: Some(image.project_id),
+                deployment_id: image.deployment_id,
+            })
+            .collect())
     }
 
     async fn cleanup_stale_images(
         &self,
         max_age: std::time::Duration,
-    ) -> Result<u64, RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("image")
-            .arg("prune")
-            .arg("--force")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--filter")
-            .arg(format!("until={}s", max_age.as_secs()));
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "Sakala image GC exited with status {:?}",
-                output.code
-            )));
-        }
-        match parse_reclaimed_bytes(&output.stdout) {
-            Ok(bytes) => Ok(bytes),
-            Err(error) => {
-                tracing::warn!(%error, "Docker image prune succeeded but reclaimed-space telemetry was not parseable");
-                Ok(0)
+    ) -> Result<ImageCleanup, RuntimeError> {
+        let mut cleanup = ImageCleanup::default();
+        for image in self.stale_images(max_age).await? {
+            // Without `--force`, Docker refuses an image a container started
+            // using after the selection, so a race keeps the image.
+            let mut command = CommandSpec::new("docker").arg("image").arg("rm");
+            if image.references.is_empty() {
+                command = command.arg(&image.id);
+            } else {
+                for reference in &image.references {
+                    command = command.arg(reference);
+                }
+            }
+            match self.runner.run(&command, &NullOutputSink).await {
+                Ok(output) if output.success => {
+                    cleanup.removed_images += 1;
+                    cleanup.reclaimed_bytes += image.size_bytes;
+                }
+                Ok(output) => warn!(
+                    image = %image.id,
+                    status = %crate::error::describe_exit(output.code),
+                    "Docker kept a stale Sakala image"
+                ),
+                Err(error) => warn!(image = %image.id, %error, "stale Sakala image removal failed"),
             }
         }
+        Ok(cleanup)
     }
 
     async fn shutdown(&self) {
@@ -725,42 +1014,6 @@ fn parse_optional_label(value: Option<&str>) -> Option<u64> {
         .and_then(|value| value.parse().ok())
 }
 
-fn parse_reclaimed_bytes(output: &str) -> Result<u64, RuntimeError> {
-    let Some(value) = output
-        .lines()
-        .find_map(|line| line.strip_prefix("Total reclaimed space: "))
-    else {
-        return Ok(0);
-    };
-    let value = value.trim();
-    let split = value
-        .find(|character: char| !(character.is_ascii_digit() || character == '.'))
-        .unwrap_or(value.len());
-    let number = value[..split].parse::<f64>().map_err(|_| {
-        RuntimeError::Container(
-            "Docker image GC returned an invalid reclaimed-space value".to_owned(),
-        )
-    })?;
-    let multiplier = match value[split..].trim().to_ascii_lowercase().as_str() {
-        "b" | "bytes" | "" => 1,
-        "kb" | "kib" => 1_024,
-        "mb" | "mib" => 1_024 * 1_024,
-        "gb" | "gib" => 1_024 * 1_024 * 1_024,
-        _ => {
-            return Err(RuntimeError::Container(
-                "Docker image GC returned an unknown reclaimed-space unit".to_owned(),
-            ));
-        }
-    };
-    let bytes = number * multiplier as f64;
-    if !bytes.is_finite() || bytes.is_sign_negative() || bytes > u64::MAX as f64 {
-        return Err(RuntimeError::Container(
-            "Docker image GC reclaimed-space value overflowed".to_owned(),
-        ));
-    }
-    Ok(bytes.round() as u64)
-}
-
 async fn run_container_command(
     runner: &dyn ProcessRunner,
     command: CommandSpec,
@@ -776,6 +1029,204 @@ async fn run_container_command(
             &output.stderr,
         ))
     }
+}
+
+/// One line of the batched `docker inspect` behind the crash report.
+#[derive(Debug)]
+struct CrashState {
+    id: String,
+    restarting: bool,
+    running: bool,
+    restart_count: u32,
+    exit_code: Option<i32>,
+    oom_flag: bool,
+    started_at: Option<OffsetDateTime>,
+    finished_at: Option<OffsetDateTime>,
+}
+
+impl CrashState {
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split('\t');
+        let id = fields.next()?.to_owned();
+        let status = fields.next()?;
+        Some(Self {
+            id,
+            restarting: status == "restarting",
+            running: status == "running",
+            restart_count: fields.next()?.parse().ok()?,
+            exit_code: fields.next()?.parse().ok(),
+            oom_flag: fields.next()? == "true",
+            started_at: parse_docker_time(fields.next()?),
+            finished_at: parse_docker_time(fields.next()?),
+        })
+    }
+
+    fn is_crashed(&self, now: OffsetDateTime, stable_window: Duration) -> bool {
+        self.restarting
+            || (self.running
+                && self.restart_count >= CRASH_LOOP_MIN_RESTARTS
+                && self
+                    .started_at
+                    .is_some_and(|started_at| now - started_at < stable_window))
+    }
+
+    /// Docker clears the exit code and the OOM flag once a restart succeeds, so
+    /// a running container's own values say nothing about its last exit.
+    fn needs_exit_history(&self) -> bool {
+        !self.restarting || (self.exit_code == Some(SIGKILL_EXIT_CODE) && !self.oom_flag)
+    }
+
+    fn exit_code(&self, last_exit: Option<&LastExit>) -> Option<i32> {
+        if self.restarting {
+            self.exit_code
+        } else {
+            last_exit.and_then(|exit| exit.exit_code)
+        }
+    }
+
+    fn oom_killed(&self, last_exit: Option<&LastExit>) -> bool {
+        (self.restarting && self.oom_flag) || last_exit.is_some_and(|exit| exit.oom_killed)
+    }
+}
+
+impl DockerContainerEngine {
+    /// A restart that is not reported as a crash must still leave a trace.
+    fn log_new_restarts(&self, states: &[(&RuntimeHealthSnapshot, CrashState)]) {
+        let counts = states
+            .iter()
+            .map(|(_, state)| (state.id.clone(), state.restart_count))
+            .collect::<Vec<_>>();
+        let new = {
+            let mut logged = self.logged_restarts.lock().expect("restart log lock");
+            new_restarts(&mut logged, counts)
+        };
+        for (snapshot, state) in states.iter().filter(|(_, state)| new.contains(&state.id)) {
+            warn!(
+                container_id = %snapshot.workload.container_id,
+                project_id = %snapshot.workload.project_id,
+                deployment_id = %snapshot.workload.deployment_id,
+                restart_count = state.restart_count,
+                running = state.running,
+                "Docker restarted a managed workload after it exited on its own"
+            );
+        }
+    }
+
+    /// Reads the last exit of the crashed workloads Docker's state no longer
+    /// describes. This is enrichment: without it a workload is still reported,
+    /// so a failure here must not fail the report.
+    async fn last_exits(
+        &self,
+        crashed: &[(&RuntimeHealthSnapshot, CrashState)],
+    ) -> HashMap<String, LastExit> {
+        let unknown = crashed
+            .iter()
+            .map(|(_, state)| state)
+            .filter(|state| state.needs_exit_history())
+            .collect::<Vec<_>>();
+        let Some(since) = unknown
+            .iter()
+            .filter_map(|state| state.finished_at)
+            .map(OffsetDateTime::unix_timestamp)
+            .min()
+        else {
+            return HashMap::new();
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp_nanos();
+        let mut command = CommandSpec::new("docker")
+            .arg("events")
+            // `finished_at` is rounded down, so this still covers the last exit.
+            .arg("--since")
+            .arg(since.to_string())
+            // A fractional value includes this very second and returns at once.
+            .arg("--until")
+            .arg(format!(
+                "{}.{:09}",
+                now / 1_000_000_000,
+                now % 1_000_000_000
+            ))
+            .arg("--filter")
+            .arg("event=die")
+            .arg("--filter")
+            .arg("event=oom")
+            .arg("--format")
+            .arg(EXIT_EVENTS_FORMAT)
+            .timeout(EXIT_EVENTS_TIMEOUT);
+        for state in &unknown {
+            command = command
+                .arg("--filter")
+                .arg(format!("container={}", state.id));
+        }
+        match self.runner.run(&command, &NullOutputSink).await {
+            Ok(output) if output.success => parse_last_exits(&output.stdout),
+            Ok(output) => {
+                debug!(status = ?output.code, "docker events returned no exit history");
+                HashMap::new()
+            }
+            Err(error) => {
+                debug!(%error, "docker events did not finish");
+                HashMap::new()
+            }
+        }
+    }
+}
+
+/// Returns the containers whose restart count rose since the last call, and
+/// forgets the containers that are gone.
+fn new_restarts(logged: &mut HashMap<String, u32>, counts: Vec<(String, u32)>) -> Vec<String> {
+    let mut new = Vec::new();
+    let mut current = HashMap::with_capacity(counts.len());
+    for (id, count) in counts {
+        if count > logged.get(&id).copied().unwrap_or(0) {
+            new.push(id.clone());
+        }
+        current.insert(id, count);
+    }
+    *logged = current;
+    new
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct LastExit {
+    exit_code: Option<i32>,
+    oom_killed: bool,
+}
+
+/// Docker emits `oom` before the `die` it caused, so an `oom` only describes the
+/// next `die` of that container. One after the last `die` belongs to the current
+/// run, in which a worker was killed but the container survived.
+fn parse_last_exits(stdout: &str) -> HashMap<String, LastExit> {
+    let mut last_exits = HashMap::<String, LastExit>::new();
+    let mut pending_oom = HashSet::new();
+    for line in stdout.lines() {
+        let mut fields = line.split('\t');
+        let (Some(id), Some(action)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        match action {
+            "oom" => {
+                pending_oom.insert(id);
+            }
+            "die" => {
+                last_exits.insert(
+                    id.to_owned(),
+                    LastExit {
+                        exit_code: fields.next().and_then(|value| value.parse().ok()),
+                        oom_killed: pending_oom.remove(id),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    last_exits
+}
+
+/// Docker prints nanoseconds and uses year 1 for "never". The report keeps whole
+/// seconds, and the zero time becomes `None`.
+fn parse_docker_time(value: &str) -> Option<OffsetDateTime> {
+    let time = OffsetDateTime::parse(value.trim(), &Rfc3339).ok()?;
+    (time.year() > 1).then(|| time.replace_nanosecond(0).unwrap_or(time))
 }
 
 fn health_state(status: &str) -> (bool, Option<String>) {
@@ -797,25 +1248,27 @@ fn health_state(status: &str) -> (bool, Option<String>) {
 }
 
 #[cfg(test)]
-mod reclaimed_space_tests {
-    use std::collections::BTreeMap;
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
 
-    use super::{DockerContainerEngine, parse_reclaimed_bytes};
+    use super::{DockerContainerEngine, new_restarts};
 
     #[test]
-    fn parses_decimal_and_compact_docker_sizes() {
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 16.43 MB\n").expect("decimal MB"),
-            (16.43_f64 * 1_048_576_f64).round() as u64
+    fn each_new_restart_is_logged_once() {
+        let mut logged = HashMap::new();
+        let at = |id: &str, count| vec![(id.to_owned(), count)];
+
+        assert!(new_restarts(&mut logged, at("a", 0)).is_empty());
+        assert_eq!(new_restarts(&mut logged, at("a", 1)), ["a"]);
+        assert!(new_restarts(&mut logged, at("a", 1)).is_empty());
+        assert_eq!(new_restarts(&mut logged, at("a", 2)), ["a"]);
+        assert!(
+            new_restarts(&mut logged, at("a", 0)).is_empty(),
+            "a restart on purpose"
         );
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 1.84kB\n").expect("compact kB"),
-            (1.84_f64 * 1_024_f64).round() as u64
-        );
-        assert_eq!(
-            parse_reclaimed_bytes("Total reclaimed space: 0B\n").expect("zero bytes"),
-            0
-        );
+        assert_eq!(new_restarts(&mut logged, at("a", 1)), ["a"]);
+        assert!(new_restarts(&mut logged, Vec::new()).is_empty());
+        assert!(logged.is_empty(), "a removed container is forgotten");
     }
 
     #[test]

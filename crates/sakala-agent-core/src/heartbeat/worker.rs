@@ -3,7 +3,9 @@ use std::{
     time::Duration,
 };
 
-use sakala_agent_protocol::{HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION};
+use sakala_agent_protocol::{
+    CrashedWorkloadDetail, HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION,
+};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{sync::watch, time::sleep};
@@ -73,6 +75,98 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         .read()
         .map(|report| report.clone())
         .unwrap_or_default();
+    let mut metadata = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_VERSION,
+        "lifecycle_state": format!("{:?}", context.node_lifecycle.state()).to_ascii_lowercase(),
+        "runtime_driver": context.runtime_driver,
+        "uptime_seconds": resources.uptime_seconds,
+        "resources": {
+            "cpu_total": resources.cpu_total,
+            "cpu_load_1m": resources.cpu_load_1m,
+            "memory_total_bytes": resources.memory_total_bytes,
+            "memory_available_bytes": resources.memory_available_bytes,
+            "disk_total_bytes": resources.disk_total_bytes,
+            "disk_available_bytes": resources.disk_available_bytes,
+            "workspace_used_bytes": resources.workspace_used_bytes,
+        },
+        "disk_pressure": {
+            "state": disk_pressure_state(resources.disk_available_bytes, context.minimum_workspace_free_bytes),
+            "minimum_workspace_free_bytes": context.minimum_workspace_free_bytes,
+            "available_workspace_bytes": resources.disk_available_bytes,
+        },
+        "workloads": {
+            "active": workloads.active,
+            "starting": workloads.starting,
+            "unhealthy": workloads.unhealthy,
+            "stopped": workloads.stopped,
+            "unhealthy_details": bounded_values(&workloads.unhealthy_details, |snapshot| json!({
+                "container_id": snapshot.workload.container_id,
+                "project_id": snapshot.workload.project_id,
+                "deployment_id": snapshot.workload.deployment_id,
+                "status": snapshot.workload.status,
+                "reason": snapshot.reason,
+            })),
+        },
+        "execution": {
+            "active_commands": context.scheduler_metrics.active_commands(),
+            "queued_local_commands": context.scheduler_metrics.queued_local_commands(),
+            "capacity_waiting_commands": context.scheduler_metrics.capacity_waiting_commands(),
+            "active_builds": workloads.active_builds,
+            "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
+        },
+        "startup_reconciliation": {
+            // `sent_at` goes through the typed payload's rfc3339 serializer;
+            // this timestamp lives inside the untyped metadata map, where
+            // OffsetDateTime would otherwise serialize as a tuple the API
+            // rejects as an invalid date.
+            "captured_at": context
+                .startup_reconciliation_at
+                .format(&Rfc3339)
+                .expect("UTC timestamp formats as RFC 3339"),
+            "inspected_containers": reconciliation.inspected_containers,
+            "cleaned_workspaces": reconciliation.cleaned_workspaces,
+            "reattached_log_followers": reconciliation.reattached_log_followers,
+            "recovered_execution_records": reconciliation.recovered_execution_records,
+            "recovered_workloads": bounded_values(&reconciliation.workloads, |workload| json!({
+                "container_id": workload.container_id,
+                "project_id": workload.project_id,
+                "deployment_id": workload.deployment_id,
+                "status": workload.status,
+            })),
+            "orphans": bounded_values(&reconciliation.orphans, |orphan| json!({
+                "container_id": orphan.container_id,
+                "project_id": orphan.project_id,
+                "reason": orphan.reason,
+            })),
+            "stale_routes": bounded_values(&reconciliation.stale_routes, |route| json!({
+                "path": route.path,
+                "project_id": route.project_id,
+                "deployment_id": route.deployment_id,
+            })),
+            "stale_images": bounded_values(&reconciliation.stale_images, |image| json!({
+                "image_id": image.image_id,
+                "project_id": image.project_id,
+                "deployment_id": image.deployment_id,
+            })),
+            "compatibility_issues": bounded_values(&reconciliation.compatibility_issues, |issue| json!({
+                "container_id": issue.container_id,
+                "project_id": issue.project_id,
+                "deployment_id": issue.deployment_id,
+                "reason": issue.reason,
+            })),
+        },
+        "detail_counts": {
+            "unhealthy_details": workloads.unhealthy_details.len(),
+            "recovered_workloads": reconciliation.workloads.len(),
+            "orphans": reconciliation.orphans.len(),
+            "stale_routes": reconciliation.stale_routes.len(),
+            "stale_images": reconciliation.stale_images.len(),
+            "compatibility_issues": reconciliation.compatibility_issues.len(),
+        },
+        "runtime_dependencies": resources.runtime_dependencies,
+    });
+    insert_crashed_details(&mut metadata, workloads.crashed_details.as_deref());
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
@@ -100,99 +194,20 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
             runtime_network: config.runtime_network.clone(),
             capabilities: config.capabilities.clone(),
         },
-        metadata: json!({
-            "version": env!("CARGO_PKG_VERSION"),
-            "protocol_version": PROTOCOL_VERSION,
-            "lifecycle_state": format!("{:?}", context.node_lifecycle.state()).to_ascii_lowercase(),
-            "runtime_driver": context.runtime_driver,
-            "uptime_seconds": resources.uptime_seconds,
-            "resources": {
-                "cpu_total": resources.cpu_total,
-                "cpu_load_1m": resources.cpu_load_1m,
-                "memory_total_bytes": resources.memory_total_bytes,
-                "memory_available_bytes": resources.memory_available_bytes,
-                "disk_total_bytes": resources.disk_total_bytes,
-                "disk_available_bytes": resources.disk_available_bytes,
-                "workspace_used_bytes": resources.workspace_used_bytes,
-            },
-            "disk_pressure": {
-                "state": disk_pressure_state(resources.disk_available_bytes, context.minimum_workspace_free_bytes),
-                "minimum_workspace_free_bytes": context.minimum_workspace_free_bytes,
-                "available_workspace_bytes": resources.disk_available_bytes,
-            },
-            "workloads": {
-                "active": workloads.active,
-                "starting": workloads.starting,
-                "unhealthy": workloads.unhealthy,
-                "stopped": workloads.stopped,
-                "unhealthy_details": bounded_values(&workloads.unhealthy_details, |snapshot| json!({
-                    "container_id": snapshot.workload.container_id,
-                    "project_id": snapshot.workload.project_id,
-                    "deployment_id": snapshot.workload.deployment_id,
-                    "status": snapshot.workload.status,
-                    "reason": snapshot.reason,
-                })),
-            },
-            "execution": {
-                "active_commands": context.scheduler_metrics.active_commands(),
-                "queued_local_commands": context.scheduler_metrics.queued_local_commands(),
-                "capacity_waiting_commands": context.scheduler_metrics.capacity_waiting_commands(),
-                "active_builds": workloads.active_builds,
-                "maximum_concurrent_builds": workloads.maximum_concurrent_builds,
-            },
-            "startup_reconciliation": {
-                // `sent_at` goes through the typed payload's rfc3339 serializer;
-                // this timestamp lives inside the untyped metadata map, where
-                // OffsetDateTime would otherwise serialize as a tuple the API
-                // rejects as an invalid date.
-                "captured_at": context
-                    .startup_reconciliation_at
-                    .format(&Rfc3339)
-                    .expect("UTC timestamp formats as RFC 3339"),
-                "inspected_containers": reconciliation.inspected_containers,
-                "cleaned_workspaces": reconciliation.cleaned_workspaces,
-                "reattached_log_followers": reconciliation.reattached_log_followers,
-                "recovered_execution_records": reconciliation.recovered_execution_records,
-                "recovered_workloads": bounded_values(&reconciliation.workloads, |workload| json!({
-                    "container_id": workload.container_id,
-                    "project_id": workload.project_id,
-                    "deployment_id": workload.deployment_id,
-                    "status": workload.status,
-                })),
-                "orphans": bounded_values(&reconciliation.orphans, |orphan| json!({
-                    "container_id": orphan.container_id,
-                    "project_id": orphan.project_id,
-                    "reason": orphan.reason,
-                })),
-                "stale_routes": bounded_values(&reconciliation.stale_routes, |route| json!({
-                    "path": route.path,
-                    "project_id": route.project_id,
-                    "deployment_id": route.deployment_id,
-                })),
-                "stale_images": bounded_values(&reconciliation.stale_images, |image| json!({
-                    "image_id": image.image_id,
-                    "project_id": image.project_id,
-                    "deployment_id": image.deployment_id,
-                })),
-                "compatibility_issues": bounded_values(&reconciliation.compatibility_issues, |issue| json!({
-                    "container_id": issue.container_id,
-                    "project_id": issue.project_id,
-                    "deployment_id": issue.deployment_id,
-                    "reason": issue.reason,
-                })),
-            },
-            "detail_counts": {
-                "unhealthy_details": workloads.unhealthy_details.len(),
-                "recovered_workloads": reconciliation.workloads.len(),
-                "orphans": reconciliation.orphans.len(),
-                "stale_routes": reconciliation.stale_routes.len(),
-                "stale_images": reconciliation.stale_images.len(),
-                "compatibility_issues": reconciliation.compatibility_issues.len(),
-            },
-            "runtime_dependencies": resources.runtime_dependencies,
-        }),
+        metadata,
         sent_at: OffsetDateTime::now_utc(),
     }
+}
+
+/// Adds the crash report only when it is known. An absent list means "unknown"
+/// to the control plane, while a present list that omits a workload means that
+/// workload is no longer crashed, so a failed probe must never send an empty one.
+fn insert_crashed_details(metadata: &mut Value, details: Option<&[CrashedWorkloadDetail]>) {
+    let Some(details) = details else { return };
+    metadata["workloads"]["crashed_details"] = Value::Array(bounded_values(details, |detail| {
+        serde_json::to_value(detail).unwrap_or(Value::Null)
+    }));
+    metadata["detail_counts"]["crashed_details"] = json!(details.len());
 }
 
 fn bounded_values<T>(items: &[T], mapper: impl Fn(&T) -> Value) -> Vec<Value> {
@@ -220,6 +235,7 @@ struct WorkloadStatistics {
     active_builds: Option<usize>,
     maximum_concurrent_builds: Option<usize>,
     unhealthy_details: Vec<crate::ports::RuntimeHealthSnapshot>,
+    crashed_details: Option<Vec<CrashedWorkloadDetail>>,
     capacity_available: bool,
     health_available: bool,
 }
@@ -236,16 +252,22 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
     let maximum_concurrent_builds = capacity
         .as_ref()
         .and_then(|value| value.maximum_concurrent_builds);
+    let health_unavailable = || WorkloadStatistics {
+        active,
+        stopped,
+        active_builds,
+        maximum_concurrent_builds,
+        capacity_available,
+        ..WorkloadStatistics::default()
+    };
     let Ok(Ok(snapshots)) = tokio::time::timeout(probe_timeout(), runtime.health_snapshot()).await
     else {
-        return WorkloadStatistics {
-            active,
-            stopped,
-            active_builds,
-            maximum_concurrent_builds,
-            capacity_available,
-            ..WorkloadStatistics::default()
-        };
+        return health_unavailable();
+    };
+    let Ok(Ok(crashed_details)) =
+        tokio::time::timeout(probe_timeout(), runtime.crashed_workloads(&snapshots)).await
+    else {
+        return health_unavailable();
     };
     let starting = snapshots
         .iter()
@@ -276,6 +298,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         starting: Some(starting),
         unhealthy: Some(unhealthy_details.len()),
         unhealthy_details,
+        crashed_details: Some(crashed_details),
         capacity_available,
         health_available: true,
     }
@@ -299,7 +322,8 @@ mod tests {
         sync::{Arc, RwLock},
     };
 
-    use sakala_agent_protocol::{NodeStatus, PROTOCOL_VERSION};
+    use sakala_agent_protocol::{CrashedWorkloadDetail, NodeStatus, PROTOCOL_VERSION};
+    use serde_json::json;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use uuid::Uuid;
 
@@ -342,6 +366,61 @@ mod tests {
             &self,
         ) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
             Ok(self.snapshots.clone())
+        }
+    }
+
+    struct CrashedRuntime {
+        details: Vec<CrashedWorkloadDetail>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for CrashedRuntime {
+        async fn crashed_workloads(
+            &self,
+            _snapshots: &[RuntimeHealthSnapshot],
+        ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
+            Ok(self.details.clone())
+        }
+    }
+
+    struct FailedCrashQueryRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for FailedCrashQueryRuntime {
+        async fn crashed_workloads(
+            &self,
+            _snapshots: &[RuntimeHealthSnapshot],
+        ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
+            Err(RuntimeExecutionError::new(
+                "runtime_container_failed",
+                "docker unavailable",
+            ))
+        }
+    }
+
+    struct FailedHealthRuntime;
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for FailedHealthRuntime {
+        async fn health_snapshot(
+            &self,
+        ) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
+            Err(RuntimeExecutionError::new(
+                "runtime_container_failed",
+                "docker unavailable",
+            ))
+        }
+    }
+
+    fn crash_detail(project_id: Uuid) -> CrashedWorkloadDetail {
+        CrashedWorkloadDetail {
+            project_id,
+            deployment_id: Uuid::new_v4(),
+            exit_code: Some(137),
+            oom_killed: true,
+            finished_at: Some(OffsetDateTime::UNIX_EPOCH),
+            restart_count: 4,
+            running: true,
         }
     }
 
@@ -670,6 +749,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_bounds_crashed_details_and_keeps_the_original_count() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let projects = (0..51).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let runtime = CrashedRuntime {
+            details: projects.iter().copied().map(crash_detail).collect(),
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        assert_eq!(
+            heartbeat.metadata["detail_counts"]["crashed_details"].as_u64(),
+            Some(51)
+        );
+        let details = heartbeat.metadata["workloads"]["crashed_details"]
+            .as_array()
+            .expect("crashed details should be an array");
+        assert_eq!(details.len(), 50);
+        assert_eq!(details[0]["project_id"], projects[0].to_string());
+        assert_eq!(details[49]["project_id"], projects[49].to_string());
+        assert_eq!(details[0]["exit_code"], 137);
+        assert_eq!(details[0]["oom_killed"], true);
+        assert_eq!(details[0]["finished_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(details[0]["restart_count"], 4);
+        assert_eq!(details[0]["running"], true);
+        assert_eq!(
+            details[0].as_object().expect("detail object").len(),
+            7,
+            "the wire shape carries nothing beyond the agreed fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_without_crashes_reports_an_empty_list_and_a_zero_count() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            heartbeat.metadata["workloads"]["crashed_details"],
+            json!([])
+        );
+        assert_eq!(
+            heartbeat.metadata["detail_counts"]["crashed_details"].as_u64(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_crash_state_omits_the_list_instead_of_claiming_no_crashes() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let runtimes: [Arc<dyn RuntimeExecutor>; 2] = [
+            Arc::new(FailedHealthRuntime),
+            Arc::new(FailedCrashQueryRuntime),
+        ];
+        for runtime in runtimes {
+            let heartbeat = payload(
+                &config,
+                &heartbeat_context(runtime, RuntimeReconciliationReport::default()),
+            )
+            .await;
+
+            assert_eq!(heartbeat.status, NodeStatus::Degraded);
+            assert!(heartbeat.metadata["workloads"]["unhealthy"].is_null());
+            assert!(
+                heartbeat.metadata["workloads"]
+                    .get("crashed_details")
+                    .is_none()
+            );
+            assert!(
+                heartbeat.metadata["detail_counts"]
+                    .get("crashed_details")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn every_timestamp_on_the_wire_is_an_rfc3339_string() {
         // Typed fields such as `sent_at` declare the rfc3339 serializer, but
         // values inside the untyped metadata map fall back to `time`'s default
@@ -680,7 +848,9 @@ mod tests {
         let heartbeat = payload(
             &config,
             &heartbeat_context(
-                Arc::new(EmptyRuntime),
+                Arc::new(CrashedRuntime {
+                    details: vec![crash_detail(Uuid::new_v4())],
+                }),
                 RuntimeReconciliationReport::default(),
             ),
         )
@@ -692,6 +862,10 @@ mod tests {
         assert!(
             timestamps.iter().any(|(key, _)| key == "captured_at"),
             "captured_at should be part of the wire payload"
+        );
+        assert!(
+            timestamps.iter().any(|(key, _)| key == "finished_at"),
+            "finished_at should be part of the wire payload"
         );
         for (key, value) in timestamps {
             let text = value

@@ -15,7 +15,7 @@ Agent adalah satu-satunya komponen Sakala yang pada masa depan boleh menyentuh r
 - Docker diakses oleh proses agent pada runtime node; socket tidak pernah dipasang ke API, console, Caddy, atau container aplikasi user.
 - Repository GitHub publik memakai checkout credential-free; repository privat memakai credential sementara melalui `GIT_ASKPASS`, tidak pernah melalui URL remote atau argument proses. Keduanya wajib memakai immutable commit SHA lengkap.
 - Domain command dibatasi ke `*.run.sakala.localhost`, `*.run.staging.sakala.dev`, dan `*.run.sakala.dev`.
-- Container memakai resource limits dari command API yang telah diverifikasi terhadap hard maximum node, `no-new-privileges`, dan drop seluruh Linux capabilities.
+- Container memakai resource limits dari command API yang telah diverifikasi terhadap hard maximum node, `no-new-privileges`, dan drop seluruh Linux capabilities kecuali `NET_BIND_SERVICE`, yang dibutuhkan biner bertanda file capability seperti FrankenPHP dan tidak menambah kemampuan di network namespace container. Lihat [Docker Runtime](DOCKER_RUNTIME.md#capability-workload).
 - Runtime environment ditulis sementara dengan mode `0600`, tidak dimasukkan ke command arguments, lalu dihapus setelah container dibuat.
 - Deployment logs melewati redactor case-insensitive untuk env-style, JSON, authorization header, bearer token, dan prefix token GitHub umum.
 - Output subprocess diredaksi per baris, dikirim dalam batch terbatas (100 baris/512 KiB per request) dengan `Idempotency-Key`, dan capture internal dibatasi 1 MiB per stream.
@@ -48,4 +48,6 @@ menentukan proses refresh credential atau retry command.
 - Dokumentasikan recovery jika command berhenti di tengah eksekusi.
 - Integrasikan desired-state reconciliation dari `sakala-api` sebelum mengaktifkan auto-removal orphan.
 - Rootless Docker mengurangi privilege daemon, tetapi tidak otomatis menjadi sandbox multi-tenant. Sebelum menerima workload publik tidak tepercaya, evaluasi rootless BuildKit pada worker terpisah atau isolated remote builder dengan filesystem, network, cache, dan credential boundary sendiri.
-- Gunakan secret delivery yang tidak menulis value ke build context; Phase 8 hanya mendukung runtime environment.
+- Variabel project sampai ke build hanya sebagai secret BuildKit, tidak lewat build argument atau build context. Lihat [Docker Runtime](DOCKER_RUNTIME.md#variabel-saat-build). Langkah build milik user tetap bisa menulis nilainya ke image.
+- Railpack dan mise menjalankan kode repository saat analisis, jadi keduanya hanya berjalan di [sandbox](RAILPACK_STRATEGY.md#sandbox). Build antar-project [diisolasi](DOCKER_RUNTIME.md#isolasi-antar-project-saat-build), dan process anak tidak mewarisi `SAKALA_*`.
+- Satu baris output process dibatasi 64 KiB, supaya container yang mencetak tanpa newline tidak bisa menghabiskan memory Agent.

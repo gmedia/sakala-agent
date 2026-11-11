@@ -4,6 +4,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
+use sakala_agent_core::logs::redactor::ValueRedactor;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
@@ -12,13 +13,16 @@ use sakala_agent_core::ports::{
     WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
-    AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentEvent,
-    DeploymentEventLevel, DeploymentLog, InspectProjectPayload, LogStream, ReconcileWorkloadAction,
-    RuntimeCleanupTarget,
+    AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
+    DeploymentBuilder, DeploymentLog, InspectProjectPayload, LogBounds, LogStream,
+    ReconcileWorkloadAction, RuntimeCleanupTarget,
 };
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -26,16 +30,21 @@ use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
-        ContainerEngine, DockerContainerEngine, ManagedWorkload, RunContainerRequest,
-        container_name, image_name,
+        ContainerEngine, DockerContainerEngine, FailureOutput, ManagedWorkload,
+        RunContainerRequest, container_name, image_name,
     },
-    health::{DockerHealthChecker, HealthChecker},
+    health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
+    logs::emit_event,
+    railpack::{RailpackSandbox, is_pinned_image},
     routing::{
         CaddyFileRouteManager, DockerExecCaddyReloader, RouteIdentity, RouteManager, RouteSpec,
     },
     telemetry::NodeTelemetryCollector,
-    workspace::{DeploymentWorkspace, GitWorkspaceManager, RepositorySource, WorkspaceManager},
+    workspace::{
+        DeploymentWorkspace, GitWorkspaceManager, RepositorySource, WorkspaceManager,
+        requested_root_directory, validate_root_directory,
+    },
 };
 
 pub struct DockerRuntimeExecutor {
@@ -46,6 +55,7 @@ pub struct DockerRuntimeExecutor {
     health: Arc<dyn HealthChecker>,
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
+    health_check_window: std::time::Duration,
     build_permits: Arc<Semaphore>,
     container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
@@ -62,6 +72,10 @@ pub(crate) struct DockerPreflight {
     runtime_network: String,
     caddy_sites_dir: std::path::PathBuf,
     caddy_container: String,
+    railpack_image: String,
+    railpack_sandbox: RailpackSandbox,
+    container_runtime: Option<String>,
+    container_dns_configured: bool,
 }
 
 impl DockerRuntimeExecutor {
@@ -81,12 +95,26 @@ impl DockerRuntimeExecutor {
             runtime_network: config.runtime_network.clone(),
             caddy_sites_dir: config.caddy_sites_dir.clone(),
             caddy_container: config.caddy_container.clone(),
+            railpack_image: config.railpack_image.clone(),
+            railpack_sandbox: RailpackSandbox::new(
+                Arc::clone(&runner),
+                config.railpack_image.clone(),
+                config.railpack_network.clone(),
+            ),
+            container_runtime: config.container_runtime.clone(),
+            container_dns_configured: !config.container_dns.is_empty(),
         };
+        let container_dns = crate::containers::ContainerDns::new(
+            &config.workspace_root,
+            config.container_dns.clone(),
+        );
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
         let workspace_gc_max_age = config.workspace_gc_max_age;
         let image_gc_max_age = config.image_gc_max_age;
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
+        let health_check_window = config.health_interval * config.health_attempts;
+        let router_container = config.caddy_container.clone();
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -96,10 +124,21 @@ impl DockerRuntimeExecutor {
                 config.workspace_root,
                 Arc::clone(&runner),
             )),
-            Arc::new(RailpackProjectInspector::new(Arc::clone(&runner))),
+            Arc::new(RailpackProjectInspector::new(Arc::new(
+                RailpackSandbox::new(
+                    Arc::clone(&runner),
+                    config.railpack_image.clone(),
+                    config.railpack_network.clone(),
+                ),
+            ))),
             Arc::new(ImageBuildService::new(
                 Arc::clone(&runner),
                 config.railpack_frontend,
+                RailpackSandbox::new(
+                    Arc::clone(&runner),
+                    config.railpack_image,
+                    config.railpack_network,
+                ),
             )),
             Arc::new(DockerContainerEngine::new(
                 Arc::clone(&runner),
@@ -107,14 +146,20 @@ impl DockerRuntimeExecutor {
                 config.resource_safety,
                 config.max_active_containers,
                 agent_id,
+                config.crash_stable_window,
+                crate::containers::WorkloadIsolation {
+                    container_runtime: config.container_runtime,
+                    container_dns,
+                },
             )),
             Arc::new(DockerHealthChecker::new(
                 Arc::clone(&runner),
-                config.health_attempts,
+                router_container,
                 config.health_interval,
             )),
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
             config.timeout_safety,
+            health_check_window,
             max_concurrent_builds,
             workspace_gc_max_age,
             image_gc_max_age,
@@ -133,6 +178,7 @@ impl DockerRuntimeExecutor {
         health: Arc<dyn HealthChecker>,
         routes: Arc<dyn RouteManager>,
         timeout_safety: crate::TimeoutSafetyConfig,
+        health_check_window: std::time::Duration,
         max_concurrent_builds: usize,
         workspace_gc_max_age: std::time::Duration,
         image_gc_max_age: std::time::Duration,
@@ -144,6 +190,8 @@ impl DockerRuntimeExecutor {
             preflight.workspace_root.clone(),
             preflight.runtime_network.clone(),
             preflight.caddy_container.clone(),
+            preflight.railpack_image.clone(),
+            preflight.container_runtime.clone(),
         );
         Self {
             workspace,
@@ -153,6 +201,7 @@ impl DockerRuntimeExecutor {
             health,
             routes,
             timeout_safety,
+            health_check_window,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
@@ -190,9 +239,15 @@ impl DockerRuntimeExecutor {
             .await?;
         let inspection_source = source.without_credential();
         drop(source);
-        let result = tokio::select! {
-            result = self.inspector.inspect(&workspace, &inspection_source, reporter) => result,
-            () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        let result = match workspace
+            .build_context(request.payload.root_directory.as_deref())
+            .await
+        {
+            Ok(context) => tokio::select! {
+                result = self.inspector.inspect(&context, &inspection_source, reporter) => result,
+                () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
+            },
+            Err(error) => Err(error),
         };
         let cleanup = self.workspace.cleanup(&workspace).await;
 
@@ -272,6 +327,8 @@ impl DockerRuntimeExecutor {
         let image = image_name(project_id, deployment_id, &payload.commit_sha);
         let container = container_name(project_id, deployment_id);
         let route_activated = AtomicBool::new(false);
+        let candidate_started = AtomicBool::new(false);
+        let cutover_started = AtomicBool::new(false);
 
         let deployment = self.deploy_inner(
             request.command_id,
@@ -284,14 +341,20 @@ impl DockerRuntimeExecutor {
             applied_resources,
             applied_timeouts,
             &route_activated,
+            &candidate_started,
+            &cutover_started,
             Arc::clone(&reporter),
         );
         tokio::pin!(deployment);
-        let result = tokio::select! {
+        let mut result = tokio::select! {
             biased;
             result = &mut deployment => result,
             () = request.cancellation.cancelled() => {
-                if route_activated.load(Ordering::Acquire) {
+                // Dropping a route activation halfway could leave the project's
+                // route pointing at the candidate that cleanup is about to remove,
+                // which would take down the deployment it was replacing. It either
+                // commits or rolls itself back, so let it finish.
+                if cutover_started.load(Ordering::Acquire) {
                     deployment.await
                 } else {
                     Err(RuntimeError::Cancelled)
@@ -299,8 +362,20 @@ impl DockerRuntimeExecutor {
             },
         };
 
-        if result.is_err()
-            && !route_activated.load(Ordering::Acquire)
+        // The app's output only exists in the container, so it must be read before
+        // cleanup removes it. A cancelled command is not an app failure, and its
+        // shutdown grace is better spent on cleanup.
+        let failed_before_cutover = result.is_err() && !route_activated.load(Ordering::Acquire);
+        if failed_before_cutover
+            && candidate_started.load(Ordering::Acquire)
+            && !matches!(result, Err(RuntimeError::Cancelled))
+        {
+            let output = self
+                .report_candidate_output(&container, payload.log_bounds, reporter.as_ref())
+                .await;
+            result = result.map_err(|error| error.refine_crash(output.exec_denied));
+        }
+        if failed_before_cutover
             && let Err(error) = self.containers.cleanup_candidate(&container, &image).await
         {
             let _ = reporter
@@ -309,12 +384,18 @@ impl DockerRuntimeExecutor {
                 )))
                 .await;
         }
+        // The path is the node's, so it stays in the Agent's own log.
         if let Err(error) = self.workspace.cleanup(&workspace).await {
+            tracing::warn!(
+                workspace = %workspace.root().display(),
+                %error,
+                "deployment workspace cleanup failed"
+            );
             let _ = reporter
-                .log(system_log(format!(
-                    "workspace cleanup warning for {}: {error}",
-                    workspace.root().display()
-                )))
+                .log(system_log(
+                    "The build files of this deployment could not be fully removed from the server. This does not affect the deployment."
+                        .to_owned(),
+                ))
                 .await;
         }
 
@@ -329,6 +410,49 @@ impl DockerRuntimeExecutor {
             RuntimeError::Execution(format!("failed to serialize deployment result: {error}"))
         })?;
         Ok(CommandOutput::with_result(completion))
+    }
+
+    /// Best effort by design: nothing here may replace the deployment's own error,
+    /// though what the output shows may refine it.
+    async fn report_candidate_output(
+        &self,
+        container: &str,
+        log_bounds: LogBounds,
+        reporter: &dyn RuntimeReporter,
+    ) -> FailureOutput {
+        let _ = reporter
+            .log(system_log(
+                "Last application output before the failed start was removed:".to_owned(),
+            ))
+            .await;
+        let output = match self
+            .containers
+            .report_failure_logs(container, log_bounds, reporter)
+            .await
+        {
+            Ok(output) => {
+                if !output.had_output {
+                    let _ = reporter
+                        .log(system_log(
+                            "The application wrote no output before it failed.".to_owned(),
+                        ))
+                        .await;
+                }
+                output
+            }
+            Err(error) => {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "application output could not be collected: {error}"
+                    )))
+                    .await;
+                FailureOutput::default()
+            }
+        };
+        if let Err(error) = reporter.flush().await {
+            tracing::warn!(%error, "failed start output could not be fully delivered");
+        }
+        output
     }
 
     async fn ensure_workspace_capacity(&self) -> Result<(), RuntimeError> {
@@ -355,22 +479,20 @@ impl DockerRuntimeExecutor {
         applied_resources: AppliedRuntimeResources,
         applied_timeouts: crate::config::AppliedRuntimeTimeouts,
         route_activated: &AtomicBool,
+        candidate_started: &AtomicBool,
+        cutover_started: &AtomicBool,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
         let reporter_ref = reporter.as_ref();
+        let context = workspace
+            .build_context(payload.root_directory.as_deref())
+            .await?;
         let build_permit = Arc::clone(&self.build_permits)
             .acquire_owned()
             .await
             .map_err(|_| {
                 RuntimeError::Execution("build concurrency scheduler is unavailable".to_owned())
             })?;
-        emit_event(
-            reporter_ref,
-            "deployment.build.started",
-            "Preparing application image.",
-            json!({ "requested_builder": payload.builder }),
-        )
-        .await?;
         let build = tokio::time::timeout(
             applied_timeouts.build,
             self.builder.build(
@@ -378,9 +500,12 @@ impl DockerRuntimeExecutor {
                     project_id,
                     deployment_id,
                     workspace: workspace.root().to_owned(),
-                    source: workspace.source().to_owned(),
+                    source: context,
                     image: image.to_owned(),
                     requested: payload.builder,
+                    environment: build_environment(payload),
+                    build_command: command_field(payload.build_command.as_deref()),
+                    start_command: command_field(payload.start_command.as_deref()),
                 },
                 reporter_ref,
             ),
@@ -401,6 +526,7 @@ impl DockerRuntimeExecutor {
             json!({ "container": container, "image": image }),
         )
         .await?;
+        let start_began = Instant::now();
         tokio::time::timeout(applied_timeouts.start, async {
             // The early capacity check is only a fast-fail optimization. This
             // serialized re-check is authoritative and closes concurrent admission races.
@@ -420,18 +546,50 @@ impl DockerRuntimeExecutor {
                         domain: payload.domain.clone(),
                         port: payload.container_port,
                         log_bounds: payload.log_bounds,
+                        // A Railpack image already starts with this command.
+                        start_command: command_field(payload.start_command.as_deref())
+                            .filter(|_| build.builder == DeploymentBuilder::Dockerfile),
                     },
                     reporter_ref,
                 )
                 .await?;
             drop(admission);
-            self.health.wait_until_ready(container).await
+            Ok::<(), RuntimeError>(())
         })
         .await
         .map_err(|_| RuntimeError::Timeout {
             operation: "deployment-start".to_owned(),
             seconds: applied_timeouts.start.as_secs(),
         })??;
+        candidate_started.store(true, Ordering::Release);
+        emit_event(
+            reporter_ref,
+            "deployment.health.started",
+            "Waiting for the application to answer on its port.",
+            json!({
+                "port": payload.container_port,
+                "timeout_seconds": applied_timeouts.start.as_secs(),
+            }),
+        )
+        .await?;
+        self.health
+            .wait_until_ready(&ReadinessRequest {
+                container: container.to_owned(),
+                port: payload.container_port,
+                started_at: start_began,
+                timeout: applied_timeouts.start,
+                expected_restarts: Some(0),
+                operation: "deployment-start",
+            })
+            .await?;
+        emit_event(
+            reporter_ref,
+            "deployment.route.started",
+            "Application answered; activating its route.",
+            json!({ "domain": payload.domain, "port": payload.container_port }),
+        )
+        .await?;
+        cutover_started.store(true, Ordering::Release);
         self.routes
             .activate(
                 &RouteSpec {
@@ -515,12 +673,49 @@ impl DockerRuntimeExecutor {
             .ok_or(RuntimeError::WorkloadNotFound)
     }
 
+    /// A lifecycle command has no start deadline of its own in its payload.
+    fn workload_readiness(
+        &self,
+        workload: &ManagedWorkload,
+        timeout: std::time::Duration,
+    ) -> ReadinessRequest {
+        ReadinessRequest {
+            container: container_name(workload.project_id, workload.deployment_id),
+            port: workload.port,
+            started_at: Instant::now(),
+            timeout,
+            expected_restarts: None,
+            operation: "workload-readiness",
+        }
+    }
+
+    /// A follower that outlives its command has lost the payload's values, so
+    /// they are read back from the container. Without them it still redacts by
+    /// key name and token prefix, so a failure here does not stop its logs.
+    async fn follower_redactor(&self, container: &str) -> ValueRedactor {
+        match self.containers.environment_values(container).await {
+            Ok(values) => ValueRedactor::new(values),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    container,
+                    "log follower cannot redact environment values for this workload"
+                );
+                ValueRedactor::default()
+            }
+        }
+    }
+
     async fn activate_workload(
         &self,
         workload: &ManagedWorkload,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        self.health.wait_until_ready(&workload.container_id).await?;
+        self.health
+            .wait_until_ready(
+                &self.workload_readiness(workload, self.timeout_safety.max_start_timeout),
+            )
+            .await?;
         self.routes
             .activate(
                 &RouteSpec {
@@ -642,18 +837,20 @@ impl DockerRuntimeExecutor {
         let workload = self.workload(&request).await?;
         let running = workload.status.to_ascii_lowercase().starts_with("up");
         let readiness = if running {
-            self.health.wait_until_ready(&workload.container_id).await
+            self.health
+                .wait_until_ready(&self.workload_readiness(&workload, self.health_check_window))
+                .await
         } else {
             Err(RuntimeError::WorkloadNotRunning)
         };
-        let ready = readiness.is_ok();
-        let reason = readiness.err().map(|error| error.to_string());
+        let failure = readiness.err();
         Ok(CommandOutput::with_result(json!({
             "container_id": workload.container_id,
             "running": running,
-            "ready": ready,
+            "ready": failure.is_none(),
             "docker_status": workload.status,
-            "reason": reason,
+            "reason": failure.as_ref().map(ToString::to_string),
+            "error_code": failure.as_ref().map(RuntimeError::code),
         })))
     }
 
@@ -673,6 +870,9 @@ impl DockerRuntimeExecutor {
 
 impl DockerPreflight {
     async fn run(&self) -> Result<RuntimePreflightReport, RuntimeError> {
+        // First, because `workspace-disk` fails on a path that does not exist,
+        // which on a fresh node would be this directory.
+        let workspace = directory_check("workspace", &self.workspace_root, true).await;
         let mut checks = vec![
             self.command_check("git", CommandSpec::new("git").arg("--version"))
                 .await,
@@ -689,8 +889,6 @@ impl DockerPreflight {
                 CommandSpec::new("docker").arg("buildx").arg("version"),
             )
             .await,
-            self.command_check("railpack", CommandSpec::new("railpack").arg("--version"))
-                .await,
             self.command_check(
                 "caddy-routing",
                 CommandSpec::new("docker")
@@ -714,10 +912,134 @@ impl DockerPreflight {
             )
             .await,
         ];
-        checks.push(directory_check("workspace", &self.workspace_root, true).await);
+        // Not fatal: a stopped router is already a degraded heartbeat, and a node
+        // must keep starting in any order relative to it. Readiness then fails
+        // with a message that names this dependency.
+        let mut http_probe = self
+            .command_check(
+                "caddy-http-probe",
+                CommandSpec::new("docker")
+                    .arg("exec")
+                    .arg(&self.caddy_container)
+                    .arg("wget")
+                    .arg("--help"),
+            )
+            .await;
+        http_probe.fatal = false;
+        checks.push(http_probe);
+        checks.push(self.railpack_sandbox_check().await);
+        if let Some(runtime) = &self.container_runtime {
+            checks.extend(self.container_runtime_checks(runtime).await);
+        }
+        checks.push(workspace);
         checks.push(directory_check("caddy-sites", &self.caddy_sites_dir, true).await);
 
         Ok(RuntimePreflightReport { checks })
+    }
+
+    /// Railpack only ever runs in its sandbox, so the host needs the image, not the
+    /// CLI. A floating tag is refused outright.
+    async fn railpack_sandbox_check(&self) -> RuntimePreflightCheck {
+        const NAME: &str = "railpack-sandbox";
+        let failed = |detail: String| RuntimePreflightCheck {
+            name: NAME.to_owned(),
+            fatal: true,
+            ready: false,
+            detail,
+        };
+        if !is_pinned_image(&self.railpack_image) {
+            return failed("SAKALA_RAILPACK_IMAGE must be set and pinned by digest".to_owned());
+        }
+        if let Err(error) = self.railpack_sandbox.ensure_network().await {
+            return failed(error.to_string());
+        }
+        self.command_check(
+            NAME,
+            CommandSpec::new("docker")
+                .arg("image")
+                .arg("inspect")
+                .arg("--format")
+                .arg("{{.Id}}")
+                .arg(&self.railpack_image),
+        )
+        .await
+    }
+
+    /// Fatal when the runtime is missing, because the alternative is finding out on the
+    /// first deployment, and a node that was promised an isolation runtime must not
+    /// start without it. What the runtime then cannot do is only reported.
+    async fn container_runtime_checks(&self, runtime: &str) -> Vec<RuntimePreflightCheck> {
+        let registered = |ready: bool, detail: String| RuntimePreflightCheck {
+            name: "container-runtime".to_owned(),
+            fatal: true,
+            ready,
+            detail,
+        };
+        let listing = crate::telemetry::registered_runtimes_command();
+        let output = match self.runner.run(&listing, &crate::NullOutputSink).await {
+            Ok(output) if output.success => output,
+            Ok(output) => {
+                return vec![registered(
+                    false,
+                    format!(
+                        "could not list Docker's runtimes: {}",
+                        crate::error::describe_exit(output.code)
+                    ),
+                )];
+            }
+            Err(error) => {
+                return vec![registered(
+                    false,
+                    format!("could not list Docker's runtimes: {error}"),
+                )];
+            }
+        };
+        let names = crate::telemetry::registered_runtime_names(&output.stdout);
+        if !names.contains(&runtime) {
+            return vec![registered(
+                false,
+                format!(
+                    "SAKALA_CONTAINER_RUNTIME is {runtime}, but Docker has no runtime of that name \
+                     (registered: {}). Register it under \"runtimes\" in Docker's daemon.json and \
+                     restart Docker. The Agent does not fall back to another runtime.",
+                    names.join(", ")
+                ),
+            )];
+        }
+        let warning = |name: &str, ready: bool, detail: String| RuntimePreflightCheck {
+            name: name.to_owned(),
+            fatal: false,
+            ready,
+            detail,
+        };
+        let ignores_cgroups = crate::telemetry::runtime_ignores_cgroups(&output.stdout, runtime);
+        vec![
+            registered(true, runtime.to_owned()),
+            warning(
+                "container-runtime-limits",
+                !ignores_cgroups,
+                if ignores_cgroups {
+                    format!(
+                        "{runtime} runs with --ignore-cgroups, so memory, CPU, and process limits \
+                         are not enforced on workloads. See docs/RUNTIME_HARDENING.md."
+                    )
+                } else {
+                    "enforced through cgroups".to_owned()
+                },
+            ),
+            warning(
+                "container-dns",
+                self.container_dns_configured,
+                if self.container_dns_configured {
+                    "SAKALA_CONTAINER_DNS is set".to_owned()
+                } else {
+                    format!(
+                        "SAKALA_CONTAINER_DNS is not set. Under {runtime}, Docker's embedded DNS is \
+                         out of reach, so a workload cannot resolve any hostname."
+                    )
+                },
+            ),
+        ]
     }
 
     async fn command_check(&self, name: &str, command: CommandSpec) -> RuntimePreflightCheck {
@@ -732,7 +1054,10 @@ impl DockerPreflight {
                 name: name.to_owned(),
                 fatal: true,
                 ready: false,
-                detail: format!("command exited with status {:?}", output.code),
+                detail: format!(
+                    "command failed with {}",
+                    crate::error::describe_exit(output.code)
+                ),
             },
             Err(error) => RuntimePreflightCheck {
                 name: name.to_owned(),
@@ -839,7 +1164,8 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             let Some(factory) = &reporter_factory else {
                 continue;
             };
-            let reporter = factory.reporter(command_id, workload.log_bounds);
+            let redactor = self.follower_redactor(&workload.container_id).await;
+            let reporter = factory.reporter(command_id, workload.log_bounds, redactor);
             if self
                 .containers
                 .start_log_follower(&workload.container_id, reporter)
@@ -862,6 +1188,16 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
         self.containers.health_snapshot().await.map_err(Into::into)
+    }
+
+    async fn crashed_workloads(
+        &self,
+        snapshots: &[RuntimeHealthSnapshot],
+    ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
+        self.containers
+            .crashed_workloads(snapshots)
+            .await
+            .map_err(Into::into)
     }
 
     async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {
@@ -918,7 +1254,9 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                         )
                         .into());
                     };
-                    let follower_reporter = factory.reporter(command_id, workload.log_bounds);
+                    let redactor = self.follower_redactor(&workload.container_id).await;
+                    let follower_reporter =
+                        factory.reporter(command_id, workload.log_bounds, redactor);
                     let started = self
                         .containers
                         .start_log_follower(&workload.container_id, follower_reporter);
@@ -979,6 +1317,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .into());
         }
         let mut cleaned_workspaces = 0;
+        let mut removed_images = 0;
         let mut reclaimed_image_bytes = 0;
         let mut cleaned_routes = 0;
         for target in request.targets {
@@ -993,10 +1332,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                         .await?;
                 }
                 RuntimeCleanupTarget::StaleImages => {
-                    reclaimed_image_bytes += self
+                    let images = self
                         .containers
                         .cleanup_stale_images(self.image_gc_max_age)
                         .await?;
+                    removed_images += images.removed_images;
+                    reclaimed_image_bytes += images.reclaimed_bytes;
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
                     let discovered = self.containers.detect_orphans().await?;
@@ -1012,6 +1353,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             "approved": true,
             "cleaned_workspaces": cleaned_workspaces,
             "cleaned_routes": cleaned_routes,
+            "removed_images": removed_images,
             "reclaimed_image_bytes": reclaimed_image_bytes,
         })))
     }
@@ -1098,8 +1440,53 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     }
 }
 
+/// An empty value is left out: nothing is lost, and BuildKit has no use for an
+/// empty secret. `PORT` belongs to the runtime contract, not the build.
+fn build_environment(
+    payload: &DeployProjectPayload,
+) -> Vec<(String, sakala_agent_core::ports::SecretString)> {
+    payload
+        .environment
+        .iter()
+        .filter(|(key, value)| key.as_str() != "PORT" && !value.is_empty())
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                sakala_agent_core::ports::SecretString::new(value.clone()),
+            )
+        })
+        .collect()
+}
+
+const MAX_COMMAND_CHARS: usize = 1_000;
+
+/// An empty command means the project did not set one.
+fn command_field(command: Option<&str>) -> Option<String> {
+    command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .map(str::to_owned)
+}
+
+fn validate_command_field(name: &str, command: Option<&str>) -> Result<(), RuntimeError> {
+    let Some(command) = command else {
+        return Ok(());
+    };
+    if command.chars().count() > MAX_COMMAND_CHARS || command.contains(['\n', '\r', '\0']) {
+        return Err(RuntimeError::InvalidCommand(format!(
+            "{name} must be one line of at most {MAX_COMMAND_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> {
     validate_repository_source(&payload.repository_url, &payload.commit_sha)?;
+    if let Some(root_directory) = requested_root_directory(payload.root_directory.as_deref()) {
+        validate_root_directory(root_directory)?;
+    }
+    validate_command_field("build_command", payload.build_command.as_deref())?;
+    validate_command_field("start_command", payload.start_command.as_deref())?;
     if payload.container_port == 0 {
         return Err(RuntimeError::InvalidCommand(
             "container_port must be greater than zero".to_owned(),
@@ -1120,13 +1507,14 @@ fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> 
     // The agent exports PORT so the workload listens where the generated route
     // points. A deployment environment that disagrees would serve on one port
     // and be routed on another, so reject it rather than pick a winner.
-    if let Some(port) = payload.environment.get("PORT")
-        && port.parse::<u16>() != Ok(payload.container_port)
-    {
-        return Err(RuntimeError::InvalidCommand(format!(
-            "environment PORT={port} must match container_port {}",
-            payload.container_port
-        )));
+    if let Some(port) = payload.environment.get("PORT") {
+        let environment_port = port.parse::<u16>().ok();
+        if environment_port != Some(payload.container_port) {
+            return Err(RuntimeError::PortConflict {
+                environment_port,
+                container_port: payload.container_port,
+            });
+        }
     }
     Ok(())
 }
@@ -1136,6 +1524,9 @@ fn inspection_source(
     credential: Option<sakala_agent_core::ports::RepositoryCredential>,
 ) -> Result<RepositorySource, RuntimeError> {
     validate_repository_source(&payload.repository_url, &payload.commit_sha)?;
+    if let Some(root_directory) = requested_root_directory(payload.root_directory.as_deref()) {
+        validate_root_directory(root_directory)?;
+    }
     Ok(RepositorySource {
         repository_url: payload.repository_url.clone(),
         commit_sha: payload.commit_sha.clone(),
@@ -1216,24 +1607,6 @@ fn valid_env_key(key: &str) -> bool {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
-async fn emit_event(
-    reporter: &dyn RuntimeReporter,
-    event_type: &str,
-    message: &str,
-    metadata: serde_json::Value,
-) -> Result<(), RuntimeError> {
-    reporter
-        .event(DeploymentEvent {
-            event_type: event_type.to_owned(),
-            level: DeploymentEventLevel::Info,
-            message: message.to_owned(),
-            metadata,
-            occurred_at: OffsetDateTime::now_utc(),
-        })
-        .await
-        .map_err(Into::into)
-}
-
 fn system_log(message: String) -> DeploymentLog {
     DeploymentLog {
         stream: LogStream::System,
@@ -1286,6 +1659,21 @@ mod tests {
 
         let error = validate_payload(&payload).expect_err("conflicting PORT must be rejected");
 
-        assert!(error.to_string().contains("must match container_port"));
+        assert_eq!(error.code(), "runtime_port_conflict");
+        assert!(error.to_string().contains("PORT=8080"));
+        assert!(error.to_string().contains("must match container_port 3000"));
+    }
+
+    #[test]
+    fn a_port_value_that_is_not_a_port_is_never_repeated_in_the_failure() {
+        let mut payload = payload();
+        payload.environment =
+            BTreeMap::from([("PORT".to_owned(), "hunter2-not-a-port".to_owned())]);
+
+        let error = validate_payload(&payload).expect_err("invalid PORT must be rejected");
+
+        assert_eq!(error.code(), "runtime_port_conflict");
+        assert!(error.to_string().contains("container_port 3000"));
+        assert!(!error.to_string().contains("hunter2"));
     }
 }
