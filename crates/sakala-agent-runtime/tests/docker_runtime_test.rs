@@ -4048,6 +4048,79 @@ async fn inspection_looks_at_the_requested_root_directory() {
 }
 
 #[tokio::test]
+async fn inspection_reports_the_ports_the_dockerfile_exposes() {
+    for (root_directory, expected) in [
+        (None, json!([8080])),
+        (Some("apps/web"), json!([80])),
+        // The Dockerfile there is a symlink to a host file, which is never read.
+        (Some("apps/evil"), json!([])),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+        let mut command = inspect_command();
+        if let Some(root_directory) = root_directory {
+            command.payload["root_directory"] = json!(root_directory);
+        }
+
+        let output = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+            .await
+            .expect("inspection completes");
+
+        assert_eq!(
+            output.result["exposed_ports"], expected,
+            "{root_directory:?}"
+        );
+    }
+}
+
+/// Railpack exits 1 for a repository with only a Dockerfile, but a Dockerfile build
+/// never asks Railpack, so the preview still succeeds. Without a Dockerfile the
+/// failure stands, because then Railpack is what would build the app.
+#[tokio::test]
+async fn a_railpack_failure_only_fails_the_inspection_without_a_dockerfile() {
+    for dockerfile in [true, false] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(dockerfile).with_failed_sandbox_info());
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+        let result = dispatch(
+            executor,
+            &inspect_command(),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await;
+
+        if dockerfile {
+            let output = result.expect("inspection completes");
+            assert_eq!(output.result["exposed_ports"], json!([8080]));
+            assert_eq!(output.result["railpack"], serde_json::Value::Null);
+        } else {
+            let error = result.expect_err("inspection fails");
+            assert_eq!(error.code(), "runtime_build_failed");
+        }
+    }
+}
+
+#[tokio::test]
+async fn inspection_without_a_dockerfile_reports_no_ports() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = dispatch(
+        executor,
+        &inspect_command(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("inspection completes");
+
+    assert_eq!(output.result["dockerfile_found"], false);
+    assert_eq!(output.result["exposed_ports"], json!([]));
+}
+
+#[tokio::test]
 async fn inspection_refuses_a_root_directory_outside_the_repository() {
     for (root_directory, processes_run) in [("../outside", false), ("link-out", true)] {
         let temp = TempDir::new().expect("temp directory should be available");
@@ -5384,6 +5457,7 @@ struct FakeRunner {
     sandbox_stdout: Option<String>,
     registered_runtimes: String,
     fail_workload_run: bool,
+    fail_sandbox_info: bool,
     built_dockerfiles: Mutex<Vec<String>>,
     /// `docker ps --filter network=<name>` output, by network. Missing means unused.
     network_users: Mutex<HashMap<String, String>>,
@@ -5575,6 +5649,7 @@ impl FakeRunner {
             sandbox_stdout: None,
             registered_runtimes: "io.containerd.runc.v2\nrunc\n".to_owned(),
             fail_workload_run: false,
+            fail_sandbox_info: false,
             built_dockerfiles: Mutex::new(Vec::new()),
             network_users: Mutex::new(HashMap::new()),
             project_networks_stdout: String::new(),
@@ -5638,6 +5713,12 @@ impl FakeRunner {
 
     fn with_failed_workload_run(mut self) -> Self {
         self.fail_workload_run = true;
+        self
+    }
+
+    /// `railpack info` exits 1, as it does when no provider recognises the repository.
+    fn with_failed_sandbox_info(mut self) -> Self {
+        self.fail_sandbox_info = true;
         self
     }
 
@@ -5837,7 +5918,7 @@ impl ProcessRunner for FakeRunner {
             if self.dockerfile {
                 fs::write(
                     std::path::Path::new(source).join("Dockerfile"),
-                    "FROM scratch\n",
+                    "FROM scratch\nEXPOSE 8080\n",
                 )
                 .expect("fake Dockerfile should be created");
             }
@@ -5862,7 +5943,7 @@ impl ProcessRunner for FakeRunner {
             if self.dockerfile {
                 fs::write(
                     app.join("Dockerfile"),
-                    "# syntax=evil/frontend\nFROM scratch\n# apps-web\n",
+                    "# syntax=evil/frontend\nFROM scratch\n# apps-web\nEXPOSE 80/tcp\n",
                 )
                 .expect("fake app Dockerfile");
             }
@@ -5883,6 +5964,17 @@ impl ProcessRunner for FakeRunner {
                 .lock()
                 .expect("dockerfile lock")
                 .push(content);
+        }
+        if self.fail_sandbox_info
+            && is_sandbox(spec)
+            && spec.args.iter().any(|argument| argument == "info")
+        {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "Railpack could not determine how to build the app.".to_owned(),
+            });
         }
         if is_sandbox(spec) {
             let result = if spec.args.iter().any(|argument| argument == "prepare") {

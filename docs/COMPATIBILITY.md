@@ -108,6 +108,15 @@ either side can be deployed first.
 | --- | --- | --- |
 | `StopProject` payload field `remove_images` | Honoured. | Optional boolean. The API should send `true` only on the stop it creates when a project is deleted (`DeleteProjectAction`, which today sends `{}`). The stop result then adds `removed_images` and `reclaimed_image_bytes`. An older Agent ignores the field; without it, the periodic image GC removes a deleted project's images once they are older than `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS`. |
 
+## Revision 4 additions after v0.4.0
+
+Still revision 4, and either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `InspectProject` result field `exposed_ports` | Sent, always. | List of TCP ports from `EXPOSE` in the final Dockerfile stage, `[]` when there is none. Rules in [Sakala Agent API](AGENT_API.md#project-inspection-command). An older API validates `result` only as an object and copies known keys, so it ignores the field. A result without the field comes from an older Agent, and the API must then leave its stored port alone. The API stores the port as `detected_port` only when the list has exactly one entry, and `container_port` stays `configured_port`, then `detected_port`, then 3000. |
+| `InspectProject` result `railpack: null` | Sent when `railpack info` fails on a project with a Dockerfile. | Such an inspection used to end in `fail` with `runtime_build_failed`. `ProjectInspectionResultData` in every released API already reads a non-object `railpack` as `null`. |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

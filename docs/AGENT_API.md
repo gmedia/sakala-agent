@@ -490,10 +490,42 @@ Setelah `railpack info` dan scanner selesai, agent menyelesaikan command dengan 
     "compose_found": false,
     "manifests": [".env.example", "package.json", "pnpm-lock.yaml"],
     "package_manager": "pnpm",
+    "exposed_ports": [],
     "railpack": {}
   }
 }
 ```
+
+`exposed_ports` berisi port TCP yang dideklarasikan `EXPOSE` di stage terakhir
+`Dockerfile` pada direktori yang diinspeksi, terurut dan tanpa duplikat, paling banyak
+32 entri. Field ini selalu dikirim, dan berupa `[]` bila tidak ada Dockerfile, tidak
+ada `EXPOSE`, atau tidak ada port yang bisa dipastikan. Aturannya mengikuti BuildKit:
+
+- Hanya stage terakhir yang dihitung, karena Agent tidak memakai `--target`. Stage
+  yang dibangun dari stage sebelumnya (`FROM build`) mewarisi port dan variabelnya.
+  Port yang dideklarasikan image dari registry, misalnya `EXPOSE 80` di dalam image
+  `nginx`, tidak diketahui karena inspection tidak menarik image.
+- `80`, `80/tcp`, dan rentang `8000-8002` dihitung. Port `/udp` dan `/sctp` tidak.
+- `$NAME`, `${NAME}`, `${NAME:-word}`, dan `${NAME:+word}` diisi dari `ARG` dan `ENV`
+  di stage itu, dengan yang belakangan menang seperti di BuildKit. `ARG` global perlu
+  dideklarasikan ulang di stage. Nilai yang tidak bisa dipastikan, misalnya variabel
+  dari base image atau `ARG` tanpa default, diabaikan beserta port-nya. Agent tidak
+  mengisi `ARG` dari environment project, jadi default di Dockerfile adalah nilainya.
+- Komentar, continuation, directive `# escape=`, dan isi heredoc diperlakukan seperti
+  BuildKit. Instruction lain diabaikan, jadi Dockerfile yang tidak bisa dibaca
+  sepenuhnya tetap menghasilkan port yang bisa dibaca.
+- `Dockerfile` berupa symlink hanya dibaca bila tujuannya tetap di dalam direktori yang
+  diinspeksi, dan file di atas 1 MiB tidak dibaca.
+
+API memakai `exposed_ports` untuk memilih port default; lihat
+[Compatibility](COMPATIBILITY.md#revision-4-additions-after-v040). `container_port`
+pada `DeployProject` tetap ditentukan API, dan `PORT` tetap kontraknya.
+
+Untuk project dengan `Dockerfile`, kegagalan `railpack info` tidak menggagalkan
+inspection, karena build Dockerfile tidak memakai Railpack. Railpack gagal, misalnya,
+pada repository yang hanya berisi Dockerfile. `railpack` lalu bernilai `null`, dan
+output Railpack tetap ada di log command. Tanpa Dockerfile, kegagalan itu tetap
+menjadi `fail` dengan `runtime_build_failed`.
 
 Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan raw JSON untuk audit dan evolusi adapter; console tidak boleh bergantung langsung pada struktur raw tersebut tanpa schema/normalization.
 

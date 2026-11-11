@@ -264,6 +264,7 @@ impl DockerRuntimeExecutor {
             "Project stack preview is ready.",
             json!({
                 "dockerfile_found": inspection.dockerfile_found,
+                "exposed_ports": inspection.exposed_ports,
                 "package_manager": inspection.package_manager,
             }),
         )

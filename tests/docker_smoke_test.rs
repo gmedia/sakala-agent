@@ -1618,6 +1618,68 @@ async fn a_real_repository_deploys_with_railpack_in_the_sandbox() {
     harness.executor.shutdown().await.expect("shutdown");
 }
 
+/// The most common student Dockerfile: build with Node, serve with nginx on port 80.
+/// A real inspection, Railpack sandbox included, reports port 80 and not the build
+/// stage's 3000, and BuildKit gives the image built from the same file the same port.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, network access, node:24-alpine, and nginx:alpine"]
+async fn a_real_inspection_reports_the_port_of_an_nginx_dockerfile() {
+    const DOCKERFILE: &str = "\
+ARG NODE_VERSION=24
+FROM node:${NODE_VERSION}-alpine AS build
+WORKDIR /app
+EXPOSE 3000
+RUN echo '<h1>ok</h1>' > index.html
+
+FROM nginx:alpine
+COPY --from=build /app/index.html /usr/share/nginx/html/index.html
+EXPOSE 80
+";
+    const TAG: &str = "sakala-agent-sm/exposed-ports:smoke";
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let image = build_sandbox_image();
+
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start_with(&temp, &image, None).await;
+    harness
+        .runner
+        .use_real_build(vec![("Dockerfile".to_owned(), DOCKERFILE.to_owned())]);
+    let inspection = harness
+        .inspect(
+            "https://github.com/sakala-demo/static-site.git",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .await;
+    println!("inspection exposed_ports: {}", inspection["exposed_ports"]);
+    assert_eq!(inspection["dockerfile_found"], true);
+    assert_eq!(inspection["exposed_ports"], json!([80]));
+
+    let context = temp.path().join("buildkit");
+    write_repository(&context, &[("Dockerfile", DOCKERFILE)]);
+    docker(&[
+        "buildx",
+        "build",
+        "--load",
+        "--tag",
+        TAG,
+        context.to_str().expect("path"),
+    ]);
+    let exposed = docker(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.ExposedPorts}}",
+        TAG,
+    ]);
+    docker(&["image", "rm", TAG]);
+    println!("BuildKit ExposedPorts: {}", exposed.trim());
+    assert_eq!(exposed.trim(), r#"{"80/tcp":{}}"#);
+    harness.executor.shutdown().await.expect("shutdown");
+}
+
 /// Laravel at a fixed commit, built by Railpack and started by Railpack's own
 /// `/start-container.sh`, which ends in FrankenPHP. The FrankenPHP binary carries
 /// the file capability `cap_net_bind_service=ep`, and the kernel refuses to exec
