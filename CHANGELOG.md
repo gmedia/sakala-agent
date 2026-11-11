@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
 ### Added
 
 - Result `InspectProject` kini memuat `exposed_ports`, yaitu port TCP yang dideklarasikan `EXPOSE` di stage terakhir `Dockerfile`, misalnya `[80]` untuk Dockerfile yang berakhir di `nginx:alpine` dengan `EXPOSE 80`. API bisa memakainya sebagai port default bila hanya ada satu port, sehingga aplikasi seperti itu tidak lagi gagal dengan `runtime_app_not_listening` karena Sakala memprobe port 3000. Pembacanya mengikuti aturan BuildKit untuk multi-stage, `ARG` dan `ENV`, komentar, continuation, dan heredoc, dan mengabaikan nilai yang tidak bisa dipastikan. Hasilnya sudah dicocokkan dengan `ExposedPorts` dari build BuildKit sungguhan untuk 24 Dockerfile. Field ini aditif di protocol revision 4; lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v040).
@@ -168,7 +170,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/gmedia/sakala-agent/compare/v0.2.2...v0.2.3

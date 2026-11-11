@@ -13,7 +13,7 @@ async-trait.workspace = true
 base64 = "0.23"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 oci-spec = { version = "0.10.0", default-features = false, features = ["distribution"] }
-sakala-agent-core = { version = "0.4.0", path = "../sakala-agent-core" }
+sakala-agent-core = { version = "0.5.0", path = "../sakala-agent-core" }
 sakala-agent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
