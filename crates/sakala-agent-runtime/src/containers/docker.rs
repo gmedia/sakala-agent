@@ -61,6 +61,30 @@ const CRASH_STATE_FORMAT: &str = "{{.Id}}\t{{.State.Status}}\t{{.RestartCount}}\
 const EXIT_EVENTS_FORMAT: &str = "{{.Actor.ID}}\t{{.Action}}\t{{.Actor.Attributes.exitCode}}";
 /// Exit code of a SIGKILL, which is what the kernel OOM killer sends.
 const SIGKILL_EXIT_CODE: i32 = 137;
+/// The only Linux capabilities a workload keeps after `--cap-drop ALL`.
+///
+/// Most images start as root and then switch to an unprivileged user: the
+/// official nginx image chowns its cache directories to uid 101 before its
+/// workers drop to that user, and httpd, `gosu`/`su-exec` entrypoints,
+/// supervisord, and php-fpm pools do the same. Without CHOWN, SETUID, and
+/// SETGID nginx exits 1 at start, and httpd keeps serving as root because its
+/// workers cannot drop. The rest of Docker's default set stays dropped:
+/// NET_RAW (forged packets on the shared bridge), MKNOD, SYS_CHROOT,
+/// AUDIT_WRITE, SETFCAP, and SETPCAP. NET_BIND_SERVICE is here because the
+/// kernel refuses to exec a binary marked `cap_net_bind_service=ep`, such as
+/// FrankenPHP or Caddy, when it is outside the bounding set.
+/// `no-new-privileges` stays on, so a non-root process gains none of these
+/// through a file. See docs/DOCKER_RUNTIME.md#capability-workload.
+const WORKLOAD_CAPABILITIES: [&str; 8] = [
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "KILL",
+    "SETGID",
+    "SETUID",
+    "NET_BIND_SERVICE",
+];
 
 /// The name servers workloads use instead of Docker's embedded DNS. The file outlives
 /// every workspace, because Docker reads it again whenever a container restarts.
@@ -715,17 +739,11 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--security-opt")
             .arg("no-new-privileges:true")
             .arg("--cap-drop")
-            .arg("ALL")
-            // FrankenPHP, Caddy, and other images ship binaries marked
-            // `cap_net_bind_service=ep`. The kernel refuses to exec such a file
-            // with EPERM when the capability is missing from the bounding set
-            // (`bprm_caps_from_vfs_caps` in security/commoncap.c), so every
-            // Railpack PHP app exited 126 at start. Keeping only this one grants
-            // nothing new: Docker sets `net.ipv4.ip_unprivileged_port_start=0` in
-            // the container's own network namespace, and `no-new-privileges`
-            // still keeps a non-root process from gaining it through the file.
-            .arg("--cap-add")
-            .arg("NET_BIND_SERVICE")
+            .arg("ALL");
+        for capability in WORKLOAD_CAPABILITIES {
+            command = command.arg("--cap-add").arg(capability);
+        }
+        command = command
             .arg("--memory")
             .arg(format!("{}m", request.resources.memory_mb))
             .arg("--memory-swap")
@@ -1289,7 +1307,7 @@ fn health_state(status: &str) -> (bool, Option<String>) {
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use super::{DockerContainerEngine, new_restarts};
+    use super::{DockerContainerEngine, WORKLOAD_CAPABILITIES, new_restarts};
 
     #[test]
     fn each_new_restart_is_logged_once() {
@@ -1328,5 +1346,45 @@ mod tests {
         let effective = DockerContainerEngine::effective_environment(&environment, 3000);
 
         assert_eq!(effective.get("PORT"), Some(&"3000".to_owned()));
+    }
+
+    /// The allowlist stays a strict subset of Docker's default set. The six
+    /// dropped ones give a tenant nothing a web app needs: NET_RAW forges
+    /// packets on the shared bridge, MKNOD creates device nodes, SYS_CHROOT
+    /// and AUDIT_WRITE serve login tooling, and SETFCAP and SETPCAP change
+    /// capabilities themselves.
+    #[test]
+    fn the_workload_allowlist_drops_the_risky_part_of_docker_defaults() {
+        const DOCKER_DEFAULTS: [&str; 14] = [
+            "AUDIT_WRITE",
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "MKNOD",
+            "NET_BIND_SERVICE",
+            "NET_RAW",
+            "SETFCAP",
+            "SETGID",
+            "SETPCAP",
+            "SETUID",
+            "SYS_CHROOT",
+        ];
+        for capability in WORKLOAD_CAPABILITIES {
+            assert!(DOCKER_DEFAULTS.contains(&capability), "{capability}");
+        }
+        for dropped in [
+            "NET_RAW",
+            "MKNOD",
+            "SYS_CHROOT",
+            "AUDIT_WRITE",
+            "SETFCAP",
+            "SETPCAP",
+            "SYS_ADMIN",
+            "NET_ADMIN",
+        ] {
+            assert!(!WORKLOAD_CAPABILITIES.contains(&dropped), "{dropped}");
+        }
     }
 }

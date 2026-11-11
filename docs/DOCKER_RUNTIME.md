@@ -259,7 +259,7 @@ pakai hanya pada node yang menjalankan repository tepercaya.
 - Process anak hanya mewarisi allowlist environment (`PATH`, `HOME`, `DOCKER_*`, `BUILDX_*`, dan sejenisnya). `SAKALA_*`, termasuk token Agent, tidak pernah diwariskan.
 - Runtime env ditulis sementara ke file mode `0600`, dibaca `docker run --env-file`, lalu dihapus.
 - Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Tidak ada deteksi port otomatis: aplikasi wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
-- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan drop seluruh capability kecuali `NET_BIND_SERVICE`. Lihat [Capability workload](#capability-workload).
+- Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan `--cap-drop ALL` lalu hanya delapan capability dari allowlist kecil yang dikembalikan. Lihat [Capability workload](#capability-workload).
 - Tidak ada host volume atau Docker socket di aplikasi user.
 - Caddy dan aplikasi user tidak menerima Docker socket.
 
@@ -267,8 +267,57 @@ Ini belum merupakan multi-tenant sandbox. Docker daemon access tetap privileged;
 
 ## Capability workload
 
-Workload berjalan dengan `--cap-drop ALL --cap-add NET_BIND_SERVICE` dan
-`--security-opt no-new-privileges:true`.
+Workload berjalan dengan `--security-opt no-new-privileges:true`, `--cap-drop ALL`, lalu
+`--cap-add` untuk delapan capability ini, dalam urutan yang sama dengan konstanta
+`WORKLOAD_CAPABILITIES` di `crates/sakala-agent-runtime/src/containers/docker.rs`:
+
+| Capability | Kenapa dipertahankan |
+| --- | --- |
+| `CHOWN` | Image nginx resmi meng-`chown` direktori cache ke uid 101 sebelum worker-nya turun ke user itu. |
+| `DAC_OVERRIDE` | Proses root di entrypoint membaca dan menulis file milik user aplikasi, misalnya saat menyiapkan direktori sebelum turun privilege. |
+| `FOWNER` | `chmod` dan `utime` pada file milik user lain, dipakai entrypoint yang menyiapkan direktori. |
+| `FSETID` | Bit setgid tetap terpasang saat root mengubah file milik grup lain. |
+| `KILL` | Master process mengirim sinyal ke worker yang sudah berjalan dengan uid lain. |
+| `SETGID`, `SETUID` | Turun dari root ke user tanpa privilege: worker nginx dan httpd, `gosu`, `su-exec`, supervisord, pool php-fpm. |
+| `NET_BIND_SERVICE` | Exec biner bertanda `cap_net_bind_service=ep` seperti FrankenPHP dan Caddy. Lihat di bawah. |
+
+Sisa set default Docker tetap dibuang:
+
+| Capability | Alasan tetap dibuang |
+| --- | --- |
+| `NET_RAW` | Raw socket dan packet socket memungkinkan memalsukan paket (ARP, IP) ke container tenant lain di bridge yang sama. |
+| `MKNOD` | Membuat device node. Workload web tidak memerlukannya. |
+| `SYS_CHROOT` | Hanya dipakai tooling login dan sebagian daemon mail; tidak dibutuhkan image web. |
+| `AUDIT_WRITE` | Menulis ke audit log kernel host, dipakai PAM dan sshd. |
+| `SETFCAP` | Memasang file capability pada biner, yang bisa dipakai menyiapkan biner untuk menaikkan privilege. |
+| `SETPCAP` | Mengubah capability process lain dan bounding set. |
+
+Allowlist ini delapan dari 14 capability default Docker, dan tidak memuat capability
+di luar set default seperti `SYS_ADMIN` atau `NET_ADMIN`. Root di dalam container tetap
+dibatasi mount namespace-nya sendiri: workload tidak punya host volume, dan satu-satunya
+mount dari host, `/etc/resolv.conf` dari `SAKALA_CONTAINER_DNS`, dipasang read-only, yang
+tidak bisa ditembus `DAC_OVERRIDE`. `KILL` hanya menjangkau process di PID namespace
+container sendiri. Karena `no-new-privileges` tetap dipasang, process non-root tidak
+mendapat satu pun capability ini lewat file setuid atau file capability.
+
+### Kenapa bukan hanya `NET_BIND_SERVICE`
+
+v0.3.0 hanya mempertahankan `NET_BIND_SERVICE`. Pada 2026-11-11 terbukti di staging dan
+terulang di Docker 29.9.3 lokal bahwa image yang dimulai sebagai root lalu turun privilege
+tidak bisa berjalan dengan aturan itu. Hasil pada `nginx:alpine`
+(`sha256:713fc2eb...`), `httpd:alpine` (`sha256:610eddac...`), dan `node:22-alpine`
+(`sha256:0e175475...`), dicek dengan `wget` dari dalam container:
+
+| Image | Hanya `NET_BIND_SERVICE` | Allowlist |
+| --- | --- | --- |
+| `nginx:alpine` | Keluar dengan exit code 1, `chown("/var/cache/nginx/client_temp", 101) failed (1: Operation not permitted)` | Melayani port 80, `CapEff` 0x4fb |
+| `httpd:alpine` | Melayani port 80, tetapi worker gagal `setgid` (`AH02156`) dan tetap berjalan sebagai root | Melayani port 80, worker berjalan sebagai `www-data` |
+| `node:22-alpine` sebagai user 1000 | Melayani port 3000, `CapEff` 0 | Sama, `CapEff` 0 |
+
+Kasus httpd menunjukkan aturan lama justru lebih lemah untuk image seperti itu: request
+dilayani process root karena process itu tidak bisa turun ke user tanpa privilege.
+
+### File capability dan `NET_BIND_SERVICE`
 
 `NET_BIND_SERVICE` dipertahankan karena image seperti FrankenPHP (image PHP Railpack)
 dan Caddy membawa biner bertanda file capability `cap_net_bind_service=ep`. Smoke test
@@ -278,8 +327,8 @@ biner itu sebagai *capability-dumb*, dan saat exec kernel mewajibkan seluruh fil
 permitted capability benar-benar didapat. Bila capability itu tidak ada di bounding set,
 `execve` gagal dengan `EPERM` (`bprm_caps_from_vfs_caps` di `security/commoncap.c`,
 Linux v6.18 baris 634-647, dan bagian "Safety checking for capability-dumb binaries" di
-capabilities(7)). `--cap-drop ALL` mengosongkan bounding set, sehingga setiap aplikasi
-Laravel hasil Railpack keluar dengan exit code 126 dan
+capabilities(7)). `--cap-drop ALL` tanpa capability ini mengosongkan bounding set,
+sehingga setiap aplikasi Laravel hasil Railpack keluar dengan exit code 126 dan
 `exec: frankenphp: Operation not permitted`.
 
 `no-new-privileges` bukan penyebabnya dan tetap dipasang. Dengan flag itu kernel hanya
@@ -298,8 +347,8 @@ Capability ini tidak menambah kemampuan yang berarti. Docker memasang
 capability pun sudah bisa listen di port 80 di namespace itu, dan namespace itu milik
 container sendiri. Aplikasi tetap listen di `$PORT`.
 
-Biner yang meminta capability lain, misalnya `cap_net_raw`, tetap gagal dengan
-`runtime_app_exec_denied`. Solusinya `setcap -r` di image atau image lain, bukan
+Biner yang meminta capability di luar allowlist, misalnya `cap_net_raw`, tetap gagal
+dengan `runtime_app_exec_denied`. Solusinya `setcap -r` di image atau image lain, bukan
 menambah capability.
 
 ## Log deployment
