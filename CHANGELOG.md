@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-12
+
 ### Added
 
 - `SAKALA_PROJECT_DOMAIN_SUFFIXES` mengatur suffix domain yang boleh dipakai deployment, dipisah koma, misalnya `run.example.ac.id`. Sebelumnya Agent hanya menerima domain di bawah `run.sakala.localhost`, `run.staging.sakala.dev`, dan `run.sakala.dev`, sehingga instalasi self-hosted di domain lain ditolak di setiap deploy. Tanpa variabel ini ketiga suffix itu tetap dipakai, jadi Sakala hosted berperilaku sama. Setiap suffix divalidasi saat start (huruf kecil, minimal dua label, tanpa wildcard, label internasional dalam bentuk `xn--`), dan nilai yang tidak valid menghentikan Agent dengan pesan yang menyebut variabel dan alasannya. Suffix yang berlaku dicatat di log preflight sebagai check `project-domains`. Lihat [Domain project](docs/CONFIGURATION.md#domain-project).
@@ -178,7 +180,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gmedia/sakala-agent/compare/v0.2.3...v0.3.0
