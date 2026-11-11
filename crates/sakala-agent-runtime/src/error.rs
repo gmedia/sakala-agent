@@ -53,10 +53,10 @@ pub enum RuntimeError {
     #[error("the app exited during start with {}", describe_exit_code(*.exit_code))]
     AppCrashed { exit_code: Option<i32> },
     /// The kernel refused to execute a program in the image with EPERM. In a
-    /// Sakala container that means a file capability other than
-    /// NET_BIND_SERVICE, the only capability the container keeps.
+    /// Sakala container that means a file capability outside the workload
+    /// allowlist, such as `cap_net_raw`.
     #[error(
-        "the app could not start because Linux refused to run one of its programs (exit code {exit_code}, operation not permitted); the program asks for Linux capabilities Sakala containers do not grant, and only NET_BIND_SERVICE is kept, so remove its file capabilities with setcap -r or use an image that does not need them"
+        "the app could not start because Linux refused to run one of its programs (exit code {exit_code}, operation not permitted); the program asks for a Linux capability outside the small set Sakala containers keep, such as NET_RAW, so remove its file capabilities with setcap -r or use an image that does not need them"
     )]
     AppExecDenied { exit_code: i32 },
     #[error("the app ran out of memory during start; {}", describe_memory_limit(*.memory_limit_mb))]
@@ -408,7 +408,8 @@ mod tests {
             .refine_crash(true);
             assert_eq!(error.code(), "runtime_app_exec_denied");
             let message = error.to_string();
-            assert!(message.contains("NET_BIND_SERVICE"), "{message}");
+            assert!(message.contains("setcap -r"), "{message}");
+            assert!(!message.contains("only NET_BIND_SERVICE"), "{message}");
             assert!(!message.contains("environment"), "{message}");
             assert_reads_as_words(&message);
         }

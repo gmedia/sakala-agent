@@ -4250,11 +4250,15 @@ async fn inspection_runs_railpack_in_the_sandbox_too() {
     assert_eq!(output.result["railpack"]["provider"], "node");
 }
 
-/// Railpack's PHP image runs FrankenPHP, a binary marked
-/// `cap_net_bind_service=ep`, which the kernel refuses to exec when that
-/// capability is outside the bounding set. Only that one capability returns.
+/// Images that start as root and then drop to an unprivileged user need
+/// CHOWN, SETUID, SETGID, and the file capabilities around them: the official
+/// nginx image exited 1 with `chown("/var/cache/nginx/client_temp", 101) failed
+/// (1: Operation not permitted)` when only NET_BIND_SERVICE was kept. That one
+/// stays because the kernel refuses to exec FrankenPHP, a binary marked
+/// `cap_net_bind_service=ep`, when it is outside the bounding set. Everything
+/// else, NET_RAW above all, stays dropped.
 #[tokio::test]
-async fn a_workload_keeps_only_the_capability_that_file_capability_binaries_need() {
+async fn a_workload_keeps_only_the_capabilities_of_the_allowlist() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(FakeRunner::new(false));
     let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
@@ -4276,7 +4280,46 @@ async fn a_workload_keeps_only_the_capability_that_file_capability_binaries_need
             .collect::<Vec<_>>()
     };
     assert_eq!(values_of("--cap-drop"), ["ALL"], "{workload:?}");
-    assert_eq!(values_of("--cap-add"), ["NET_BIND_SERVICE"], "{workload:?}");
+    let expected = [
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--cap-add",
+        "FOWNER",
+        "--cap-add",
+        "FSETID",
+        "--cap-add",
+        "KILL",
+        "--cap-add",
+        "SETGID",
+        "--cap-add",
+        "SETUID",
+        "--cap-add",
+        "NET_BIND_SERVICE",
+    ];
+    assert!(
+        workload
+            .windows(expected.len())
+            .any(|found| found == expected),
+        "the drop comes first and the allowlist follows it: {workload:?}"
+    );
+    assert_eq!(
+        values_of("--cap-add"),
+        [
+            "CHOWN",
+            "DAC_OVERRIDE",
+            "FOWNER",
+            "FSETID",
+            "KILL",
+            "SETGID",
+            "SETUID",
+            "NET_BIND_SERVICE",
+        ],
+        "{workload:?}"
+    );
     assert_eq!(
         values_of("--security-opt"),
         ["no-new-privileges:true"],
