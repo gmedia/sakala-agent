@@ -14,9 +14,11 @@ use sakala_agent_core::ports::{
 mod docker;
 pub(crate) mod images;
 pub(crate) mod limits;
+pub(crate) mod network;
 
 pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
 pub use limits::ResourceSafetyConfig;
+pub use network::{NetworkReconciliation, project_network_name};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunContainerRequest {
@@ -91,11 +93,26 @@ pub trait ContainerEngine: Send + Sync {
 
     async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
 
+    /// Starts a workload on its project's own network, which it creates first
+    /// and connects the router to. The workload never joins the shared runtime
+    /// network, so it cannot reach other projects.
     async fn start(
         &self,
         request: &RunContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
+
+    /// Connects the router to the project's network again, when the project has
+    /// one. A workload started by an older Agent lives on the shared network.
+    async fn attach_router(&self, project_id: Uuid) -> Result<(), RuntimeError>;
+
+    /// Disconnects the router and removes the project's network once no
+    /// container, running or stopped, uses it.
+    async fn release_network(&self, project_id: Uuid) -> Result<(), RuntimeError>;
+
+    /// Startup only: removes project networks without containers and reconnects
+    /// the router to the rest.
+    async fn reconcile_networks(&self) -> Result<NetworkReconciliation, RuntimeError>;
 
     async fn report_startup_logs(
         &self,

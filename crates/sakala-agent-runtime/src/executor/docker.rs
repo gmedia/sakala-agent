@@ -76,6 +76,7 @@ pub(crate) struct DockerPreflight {
     railpack_sandbox: RailpackSandbox,
     container_runtime: Option<String>,
     container_dns_configured: bool,
+    max_active_containers: u32,
 }
 
 impl DockerRuntimeExecutor {
@@ -103,6 +104,7 @@ impl DockerRuntimeExecutor {
             ),
             container_runtime: config.container_runtime.clone(),
             container_dns_configured: !config.container_dns.is_empty(),
+            max_active_containers: config.max_active_containers,
         };
         let container_dns = crate::containers::ContainerDns::new(
             &config.workspace_root,
@@ -142,7 +144,7 @@ impl DockerRuntimeExecutor {
             )),
             Arc::new(DockerContainerEngine::new(
                 Arc::clone(&runner),
-                config.runtime_network,
+                router_container.clone(),
                 config.resource_safety,
                 config.max_active_containers,
                 agent_id,
@@ -375,14 +377,16 @@ impl DockerRuntimeExecutor {
                 .await;
             result = result.map_err(|error| error.refine_crash(output.exec_denied));
         }
-        if failed_before_cutover
-            && let Err(error) = self.containers.cleanup_candidate(&container, &image).await
-        {
-            let _ = reporter
-                .log(system_log(format!(
-                    "candidate cleanup warning for {container}: {error}"
-                )))
-                .await;
+        if failed_before_cutover {
+            if let Err(error) = self.containers.cleanup_candidate(&container, &image).await {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "candidate cleanup warning for {container}: {error}"
+                    )))
+                    .await;
+            }
+            // A first deployment leaves the network with nobody but the router.
+            self.release_network(project_id).await;
         }
         // The path is the node's, so it stays in the Agent's own log.
         if let Err(error) = self.workspace.cleanup(&workspace).await {
@@ -706,11 +710,21 @@ impl DockerRuntimeExecutor {
         }
     }
 
+    /// Best effort: a network left behind holds no state, and startup
+    /// reconciliation removes it. The operator log says why it stayed.
+    async fn release_network(&self, project_id: Uuid) {
+        if let Err(error) = self.containers.release_network(project_id).await {
+            tracing::warn!(%project_id, %error, "project network was not removed");
+        }
+    }
+
     async fn activate_workload(
         &self,
         workload: &ManagedWorkload,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
+        // A recreated router container has lost its project networks.
+        self.containers.attach_router(workload.project_id).await?;
         self.health
             .wait_until_ready(
                 &self.workload_readiness(workload, self.timeout_safety.max_start_timeout),
@@ -772,6 +786,7 @@ impl DockerRuntimeExecutor {
                         reporter.as_ref(),
                     )
                     .await?;
+                self.release_network(request.project_id).await;
                 return Ok(CommandOutput::with_result(
                     json!({ "status": "already_stopped" }),
                 ));
@@ -790,6 +805,7 @@ impl DockerRuntimeExecutor {
             .await?;
         if remove {
             self.containers.remove(&workload).await?;
+            self.release_network(workload.project_id).await;
         }
         let event_type = if remove {
             "workload.stop.completed"
@@ -927,6 +943,13 @@ impl DockerPreflight {
             .await;
         http_probe.fatal = false;
         checks.push(http_probe);
+        checks.push(
+            crate::containers::network::preflight_check(
+                self.runner.as_ref(),
+                self.max_active_containers,
+            )
+            .await,
+        );
         checks.push(self.railpack_sandbox_check().await);
         if let Some(runtime) = &self.container_runtime {
             checks.extend(self.container_runtime_checks(runtime).await);
@@ -1126,6 +1149,11 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.reconcile().await?;
+        // Unlike containers, a network holds no state, so one without containers
+        // is removed here instead of only reported.
+        if let Err(error) = self.containers.reconcile_networks().await {
+            tracing::warn!(%error, "project network reconciliation failed");
+        }
         for discovered in report.workloads.clone() {
             let workload = match self
                 .containers
@@ -1280,6 +1308,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                         .into());
                     }
                     self.containers.remove(workload).await?;
+                    self.release_network(workload.project_id).await;
                     actions_applied.push(json!({
                         "action": "cleanup_failed_candidate",
                         "container_id": workload.container_id,

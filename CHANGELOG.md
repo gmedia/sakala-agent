@@ -4,6 +4,17 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Security
+
+- Setiap project kini berjalan di bridge network sendiri, `sakala-project-<project-id>`, bukan di `sakala-runtime` bersama semua project. Sebelumnya aplikasi satu tenant bisa membuka koneksi langsung ke aplikasi tenant lain tanpa melewati Caddy. Agent menyambungkan container Caddy ke network project sebelum probe dan route, memutusnya dan menghapus network saat container terakhir project hilang, serta saat startup menghapus network kosong dan menyambungkan ulang Caddy. Workload dari Agent lama tetap dilayani di `sakala-runtime` sampai redeploy berikutnya. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#network-per-project).
+
+Pool alamat bawaan Docker hanya cukup untuk sekitar 31 bridge network. Atur `default-address-pools` di `daemon.json` sebelum node menampung lebih dari sekitar 20 project; tanpa itu deploy gagal dengan `runtime_capacity_exceeded`. Container Caddy yang dibuat ulang kehilangan network project, jadi restart Agent setelahnya.
+
+### Added
+
+- Check preflight non-fatal `project-networks`, yang mencoba membuat network dan memperkirakan sisa address pool Docker.
+- Smoke test opt-in `project_network_smoke_test` untuk isolasi network antar-project.
+
 ## [0.3.0] - 2026-11-11
 
 ### Security

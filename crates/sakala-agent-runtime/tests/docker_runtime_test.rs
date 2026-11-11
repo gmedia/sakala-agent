@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     sync::{
         Arc, Mutex,
@@ -134,7 +134,13 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
         .expect("fake runtime dependencies should be checked");
 
     assert!(!report.has_fatal_failure());
-    assert_eq!(report.checks.len(), 10);
+    assert_eq!(report.checks.len(), 11);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "project-networks" && !check.fatal && check.ready)
+    );
     assert!(
         report
             .checks
@@ -4539,6 +4545,344 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
     }
 }
 
+const PROJECT_NETWORK: &str = "sakala-project-ff66ed4a-6303-4be6-8ef4-63c28b112680";
+
+fn command_index(runner: &FakeRunner, matches: impl Fn(&[String]) -> bool) -> Option<usize> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(|command| command.program == "docker" && matches(&string_arguments(command)))
+}
+
+fn is_network(args: &[String], action: &str) -> bool {
+    args.first().is_some_and(|arg| arg == "network") && args.get(1).is_some_and(|a| a == action)
+}
+
+fn network_removed(runner: &FakeRunner) -> bool {
+    command_index(runner, |args| args == ["network", "rm", PROJECT_NETWORK]).is_some()
+}
+
+#[tokio::test]
+async fn a_workload_joins_only_its_own_project_network_after_the_router_does() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment should complete");
+
+    let run = string_arguments(&find_command(&runner, is_workload_run));
+    let network = run
+        .iter()
+        .position(|arg| arg == "--network")
+        .map(|index| run[index + 1].clone());
+    assert_eq!(network.as_deref(), Some(PROJECT_NETWORK));
+    assert!(!run.iter().any(|arg| arg == "sakala-runtime"), "{run:?}");
+
+    let create = command_index(&runner, |args| is_network(args, "create")).expect("create");
+    let created = string_arguments(&runner.commands.lock().expect("command lock")[create]);
+    for label in [
+        "dev.sakala.managed=true",
+        "dev.sakala.network-kind=project",
+        "dev.sakala.project-id=ff66ed4a-6303-4be6-8ef4-63c28b112680",
+        "dev.sakala.agent-id=local-agent-01",
+    ] {
+        assert!(created.iter().any(|arg| arg == label), "{label}");
+    }
+    assert_eq!(created.last().map(String::as_str), Some(PROJECT_NETWORK));
+    let connect = command_index(&runner, |args| {
+        args == ["network", "connect", PROJECT_NETWORK, "sakala-caddy"]
+    })
+    .expect("the router joins the project network");
+    let started = command_index(&runner, |args| args.first().is_some_and(|a| a == "run"))
+        .expect("workload run");
+    let probed = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(is_probe)
+        .expect("probe");
+    assert!(create < connect && connect < started && started < probed);
+    assert!(
+        !network_removed(&runner),
+        "a live deployment keeps its network"
+    );
+}
+
+#[tokio::test]
+async fn stop_removes_the_project_network_once_only_the_router_uses_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("stopping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n")
+            .with_network_users(PROJECT_NETWORK, "sakala-caddy\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop should succeed");
+
+    let removed_container =
+        command_index(&runner, |args| args == ["rm", "stopping"]).expect("container removal");
+    let disconnect = command_index(&runner, |args| {
+        args == ["network", "disconnect", PROJECT_NETWORK, "sakala-caddy"]
+    })
+    .expect("the router leaves the network");
+    let removed_network = command_index(&runner, |args| args == ["network", "rm", PROJECT_NETWORK])
+        .expect("network removal");
+    assert!(removed_container < disconnect && disconnect < removed_network);
+}
+
+#[tokio::test]
+async fn stop_keeps_the_network_while_another_container_still_uses_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("stopping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n")
+            .with_network_users(
+                PROJECT_NETWORK,
+                "sakala-caddy\nsakala-app-ff66ed4a-sleeping\n",
+            ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop should succeed");
+
+    assert!(!network_removed(&runner));
+    assert!(command_index(&runner, |args| is_network(args, "disconnect")).is_none());
+}
+
+#[tokio::test]
+async fn stopping_an_absent_workload_still_removes_its_leftover_network() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop is idempotent");
+
+    assert_eq!(output.result["status"], "already_stopped");
+    assert!(network_removed(&runner));
+}
+
+#[tokio::test]
+async fn sleep_keeps_the_network_the_stopped_container_needs_to_wake() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep should succeed");
+
+    assert!(command_index(&runner, |args| args.first().is_some_and(|a| a == "network")).is_none());
+}
+
+#[tokio::test]
+async fn a_failed_first_deployment_leaves_no_project_network() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_failed_workload_run());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the deployment must fail");
+
+    let candidate_removed = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(is_candidate_removal)
+        .expect("candidate removal");
+    let removed = command_index(&runner, |args| args == ["network", "rm", PROJECT_NETWORK])
+        .expect("network removal");
+    assert!(candidate_removed < removed);
+}
+
+#[tokio::test]
+async fn waking_a_workload_reconnects_the_router_before_probing_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "sleeping\tExited (0) 1 minute ago\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake should succeed");
+
+    let connect = command_index(&runner, |args| {
+        args == ["network", "connect", PROJECT_NETWORK, "sakala-caddy"]
+    })
+    .expect("router reconnect");
+    let probed = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(is_probe)
+        .expect("probe");
+    assert!(connect < probed);
+    assert!(command_index(&runner, |args| is_network(args, "create")).is_none());
+}
+
+#[tokio::test]
+async fn startup_recovery_removes_unused_project_networks_and_reconnects_the_router() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let used = "sakala-project-11111111-1111-4111-8111-111111111111";
+    let attached = "sakala-project-22222222-2222-4222-8222-222222222222";
+    let empty = "sakala-project-33333333-3333-4333-8333-333333333333";
+    let mut runner = FakeRunner::new(true)
+        .with_network_users(used, "sakala-app-11111111-a\n")
+        .with_network_users(attached, "sakala-caddy\nsakala-app-22222222-b\n");
+    runner.project_networks_stdout = format!("{used}\n{attached}\n{empty}\nsakala-project-x\n");
+    runner.router_networks_stdout = format!("sakala-runtime\n{attached}\n");
+    let runner = Arc::new(runner);
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::recover(&executor, None)
+        .await
+        .expect("recovery should succeed");
+
+    let listing = find_command(&runner, |spec| {
+        string_arguments(spec).starts_with(&["network".to_owned(), "ls".to_owned()])
+    });
+    assert!(
+        string_arguments(&listing)
+            .iter()
+            .any(|arg| arg == "label=dev.sakala.agent-id=local-agent-01"),
+        "only this Agent's networks are touched"
+    );
+    let removed = |name: &str| command_index(&runner, |args| args == ["network", "rm", name]);
+    let connected = |name: &str| {
+        command_index(&runner, |args| {
+            args == ["network", "connect", name, "sakala-caddy"]
+        })
+    };
+    assert!(removed(empty).is_some());
+    assert!(removed(used).is_none() && removed(attached).is_none());
+    assert!(connected(used).is_some());
+    assert!(connected(attached).is_none() && connected(empty).is_none());
+    assert!(removed("sakala-project-x").is_none());
+}
+
+#[tokio::test]
+async fn preflight_warns_without_stopping_the_node_when_address_pools_run_short() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut runner = FakeRunner::new(true);
+    runner.address_pools_stdout = "null\n".to_owned();
+    let config = DockerRuntimeConfig {
+        max_active_containers: 40,
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(runner));
+
+    let report = RuntimeExecutor::preflight(&executor)
+        .await
+        .expect("preflight");
+
+    assert!(!report.has_fatal_failure());
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "project-networks")
+        .expect("check");
+    assert!(!check.ready && !check.fatal);
+    assert!(check.detail.contains("about 31 more"), "{}", check.detail);
+    assert!(
+        check.detail.contains("default-address-pools"),
+        "{}",
+        check.detail
+    );
+}
+
+#[tokio::test]
+async fn preflight_warns_when_docker_cannot_create_a_network() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut runner = FakeRunner::new(true);
+    runner.network_create_stderr = Some(
+        "Error response from daemon: all predefined address pools have been fully subnetted"
+            .to_owned(),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), Arc::new(runner));
+
+    let report = RuntimeExecutor::preflight(&executor)
+        .await
+        .expect("preflight");
+
+    assert!(!report.has_fatal_failure());
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "project-networks")
+        .expect("check");
+    assert!(!check.ready);
+    assert!(check.detail.contains("fully subnetted"), "{}", check.detail);
+}
+
+#[tokio::test]
+async fn a_deployment_without_a_free_address_range_fails_as_node_capacity() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut runner = FakeRunner::new(true);
+    runner.network_create_stderr = Some(
+        "Error response from daemon: could not find an available, non-overlapping IPv4 address pool among the defaults to assign to the network".to_owned(),
+    );
+    let runner = Arc::new(runner);
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the deployment must fail");
+
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert!(!error.to_string().contains("daemon"), "{error}");
+    assert_eq!(runner.count_commands(is_workload_run), 0);
+}
+
 async fn dispatch<R>(
     executor: DockerRuntimeExecutor,
     command: &AgentCommand,
@@ -4758,6 +5102,12 @@ struct FakeRunner {
     registered_runtimes: String,
     fail_workload_run: bool,
     built_dockerfiles: Mutex<Vec<String>>,
+    /// `docker ps --filter network=<name>` output, by network. Missing means unused.
+    network_users: Mutex<HashMap<String, String>>,
+    project_networks_stdout: String,
+    router_networks_stdout: String,
+    address_pools_stdout: String,
+    network_create_stderr: Option<String>,
 }
 
 struct AdmissionRunner {
@@ -4941,7 +5291,20 @@ impl FakeRunner {
             registered_runtimes: "io.containerd.runc.v2\nrunc\n".to_owned(),
             fail_workload_run: false,
             built_dockerfiles: Mutex::new(Vec::new()),
+            network_users: Mutex::new(HashMap::new()),
+            project_networks_stdout: String::new(),
+            router_networks_stdout: String::new(),
+            address_pools_stdout: r#"[{"Base":"172.16.0.0/12","Size":24}]"#.to_owned(),
+            network_create_stderr: None,
         }
+    }
+
+    fn with_network_users(self, network: &str, users: &str) -> Self {
+        self.network_users
+            .lock()
+            .expect("network lock")
+            .insert(network.to_owned(), users.to_owned());
+        self
     }
 
     /// Container states `docker inspect` reports, in order. The last one repeats.
@@ -5130,6 +5493,9 @@ impl ProcessRunner for FakeRunner {
                 stdout: String::new(),
                 stderr: "Caddy is not running".to_owned(),
             });
+        }
+        if let Some(output) = self.network_output(spec) {
+            return Ok(output);
         }
         let previous_stop = spec.program == "docker"
             && spec.args.first().is_some_and(|argument| argument == "stop")
@@ -5402,6 +5768,62 @@ impl ProcessRunner for FakeRunner {
             stdout: stdout.to_owned(),
             stderr: String::new(),
         })
+    }
+}
+
+impl FakeRunner {
+    /// Answers the project network commands, which the generic branches would
+    /// otherwise mistake for container commands.
+    fn network_output(&self, spec: &CommandSpec) -> Option<ProcessOutput> {
+        if spec.program != "docker" {
+            return None;
+        }
+        let args = string_arguments(spec);
+        let ok = |stdout: &str| ProcessOutput {
+            success: true,
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        };
+        if args.first().is_some_and(|arg| arg == "ps")
+            && let Some(network) = args.iter().find_map(|arg| arg.strip_prefix("network="))
+        {
+            let users = self.network_users.lock().expect("network lock");
+            return Some(ok(users.get(network).map_or("", String::as_str)));
+        }
+        if args
+            .iter()
+            .any(|arg| arg.contains(".NetworkSettings.Networks"))
+        {
+            return Some(ok(&self.router_networks_stdout));
+        }
+        if args.iter().any(|arg| arg.contains(".DefaultAddressPools")) {
+            return Some(ok(&self.address_pools_stdout));
+        }
+        if args.first().is_some_and(|arg| arg == "network") {
+            match args.get(1).map(String::as_str) {
+                Some("create") => {
+                    if let Some(stderr) = &self.network_create_stderr {
+                        return Some(ProcessOutput {
+                            success: false,
+                            code: Some(1),
+                            stdout: String::new(),
+                            stderr: stderr.clone(),
+                        });
+                    }
+                }
+                Some("ls")
+                    if args
+                        .iter()
+                        .any(|arg| arg == "label=dev.sakala.network-kind=project") =>
+                {
+                    return Some(ok(&self.project_networks_stdout));
+                }
+                _ => {}
+            }
+            return Some(ok(""));
+        }
+        None
     }
 }
 
