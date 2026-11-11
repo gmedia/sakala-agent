@@ -4,6 +4,16 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Image project yang sudah dihapus tidak lagi tertinggal selamanya di node. Aturan GC per project selalu mempertahankan image aktif dan image sebelumnya, sedangkan project yang dihapus tidak punya container lagi, sehingga dua image terakhirnya (di staging 239 sampai 593 MB per image) tidak pernah terhapus dan disk terus terisi. Kini project tanpa container sama sekali kehilangan semua image yang lebih tua dari `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam, minimal `SAKALA_COMMAND_TIMEOUT_SECONDS`), termasuk image terbarunya. Image yang dipakai container mana pun tetap dipertahankan.
+- Image GC hanya memilih image yang semua namanya `sakala/project-<project_id>:<tag>`. Image berlabel Sakala yang di-tag ulang dengan nama lain, atau yang dangling, tidak lagi dihapus.
+
+### Added
+
+- Image GC kini berjalan sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS` (default satu jam) dengan aturan yang sama seperti target `stale_images` pada `CleanupRuntime`, dan dilewati selama ada command aktif. Sebelumnya image hanya dihapus lewat `CleanupRuntime` yang disetujui admin.
+- Field opsional `remove_images` pada payload `StopProject`. Bila `true`, Agent menghapus semua image project setelah container-nya hilang, dan result menambah `removed_images` serta `reclaimed_image_bytes`. API perlu mengirimnya saat project dihapus; sampai itu terjadi, image GC yang menghapusnya. Lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v030).
+
 ## [0.3.0] - 2026-11-11
 
 ### Security

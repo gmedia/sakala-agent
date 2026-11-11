@@ -105,9 +105,14 @@ impl CommandDispatcher {
                     .await
             }
             CommandType::StopProject => {
-                self.runtime
-                    .stop_project(lifecycle_request(command, cancellation)?, reporter)
-                    .await
+                let payload = command.stop_project_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "StopProject payload is invalid: {error}"
+                    ))
+                })?;
+                let mut request = lifecycle_request(command, cancellation)?;
+                request.remove_images = payload.remove_images;
+                self.runtime.stop_project(request, reporter).await
             }
             CommandType::SleepProject => {
                 self.runtime
@@ -243,6 +248,117 @@ fn lifecycle_request(
         command_id: command.id,
         project_id,
         deployment_id,
+        remove_images: false,
         cancellation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use sakala_agent_protocol::{CommandStatus, DeploymentLog};
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingRuntime {
+        stops: Mutex<Vec<bool>>,
+        sleeps: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl RuntimeExecutor for RecordingRuntime {
+        async fn stop_project(
+            &self,
+            request: WorkloadLifecycleRequest,
+            _reporter: Arc<dyn RuntimeReporter>,
+        ) -> Result<CommandOutput, RuntimeExecutionError> {
+            self.stops.lock().expect("lock").push(request.remove_images);
+            Ok(CommandOutput::empty())
+        }
+
+        async fn sleep_project(
+            &self,
+            request: WorkloadLifecycleRequest,
+            _reporter: Arc<dyn RuntimeReporter>,
+        ) -> Result<CommandOutput, RuntimeExecutionError> {
+            self.sleeps
+                .lock()
+                .expect("lock")
+                .push(request.remove_images);
+            Ok(CommandOutput::empty())
+        }
+    }
+
+    struct SilentReporter;
+
+    #[async_trait]
+    impl RuntimeReporter for SilentReporter {
+        async fn event(&self, _event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+            Ok(())
+        }
+
+        async fn log(&self, _log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+            Ok(())
+        }
+    }
+
+    fn command(command_type: CommandType, payload: Value) -> AgentCommand {
+        AgentCommand {
+            id: Uuid::new_v4(),
+            command_type,
+            status: CommandStatus::Claimed,
+            project_id: Some(Uuid::new_v4()),
+            deployment_id: Some(Uuid::new_v4()),
+            payload,
+        }
+    }
+
+    async fn dispatch(
+        dispatcher: &CommandDispatcher,
+        command_type: CommandType,
+        payload: Value,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        dispatcher
+            .dispatch(
+                &command(command_type, payload),
+                Arc::new(SilentReporter),
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn only_a_stop_that_asks_for_it_removes_the_project_images() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let dispatcher = CommandDispatcher::new(Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>);
+
+        for payload in [json!({}), Value::Null, json!({ "remove_images": true })] {
+            dispatch(&dispatcher, CommandType::StopProject, payload)
+                .await
+                .expect("stop");
+        }
+        dispatch(
+            &dispatcher,
+            CommandType::SleepProject,
+            json!({ "remove_images": true }),
+        )
+        .await
+        .expect("sleep");
+        let error = dispatch(
+            &dispatcher,
+            CommandType::StopProject,
+            json!({ "remove_images": "yes" }),
+        )
+        .await
+        .expect_err("a malformed stop payload is rejected");
+
+        assert_eq!(*runtime.stops.lock().expect("lock"), [false, false, true]);
+        assert_eq!(*runtime.sleeps.lock().expect("lock"), [false]);
+        assert_eq!(error.code(), "invalid_runtime_command");
+    }
 }

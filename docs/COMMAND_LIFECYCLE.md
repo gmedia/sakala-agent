@@ -45,7 +45,7 @@ dapat drift dari deployment aktif.
 | Command | Perilaku | Idempotensi |
 | --- | --- | --- |
 | `RestartProject` | Restart container aktif dengan graceful Docker stop timeout, tunggu readiness, lalu tulis dan validasi ulang route. | Workload yang sudah stopped menghasilkan `runtime_workload_not_running`; tidak membuat deployment baru. |
-| `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan. | Bila container sudah tidak ada, route owned Agent tetap dinonaktifkan dan command sukses idempoten. |
+| `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan, kecuali payload membawa `remove_images: true`: setelah container hilang, semua image project yang tidak dipakai container lain ikut dihapus. | Bila container sudah tidak ada, route owned Agent tetap dinonaktifkan, image tetap dihapus bila diminta, dan command sukses idempoten. |
 | `SleepProject` | Hapus route dan stop container, tetapi tidak menghapus container maupun image. | Container yang sudah stopped tetap sukses; container yang hilang menghasilkan drift/error karena tidak ada artifact untuk di-wake. |
 | `WakeProject` | Start kembali container hasil sleep, tunggu readiness, lalu restore route dari label domain/port. | Container yang sudah running hanya merevalidasi readiness dan route. |
 | `HealthCheck` | Menginspeksi container managed dan mem-probe HTTP aplikasinya, lalu mengembalikan state running, ready, status Docker, reason aman, serta `error_code`. | Read-only. |
@@ -56,7 +56,8 @@ dapat drift dari deployment aktif.
 | `ResumeNode` | Menjalankan runtime preflight; hanya bila tidak ada kegagalan fatal scheduler kembali menerima command workload. | Aman diulang saat node sudah active. |
 
 `StopProject` dan `SleepProject` sengaja berbeda pada retensi: stop menghapus
-container (namun bukan image), sedangkan sleep mempertahankan container supaya wake
+container (namun bukan image, kecuali project dihapus dan API mengirim
+`remove_images: true`), sedangkan sleep mempertahankan container supaya wake
 tidak membutuhkan checkout atau build. Agent tidak membuat kebijakan retry/restart
 otomatis; ia hanya menjalankan intent command yang sudah disetujui control plane.
 `CleanupRuntime` menolak payload tanpa approval eksplisit, sementara penghapusan

@@ -19,6 +19,7 @@ pub mod status;
 pub use commands::{
     AgentCommand, CleanupRuntimePayload, CommandPoll, CommandType, CompleteCommandPayload,
     DesiredWorkloadState, ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
+    StopProjectPayload,
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,

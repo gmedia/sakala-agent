@@ -38,7 +38,19 @@ pub struct WorkloadLifecycleRequest {
     pub command_id: Uuid,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
+    /// Only `StopProject` reads it: once the containers are gone, every image
+    /// of the project is removed as well. Set when the project was deleted.
+    pub remove_images: bool,
     pub cancellation: CancellationToken,
+}
+
+/// What one image garbage collection removed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeImageCleanup {
+    pub removed_images: u64,
+    /// Docker's sizes of the removed images added up. Layers shared with
+    /// images that remain are counted too, so this is an upper bound.
+    pub reclaimed_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -319,6 +331,12 @@ pub trait RuntimeExecutor: Send + Sync {
         _reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         self.reconcile().await
+    }
+
+    /// Removes the Sakala images nothing needs any more, by the same rules as the
+    /// `stale_images` target of `CleanupRuntime`. The periodic image GC calls it.
+    async fn collect_stale_images(&self) -> Result<RuntimeImageCleanup, RuntimeExecutionError> {
+        Ok(RuntimeImageCleanup::default())
     }
 
     /// Mengambil kapasitas deployment lokal tanpa mengubah runtime.
