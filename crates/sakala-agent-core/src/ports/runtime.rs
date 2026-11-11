@@ -53,6 +53,15 @@ pub struct RuntimeImageCleanup {
     pub reclaimed_bytes: u64,
 }
 
+/// What one project network reconciliation changed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeNetworkReconciliation {
+    /// Project networks removed because no container used them.
+    pub removed: usize,
+    /// Project networks the router was connected to again.
+    pub router_attached: usize,
+}
+
 #[derive(Clone)]
 pub struct ReconcileWorkloadRequest {
     pub project_id: Uuid,
@@ -337,6 +346,17 @@ pub trait RuntimeExecutor: Send + Sync {
     /// `stale_images` target of `CleanupRuntime`. The periodic image GC calls it.
     async fn collect_stale_images(&self) -> Result<RuntimeImageCleanup, RuntimeExecutionError> {
         Ok(RuntimeImageCleanup::default())
+    }
+
+    /// Connects the router to every project network it lost, for example after
+    /// its container was recreated, and with `remove_unused` also removes the
+    /// project networks no container uses. The periodic network worker and
+    /// startup recovery call it.
+    async fn reconcile_networks(
+        &self,
+        _remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeExecutionError> {
+        Ok(RuntimeNetworkReconciliation::default())
     }
 
     /// Mengambil kapasitas deployment lokal tanpa mengubah runtime.

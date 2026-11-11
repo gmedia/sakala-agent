@@ -7,8 +7,8 @@ use std::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{
-    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeOrphan, RuntimeReconciliationReport,
-    RuntimeStaleImage, RuntimeWorkload,
+    RuntimeCapacity, RuntimeHealthSnapshot, RuntimeNetworkReconciliation, RuntimeOrphan,
+    RuntimeReconciliationReport, RuntimeStaleImage, RuntimeWorkload,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
@@ -33,6 +33,7 @@ use crate::{
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
             parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
         },
+        network::ProjectNetworks,
     },
     logs::ReporterOutputSink,
     process::run_checked,
@@ -135,7 +136,7 @@ pub struct WorkloadIsolation {
 
 pub struct DockerContainerEngine {
     runner: Arc<dyn ProcessRunner>,
-    runtime_network: String,
+    networks: ProjectNetworks,
     resource_safety: ResourceSafetyConfig,
     max_active_containers: u32,
     agent_id: String,
@@ -280,10 +281,12 @@ impl DockerContainerEngine {
         }
     }
 
+    /// `router_container` is the runtime Caddy container, which joins every
+    /// project network so it can reach each workload by name.
     #[must_use]
     pub fn new(
         runner: Arc<dyn ProcessRunner>,
-        runtime_network: String,
+        router_container: String,
         resource_safety: ResourceSafetyConfig,
         max_active_containers: u32,
         agent_id: String,
@@ -291,8 +294,8 @@ impl DockerContainerEngine {
         isolation: WorkloadIsolation,
     ) -> Self {
         Self {
+            networks: ProjectNetworks::new(Arc::clone(&runner), router_container, agent_id.clone()),
             runner,
-            runtime_network,
             resource_safety,
             max_active_containers,
             agent_id,
@@ -714,6 +717,8 @@ impl ContainerEngine for DockerContainerEngine {
         request: &RunContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
+        let _start = self.networks.start_guard().await;
+        let network = self.networks.prepare(request.project_id).await?;
         let environment = Self::effective_environment(&request.environment, request.port);
         let env_file = Self::write_env_file(&request.workspace, &environment).await?;
         let mut command = CommandSpec::new("docker")
@@ -722,7 +727,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--name")
             .arg(&request.name)
             .arg("--network")
-            .arg(&self.runtime_network);
+            .arg(&network);
         // Docker refuses an unknown runtime, and the failure stays a failure: a
         // workload must not end up on a weaker runtime than the node promises.
         if let Some(container_runtime) = &self.container_runtime {
@@ -801,6 +806,21 @@ impl ContainerEngine for DockerContainerEngine {
             }
         }
         result.map(|_| ())
+    }
+
+    async fn attach_router(&self, project_id: Uuid) -> Result<(), RuntimeError> {
+        self.networks.attach_router(project_id).await
+    }
+
+    async fn release_network(&self, project_id: Uuid) -> Result<(), RuntimeError> {
+        self.networks.release(project_id).await.map(|_| ())
+    }
+
+    async fn reconcile_networks(
+        &self,
+        remove_unused: bool,
+    ) -> Result<RuntimeNetworkReconciliation, RuntimeError> {
+        self.networks.reconcile(remove_unused).await
     }
 
     async fn report_startup_logs(

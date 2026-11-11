@@ -14,7 +14,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_MAX_CONCURRENT_COMMANDS` | `4` | Batas global command aktif. Command pada project yang sama tetap diproses satu per satu; command yang belum mendapat slot tetap pending di control plane. |
 | `SAKALA_SHUTDOWN_GRACE_SECONDS` | `30` | Waktu maksimum untuk command aktif menyelesaikan cancellation dan cleanup sebelum agent membatalkan task yang tersisa. |
 | `SAKALA_MAX_CONCURRENT_BUILDS` | `1` | Batas build image Docker/Railpack aktif pada node agar build tidak saling menghabiskan CPU, memori, dan I/O. |
-| `SAKALA_RUNTIME_NETWORK` | `sakala-runtime` | Nama network referensi dari `sakala-infra`. |
+| `SAKALA_RUNTIME_NETWORK` | `sakala-runtime` | Network bersama tempat container Caddy berada. Workload baru tidak bergabung ke sini, melainkan ke network project masing-masing; network ini tetap dibutuhkan untuk workload dari Agent lama. Lihat [Network per project](DOCKER_RUNTIME.md#network-per-project). |
 | `SAKALA_RUNTIME_DRIVER` | `noop` | `noop` atau executor opt-in `docker`. |
 | `SAKALA_RUNTIME_WORKSPACE` | `/var/lib/sakala/builds` | Root workspace checkout/build sementara. |
 | `SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS` | `86400` | Umur minimum workspace UUID terbengkalai sebelum GC startup boleh menghapusnya. Nama non-UUID dan symlink tidak disentuh. |
@@ -66,7 +66,7 @@ Jangan menyimpan token issued pada repository atau command history yang dibagika
 
 Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, image sandbox Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
 
-Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
+Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Agent menyambungkan container itu ke network setiap project, dan menyambungkannya lagi dalam 60 detik bila container Caddy dibuat ulang. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
 
 ## Resource Policy Boundary
 

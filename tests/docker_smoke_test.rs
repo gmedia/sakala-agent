@@ -55,6 +55,8 @@ const HOST_NETWORK_BUILDER: &str = "sakala-agent-sm-builder";
 const PREFIX: &str = "sakala-agent-sm";
 /// Stands in for `sakala-app-` and keeps the name inside one 63-octet DNS label.
 const APP_NAME_PREFIX: &str = "sakala-agent-sm-";
+/// Stands in for `sakala-project-`, the network of each project.
+const PROJECT_NETWORK_PREFIX: &str = "sakala-agent-sm-project-";
 const SECRET: &str = "sk-smoke-secret-value";
 /// Shortened from five minutes, and longer than the crash loop's run time.
 const STABLE_WINDOW: Duration = Duration::from_secs(10);
@@ -2665,6 +2667,7 @@ impl ProcessRunner for SmokeRunner {
                 argument
                     .to_string_lossy()
                     .replace("sakala-app-", APP_NAME_PREFIX)
+                    .replace("sakala-project-", PROJECT_NETWORK_PREFIX)
                     .replace("sakala-agent-railpack-", APP_NAME_PREFIX)
                     .replace("sakala/project-", &format!("{PREFIX}/project-"))
                     .into()
@@ -2696,7 +2699,10 @@ impl ProcessRunner for SmokeRunner {
             .run(&real, sink)
             .await?;
         // The runtime compares these names with the ones it generated.
-        output.stdout = output.stdout.replace(APP_NAME_PREFIX, "sakala-app-");
+        output.stdout = output
+            .stdout
+            .replace(PROJECT_NETWORK_PREFIX, "sakala-project-")
+            .replace(APP_NAME_PREFIX, "sakala-app-");
         Ok(output)
     }
 }
@@ -2785,6 +2791,11 @@ impl Cleanup {
                 image.starts_with("sakala/project-") && image.contains(":sakala-agent-sm-");
             if image.starts_with("sakala-agent-sm/") || deployment_named {
                 quiet(&["image", "rm", "-f", image]);
+            }
+        }
+        for network in list(&["network", "ls", "--format", "{{.Name}}"]).lines() {
+            if network.starts_with(PROJECT_NETWORK_PREFIX) {
+                quiet(&["network", "rm", network]);
             }
         }
         quiet(&["network", "rm", NETWORK]);

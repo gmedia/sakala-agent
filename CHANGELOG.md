@@ -4,6 +4,12 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Security
+
+- Setiap project kini berjalan di bridge network sendiri, `sakala-project-<project-id>`, bukan di `sakala-runtime` bersama semua project. Sebelumnya aplikasi satu tenant bisa membuka koneksi langsung ke aplikasi tenant lain tanpa melewati Caddy. Agent menyambungkan container Caddy ke network project sebelum probe dan route, dan memutusnya serta menghapus network saat container terakhir project hilang. Saat startup dan setiap 60 detik, Agent menyambungkan ulang Caddy yang kehilangan network project, misalnya karena container-nya dibuat ulang, dan menghapus network kosong ketika tidak ada command aktif. Workload dari Agent lama tetap dilayani di `sakala-runtime` sampai redeploy berikutnya. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#network-per-project).
+
+Pool alamat bawaan Docker hanya cukup untuk sekitar 31 bridge network. Atur `default-address-pools` di `daemon.json` sebelum node menampung lebih dari sekitar 20 project; tanpa itu deploy gagal dengan `runtime_capacity_exceeded`.
+
 ### Fixed
 
 - Aplikasi yang image-nya berakhir di `nginx` resmi, termasuk build multi-stage yang menyajikan file statis dengan `nginx:alpine`, kini bisa start. Sejak v0.3.0 container seperti itu keluar dengan exit code 1 dan `chown("/var/cache/nginx/client_temp", 101) failed (1: Operation not permitted)`, karena workload hanya mempertahankan `NET_BIND_SERVICE`. Workload kini mempertahankan allowlist `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`, `SETUID`, dan `NET_BIND_SERVICE` yang dibutuhkan image yang mulai sebagai root lalu turun ke user tanpa privilege. Worker httpd pun kini benar-benar turun ke `www-data`; sebelumnya `setgid` gagal dan request dilayani sebagai root. `NET_RAW`, `MKNOD`, `SYS_CHROOT`, `AUDIT_WRITE`, `SETFCAP`, dan `SETPCAP` tetap dibuang, dan `no-new-privileges` tetap dipasang. Pesan `runtime_app_exec_denied` tidak lagi menyebut `NET_BIND_SERVICE` sebagai satu-satunya capability. Lihat [Docker Runtime](docs/DOCKER_RUNTIME.md#capability-workload).
@@ -14,6 +20,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 - Image GC kini berjalan sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS` (default satu jam) dengan aturan yang sama seperti target `stale_images` pada `CleanupRuntime`, dan dilewati selama ada command aktif. Sebelumnya image hanya dihapus lewat `CleanupRuntime` yang disetujui admin.
 - Field opsional `remove_images` pada payload `StopProject`. Bila `true`, Agent menghapus semua image project setelah container-nya hilang, dan result menambah `removed_images` serta `reclaimed_image_bytes`. API perlu mengirimnya saat project dihapus; sampai itu terjadi, image GC yang menghapusnya. Lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v030).
+- Check preflight non-fatal `project-networks`, yang mencoba membuat network dan memperkirakan sisa address pool Docker.
+- Smoke test opt-in `project_network_smoke_test` untuk isolasi network antar-project.
 
 ## [0.3.0] - 2026-11-11
 

@@ -10,7 +10,7 @@ pub use runtime::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
     RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
-    RuntimeOrphan, RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
-    RuntimeReporter, RuntimeReporterFactory, RuntimeStaleImage, RuntimeStaleRoute, RuntimeWorkload,
-    WorkloadLifecycleRequest,
+    RuntimeNetworkReconciliation, RuntimeOrphan, RuntimePreflightCheck, RuntimePreflightReport,
+    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, RuntimeStaleImage,
+    RuntimeStaleRoute, RuntimeWorkload, WorkloadLifecycleRequest,
 };

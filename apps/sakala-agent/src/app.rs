@@ -15,6 +15,10 @@ use tracing::{info, warn};
 
 use crate::config::{AppConfig, RuntimeDriver};
 
+/// How often the router is reconnected to project networks it lost, which is
+/// how long project routes can fail after its container is recreated.
+const PROJECT_NETWORK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     info!(
         agent_id = %config.agent.agent_id,
@@ -120,6 +124,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::clone(&scheduler_metrics),
         shutdown_rx.clone(),
     ));
+    let network_task = tokio::spawn(sakala_agent_core::networks::worker::run(
+        Arc::clone(&runtime),
+        PROJECT_NETWORK_INTERVAL,
+        Arc::clone(&scheduler_metrics),
+        shutdown_rx.clone(),
+    ));
     let heartbeat_task = tokio::spawn(heartbeat::worker::run(
         config.agent.clone(),
         client.clone(),
@@ -159,6 +169,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         .await
         .context("runtime health worker task failed")?;
     image_gc_task.await.context("image GC worker task failed")?;
+    network_task
+        .await
+        .context("project network worker task failed")?;
     runtime
         .shutdown()
         .await

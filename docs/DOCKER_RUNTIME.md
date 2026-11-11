@@ -10,7 +10,8 @@ validate command
 -> pilih Dockerfile atau Railpack
 -> enforce build deadline
 -> docker buildx build --load
--> docker run candidate pada sakala-runtime
+-> buat network project bila belum ada, sambungkan container Caddy ke sana
+-> docker run candidate pada network project
 -> deployment.health.started: tunggu state Docker, lalu probe HTTP dari dalam container Caddy
 -> deployment.route.started
 -> tulis route Caddy secara atomik
@@ -30,7 +31,99 @@ project/deployment valid dan menyimpan status Docker-nya dalam report lokal.
 Container dengan label tidak lengkap atau status `Created`/`Exited`/`Dead`
 tetap dilaporkan sebagai orphan, bukan dihapus otomatis.
 
-Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, network runtime, filesystem workspace (termasuk akses direktori), disk workspace, serta direktori route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator.
+Sebelum polling command, driver Docker menjalankan preflight fatal untuk Git, Docker daemon, Docker Buildx, Railpack, container Caddy, network runtime, filesystem workspace (termasuk akses direktori), disk workspace, serta direktori route. Node tidak mulai menerima command bila salah satunya gagal; log menyertakan nama check dan detail yang aman untuk operator. Check `project-networks` tidak fatal, lihat [Network per project](#network-per-project).
+
+## Network per project
+
+Setiap project punya bridge network sendiri bernama `sakala-project-<project-id>`.
+Workload tidak lagi bergabung ke `sakala-runtime`. Di network itu hanya ada
+container project tersebut, yaitu paling banyak deployment lama dan candidate saat
+redeploy, ditambah container Caddy runtime. Docker memisahkan bridge network satu
+sama lain, jadi aplikasi satu project tidak bisa menjangkau aplikasi project lain,
+baik lewat nama maupun IP, kecuali lewat Caddy seperti pengunjung biasa.
+Sebelumnya semua workload berbagi `sakala-runtime` dengan ICC default, sehingga
+aplikasi satu mahasiswa bisa membuka koneksi langsung ke aplikasi mahasiswa lain.
+
+Network diberi label `dev.sakala.managed=true`, `dev.sakala.network-kind=project`,
+`dev.sakala.project-id`, dan `dev.sakala.agent-id`. ICC di dalamnya tetap default,
+karena isinya hanya satu project.
+
+Siklus hidupnya:
+
+- **Deploy.** Sebelum `docker run`, Agent membuat network bila belum ada dan
+  menjalankan `docker network connect <network> <SAKALA_CADDY_CONTAINER>`. Probe
+  readiness (`docker exec <caddy> wget`) dan route tetap memakai nama container.
+- **Restart, wake, `RefreshRoute`, `restore_route`.** Agent menyambungkan Caddy lagi
+  sebelum probe, untuk kasus container Caddy dibuat ulang.
+- **Stop, candidate gagal, `cleanup_failed_candidate`.** Setelah container dihapus,
+  Agent memeriksa `docker ps --all --filter network=<network>`. Bila tidak ada
+  container lain selain Caddy, Caddy diputus dan network dihapus. Container yang
+  sedang sleep ikut dihitung, karena `docker start` gagal bila network-nya hilang.
+  Kegagalan di langkah ini hanya dicatat di log Agent, tidak menggagalkan command.
+- **Startup, lalu setiap 60 detik.** Agent menyambungkan Caddy ke setiap network
+  project milik `SAKALA_AGENT_ID` ini yang belum tersambung. Berbeda dengan container
+  dan image yang hanya dilaporkan, network yang tidak dipakai container mana pun
+  langsung dihapus, karena network tidak menyimpan state.
+
+Pemeriksaan berkala ini menangani container Caddy yang dibuat ulang saat Agent
+berjalan, misalnya oleh `docker compose up`, pergantian pin image Caddy, atau reboot
+host. Container baru itu hanya tersambung ke `sakala-runtime`, jadi route project
+gagal 502 paling lama sekitar 60 detik sampai Agent menyambungkannya lagi. Operator
+tidak perlu me-restart Agent. Pada smoke test dengan interval 1 detik, kedua project
+kembali terjangkau 1,8 detik setelah Caddy dibuat ulang.
+
+Saat tidak ada perubahan, pemeriksaan ini hanya `docker network ls`, inspect
+container Caddy, dan satu `docker ps`. Log hanya ditulis bila ada network yang
+disambungkan ulang atau dihapus. Penyambungan ulang selalu berjalan. Penghapusan
+dilewati selama ada command aktif, dan juga tidak bisa berjalan bersamaan dengan
+start workload: start memegang lock bersama dari pembuatan network sampai
+`docker run` selesai, sedangkan penghapusan memegang lock eksklusif. Tanpa lock
+itu, network yang baru disiapkan untuk candidate bisa terhapus sebelum candidate
+memakainya. Pemeriksaan ini berjalan dari worker sendiri, bukan dari health worker,
+karena kontrak `health_snapshot` melarang mutasi runtime.
+
+**Kompatibilitas.** Workload dari Agent versi lama tetap berada di `sakala-runtime`
+dan tetap dilayani, karena Caddy tetap tergabung di sana. Redeploy berikutnya
+memindahkannya: candidate dibuat di network project, lalu container lama dihapus.
+Karena itu `sakala-runtime` dan check `runtime-network` tetap dibutuhkan. Pada
+`runsc`, Caddy tetap berjalan dengan runtime default dan me-resolve nama workload
+lewat DNS bawaan Docker, sama seperti di `sakala-runtime`; jalur ini belum diuji
+ulang dengan `runsc` sejak network per project.
+
+### Address pool Docker
+
+Tanpa pengaturan, Docker hanya punya sekitar 31 subnet untuk bridge network
+(172.17.0.0/16 sampai 172.31.0.0/16 dan 192.168.0.0/16 yang dipecah menjadi /20),
+dan sebagian sudah dipakai `docker0`, `sakala-runtime`, `sakala-railpack`, serta
+network Compose lain. Node dengan lebih dari sekitar 20 project akan kehabisan, dan
+deploy berikutnya gagal dengan `runtime_capacity_exceeded`.
+
+Agent tidak memilih subnet sendiri. Atur pool di `daemon.json` Docker
+(`/etc/docker/daemon.json`, atau `~/.config/docker/daemon.json` pada Docker rootless):
+
+```json
+{
+  "default-address-pools": [
+    { "base": "172.16.0.0/12", "size": 24 }
+  ]
+}
+```
+
+Rentang ini sama dengan rentang bawaan Docker, jadi tidak menambah risiko bentrok
+dengan network host, dan memberi 4.096 network /24. Network yang sudah ada tetap
+memakai subnetnya. Docker harus di-restart, dan tanpa `live-restore` restart itu
+ikut me-restart semua container. Pengaturan ini belum diuji pada daemon Sakala;
+cek setelah restart dengan `docker info --format '{{json .DefaultAddressPools}}'`.
+
+Check preflight `project-networks` (tidak fatal) mencoba membuat lalu menghapus
+network `sakala-project-preflight`, membaca `DefaultAddressPools` dari `docker info`,
+dan menghitung kira-kira berapa network lagi yang bisa dibuat. Check ini memberi
+peringatan bila pembuatan network gagal, atau bila sisanya lebih kecil dari
+`SAKALA_MAX_ACTIVE_CONTAINERS`. Contoh pada daemon tanpa pengaturan:
+
+```text
+Docker can create only about 17 more bridge networks (31 in Docker's default address pools, 14 exist), fewer than SAKALA_MAX_ACTIVE_CONTAINERS (20). ...
+```
 
 Image ditag berdasarkan project, commit, dan deployment. Image dan container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
 
@@ -261,6 +354,7 @@ pakai hanya pada node yang menjalankan repository tepercaya.
 - Agent mengekspor `PORT=container_port` ke env container bila deployment tidak menyetelnya. Image Railpack menyajikan aplikasi pada `$PORT` (Caddyfile-nya listen pada `:{$PORT:80}`, starter Node membaca `process.env.PORT`), sehingga tanpa variabel ini workload listen pada default-nya sendiri sementara route menunjuk port yang dipilih control plane. `PORT` dari payload yang berbeda dari `container_port` ditolak dengan `runtime_port_conflict`, bukan dimenangkan salah satu. Tidak ada deteksi port otomatis: aplikasi wajib listen di `0.0.0.0:$PORT`, dan kegagalan readiness menyebut port-nya.
 - Container memakai memory, CPU, PID limit dari command control plane, `no-new-privileges`, dan `--cap-drop ALL` lalu hanya delapan capability dari allowlist kecil yang dikembalikan. Lihat [Capability workload](#capability-workload).
 - Tidak ada host volume atau Docker socket di aplikasi user.
+- Setiap project berada di bridge network sendiri bersama Caddy, sehingga aplikasi tidak bisa menjangkau aplikasi project lain secara langsung. Lihat [Network per project](#network-per-project).
 - Caddy dan aplikasi user tidak menerima Docker socket.
 
 Ini belum merupakan multi-tenant sandbox. Docker daemon access tetap privileged; pilot harus memakai node khusus dan workload terkontrol.
@@ -373,6 +467,19 @@ Kegagalan cepat saat menghentikan atau menghapus container deployment sebelumnya
 ## Verifikasi
 
 Test default memakai fake process runner dan tidak menyentuh daemon. Integration test nyata perlu dijalankan secara opt-in pada node disposable dengan `sakala-api` yang mendukung protocol revision 4.
+
+Isolasi network per project diuji terhadap daemon sungguhan oleh smoke test opt-in
+yang hanya membuat resource berawalan `sakala-netiso-` dan tidak membangun image:
+
+```bash
+cargo test -p sakala-agent-runtime --test project_network_smoke_test -- --ignored --nocapture
+```
+
+Test ini membuktikan Caddy menjangkau dua project dan workload lama di network
+bersama lewat nama, project A gagal menjangkau project B dan workload lama lewat
+nama maupun IP, worker berkala menyambungkan ulang Caddy yang dibuat ulang,
+`StopProject` menghapus network A dan memutus Caddy, serta startup menyambungkan
+ulang Caddy dan menghapus network yang kosong.
 
 Perilaku Docker dan `wget` diuji sungguhan oleh smoke test opt-in. Test ini menjalankan executor dan reporter asli terhadap daemon lokal, hanya checkout Git dan build image yang diganti, serta hanya membuat dan menghapus resource berawalan `sakala-agent-sm`:
 
