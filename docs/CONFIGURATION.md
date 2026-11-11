@@ -30,6 +30,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_RAILPACK_NETWORK` | `sakala-railpack` | Network sandbox Railpack. Dibuat Agent bila belum ada, tanpa komunikasi antar-container. |
 | `SAKALA_CONTAINER_RUNTIME` | kosong | Runtime OCI untuk workload, misalnya `runsc`, dengan nama yang terdaftar di Docker. Kosong berarti default Docker. Build dan sandbox Railpack tidak terpengaruh. Bila terisi tetapi tidak terdaftar, preflight gagal fatal, dan Agent tidak pernah pindah ke runtime lain. Lihat [gVisor](RUNTIME_HARDENING.md#gvisor). |
 | `SAKALA_CONTAINER_DNS` | kosong | Daftar IP name server untuk workload, dipisah koma, misalnya `1.1.1.1,8.8.8.8`. Agent menulisnya ke `.sakala-resolv.conf` di `SAKALA_RUNTIME_WORKSPACE` dan me-mount-nya sebagai `/etc/resolv.conf` read-only. Wajib di bawah `runsc`; tanpa ini workload tidak bisa me-resolve hostname. |
+| `SAKALA_PROJECT_DOMAIN_SUFFIXES` | `run.sakala.localhost,run.staging.sakala.dev,run.sakala.dev` | Suffix domain yang boleh dipakai deployment, dipisah koma, misalnya `run.example.ac.id`. Domain diterima hanya bila berupa tepat satu label DNS ditambah salah satu suffix ini, seperti `portfolio.run.example.ac.id`. Isi dengan `SAKALA_PROJECT_DEFAULT_DOMAIN` milik `sakala-api`. Setiap suffix wajib huruf kecil, minimal dua label, tanpa wildcard, dan label internasional ditulis dalam bentuk `xn--`. Nilai yang tidak valid membuat Agent berhenti saat start. Kosong atau tidak diisi berarti tiga suffix default Sakala hosted. Lihat [Domain project](#domain-project). |
 | `SAKALA_BUILD_TIMEOUT_SECONDS` | `600` | Hard maximum node untuk fase build image; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_START_TIMEOUT_SECONDS` | `120` | Hard maximum node untuk start container dan health readiness; harus lebih pendek dari command timeout. |
 | `SAKALA_MAX_ACTIVE_CONTAINERS` | `20` | Guard kapasitas workload aktif pada node, bukan kuota plan/user. Redeploy project aktif tetap memperoleh replacement slot. |
@@ -67,6 +68,20 @@ Jangan menyimpan token issued pada repository atau command history yang dibagika
 Executor Docker harus diaktifkan eksplisit dan hanya pada runtime node yang telah memiliki Git, Docker Buildx, image sandbox Railpack, network `sakala-runtime`, dan Caddy contract dari `sakala-infra`. Jangan mengaktifkannya pada laptop contributor tanpa memahami operasi container yang akan dijalankan.
 
 Implementasi MVP mengharapkan Caddy berjalan sebagai container bernama `SAKALA_CADDY_CONTAINER` dan bergabung ke network `sakala-runtime`. Agent menyambungkan container itu ke network setiap project, dan menyambungkannya lagi dalam 60 detik bila container Caddy dibuat ulang. Instalasi `/usr/bin/caddy` pada host tidak dipakai oleh adapter ini. Jangan menjalankan Caddy host dan Caddy container pada host port yang sama.
+
+## Domain project
+
+Payload `DeployProject` membawa `domain` yang ditulis Agent ke route Caddy. Agent hanya menerima domain yang berupa satu label DNS di bawah suffix pada `SAKALA_PROJECT_DOMAIN_SUFFIXES`, supaya satu project tidak bisa mengklaim domain project lain atau domain yang tidak dilayani node ini.
+
+Instalasi self-hosted di `example.ac.id` yang memberi domain project `<slug>.run.example.ac.id` cukup memakai:
+
+```bash
+SAKALA_PROJECT_DOMAIN_SUFFIXES=run.example.ac.id
+```
+
+Dengan nilai itu, `portfolio.run.example.ac.id` diterima, sedangkan `api.portfolio.run.example.ac.id` (subdomain bertingkat), `Portfolio.run.example.ac.id` (huruf besar), `portfolio.run.sakala.dev`, dan label lebih dari 63 karakter ditolak dengan `invalid_runtime_command`. Panjang domain maksimum 253 karakter sesuai RFC 1035. Label internasional harus dikirim dalam bentuk `xn--`, misalnya `xn--mnchen-3ya.run.example.ac.id`; ejaan Unicode dan label `xn--` yang bukan punycode valid ditolak.
+
+Suffix yang berlaku dicatat pada log preflight sebagai check `project-domains`. Ganti nilainya bila `SAKALA_PROJECT_DEFAULT_DOMAIN` di `sakala-api` berubah, karena domain yang dikirim API harus tetap berada di bawah salah satu suffix ini.
 
 ## Resource Policy Boundary
 

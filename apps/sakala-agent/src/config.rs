@@ -2,7 +2,9 @@ use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError};
-use sakala_agent_runtime::{DockerRuntimeConfig, ResourceSafetyConfig, TimeoutSafetyConfig};
+use sakala_agent_runtime::{
+    DockerRuntimeConfig, ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
@@ -127,6 +129,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_CONTAINER_DNS")]
     container_dns: Option<String>,
 
+    #[arg(long, env = "SAKALA_PROJECT_DOMAIN_SUFFIXES")]
+    project_domain_suffixes: Option<String>,
+
     #[arg(long, env = "SAKALA_BUILD_TIMEOUT_SECONDS")]
     build_timeout_seconds: Option<String>,
 
@@ -246,6 +251,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         cli.container_runtime,
     );
     insert(&mut values, "SAKALA_CONTAINER_DNS", cli.container_dns);
+    insert(
+        &mut values,
+        "SAKALA_PROJECT_DOMAIN_SUFFIXES",
+        cli.project_domain_suffixes,
+    );
     insert(
         &mut values,
         "SAKALA_BUILD_TIMEOUT_SECONDS",
@@ -369,6 +379,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             railpack_network: get(values, "SAKALA_RAILPACK_NETWORK", "sakala-railpack"),
             container_runtime: container_runtime(values)?,
             container_dns: container_dns(values)?,
+            project_domain_suffixes: project_domain_suffixes(values)?,
             resource_safety,
             timeout_safety: TimeoutSafetyConfig {
                 max_build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
@@ -487,6 +498,23 @@ fn container_dns(values: &HashMap<String, String>) -> Result<Vec<std::net::IpAdd
             })
         })
         .collect()
+}
+
+/// Unset or empty keeps the hosted Sakala suffixes. Anything else must be a valid
+/// list, so a typo stops the agent instead of quietly routing a different zone.
+fn project_domain_suffixes(
+    values: &HashMap<String, String>,
+) -> Result<ProjectDomainSuffixes, CoreError> {
+    match values
+        .get("SAKALA_PROJECT_DOMAIN_SUFFIXES")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(ProjectDomainSuffixes::default()),
+        Some(value) => ProjectDomainSuffixes::parse(value).map_err(|reason| {
+            CoreError::InvalidConfiguration(format!("SAKALA_PROJECT_DOMAIN_SUFFIXES {reason}"))
+        }),
+    }
 }
 
 fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
@@ -628,6 +656,35 @@ mod tests {
         );
         for invalid in ["dns.example.com", "1.1.1.1;id", "1.1.1"] {
             assert!(load(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn project_domain_suffixes_default_to_hosted_zones_and_reject_bad_values() {
+        let load = |value: &str| {
+            from_values(&HashMap::from([(
+                "SAKALA_PROJECT_DOMAIN_SUFFIXES".to_owned(),
+                value.to_owned(),
+            )]))
+        };
+        let suffixes = |config: AppConfig| config.docker_runtime.project_domain_suffixes;
+
+        let hosted = ProjectDomainSuffixes::default();
+        assert_eq!(
+            suffixes(from_values(&HashMap::new()).expect("config")),
+            hosted
+        );
+        assert_eq!(suffixes(load("  ").expect("config")), hosted);
+        assert_eq!(
+            suffixes(load("run.example.ac.id, apps.example.org").expect("config")).as_slice(),
+            ["run.example.ac.id", "apps.example.org"]
+        );
+        for invalid in [",", "*.run.example.ac.id", "localhost", "Run.Example.ac.id"] {
+            let error = load(invalid).expect_err(invalid).to_string();
+            assert!(
+                error.contains("SAKALA_PROJECT_DOMAIN_SUFFIXES"),
+                "{invalid}: {error}"
+            );
         }
     }
 

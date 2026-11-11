@@ -144,6 +144,11 @@ seperti sebelumnya, dan nilai kosong berarti tidak diisi.
 `container_port` adalah port efektif pilihan API. Agent mengekspornya sebagai `PORT`,
 memprobe-nya, dan membuat route ke sana.
 
+`domain` harus berupa tepat satu label DNS huruf kecil ditambah salah satu suffix pada
+`SAKALA_PROJECT_DOMAIN_SUFFIXES` node, misalnya `portfolio.run.sakala.dev`. Domain lain,
+termasuk subdomain bertingkat, ditolak dengan `invalid_runtime_command` sebelum checkout.
+Lihat [Domain project](CONFIGURATION.md#domain-project).
+
 Agent memvalidasi ulang `root_directory`, karena nilai ini memilih path di host.
 Path absolut, `..`, backslash, dan control character ditolak sebelum proses apa pun
 berjalan. Setelah checkout, path di-resolve: symlink yang keluar dari repository,

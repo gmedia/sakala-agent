@@ -3,6 +3,7 @@
 pub mod builders;
 pub mod config;
 pub mod containers;
+pub mod domains;
 pub mod error;
 pub mod executor;
 pub mod health;
@@ -16,6 +17,7 @@ pub mod workspace;
 
 pub use config::{DEFAULT_CRASH_STABLE_WINDOW, DockerRuntimeConfig, TimeoutSafetyConfig};
 pub use containers::ResourceSafetyConfig;
+pub use domains::{DEFAULT_PROJECT_DOMAIN_SUFFIXES, ProjectDomainSuffixes};
 pub use error::RuntimeError;
 pub use executor::{DockerRuntimeExecutor, NoopRuntimeExecutor};
 pub use process::{

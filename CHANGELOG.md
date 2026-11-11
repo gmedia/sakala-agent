@@ -4,6 +4,14 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- `SAKALA_PROJECT_DOMAIN_SUFFIXES` mengatur suffix domain yang boleh dipakai deployment, dipisah koma, misalnya `run.example.ac.id`. Sebelumnya Agent hanya menerima domain di bawah `run.sakala.localhost`, `run.staging.sakala.dev`, dan `run.sakala.dev`, sehingga instalasi self-hosted di domain lain ditolak di setiap deploy. Tanpa variabel ini ketiga suffix itu tetap dipakai, jadi Sakala hosted berperilaku sama. Setiap suffix divalidasi saat start (huruf kecil, minimal dua label, tanpa wildcard, label internasional dalam bentuk `xn--`), dan nilai yang tidak valid menghentikan Agent dengan pesan yang menyebut variabel dan alasannya. Suffix yang berlaku dicatat di log preflight sebagai check `project-domains`. Lihat [Domain project](docs/CONFIGURATION.md#domain-project).
+
+### Security
+
+- Domain deployment kini harus tepat satu label DNS di bawah suffix yang diizinkan. Sebelumnya subdomain bertingkat seperti `api.portfolio.run.sakala.dev` ikut diterima, sehingga satu project bisa meminta route di bawah domain project lain. `sakala-api` selalu mengirim `<slug>.<SAKALA_PROJECT_DEFAULT_DOMAIN>`, jadi domain yang dibuat API tidak terpengaruh. Label `xn--` yang bukan punycode valid juga ditolak.
+
 ## [0.5.0] - 2026-11-11
 
 ### Added

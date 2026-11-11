@@ -62,6 +62,7 @@ pub struct DockerRuntimeExecutor {
     workspace_gc_max_age: std::time::Duration,
     image_retention: ImageRetention,
     min_workspace_free_bytes: u64,
+    project_domains: crate::ProjectDomainSuffixes,
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
 }
@@ -76,6 +77,7 @@ pub(crate) struct DockerPreflight {
     railpack_sandbox: RailpackSandbox,
     container_runtime: Option<String>,
     container_dns_configured: bool,
+    project_domains: crate::ProjectDomainSuffixes,
     max_active_containers: u32,
 }
 
@@ -104,6 +106,7 @@ impl DockerRuntimeExecutor {
             ),
             container_runtime: config.container_runtime.clone(),
             container_dns_configured: !config.container_dns.is_empty(),
+            project_domains: config.project_domain_suffixes.clone(),
             max_active_containers: config.max_active_containers,
         };
         let container_dns = crate::containers::ContainerDns::new(
@@ -214,6 +217,7 @@ impl DockerRuntimeExecutor {
             workspace_gc_max_age,
             image_retention,
             min_workspace_free_bytes,
+            project_domains: preflight.project_domains.clone(),
             preflight,
             telemetry,
         }
@@ -285,7 +289,7 @@ impl DockerRuntimeExecutor {
         let project_id = request.project_id;
         let deployment_id = request.deployment_id;
         let payload = request.payload;
-        validate_payload(&payload)?;
+        validate_payload(&payload, &self.project_domains)?;
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload, request.repository_credential)?;
@@ -999,6 +1003,15 @@ impl DockerPreflight {
         }
         checks.push(workspace);
         checks.push(directory_check("caddy-sites", &self.caddy_sites_dir, true).await);
+        checks.push(RuntimePreflightCheck {
+            name: "project-domains".to_owned(),
+            fatal: false,
+            ready: true,
+            detail: format!(
+                "deployments may use one label under {} (SAKALA_PROJECT_DOMAIN_SUFFIXES)",
+                self.project_domains
+            ),
+        });
 
         Ok(RuntimePreflightReport { checks })
     }
@@ -1573,7 +1586,10 @@ fn validate_command_field(name: &str, command: Option<&str>) -> Result<(), Runti
     Ok(())
 }
 
-fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> {
+fn validate_payload(
+    payload: &DeployProjectPayload,
+    project_domains: &crate::ProjectDomainSuffixes,
+) -> Result<(), RuntimeError> {
     validate_repository_source(&payload.repository_url, &payload.commit_sha)?;
     if let Some(root_directory) = requested_root_directory(payload.root_directory.as_deref()) {
         validate_root_directory(root_directory)?;
@@ -1585,10 +1601,11 @@ fn validate_payload(payload: &DeployProjectPayload) -> Result<(), RuntimeError> 
             "container_port must be greater than zero".to_owned(),
         ));
     }
-    if !valid_domain(&payload.domain) {
-        return Err(RuntimeError::InvalidCommand(
-            "domain must be a valid *.run.sakala.localhost, *.run.staging.sakala.dev, or *.run.sakala.dev hostname".to_owned(),
-        ));
+    if !project_domains.accepts(&payload.domain) {
+        return Err(RuntimeError::InvalidCommand(format!(
+            "domain must be one lowercase DNS label under an allowed suffix ({project_domains}), such as portfolio.{}",
+            project_domains.as_slice()[0]
+        )));
     }
     for (key, value) in &payload.environment {
         if !valid_env_key(key) || value.contains(['\n', '\r', '\0']) {
@@ -1675,23 +1692,6 @@ fn validate_repository_source(repository_url: &str, commit_sha: &str) -> Result<
     Ok(())
 }
 
-fn valid_domain(domain: &str) -> bool {
-    let allowed_suffix = domain.ends_with(".run.sakala.localhost")
-        || domain.ends_with(".run.staging.sakala.dev")
-        || domain.ends_with(".run.sakala.dev");
-    allowed_suffix
-        && domain.len() <= 253
-        && domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-}
-
 fn valid_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     bytes
@@ -1714,7 +1714,8 @@ mod tests {
 
     use sakala_agent_protocol::DeployProjectPayload;
 
-    use super::{valid_domain, validate_payload};
+    use super::validate_payload;
+    use crate::ProjectDomainSuffixes;
 
     fn payload() -> DeployProjectPayload {
         serde_json::from_value(serde_json::json!({
@@ -1726,15 +1727,51 @@ mod tests {
         .expect("deploy payload")
     }
 
+    fn validate(payload: &DeployProjectPayload) -> Result<(), crate::RuntimeError> {
+        validate_payload(payload, &ProjectDomainSuffixes::default())
+    }
+
+    fn with_domain(domain: &str) -> DeployProjectPayload {
+        let mut payload = payload();
+        payload.domain = domain.to_owned();
+        payload
+    }
+
     #[test]
     fn accepts_staging_runtime_domains() {
-        assert!(valid_domain("portfolio.run.staging.sakala.dev"));
+        assert!(validate(&payload()).is_ok());
     }
 
     #[test]
     fn rejects_domains_outside_runtime_zones() {
-        assert!(!valid_domain("portfolio.staging.sakala.dev"));
-        assert!(!valid_domain("portfolio.run.example.test"));
+        for domain in [
+            "portfolio.staging.sakala.dev",
+            "portfolio.run.example.test",
+            "api.portfolio.run.sakala.dev",
+        ] {
+            let error = validate(&with_domain(domain)).expect_err(domain);
+            assert_eq!(error.code(), "invalid_runtime_command");
+            assert!(
+                error.to_string().contains(
+                    "allowed suffix (run.sakala.localhost, run.staging.sakala.dev, run.sakala.dev)"
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_suffix_admits_self_hosted_domains_only() {
+        let suffixes = ProjectDomainSuffixes::parse("run.example.ac.id").expect("suffix");
+
+        assert!(validate_payload(&with_domain("portfolio.run.example.ac.id"), &suffixes).is_ok());
+        let error = validate_payload(&payload(), &suffixes).expect_err("hosted zone");
+        assert!(
+            error
+                .to_string()
+                .contains("(run.example.ac.id), such as portfolio.run.example.ac.id"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1742,7 +1779,7 @@ mod tests {
         let mut payload = payload();
         payload.environment = BTreeMap::from([("PORT".to_owned(), "3000".to_owned())]);
 
-        assert!(validate_payload(&payload).is_ok());
+        assert!(validate(&payload).is_ok());
     }
 
     #[test]
@@ -1750,7 +1787,7 @@ mod tests {
         let mut payload = payload();
         payload.environment = BTreeMap::from([("PORT".to_owned(), "8080".to_owned())]);
 
-        let error = validate_payload(&payload).expect_err("conflicting PORT must be rejected");
+        let error = validate(&payload).expect_err("conflicting PORT must be rejected");
 
         assert_eq!(error.code(), "runtime_port_conflict");
         assert!(error.to_string().contains("PORT=8080"));
@@ -1763,7 +1800,7 @@ mod tests {
         payload.environment =
             BTreeMap::from([("PORT".to_owned(), "hunter2-not-a-port".to_owned())]);
 
-        let error = validate_payload(&payload).expect_err("invalid PORT must be rejected");
+        let error = validate(&payload).expect_err("invalid PORT must be rejected");
 
         assert_eq!(error.code(), "runtime_port_conflict");
         assert!(error.to_string().contains("container_port 3000"));
