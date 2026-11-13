@@ -72,10 +72,11 @@ route, aturan escape, dan perilaku bila halaman tidak bisa dibangun ada di
 
 Wake masuk lewat admission yang sama dengan deploy: kapasitas dicek dan
 container di-start di bawah lock yang sama, sehingga wake dan deploy yang
-bersamaan tidak bisa melewati `SAKALA_MAX_ACTIVE_CONTAINERS`. Bila container
-sudah start tetapi aplikasinya tidak ready dalam batas start node, wake gagal,
-route tidur tetap terpasang, dan container dibiarkan berjalan seperti
-sebelumnya; control plane yang memutuskan langkah berikutnya.
+bersamaan tidak bisa melewati `SAKALA_MAX_ACTIVE_CONTAINERS`. Bila wake sudah
+menjalankan container tetapi aplikasinya tidak ready dalam batas start node atau
+route-nya ditolak, Agent menghentikan container itu lagi tanpa menghapusnya,
+route tidur tetap terpasang, dan command gagal dengan error aslinya (kegagalan
+stop hanya dicatat sebagai peringatan di log operator).
 
 Kapan sebuah project dianggap sepi ditentukan control plane dari
 `metadata.workloads.traffic` di heartbeat. Agent tidak menidurkan project atas

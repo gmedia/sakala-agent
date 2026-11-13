@@ -2242,6 +2242,114 @@ async fn wake_on_a_full_node_fails_and_keeps_the_sleeping_page() {
     );
 }
 
+const CRASHING_STATE: &str = "restarting\t2\t3\tfalse\tnone\t268435456\n";
+
+fn stops_of(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .map(string_arguments)
+        .filter(|args| args.first().is_some_and(|a| a == "stop"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_wake_that_never_becomes_ready_stops_the_container_and_keeps_the_page() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(EXITED_WORKLOAD)
+            .with_inspect_states(&[CRASHING_STATE]),
+    );
+    let config = runtime_config(&temp);
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an app that crashes on start cannot wake");
+
+    assert_eq!(error.code(), "runtime_app_crashed", "{error}");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+    let started = command_position(&runner, |args| args.first().is_some_and(|a| a == "start"))
+        .expect("docker start");
+    let stopped = command_position(&runner, |args| args.first().is_some_and(|a| a == "stop"))
+        .expect("the container is stopped again");
+    assert!(started < stopped);
+    assert_eq!(stops_of(&runner), [["stop", "--time", "10", "sleeping"]]);
+    // It stays for the next wake.
+    assert_eq!(
+        command_position(&runner, |args| args.first().is_some_and(|a| a == "rm")),
+        None
+    );
+    assert_eq!(
+        command_position(&runner, |args| {
+            args.first().is_some_and(|a| a == "network") && args.get(1).is_some_and(|a| a == "rm")
+        }),
+        None
+    );
+}
+
+/// Fails every `docker stop`; everything else goes to `FakeRunner`.
+struct StopFailingRunner(FakeRunner);
+
+#[async_trait]
+impl ProcessRunner for StopFailingRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if spec.program == "docker" && spec.args.first().is_some_and(|a| a == "stop") {
+            self.0
+                .commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "Error response from daemon: cannot stop container".to_owned(),
+            });
+        }
+        self.0.run(spec, sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_stop_after_a_failed_wake_still_reports_the_wake_failure() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(StopFailingRunner(
+        FakeRunner::new(true)
+            .with_docker_ps(EXITED_WORKLOAD)
+            .with_inspect_states(&[CRASHING_STATE]),
+    ));
+    let config = runtime_config(&temp);
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an app that crashes on start cannot wake");
+
+    assert_eq!(error.code(), "runtime_app_crashed", "{error}");
+    assert_eq!(stops_of(&runner.0).len(), 1, "the stop was attempted");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+}
+
 #[tokio::test]
 async fn reconciliation_keeps_sleeping_routes_only_while_their_container_exists() {
     let temp = TempDir::new().expect("temp directory should be available");

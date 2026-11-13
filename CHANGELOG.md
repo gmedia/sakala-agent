@@ -13,6 +13,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 ### Changed
 
 - `WakeProject` kini mengecek kapasitas node seperti deploy, di bawah lock admission yang sama. Node yang sudah menjalankan `SAKALA_MAX_ACTIVE_CONTAINERS` workload menolak wake dengan `runtime_capacity_exceeded`, dan halaman tidur tetap terpasang.
+- Wake yang sudah menjalankan container tetapi aplikasinya tidak ready, atau route-nya ditolak Caddy, kini menghentikan container itu lagi (`docker stop --time 10`) supaya tidak memakai slot kapasitas. Halaman tidur tetap terpasang, container, image, dan network tidak dihapus, dan command gagal dengan error aslinya; bila stop itu gagal, Agent mencatat peringatan di log operator.
 
 ## [0.6.0] - 2026-11-12
 

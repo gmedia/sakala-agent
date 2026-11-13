@@ -944,6 +944,27 @@ impl DockerRuntimeExecutor {
         Ok(())
     }
 
+    /// Stops a container this wake started but could not bring online, so it
+    /// does not hold a slot while the sleeping page stays up. The container,
+    /// image, and network stay for the next wake. A failure here is only logged:
+    /// the wake already failed for its own reason, which is what gets reported.
+    async fn stop_failed_wake(&self, workload: &ManagedWorkload) {
+        let started = ManagedWorkload {
+            // The listing said stopped, but this wake has just started it.
+            status: "Up".to_owned(),
+            ..workload.clone()
+        };
+        if let Err(error) = self.containers.stop(&started, 10).await {
+            tracing::warn!(
+                project_id = %workload.project_id,
+                deployment_id = %workload.deployment_id,
+                container = %workload.container_id,
+                %error,
+                "failed wake could not stop the container again; it may still hold a capacity slot"
+            );
+        }
+    }
+
     async fn run_wake(
         &self,
         request: WorkloadLifecycleRequest,
@@ -958,7 +979,13 @@ impl DockerRuntimeExecutor {
         drop(admission);
         // Writes the serving route over the sleeping one in one rename, and puts
         // the sleeping page back when the router refuses the new route.
-        self.activate_workload(&workload, reporter.as_ref()).await?;
+        if let Err(error) = self.activate_workload(&workload, reporter.as_ref()).await {
+            let started_here = !workload.status.to_ascii_lowercase().starts_with("up");
+            if started_here {
+                self.stop_failed_wake(&workload).await;
+            }
+            return Err(error);
+        }
         emit_event(
             reporter.as_ref(),
             "workload.wake.completed",
