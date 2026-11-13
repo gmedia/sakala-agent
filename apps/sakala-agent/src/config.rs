@@ -388,6 +388,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             },
             max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
+            api_url: agent.api_url.clone(),
             ..DockerRuntimeConfig::default()
         },
         runtime_health_interval: Duration::from_secs(positive_u64(
@@ -453,6 +454,8 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             "railpack-info",
             "railpack-build",
             "caddy-file-routing",
+            // Sleeping routes, wake capacity checks, and `workloads.traffic`.
+            "idle-sleep",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -729,6 +732,27 @@ mod tests {
                 .agent
                 .capabilities
                 .contains(&"railpack-info".to_owned())
+        );
+        assert!(config.agent.capabilities.contains(&"idle-sleep".to_owned()));
+    }
+
+    #[test]
+    fn idle_sleep_is_advertised_only_by_the_docker_runtime() {
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(!noop.agent.capabilities.contains(&"idle-sleep".to_owned()));
+
+        let values = HashMap::from([
+            ("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned()),
+            (
+                "SAKALA_API_URL".to_owned(),
+                "https://api.staging.sakala.dev".to_owned(),
+            ),
+        ]);
+        let docker = from_values(&values).expect("Docker app config should load");
+        // The sleeping page sends visitors to the same API the agent uses.
+        assert_eq!(
+            docker.docker_runtime.api_url,
+            "https://api.staging.sakala.dev"
         );
     }
 

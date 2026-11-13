@@ -26,7 +26,7 @@ pub use deployments::{
     FinalizationDeferredReason, LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
-pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload};
+pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload, WorkloadTraffic};
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};

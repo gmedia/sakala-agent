@@ -12,8 +12,8 @@ use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
 use sakala_agent_runtime::{
     CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, ProcessStream, RuntimeError,
     routing::{
-        CaddyFileRouteManager, CaddyReloader, DockerExecCaddyReloader, RouteIdentity, RouteManager,
-        RouteSpec,
+        CaddyFileRouteManager, CaddyReloader, DockerExecCaddyReloader, KnownRoutes, RouteIdentity,
+        RouteManager, RouteSpec, SleepingRouteSpec, wake_url,
     },
 };
 use tempfile::TempDir;
@@ -210,10 +210,13 @@ async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workload
     .expect("unmanaged route should be written");
 
     let stale = manager
-        .discover_stale_routes(&HashSet::from([RouteIdentity {
-            project_id: active_project,
-            deployment_id: Some(Uuid::new_v4()),
-        }]))
+        .discover_stale_routes(&KnownRoutes {
+            serving: HashSet::from([RouteIdentity {
+                project_id: active_project,
+                deployment_id: Some(Uuid::new_v4()),
+            }]),
+            ..KnownRoutes::default()
+        })
         .await
         .expect("route discovery should succeed");
 
@@ -221,6 +224,108 @@ async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workload
     assert_eq!(stale[0].project_id, stale_project);
     assert_eq!(stale[0].path, stale_path.display().to_string());
     assert!(stale_path.exists(), "discovery must not delete route files");
+}
+
+fn sleeping(project_id: Uuid, deployment_id: Uuid) -> SleepingRouteSpec {
+    SleepingRouteSpec {
+        project_id,
+        deployment_id,
+        domain: "portfolio.run.sakala.localhost".to_owned(),
+        wake_url: wake_url("https://api.sakala.dev", "portfolio").expect("wake URL"),
+    }
+}
+
+#[tokio::test]
+async fn a_refused_sleeping_route_puts_the_previous_route_back() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let serving = format!(
+        "# Managed by sakala-agent for project {project_id} deployment {}.\n",
+        Uuid::new_v4()
+    );
+    tokio::fs::write(&route_path, &serving)
+        .await
+        .expect("route should be written");
+    let reloader = Arc::new(FailingReloader::default());
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), reloader.clone());
+
+    manager
+        .activate_sleeping(&sleeping(project_id, Uuid::new_v4()), &NoopReporter)
+        .await
+        .expect_err("reload failure should fail the sleeping route");
+
+    assert_eq!(
+        tokio::fs::read_to_string(route_path)
+            .await
+            .expect("route should be restored"),
+        serving
+    );
+    assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn sleeping_routes_follow_the_deployment_ownership_rules() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+    manager
+        .activate_sleeping(&sleeping(project_id, deployment_id), &NoopReporter)
+        .await
+        .expect("sleeping route");
+    let identity = RouteIdentity {
+        project_id,
+        deployment_id: Some(deployment_id),
+    };
+
+    // Kept while its container exists in any state, stale once it is gone.
+    let kept = manager
+        .discover_stale_routes(&KnownRoutes {
+            sleeping: HashSet::from([identity]),
+            ..KnownRoutes::default()
+        })
+        .await
+        .expect("discovery");
+    assert!(kept.is_empty());
+    let stale = manager
+        .discover_stale_routes(&KnownRoutes {
+            // Running is not enough: the sleeping route needs its own container.
+            serving: HashSet::from([RouteIdentity {
+                project_id,
+                deployment_id: Some(Uuid::new_v4()),
+            }]),
+            ..KnownRoutes::default()
+        })
+        .await
+        .expect("discovery");
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].deployment_id, Some(deployment_id));
+
+    // Neither another deployment nor a legacy identity can remove it.
+    for other in [Some(Uuid::new_v4()), None] {
+        assert!(
+            !manager
+                .deactivate(
+                    RouteIdentity {
+                        project_id,
+                        deployment_id: other,
+                    },
+                    &NoopReporter,
+                )
+                .await
+                .expect("safe no-op")
+        );
+        assert!(route_path.exists());
+    }
+    assert!(
+        manager
+            .deactivate(identity, &NoopReporter)
+            .await
+            .expect("its own deployment removes it")
+    );
+    assert!(!route_path.exists());
 }
 
 fn route(project_id: Uuid) -> RouteSpec {

@@ -34,6 +34,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         AgentMode::Connected => Some(ApiClient::from_config(&config.agent)?),
     };
     let minimum_workspace_free_bytes = config.docker_runtime.min_workspace_free_bytes;
+    let max_traffic_items = config.docker_runtime.max_active_containers as usize;
     let reconciliation = Arc::new(RwLock::new(RuntimeReconciliationReport::default()));
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
@@ -141,6 +142,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             reconciliation: Arc::clone(&reconciliation),
             startup_reconciliation_at,
             minimum_workspace_free_bytes,
+            max_traffic_items,
         },
         shutdown_rx.clone(),
     ));

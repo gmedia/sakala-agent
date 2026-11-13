@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
     DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
-    RuntimeCleanupTarget,
+    RuntimeCleanupTarget, WorkloadTraffic,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -107,6 +107,9 @@ pub struct CommandOutput {
 pub struct RuntimeOrphan {
     pub container_id: String,
     pub project_id: Option<Uuid>,
+    /// Lets a sleeping route of an exited workload stay attributable to it.
+    /// Not part of the heartbeat wire shape.
+    pub deployment_id: Option<Uuid>,
     pub reason: String,
 }
 
@@ -377,6 +380,13 @@ pub trait RuntimeExecutor: Send + Sync {
         _snapshots: &[RuntimeHealthSnapshot],
     ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
         Ok(Vec::new())
+    }
+
+    /// When the router last served each running workload, for idle sleep.
+    /// `None` means unknown, for example because the router's request counters
+    /// could not be read, which the heartbeat must not report as "no traffic".
+    async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {
+        None
     }
 
     async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {

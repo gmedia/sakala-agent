@@ -117,6 +117,26 @@ Still revision 4, and either side can be deployed first.
 | `InspectProject` result field `exposed_ports` | Sent, always. | List of TCP ports from `EXPOSE` in the final Dockerfile stage, `[]` when there is none. When that stage has no `EXPOSE` at all, the ports come from its base image's config on an allowlisted public registry, so `FROM nginx:alpine` alone reports `[80]`; the field and its meaning for the API stay the same. Rules in [Sakala Agent API](AGENT_API.md#project-inspection-command). An older API validates `result` only as an object and copies known keys, so it ignores the field. A result without the field comes from an older Agent, and the API must then leave its stored port alone. The API stores the port as `detected_port` only when the list has exactly one entry, and `container_port` stays `configured_port`, then `detected_port`, then 3000. |
 | `InspectProject` result `railpack: null` | Sent when `railpack info` fails on a project with a Dockerfile. | Such an inspection used to end in `fail` with `runtime_build_failed`. `ProjectInspectionResultData` in every released API already reads a non-object `railpack` as `null`. |
 
+## Revision 4 additions for idle sleep
+
+Still revision 4: there is no new command type, only additive heartbeat fields and
+different runtime behaviour behind the existing `SleepProject` and `WakeProject`.
+Either side can be deployed first. An older API ignores the new heartbeat keys and
+the new capability, and an older Agent never sends them.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `idle-sleep` | Advertised by the `docker` driver only. | The API should only put a project to sleep for idleness on a node that advertises it. |
+| `metadata.workloads.traffic` and `metadata.detail_counts.traffic` | Sent on heartbeat, bound `SAKALA_MAX_ACTIVE_CONTAINERS`. | Items `{ project_id, deployment_id, last_request_at }`. Both keys are omitted while traffic is unknown, and a heartbeat without them must not make any project look idle. Shape and semantics in [Sakala Agent API](AGENT_API.md#traffic-workload). |
+| `SleepProject` installs a sleeping route | Behaviour change. | The project's domain answers a 503 page that asks `POST /api/v1/public/projects/<slug>/wake` (under `SAKALA_API_URL`) and reloads itself, instead of the router's 404. Suspension uses the same command, so the API must refuse wake requests for a suspended project. |
+| `WakeProject` checks node capacity | Behaviour change. | A full node fails the wake with `runtime_capacity_exceeded`, an existing code, and keeps the sleeping route. |
+
+Host requirement: the runtime Caddyfile needs `metrics { per_host }` in its global
+block for `traffic` to be sent. Without it the Agent omits the list and everything
+else works as before. The admin endpoint stays on the container's loopback; the
+Agent reads it through `docker exec` at `127.0.0.1:2019`. See
+[Caddy Integration](CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

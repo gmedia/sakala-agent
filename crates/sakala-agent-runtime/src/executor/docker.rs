@@ -15,7 +15,7 @@ use sakala_agent_core::ports::{
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
     DeploymentBuilder, DeploymentLog, InspectProjectPayload, LogBounds, LogStream,
-    ReconcileWorkloadAction, RuntimeCleanupTarget,
+    ReconcileWorkloadAction, RuntimeCleanupTarget, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -38,7 +38,9 @@ use crate::{
     logs::emit_event,
     railpack::{RailpackSandbox, is_pinned_image},
     routing::{
-        CaddyFileRouteManager, DockerExecCaddyReloader, RouteIdentity, RouteManager, RouteSpec,
+        CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, KnownRoutes,
+        RouteIdentity, RouteManager, RouteSpec, SleepingRouteSpec, traffic::TrafficTracker,
+        wake_url,
     },
     telemetry::NodeTelemetryCollector,
     workspace::{
@@ -65,6 +67,11 @@ pub struct DockerRuntimeExecutor {
     project_domains: crate::ProjectDomainSuffixes,
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
+    api_url: String,
+    router_metrics: DockerExecCaddyMetrics,
+    traffic: std::sync::Mutex<TrafficTracker>,
+    /// Keeps a router without readable counters to one warning, not one per heartbeat.
+    traffic_unreadable: AtomicBool,
 }
 
 pub(crate) struct DockerPreflight {
@@ -123,6 +130,7 @@ impl DockerRuntimeExecutor {
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let health_check_window = config.health_interval * config.health_attempts;
         let router_container = config.caddy_container.clone();
+        let api_url = config.api_url.clone();
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -174,6 +182,7 @@ impl DockerRuntimeExecutor {
             image_retention,
             min_workspace_free_bytes,
             preflight,
+            api_url,
         )
     }
 
@@ -193,6 +202,7 @@ impl DockerRuntimeExecutor {
         image_retention: ImageRetention,
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
+        api_url: String,
     ) -> Self {
         let telemetry = NodeTelemetryCollector::new(
             Arc::clone(&preflight.runner),
@@ -201,6 +211,10 @@ impl DockerRuntimeExecutor {
             preflight.caddy_container.clone(),
             preflight.railpack_image.clone(),
             preflight.container_runtime.clone(),
+        );
+        let router_metrics = DockerExecCaddyMetrics::new(
+            Arc::clone(&preflight.runner),
+            preflight.caddy_container.clone(),
         );
         Self {
             workspace,
@@ -220,6 +234,10 @@ impl DockerRuntimeExecutor {
             project_domains: preflight.project_domains.clone(),
             preflight,
             telemetry,
+            api_url,
+            router_metrics,
+            traffic: std::sync::Mutex::new(TrafficTracker::new(OffsetDateTime::now_utc())),
+            traffic_unreadable: AtomicBool::new(false),
         }
     }
 
@@ -806,18 +824,12 @@ impl DockerRuntimeExecutor {
             return Err(RuntimeError::WorkloadNotFound);
         };
         self.containers.stop(&workload, 10).await?;
-        self.routes
-            .deactivate(
-                RouteIdentity {
-                    project_id: workload.project_id,
-                    deployment_id: Some(workload.deployment_id),
-                },
-                reporter.as_ref(),
-            )
-            .await?;
         if remove {
+            self.deactivate_route(&workload, reporter.as_ref()).await?;
             self.containers.remove(&workload).await?;
             self.release_network(workload.project_id).await;
+        } else {
+            self.sleep_route(&workload, reporter.as_ref()).await?;
         }
         let remove_images = remove && request.remove_images;
         let event_type = if remove {
@@ -833,7 +845,7 @@ impl DockerRuntimeExecutor {
             } else if remove {
                 "Workload stopped and container removed; image is retained."
             } else {
-                "Workload stopped for sleep; container and image are retained."
+                "Workload stopped for sleep; container and image are retained, and its domain shows the sleeping page."
             },
             json!({ "project_id": workload.project_id, "deployment_id": workload.deployment_id }),
         )
@@ -875,13 +887,77 @@ impl DockerRuntimeExecutor {
         Ok(())
     }
 
+    async fn deactivate_route(
+        &self,
+        workload: &ManagedWorkload,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<bool, RuntimeError> {
+        self.routes
+            .deactivate(
+                RouteIdentity {
+                    project_id: workload.project_id,
+                    deployment_id: Some(workload.deployment_id),
+                },
+                reporter,
+            )
+            .await
+    }
+
+    /// Puts the sleeping page on the project's domain in place of its route. When
+    /// that page cannot be built or the router refuses it, the route is removed
+    /// as before idle sleep existed, so the project still sleeps; the operator
+    /// log says why its domain shows the router's 404 instead.
+    async fn sleep_route(
+        &self,
+        workload: &ManagedWorkload,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        let sleeping = self
+            .project_domains
+            .project_label(&workload.domain)
+            .ok_or_else(|| {
+                RuntimeError::InvalidCommand(
+                    "the workload's domain is not under an allowed project domain suffix"
+                        .to_owned(),
+                )
+            })
+            .and_then(|slug| wake_url(&self.api_url, slug))
+            .map(|wake_url| SleepingRouteSpec {
+                project_id: workload.project_id,
+                deployment_id: workload.deployment_id,
+                domain: workload.domain.clone(),
+                wake_url,
+            });
+        let result = match sleeping {
+            Ok(route) => self.routes.activate_sleeping(&route, reporter).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                project_id = %workload.project_id,
+                deployment_id = %workload.deployment_id,
+                %error,
+                "sleeping page was not installed; removing the project route instead"
+            );
+            self.deactivate_route(workload, reporter).await?;
+        }
+        Ok(())
+    }
+
     async fn run_wake(
         &self,
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let workload = self.workload(&request).await?;
+        // Same admission as a deployment: a full node refuses the wake, and the
+        // sleeping page stays until there is room.
+        let admission = self.container_admission.lock().await;
+        self.containers.ensure_capacity(workload.project_id).await?;
         self.containers.start_existing(&workload).await?;
+        drop(admission);
+        // Writes the serving route over the sleeping one in one rename, and puts
+        // the sleeping page back when the router refuses the new route.
         self.activate_workload(&workload, reporter.as_ref()).await?;
         emit_event(
             reporter.as_ref(),
@@ -1165,10 +1241,11 @@ async fn directory_check(name: &str, path: &std::path::Path, fatal: bool) -> Run
     }
 }
 
-fn routable_routes(
-    report: &RuntimeReconciliationReport,
-) -> std::collections::HashSet<RouteIdentity> {
-    report
+/// A serving route needs a running workload. A sleeping route needs only its
+/// container, which stays `exited` while the project sleeps and is listed with
+/// the orphans for that reason.
+fn known_routes(report: &RuntimeReconciliationReport) -> KnownRoutes {
+    let serving = report
         .workloads
         .iter()
         .filter(|workload| workload.status.to_ascii_lowercase().starts_with("up"))
@@ -1176,7 +1253,26 @@ fn routable_routes(
             project_id: workload.project_id,
             deployment_id: Some(workload.deployment_id),
         })
-        .collect()
+        .collect();
+    let sleeping = report
+        .workloads
+        .iter()
+        .map(|workload| (Some(workload.project_id), Some(workload.deployment_id)))
+        .chain(
+            report
+                .orphans
+                .iter()
+                .map(|orphan| (orphan.project_id, orphan.deployment_id)),
+        )
+        .filter_map(|identity| match identity {
+            (Some(project_id), Some(deployment_id)) => Some(RouteIdentity {
+                project_id,
+                deployment_id: Some(deployment_id),
+            }),
+            _ => None,
+        })
+        .collect();
+    KnownRoutes { serving, sleeping }
 }
 
 #[async_trait]
@@ -1187,7 +1283,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.containers.detect_orphans().await?;
-        let known_routes = routable_routes(&report);
+        let known_routes = known_routes(&report);
         report.stale_routes = self.routes.discover_stale_routes(&known_routes).await?;
         report.stale_images = self
             .containers
@@ -1292,6 +1388,49 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .crashed_workloads(snapshots)
             .await
             .map_err(Into::into)
+    }
+
+    async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {
+        let counters = match self.router_metrics.read().await {
+            Ok(counters) => {
+                if self.traffic_unreadable.swap(false, Ordering::Relaxed) {
+                    tracing::info!("router request counters are readable again");
+                }
+                counters
+            }
+            Err(error) => {
+                if !self.traffic_unreadable.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(%error, "router request counters are unreadable; heartbeats omit traffic");
+                }
+                return None;
+            }
+        };
+        // Without per-host counters the router has said nothing about activity.
+        let totals = crate::routing::traffic::request_totals_by_host(&counters)?;
+        let last_requests = self
+            .traffic
+            .lock()
+            .ok()?
+            .observe(totals, OffsetDateTime::now_utc());
+        let workloads = match self.containers.routed_workloads().await {
+            Ok(workloads) => workloads,
+            Err(error) => {
+                tracing::debug!(%error, "routed workloads could not be listed for traffic");
+                return None;
+            }
+        };
+        Some(
+            workloads
+                .into_iter()
+                .filter_map(|workload| {
+                    Some(WorkloadTraffic {
+                        last_request_at: *last_requests.get(&workload.domain)?,
+                        project_id: workload.project_id,
+                        deployment_id: workload.deployment_id,
+                    })
+                })
+                .collect(),
+        )
     }
 
     async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {
@@ -1447,7 +1586,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
                     let discovered = self.containers.detect_orphans().await?;
-                    let known_routes = routable_routes(&discovered);
+                    let known_routes = known_routes(&discovered);
                     cleaned_routes += self
                         .routes
                         .cleanup_stale_routes(&known_routes, reporter.as_ref())

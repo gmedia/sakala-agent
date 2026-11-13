@@ -569,7 +569,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "dockerfile-build",
     "railpack-info",
     "railpack-build",
-    "caddy-file-routing"
+    "caddy-file-routing",
+    "idle-sleep"
   ],
   "metadata": {
     "version": "0.6.0",
@@ -584,7 +585,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "stale_routes": 0,
       "stale_images": 0,
       "compatibility_issues": 0,
-      "crashed_details": 0
+      "crashed_details": 0,
+      "traffic": 1
     },
     "resources": {
       "cpu_total": 4,
@@ -601,7 +603,14 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "unhealthy": 0,
       "stopped": 1,
       "unhealthy_details": [],
-      "crashed_details": []
+      "crashed_details": [],
+      "traffic": [
+        {
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "last_request_at": "2026-06-23T07:41:09Z"
+        }
+      ]
     },
     "disk_pressure": {
       "state": "normal",
@@ -732,6 +741,69 @@ Satu heartbeat memakai listing batch `docker ps` yang sama dengan
 dan satu `docker events` batch hanya bila ada exit yang perlu dibaca. Tidak ada query
 per container, dan Agent tidak membaca environment atau secret container.
 
+### Traffic workload
+
+Capability `idle-sleep` hanya diiklankan driver `docker`. Node dengan capability ini
+memasang route tidur saat `SleepProject`, mengecek kapasitas saat `WakeProject`, dan
+mengirim `workloads.traffic`, yaitu kapan router terakhir melayani request untuk
+setiap workload yang sedang berjalan. Control plane memakainya untuk memutuskan
+kapan project ditidurkan; Agent sendiri tidak pernah menidurkan project. Field ini
+opsional, aditif pada revision 4, dan contohnya ada di
+`examples/heartbeat/workload-traffic.json`:
+
+```json
+{
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "last_request_at": "2026-11-13T05:58:12Z"
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `project_id` | UUID, wajib | Project pemilik workload, dari label container. |
+| `deployment_id` | UUID, wajib | Deployment pemilik workload, dari label container. Saat redeploy, workload lama dan baru bisa sama-sama muncul dengan domain yang sama; API mencocokkannya dengan deployment aktif project. |
+| `last_request_at` | RFC 3339 UTC, wajib, tidak pernah `null` | Waktu Agent pertama kali melihat counter request host ini berubah. Presisinya satu interval heartbeat (`SAKALA_HEARTBEAT_INTERVAL_SECONDS`, default 10 detik), bukan waktu request yang sebenarnya. |
+
+Asal nilainya counter `caddy_http_requests_total` milik Caddy runtime dengan
+`metrics { per_host }`, dijumlahkan per host lalu dipetakan ke workload yang berjalan
+lewat label `dev.sakala.domain`. Agent membandingkan setiap bacaan dengan bacaan
+sebelumnya:
+
+- **Bacaan pertama setelah Agent start** memberi setiap host waktu start Agent, bukan
+  "tidak pernah". Restart Agent tidak boleh membuat semua project tampak sepi.
+- **Counter yang berubah**, termasuk yang turun karena container Caddy di-restart dan
+  menghitung dari nol, berarti ada request sejak bacaan sebelumnya. Waktunya diisi
+  waktu bacaan sekarang.
+- **Host yang baru muncul** setelah bacaan pertama juga berarti ada request, karena
+  Caddy baru membuat counter host saat request pertamanya.
+- **Counter yang sama** mempertahankan waktu sebelumnya.
+
+Cara membaca list ini:
+
+- **List yang hadir** hanya bisa memajukan aktivitas. Workload yang tidak ada di list
+  belum punya request yang dihitung Caddy sejak Caddy start, jadi API memakai waktu
+  yang sudah disimpannya, atau waktu deployment selesai, sebagai gantinya. API
+  sebaiknya hanya memperbarui nilainya bila `last_request_at` lebih baru.
+- **List yang tidak hadir** (`traffic` dan `detail_counts.traffic` sama-sama hilang)
+  berarti Agent tidak tahu: counter tidak bisa dibaca, Caddy belum memakai
+  `metrics { per_host }`, atau Caddy belum melayani request apa pun sejak start. API
+  tidak boleh menganggap heartbeat seperti itu sebagai tanda sepi.
+- **Project yang sedang tidur tidak masuk list**, karena containernya tidak berjalan.
+  Kunjungan ke halaman tidurnya membangunkan project lewat endpoint wake, bukan lewat
+  heartbeat.
+- Request ke host tanpa blok sendiri, termasuk header `Host` dengan port, dihitung
+  Caddy sebagai `_other` dan diabaikan.
+- Bila tepat jumlah request yang sama terjadi di antara restart Caddy dan bacaan
+  berikutnya, perubahan itu tidak terlihat sampai request berikutnya. Kasus ini
+  langka dan hanya menunda, tidak pernah memajukan, waktu tidur.
+
+List dibatasi `SAKALA_MAX_ACTIVE_CONTAINERS` item, bukan 50, karena sebanyak itulah
+workload yang bisa berjalan bersamaan; `detail_counts.traffic` menyimpan jumlah asli.
+Satu heartbeat menambah satu `docker exec` ke container Caddy dan satu listing
+`docker ps`. Pembacaan dibatasi 2 detik, dan kegagalannya hanya menghilangkan list
+ini, tidak mengubah `status` node.
+
 `startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
 bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
 eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
@@ -739,7 +811,8 @@ hasil command reconciliation eksplisit.
 
 Collection detail yang berpotensi membesar (`unhealthy_details`,
 `crashed_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
-`compatibility_issues`) dibatasi maksimal 50 item per heartbeat. Agent
+`compatibility_issues`) dibatasi maksimal 50 item per heartbeat. `traffic` memakai
+batas `SAKALA_MAX_ACTIVE_CONTAINERS` seperti dijelaskan di atas. Agent
 mempertahankan urutan hasil runtime dan mengirim 50 item pertama secara
 deterministik, bukan memilih item secara acak. `metadata.detail_counts` selalu
 menyimpan jumlah asli sebelum pembatasan; nilai `0` berarti collection kosong,

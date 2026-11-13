@@ -1,6 +1,6 @@
 use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
-    FinalizationDeferredReason, HeartbeatPayload,
+    FinalizationDeferredReason, HeartbeatPayload, WorkloadTraffic,
 };
 
 #[test]
@@ -135,6 +135,36 @@ fn crashed_workloads_fixture_matches_the_heartbeat_contract() {
     assert_eq!(
         serde_json::to_value(&details).expect("details serialize"),
         heartbeat.metadata["workloads"]["crashed_details"]
+    );
+}
+
+#[test]
+fn workload_traffic_fixture_matches_the_heartbeat_contract() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/workload-traffic.json"))
+            .expect("heartbeat fixture must deserialize");
+    let traffic: Vec<WorkloadTraffic> =
+        serde_json::from_value(heartbeat.metadata["workloads"]["traffic"].clone())
+            .expect("traffic must match the DTO");
+
+    assert_eq!(
+        heartbeat.metadata["detail_counts"]["traffic"].as_u64(),
+        Some(traffic.len() as u64)
+    );
+    assert!(
+        heartbeat
+            .node
+            .capabilities
+            .iter()
+            .any(|c| c == "idle-sleep")
+    );
+    assert!(traffic[0].last_request_at > traffic[1].last_request_at);
+    assert!(traffic[0].last_request_at < heartbeat.sent_at);
+
+    // A DTO round trip keeps the exact wire shape the API validates.
+    assert_eq!(
+        serde_json::to_value(&traffic).expect("traffic serializes"),
+        heartbeat.metadata["workloads"]["traffic"]
     );
 }
 

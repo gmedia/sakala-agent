@@ -27,7 +27,7 @@ use crate::{
     containers::limits::docker_cpu_value,
     containers::{
         ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ManagedWorkload,
-        ResourceSafetyConfig, RunContainerRequest,
+        ResourceSafetyConfig, RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT,
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
@@ -434,6 +434,7 @@ impl ContainerEngine for DockerContainerEngine {
                 report.orphans.push(RuntimeOrphan {
                     container_id,
                     project_id,
+                    deployment_id,
                     reason: reason.to_owned(),
                 });
             } else if let (Some(project_id), Some(deployment_id)) = (project_id, deployment_id) {
@@ -464,6 +465,37 @@ impl ContainerEngine for DockerContainerEngine {
             active_builds: None,
             maximum_concurrent_builds: None,
         })
+    }
+
+    async fn routed_workloads(&self) -> Result<Vec<RoutedWorkload>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}\t{{.Label \"dev.sakala.domain\"}}");
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker routed workload listing failed with {}",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .filter_map(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                Some(RoutedWorkload {
+                    project_id: Uuid::parse_str(fields.get(2)?).ok()?,
+                    deployment_id: Uuid::parse_str(fields.get(3)?).ok()?,
+                    domain: fields
+                        .get(4)
+                        .filter(|domain| !domain.is_empty())?
+                        .to_string(),
+                })
+            })
+            .collect())
     }
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError> {
