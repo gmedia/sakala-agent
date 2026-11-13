@@ -123,6 +123,9 @@ pub struct DockerRuntimeConfig {
     pub health_interval: Duration,
     /// See [`DEFAULT_CRASH_STABLE_WINDOW`].
     pub crash_stable_window: Duration,
+    /// `SAKALA_API_URL`. A sleeping project's page sends visitors' browsers to
+    /// the control plane's public wake endpoint under it.
+    pub api_url: String,
 }
 
 impl Default for DockerRuntimeConfig {
@@ -150,6 +153,7 @@ impl Default for DockerRuntimeConfig {
             health_attempts: 10,
             health_interval: Duration::from_secs(1),
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,
+            api_url: "http://localhost:8000".to_owned(),
         }
     }
 }

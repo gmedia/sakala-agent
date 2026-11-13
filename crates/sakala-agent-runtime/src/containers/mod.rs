@@ -51,6 +51,14 @@ pub struct ManagedWorkload {
     pub log_bounds: LogBounds,
 }
 
+/// A running managed workload and the domain it is routed under.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutedWorkload {
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub domain: String,
+}
+
 #[async_trait]
 pub trait ContainerEngine: Send + Sync {
     fn resolve_resources(
@@ -65,6 +73,9 @@ pub trait ContainerEngine: Send + Sync {
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError>;
 
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError>;
+
+    /// Running managed workloads with their domain label, in one listing.
+    async fn routed_workloads(&self) -> Result<Vec<RoutedWorkload>, RuntimeError>;
 
     /// Resolves the crash details of snapshot workloads Docker is restarting.
     async fn crashed_workloads(

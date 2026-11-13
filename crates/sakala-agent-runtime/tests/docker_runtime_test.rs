@@ -2057,6 +2057,599 @@ async fn wake_starts_stopped_workload_and_restores_its_route() {
     }));
 }
 
+const PROJECT: &str = "ff66ed4a-6303-4be6-8ef4-63c28b112680";
+const DEPLOYMENT: &str = "4f1f21ef-730d-42d5-a46d-d965353cb993";
+const EXITED_WORKLOAD: &str =
+    "sleeping\tExited (0) 1 minute ago\tportfolio.run.sakala.localhost\t3000\n";
+
+fn route_path(config: &DockerRuntimeConfig, project: &str) -> std::path::PathBuf {
+    config.caddy_sites_dir.join(format!("{project}.Caddyfile"))
+}
+
+fn sleeping_route(project: &str, deployment: &str) -> String {
+    format!(
+        "# Managed by sakala-agent for project {project} deployment {deployment} (sleeping).\nportfolio.run.sakala.localhost:80 {{\n\trespond \"asleep\" 503\n}}\n"
+    )
+}
+
+fn write_route(config: &DockerRuntimeConfig, project: &str, content: &str) -> std::path::PathBuf {
+    fs::create_dir_all(&config.caddy_sites_dir).expect("route directory should be created");
+    let path = route_path(config, project);
+    fs::write(&path, content).expect("route should be written");
+    path
+}
+
+fn command_position(runner: &FakeRunner, matches: impl Fn(&[String]) -> bool) -> Option<usize> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .position(|command| command.program == "docker" && matches(&string_arguments(command)))
+}
+
+#[tokio::test]
+async fn sleep_puts_the_sleeping_page_on_the_project_domain() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let mut config = runtime_config(&temp);
+    config.api_url = "https://api.staging.sakala.dev/".to_owned();
+    let route = write_route(
+        &config,
+        PROJECT,
+        &format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy app:3000\n}}\n"
+        ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep should succeed");
+
+    assert_eq!(output.result["status"], "sleeping");
+    let content = fs::read_to_string(&route).expect("the sleeping route replaces the route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT} (sleeping).\nportfolio.run.sakala.localhost:80 {{\n"
+        )),
+        "{content}"
+    );
+    assert!(!content.contains("reverse_proxy"), "{content}");
+    assert!(
+        content.contains("\t\tSAKALA_SLEEPING_PAGE 503\n"),
+        "{content}"
+    );
+    assert!(content.contains(
+        "fetch(\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\""
+    ));
+    // The page goes up once the container is stopped, through the same
+    // validate-and-reload as any route.
+    let stopped = command_position(&runner, |args| args.first().is_some_and(|a| a == "stop"))
+        .expect("docker stop");
+    let validated = command_position(&runner, |args| args.iter().any(|a| a == "validate"))
+        .expect("caddy validate");
+    let reloaded =
+        command_position(&runner, |args| args.iter().any(|a| a == "reload")).expect("caddy reload");
+    assert!(stopped < validated && validated < reloaded);
+}
+
+#[tokio::test]
+async fn sleep_removes_the_route_when_the_sleeping_page_cannot_be_built() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
+    );
+    let mut config = runtime_config(&temp);
+    config.api_url = "not a URL".to_owned();
+    let route = write_route(
+        &config,
+        PROJECT,
+        &format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{}}\n"
+        ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let output = RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep still succeeds as it did before sleeping pages");
+
+    assert_eq!(output.result["status"], "sleeping");
+    assert!(!route.exists(), "the route is removed instead");
+}
+
+#[tokio::test]
+async fn wake_replaces_the_sleeping_page_with_the_serving_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(EXITED_WORKLOAD));
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake should restore the serving route");
+
+    let content = fs::read_to_string(&route).expect("route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy sakala-app-"
+        )),
+        "{content}"
+    );
+    assert!(!content.contains("(sleeping)"), "{content}");
+    // Capacity is checked before the container starts, as for a deployment.
+    let capacity = command_position(&runner, |args| {
+        args.first().is_some_and(|a| a == "ps")
+            && !args.iter().any(|a| a == "--all")
+            && args
+                .iter()
+                .any(|a| a == "{{.Label \"dev.sakala.project-id\"}}")
+    })
+    .expect("capacity probe");
+    let started = command_position(&runner, |args| args.first().is_some_and(|a| a == "start"))
+        .expect("docker start");
+    assert!(capacity < started);
+}
+
+#[tokio::test]
+async fn wake_on_a_full_node_fails_and_keeps_the_sleeping_page() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(EXITED_WORKLOAD)
+            .with_docker_ps(
+                "11111111-1111-4111-8111-111111111111\n22222222-2222-4222-8222-222222222222\n",
+            ),
+    );
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 2;
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a full node cannot wake another project");
+
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+    assert_eq!(
+        command_position(&runner, |args| args.first().is_some_and(|a| a == "start")),
+        None,
+        "the container stays stopped"
+    );
+}
+
+const CRASHING_STATE: &str = "restarting\t2\t3\tfalse\tnone\t268435456\n";
+
+fn stops_of(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .map(string_arguments)
+        .filter(|args| args.first().is_some_and(|a| a == "stop"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_wake_that_never_becomes_ready_stops_the_container_and_keeps_the_page() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(EXITED_WORKLOAD)
+            .with_inspect_states(&[CRASHING_STATE]),
+    );
+    let config = runtime_config(&temp);
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an app that crashes on start cannot wake");
+
+    assert_eq!(error.code(), "runtime_app_crashed", "{error}");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+    let started = command_position(&runner, |args| args.first().is_some_and(|a| a == "start"))
+        .expect("docker start");
+    let stopped = command_position(&runner, |args| args.first().is_some_and(|a| a == "stop"))
+        .expect("the container is stopped again");
+    assert!(started < stopped);
+    assert_eq!(stops_of(&runner), [["stop", "--time", "10", "sleeping"]]);
+    // It stays for the next wake.
+    assert_eq!(
+        command_position(&runner, |args| args.first().is_some_and(|a| a == "rm")),
+        None
+    );
+    assert_eq!(
+        command_position(&runner, |args| {
+            args.first().is_some_and(|a| a == "network") && args.get(1).is_some_and(|a| a == "rm")
+        }),
+        None
+    );
+}
+
+/// Fails every `docker stop`; everything else goes to `FakeRunner`.
+struct StopFailingRunner(FakeRunner);
+
+#[async_trait]
+impl ProcessRunner for StopFailingRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if spec.program == "docker" && spec.args.first().is_some_and(|a| a == "stop") {
+            self.0
+                .commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "Error response from daemon: cannot stop container".to_owned(),
+            });
+        }
+        self.0.run(spec, sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_stop_after_a_failed_wake_still_reports_the_wake_failure() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(StopFailingRunner(
+        FakeRunner::new(true)
+            .with_docker_ps(EXITED_WORKLOAD)
+            .with_inspect_states(&[CRASHING_STATE]),
+    ));
+    let config = runtime_config(&temp);
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an app that crashes on start cannot wake");
+
+    assert_eq!(error.code(), "runtime_app_crashed", "{error}");
+    assert_eq!(stops_of(&runner.0).len(), 1, "the stop was attempted");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+}
+
+#[tokio::test]
+async fn reconciliation_keeps_sleeping_routes_only_while_their_container_exists() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let gone_project = "33333333-3333-4333-8333-333333333333";
+    let gone_deployment = "44444444-4444-4444-8444-444444444444";
+    let stopped_project = "55555555-5555-4555-8555-555555555555";
+    let stopped_deployment = "66666666-6666-4666-8666-666666666666";
+    let config = runtime_config(&temp);
+    let kept = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    write_route(
+        &config,
+        gone_project,
+        &sleeping_route(gone_project, gone_deployment),
+    );
+    // A serving route still needs a running container.
+    write_route(
+        &config,
+        stopped_project,
+        &format!(
+            "# Managed by sakala-agent for project {stopped_project} deployment {stopped_deployment}.\nx.run.sakala.localhost:80 {{}}\n"
+        ),
+    );
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "deadbeef\tExited (0) 2 minutes ago\t{PROJECT}\t{DEPLOYMENT}\nfeedface\tExited (0) 1 minute ago\t{stopped_project}\t{stopped_deployment}\n"
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation should complete");
+
+    let mut stale = report
+        .stale_routes
+        .iter()
+        .map(|route| {
+            (
+                route.project_id.to_string(),
+                route.deployment_id.map(|id| id.to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    stale.sort();
+    assert_eq!(
+        stale,
+        [
+            (gone_project.to_owned(), Some(gone_deployment.to_owned())),
+            (
+                stopped_project.to_owned(),
+                Some(stopped_deployment.to_owned())
+            ),
+        ]
+    );
+    assert!(kept.exists(), "discovery never deletes");
+}
+
+#[tokio::test]
+async fn approved_route_cleanup_removes_a_sleeping_route_without_its_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let gone_project = "33333333-3333-4333-8333-333333333333";
+    let config = runtime_config(&temp);
+    let kept = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let removed = write_route(
+        &config,
+        gone_project,
+        &sleeping_route(gone_project, "44444444-4444-4444-8444-444444444444"),
+    );
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "deadbeef\tExited (0) 2 minutes ago\t{PROJECT}\t{DEPLOYMENT}\n"
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let output = RuntimeExecutor::cleanup_runtime(
+        &executor,
+        CleanupRuntimeRequest {
+            command_id: Uuid::new_v4(),
+            approved: true,
+            targets: vec![RuntimeCleanupTarget::StaleRoutes],
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("route cleanup should complete");
+
+    assert_eq!(output.result["cleaned_routes"], 1);
+    assert!(kept.exists());
+    assert!(!removed.exists());
+}
+
+#[tokio::test]
+async fn stop_removes_the_sleeping_route_with_the_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(EXITED_WORKLOAD));
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop should remove a sleeping workload");
+
+    assert_eq!(output.result["status"], "stopped");
+    assert!(!route.exists());
+    assert!(command_position(&runner, |args| args.first().is_some_and(|a| a == "rm")).is_some());
+}
+
+#[tokio::test]
+async fn a_stale_stop_cannot_remove_a_newer_sleeping_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let newer = sleeping_route(PROJECT, "77777777-7777-4777-8777-777777777777");
+    let route = write_route(&config, PROJECT, &newer);
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    let output = RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stale stop stays idempotent");
+
+    assert_eq!(output.result["status"], "already_stopped");
+    assert_eq!(fs::read_to_string(route).expect("route"), newer);
+}
+
+#[tokio::test]
+async fn redeploy_replaces_a_sleeping_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let route = write_route(
+        &config,
+        PROJECT,
+        &sleeping_route(PROJECT, "77777777-7777-4777-8777-777777777777"),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("redeployment should complete");
+
+    let content = fs::read_to_string(route).expect("route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\n"
+        )),
+        "{content}"
+    );
+    assert!(content.contains("reverse_proxy"), "{content}");
+}
+
+/// Answers the router's request counter read; everything else goes to `FakeRunner`.
+struct CounterRunner {
+    inner: FakeRunner,
+    counters: Mutex<Option<String>>,
+}
+
+impl CounterRunner {
+    fn new(inner: FakeRunner, counters: Option<&str>) -> Self {
+        Self {
+            inner,
+            counters: Mutex::new(counters.map(str::to_owned)),
+        }
+    }
+
+    fn set(&self, counters: Option<&str>) {
+        *self.counters.lock().expect("counter lock") = counters.map(str::to_owned);
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for CounterRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        let args = string_arguments(spec);
+        if spec.program == "docker"
+            && args.first().is_some_and(|a| a == "exec")
+            && args.get(1).is_some_and(|a| a == "sakala-caddy")
+            && args.iter().any(|a| a.contains("127.0.0.1:2019/metrics"))
+        {
+            self.inner
+                .commands
+                .lock()
+                .expect("command lock")
+                .push(spec.clone());
+            return Ok(match &*self.counters.lock().expect("counter lock") {
+                Some(counters) => ProcessOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: counters.clone(),
+                    stderr: String::new(),
+                },
+                None => ProcessOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: "wget: can't connect to remote host (127.0.0.1): Connection refused"
+                        .to_owned(),
+                },
+            });
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
+const ROUTED_WORKLOADS: &str = "c1\tUp 3 minutes\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\tportfolio.run.sakala.localhost\nc2\tUp 1 minute\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\tquiet.run.sakala.localhost\n";
+
+#[tokio::test]
+async fn traffic_maps_router_counters_to_running_workloads() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(CounterRunner::new(
+        FakeRunner::new(true).with_docker_ps(ROUTED_WORKLOADS),
+        Some(concat!(
+            "caddy_http_requests_total{handler=\"subroute\",host=\"portfolio.run.sakala.localhost\",server=\"srv0\"} 3\n",
+            "caddy_http_requests_total{handler=\"subroute\",host=\"_other\",server=\"srv0\"} 9\n",
+            "caddy_http_requests_total{handler=\"subroute\",host=\"deleted.run.sakala.localhost\",server=\"srv0\"} 4\n",
+        )),
+    ));
+    let before_start = OffsetDateTime::now_utc();
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let after_start = OffsetDateTime::now_utc();
+
+    let traffic = RuntimeExecutor::workload_traffic(&executor)
+        .await
+        .expect("counters are readable");
+
+    // `quiet` has no request counted, and `deleted` has no running workload.
+    assert_eq!(traffic.len(), 1);
+    assert_eq!(traffic[0].project_id.to_string(), PROJECT);
+    assert_eq!(traffic[0].deployment_id.to_string(), DEPLOYMENT);
+    let first = traffic[0].last_request_at;
+    assert!(
+        before_start <= first && first <= after_start,
+        "the first read dates hosts at agent start, not never"
+    );
+
+    let unchanged = RuntimeExecutor::workload_traffic(&executor)
+        .await
+        .expect("counters are readable");
+    assert_eq!(unchanged[0].last_request_at, first);
+
+    runner.set(Some(concat!(
+        "caddy_http_requests_total{handler=\"subroute\",host=\"portfolio.run.sakala.localhost\",server=\"srv0\"} 4\n",
+        "caddy_http_requests_total{handler=\"subroute\",host=\"quiet.run.sakala.localhost\",server=\"srv0\"} 1\n",
+    )));
+    let visited = RuntimeExecutor::workload_traffic(&executor)
+        .await
+        .expect("counters are readable");
+    assert_eq!(visited.len(), 2);
+    assert!(visited.iter().all(|item| item.last_request_at > first));
+}
+
+#[tokio::test]
+async fn traffic_is_unknown_when_the_router_counters_say_nothing() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(CounterRunner::new(
+        FakeRunner::new(true).with_docker_ps(ROUTED_WORKLOADS),
+        None,
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    assert_eq!(RuntimeExecutor::workload_traffic(&executor).await, None);
+
+    // Readable, but without `metrics { per_host }`.
+    runner.set(Some(
+        "caddy_http_requests_total{handler=\"subroute\",server=\"srv0\"} 12\n",
+    ));
+    assert_eq!(RuntimeExecutor::workload_traffic(&executor).await, None);
+
+    // Readable, with per-host counters, but no request yet.
+    runner.set(Some(""));
+    assert_eq!(RuntimeExecutor::workload_traffic(&executor).await, None);
+
+    let read = runner
+        .inner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .find(|command| {
+            string_arguments(command)
+                .iter()
+                .any(|a| a.contains("2019/metrics"))
+        })
+        .map(string_arguments)
+        .expect("counter read");
+    assert_eq!(read[..4], ["exec", "sakala-caddy", "sh", "-c"]);
+}
+
 #[tokio::test]
 async fn restart_rechecks_readiness_and_revalidates_route() {
     let temp = TempDir::new().expect("temp directory should be available");

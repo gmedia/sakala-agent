@@ -4,6 +4,17 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- Dasar untuk idle sleep. Saat `SleepProject`, domain project kini menampilkan halaman "Proyek sedang dinyalakan" dengan HTTP 503, `Retry-After: 5`, dan `Cache-Control: no-store`, bukan 404 bawaan router. Halaman itu meminta `sakala-api` membangunkan project lewat `POST <SAKALA_API_URL>/api/v1/public/projects/<slug>/wake`, lalu memuat ulang sendiri setiap 3 detik. Route tidur memakai penanda kepemilikan `(sleeping)`, tetap dipertahankan selama container deployment-nya masih ada, dan dihapus oleh `StopProject`, redeploy, atau cleanup route basi bila containernya sudah hilang. Bila halaman tidak bisa dibangun, route dihapus seperti sebelumnya. Lihat [Caddy Integration](docs/CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
+- Heartbeat kini memuat `metadata.workloads.traffic`, yaitu kapan router terakhir melayani request untuk setiap workload yang berjalan, plus `detail_counts.traffic`. Nilainya dibaca dari counter `caddy_http_requests_total` milik Caddy runtime, yang membutuhkan `metrics { per_host }` di Caddyfile runtime. Restart Agent memberi setiap host waktu start Agent, bukan "tidak pernah", dan list dihilangkan saat counter tidak bisa dibaca. Field ini aditif di protocol revision 4; lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-idle-sleep).
+- Capability node `idle-sleep`, diiklankan hanya oleh driver `docker`.
+
+### Changed
+
+- `WakeProject` kini mengecek kapasitas node seperti deploy, di bawah lock admission yang sama. Node yang sudah menjalankan `SAKALA_MAX_ACTIVE_CONTAINERS` workload menolak wake dengan `runtime_capacity_exceeded`, dan halaman tidur tetap terpasang.
+- Wake yang sudah menjalankan container tetapi aplikasinya tidak ready, atau route-nya ditolak Caddy, kini menghentikan container itu lagi (`docker stop --time 10`) supaya tidak memakai slot kapasitas. Halaman tidur tetap terpasang, container, image, dan network tidak dihapus, dan command gagal dengan error aslinya; bila stop itu gagal, Agent mencatat peringatan di log operator.
+
 ## [0.6.0] - 2026-11-12
 
 ### Added

@@ -77,6 +77,17 @@ impl ProjectDomainSuffixes {
             && self.0.iter().any(|allowed| allowed == suffix)
             && canonical_hostname(domain)
     }
+
+    /// The project label of an accepted domain, `portfolio` for
+    /// `portfolio.run.sakala.dev`, which is the project's slug in the control
+    /// plane. `None` for a domain [`Self::accepts`] refuses.
+    #[must_use]
+    pub fn project_label<'a>(&self, domain: &'a str) -> Option<&'a str> {
+        if !self.accepts(domain) {
+            return None;
+        }
+        domain.split_once('.').map(|(label, _)| label)
+    }
 }
 
 impl fmt::Display for ProjectDomainSuffixes {
@@ -138,6 +149,27 @@ mod tests {
 
     fn custom() -> ProjectDomainSuffixes {
         ProjectDomainSuffixes::parse("run.example.ac.id").expect("valid suffix")
+    }
+
+    #[test]
+    fn the_project_label_is_the_slug_of_an_accepted_domain_only() {
+        let hosted = ProjectDomainSuffixes::default();
+
+        assert_eq!(
+            hosted.project_label("portfolio.run.sakala.dev"),
+            Some("portfolio")
+        );
+        assert_eq!(
+            custom().project_label("web-1.run.example.ac.id"),
+            Some("web-1")
+        );
+        for domain in [
+            "api.portfolio.run.sakala.dev",
+            "portfolio.example.com",
+            "Portfolio.run.sakala.dev",
+        ] {
+            assert_eq!(hosted.project_label(domain), None, "{domain}");
+        }
     }
 
     #[test]

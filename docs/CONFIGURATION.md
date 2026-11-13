@@ -7,7 +7,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_AGENT_MODE` | `local` | `local` atau `connected`. |
 | `SAKALA_AGENT_ID` | `local-agent-01` | Identitas node yang dikirim sebagai `X-Agent-Id`. |
 | `SAKALA_AGENT_TOKEN` | tidak ada | Bearer token; wajib dan bukan `change-me` pada connected mode. |
-| `SAKALA_API_URL` | `http://localhost:8000` | Base URL `sakala-api` control plane. |
+| `SAKALA_API_URL` | `http://localhost:8000` | Base URL `sakala-api` control plane. Halaman route tidur juga mengarahkan browser pengunjung ke endpoint wake di bawah URL ini, jadi pakai URL publik agar project bisa dibangunkan dari halamannya. |
 | `SAKALA_POLL_INTERVAL_SECONDS` | `3` | Interval polling command, harus lebih besar dari nol. |
 | `SAKALA_HEARTBEAT_INTERVAL_SECONDS` | `10` | Interval heartbeat, harus lebih besar dari nol. `sakala-api` menandai node `offline` dan berhenti menawarkan command bila tidak ada heartbeat selama `SAKALA_AGENT_OFFLINE_AFTER_SECONDS` (default API 60 detik); jangan mendekati batas itu tanpa koordinasi. |
 | `SAKALA_COMMAND_TIMEOUT_SECONDS` | `900` | Hard maximum node untuk deadline seluruh lifecycle command setelah claim; payload deployment boleh meminta nilai lebih pendek. |
@@ -33,7 +33,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_PROJECT_DOMAIN_SUFFIXES` | `run.sakala.localhost,run.staging.sakala.dev,run.sakala.dev` | Suffix domain yang boleh dipakai deployment, dipisah koma, misalnya `run.example.ac.id`. Domain diterima hanya bila berupa tepat satu label DNS ditambah salah satu suffix ini, seperti `portfolio.run.example.ac.id`. Isi dengan `SAKALA_PROJECT_DEFAULT_DOMAIN` milik `sakala-api`. Setiap suffix wajib huruf kecil, minimal dua label, tanpa wildcard, dan label internasional ditulis dalam bentuk `xn--`. Nilai yang tidak valid membuat Agent berhenti saat start. Kosong atau tidak diisi berarti tiga suffix default Sakala hosted. Lihat [Domain project](#domain-project). |
 | `SAKALA_BUILD_TIMEOUT_SECONDS` | `600` | Hard maximum node untuk fase build image; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_START_TIMEOUT_SECONDS` | `120` | Hard maximum node untuk start container dan health readiness; harus lebih pendek dari command timeout. |
-| `SAKALA_MAX_ACTIVE_CONTAINERS` | `20` | Guard kapasitas workload aktif pada node, bukan kuota plan/user. Redeploy project aktif tetap memperoleh replacement slot. |
+| `SAKALA_MAX_ACTIVE_CONTAINERS` | `20` | Guard kapasitas workload aktif pada node, bukan kuota plan/user. Redeploy project aktif tetap memperoleh replacement slot. `WakeProject` memakai guard yang sama, dan nilai ini juga menjadi batas item `workloads.traffic` di heartbeat. |
 | `SAKALA_DEFAULT_CONTAINER_MEMORY_MB` | `256` | Fallback memory bila command tidak menentukan nilai. |
 | `SAKALA_MAX_CONTAINER_MEMORY_MB` | `512` | Hard ceiling memory yang diizinkan node. |
 | `SAKALA_DEFAULT_CONTAINER_CPU_MILLIS` | `500` | Fallback CPU; `500` berarti `0.5` vCPU. |

@@ -81,3 +81,45 @@ impl CaddyReloader for DockerExecCaddyReloader {
             .await;
     }
 }
+
+/// Reads Caddy's request counters from its admin endpoint inside the router
+/// container, keeping only the request counter lines: the full output repeats
+/// every host in several histograms and would outgrow the captured output on a
+/// busy node. The address is an IP, not `localhost`, because BusyBox `wget`
+/// tries `::1` first and `admin localhost:2019` listens on `127.0.0.1` only. A
+/// failed read exits non-zero; a read without any counter line is empty.
+const CADDY_REQUEST_COUNTERS_SCRIPT: &str = "m=$(wget -qO- http://127.0.0.1:2019/metrics) || exit 1; \
+printf '%s\\n' \"$m\" | grep '^caddy_http_requests_total' || true";
+
+/// Reads Caddy's request counters through its local admin endpoint. The agent
+/// only reads them to judge idleness; it never serves or forwards them.
+pub struct DockerExecCaddyMetrics {
+    runner: Arc<dyn ProcessRunner>,
+    container: String,
+}
+
+impl DockerExecCaddyMetrics {
+    #[must_use]
+    pub fn new(runner: Arc<dyn ProcessRunner>, container: String) -> Self {
+        Self { runner, container }
+    }
+
+    /// The request counter lines of the router's Prometheus text exposition, or
+    /// an error that names only the exit status. The output is not logged.
+    pub async fn read(&self) -> Result<String, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("exec")
+            .arg(&self.container)
+            .arg("sh")
+            .arg("-c")
+            .arg(CADDY_REQUEST_COUNTERS_SCRIPT);
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Routing(format!(
+                "the router's request counters could not be read ({})",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+        Ok(output.stdout)
+    }
+}

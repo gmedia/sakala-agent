@@ -39,3 +39,19 @@ pub struct CrashedWorkloadDetail {
     /// Whether a process is running at this moment, between two crashes.
     pub running: bool,
 }
+
+/// One entry of `metadata.workloads.traffic`: when the router last served a
+/// request for a running managed workload, read from the router's own request
+/// counters.
+///
+/// The value is never earlier than the agent's start for a host the router had
+/// already counted at that moment, because counters cannot say when a request
+/// arrived before the agent first read them. A workload without any request
+/// counted by the router is not listed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkloadTraffic {
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_request_at: OffsetDateTime,
+}

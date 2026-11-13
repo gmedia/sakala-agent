@@ -5,6 +5,7 @@ use std::{
 
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION,
+    WorkloadTraffic,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -28,6 +29,9 @@ pub struct HeartbeatRuntimeContext {
     pub reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
     pub startup_reconciliation_at: OffsetDateTime,
     pub minimum_workspace_free_bytes: u64,
+    /// Bound of `workloads.traffic`, the node's `SAKALA_MAX_ACTIVE_CONTAINERS`:
+    /// at most that many workloads can be running and served at once.
+    pub max_traffic_items: usize,
 }
 
 pub async fn run(
@@ -70,6 +74,10 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         Err(_) => (NodeTelemetry::default(), false),
     };
     let workloads = workload_statistics(context.runtime.as_ref()).await;
+    let traffic = tokio::time::timeout(probe_timeout(), context.runtime.workload_traffic())
+        .await
+        .ok()
+        .flatten();
     let reconciliation = context
         .reconciliation
         .read()
@@ -167,6 +175,7 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         "runtime_dependencies": resources.runtime_dependencies,
     });
     insert_crashed_details(&mut metadata, workloads.crashed_details.as_deref());
+    insert_traffic(&mut metadata, traffic.as_deref(), context.max_traffic_items);
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
@@ -208,6 +217,22 @@ fn insert_crashed_details(metadata: &mut Value, details: Option<&[CrashedWorkloa
         serde_json::to_value(detail).unwrap_or(Value::Null)
     }));
     metadata["detail_counts"]["crashed_details"] = json!(details.len());
+}
+
+/// Adds the last request per workload only when the router's counters were read.
+/// An absent list means unknown, and the control plane must not read it as idle.
+/// A present list only ever moves activity forward: a workload missing from it
+/// has had no request counted since the router started, not "no request now".
+fn insert_traffic(metadata: &mut Value, traffic: Option<&[WorkloadTraffic]>, bound: usize) {
+    let Some(traffic) = traffic else { return };
+    metadata["workloads"]["traffic"] = Value::Array(
+        traffic
+            .iter()
+            .take(bound)
+            .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
+            .collect(),
+    );
+    metadata["detail_counts"]["traffic"] = json!(traffic.len());
 }
 
 fn bounded_values<T>(items: &[T], mapper: impl Fn(&T) -> Value) -> Vec<Value> {
@@ -322,7 +347,9 @@ mod tests {
         sync::{Arc, RwLock},
     };
 
-    use sakala_agent_protocol::{CrashedWorkloadDetail, NodeStatus, PROTOCOL_VERSION};
+    use sakala_agent_protocol::{
+        CrashedWorkloadDetail, NodeStatus, PROTOCOL_VERSION, WorkloadTraffic,
+    };
     use serde_json::json;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use uuid::Uuid;
@@ -398,6 +425,25 @@ mod tests {
         }
     }
 
+    struct TrafficRuntime {
+        traffic: Option<Vec<WorkloadTraffic>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for TrafficRuntime {
+        async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {
+            self.traffic.clone()
+        }
+    }
+
+    fn traffic_item(project_id: Uuid) -> WorkloadTraffic {
+        WorkloadTraffic {
+            project_id,
+            deployment_id: Uuid::new_v4(),
+            last_request_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
     struct FailedHealthRuntime;
 
     #[async_trait::async_trait]
@@ -436,6 +482,7 @@ mod tests {
             reconciliation: Arc::new(RwLock::new(reconciliation)),
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
+            max_traffic_items: 20,
         }
     }
 
@@ -459,6 +506,7 @@ mod tests {
             })),
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
+            max_traffic_items: 20,
         };
         let heartbeat = payload(&config, &context).await;
 
@@ -531,6 +579,7 @@ mod tests {
             orphans: vec![RuntimeOrphan {
                 container_id: "orphan-00".to_owned(),
                 project_id: Some(project_id),
+                deployment_id: None,
                 reason: "unmanaged".to_owned(),
             }],
             stale_routes: vec![RuntimeStaleRoute {
@@ -648,6 +697,7 @@ mod tests {
                 .map(|index| RuntimeOrphan {
                     container_id: format!("orphan-{index:02}"),
                     project_id: Some(project_id),
+                    deployment_id: None,
                     reason: "unmanaged".to_owned(),
                 })
                 .collect(),
@@ -838,6 +888,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_reports_the_last_request_of_each_served_workload() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let project_id = Uuid::new_v4();
+        let item = traffic_item(project_id);
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(TrafficRuntime {
+                    traffic: Some(vec![item.clone()]),
+                }),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            heartbeat.metadata["workloads"]["traffic"],
+            json!([{
+                "project_id": project_id,
+                "deployment_id": item.deployment_id,
+                "last_request_at": "1970-01-01T00:00:00Z",
+            }])
+        );
+        assert_eq!(
+            heartbeat.metadata["detail_counts"]["traffic"].as_u64(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn traffic_is_bounded_by_the_node_container_limit_and_keeps_the_count() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let projects = (0..7).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let mut context = heartbeat_context(
+            Arc::new(TrafficRuntime {
+                traffic: Some(projects.iter().copied().map(traffic_item).collect()),
+            }),
+            RuntimeReconciliationReport::default(),
+        );
+        context.max_traffic_items = 5;
+
+        let heartbeat = payload(&config, &context).await;
+
+        let traffic = heartbeat.metadata["workloads"]["traffic"]
+            .as_array()
+            .expect("traffic should be an array");
+        assert_eq!(traffic.len(), 5);
+        assert_eq!(traffic[0]["project_id"], projects[0].to_string());
+        assert_eq!(traffic[4]["project_id"], projects[4].to_string());
+        assert_eq!(
+            heartbeat.metadata["detail_counts"]["traffic"].as_u64(),
+            Some(7)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_traffic_omits_both_keys_and_known_silence_sends_an_empty_list() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let unknown = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        assert!(unknown.metadata["workloads"].get("traffic").is_none());
+        assert!(unknown.metadata["detail_counts"].get("traffic").is_none());
+
+        let silent = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(TrafficRuntime {
+                    traffic: Some(Vec::new()),
+                }),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        assert_eq!(silent.metadata["workloads"]["traffic"], json!([]));
+        assert_eq!(
+            silent.metadata["detail_counts"]["traffic"].as_u64(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
     async fn every_timestamp_on_the_wire_is_an_rfc3339_string() {
         // Typed fields such as `sent_at` declare the rfc3339 serializer, but
         // values inside the untyped metadata map fall back to `time`'s default
@@ -917,6 +1057,7 @@ mod tests {
             reconciliation: Arc::new(RwLock::new(RuntimeReconciliationReport::default())),
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
+            max_traffic_items: 20,
         };
 
         assert_eq!(
