@@ -4,6 +4,14 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- Payload `SleepProject` kini boleh membawa `page`, berisi `waking` (default) atau `unavailable`. Dengan `unavailable`, domain project menampilkan halaman statis "Proyek tidak tersedia" dengan HTTP 503, tanpa script, tanpa permintaan wake, tanpa muat ulang, dan tanpa `Retry-After`. API bisa memakainya untuk project yang di-suspend, yang sebelumnya ikut menampilkan "Proyek sedang dinyalakan" dan memuat ulang terus walaupun tidak akan pernah bangun. Route-nya memakai penanda `(sleeping)` yang sama, jadi `WakeProject`, `StopProject`, redeploy, dan cleanup route basi tidak berubah. Payload tanpa `page` berperilaku seperti sebelumnya, dan nilai yang tidak dikenal dibaca sebagai `waking` dengan peringatan di log, tanpa menolak sleep. Field ini aditif di protocol revision 4; lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v070).
+
+### Fixed
+
+- Halaman "Proyek sedang dinyalakan" tidak lagi memuat ulang tanpa henti. Sebelumnya, project yang tidak bisa bangun, misalnya karena batas container workspace penuh, membuat setiap tab pengunjung memuat ulang setiap 3 detik selamanya dan memanggil endpoint wake sekitar 20 kali per menit. Kini halaman meminta wake sekali per kunjungan, memuat ulang setiap 3 detik paling lama 2 menit (dihitung di `sessionStorage`), lalu menampilkan "Proyek belum bisa dinyalakan" dengan tombol "Coba lagi" yang mengirim satu permintaan wake lagi. Tanpa JavaScript atau bila `sessionStorage` diblokir, halaman memuat ulang setiap 15 detik, bukan 5 atau 3 detik. Lihat [Caddy Integration](docs/CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
+
 ## [0.7.0] - 2026-11-13
 
 ### Added

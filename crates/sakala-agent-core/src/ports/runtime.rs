@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
     DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
-    RuntimeCleanupTarget, WorkloadTraffic,
+    RuntimeCleanupTarget, SleepingPage, WorkloadTraffic,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -41,6 +41,9 @@ pub struct WorkloadLifecycleRequest {
     /// Only `StopProject` reads it: once the containers are gone, every image
     /// of the project is removed as well. Set when the project was deleted.
     pub remove_images: bool,
+    /// Only `SleepProject` reads it: the page the project's domain shows while
+    /// it sleeps.
+    pub sleeping_page: SleepingPage,
     pub cancellation: CancellationToken,
 }
 

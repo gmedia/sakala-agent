@@ -46,7 +46,7 @@ dapat drift dari deployment aktif.
 | --- | --- | --- |
 | `RestartProject` | Restart container aktif dengan graceful Docker stop timeout, tunggu readiness, lalu tulis dan validasi ulang route. | Workload yang sudah stopped menghasilkan `runtime_workload_not_running`; tidak membuat deployment baru. |
 | `StopProject` | Hapus route, stop lalu remove container. Image deployment tetap dipertahankan, kecuali payload membawa `remove_images: true`: setelah container hilang, semua image project yang tidak dipakai container lain ikut dihapus. | Bila container sudah tidak ada, route owned Agent tetap dinonaktifkan, image tetap dihapus bila diminta, dan command sukses idempoten. |
-| `SleepProject` | Stop container, lalu ganti route project dengan route tidur yang menjawab halaman "sedang dinyalakan" (HTTP 503). Container dan image tidak dihapus. | Container yang sudah stopped tetap sukses; container yang hilang menghasilkan drift/error karena tidak ada artifact untuk di-wake. |
+| `SleepProject` | Stop container, lalu ganti route project dengan route tidur (HTTP 503). Halamannya "Proyek sedang dinyalakan" secara default, atau "Proyek tidak tersedia" bila payload membawa `page: "unavailable"`. Container dan image tidak dihapus. | Container yang sudah stopped tetap sukses; container yang hilang menghasilkan drift/error karena tidak ada artifact untuk di-wake. |
 | `WakeProject` | Cek kapasitas node seperti deploy, start kembali container hasil sleep, tunggu readiness, lalu tulis route biasa di atas route tidur dari label domain/port. Node penuh menghasilkan `runtime_capacity_exceeded` dan route tidur tetap terpasang. | Container yang sudah running hanya merevalidasi readiness dan route. |
 | `HealthCheck` | Menginspeksi container managed dan mem-probe HTTP aplikasinya, lalu mengembalikan state running, ready, status Docker, reason aman, serta `error_code`. | Read-only. |
 | `RefreshRoute` | Menolak container yang tidak ready; kemudian membangun ulang route deterministik dari label domain/port dan menjalankan validate/reload Caddy. | Menulis konten route yang sama secara atomik; aman diulang. |
@@ -63,10 +63,15 @@ tidak membutuhkan checkout atau build.
 ### Sleep dan wake
 
 Route tidur memakai domain yang sama dengan route project dan penanda
-kepemilikan `... deployment <id> (sleeping).`. Halamannya meminta control plane
-membangunkan project lewat endpoint publik, lalu memuat ulang sendiri. Agent
-tidak membedakan sleep karena sepi dari suspend admin: keduanya `SleepProject`,
-dan untuk project yang di-suspend, API yang menolak permintaan wake. Bentuk
+kepemilikan `... deployment <id> (sleeping).`. Halaman default-nya meminta control
+plane membangunkan project lewat endpoint publik, lalu memuat ulang sendiri selama
+paling lama 2 menit sebelum menawarkan tombol "Coba lagi". Agent tidak tahu kenapa
+project ditidurkan: API yang memilih halamannya lewat field `page`. Untuk sleep karena
+sepi, API mengirim `waking` atau tidak mengirim apa pun. Untuk suspend admin, API
+mengirim `unavailable`, sehingga halamannya statis dan tidak pernah meminta wake. API
+tetap harus menolak permintaan wake untuk project yang di-suspend, karena node versi
+lama mengabaikan `page`. `WakeProject` memulihkan route biasa dari halaman mana pun;
+API yang memutuskan apakah wake boleh dikirim. Bentuk
 route, aturan escape, dan perilaku bila halaman tidak bisa dibangun ada di
 [Caddy Integration](CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
 

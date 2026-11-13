@@ -13,7 +13,7 @@ use sakala_agent_runtime::{
     CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, ProcessStream, RuntimeError,
     routing::{
         CaddyFileRouteManager, CaddyReloader, DockerExecCaddyReloader, KnownRoutes, RouteIdentity,
-        RouteManager, RouteSpec, SleepingRouteSpec, wake_url,
+        RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec, wake_url,
     },
 };
 use tempfile::TempDir;
@@ -226,12 +226,26 @@ async fn stale_route_discovery_only_reports_sakala_owned_routes_without_workload
     assert!(stale_path.exists(), "discovery must not delete route files");
 }
 
+fn waking_page() -> SleepingRoutePage {
+    SleepingRoutePage::Waking {
+        wake_url: wake_url("https://api.sakala.dev", "portfolio").expect("wake URL"),
+    }
+}
+
 fn sleeping(project_id: Uuid, deployment_id: Uuid) -> SleepingRouteSpec {
+    sleeping_with(project_id, deployment_id, waking_page())
+}
+
+fn sleeping_with(
+    project_id: Uuid,
+    deployment_id: Uuid,
+    page: SleepingRoutePage,
+) -> SleepingRouteSpec {
     SleepingRouteSpec {
         project_id,
         deployment_id,
         domain: "portfolio.run.sakala.localhost".to_owned(),
-        wake_url: wake_url("https://api.sakala.dev", "portfolio").expect("wake URL"),
+        page,
     }
 }
 
@@ -266,15 +280,32 @@ async fn a_refused_sleeping_route_puts_the_previous_route_back() {
 
 #[tokio::test]
 async fn sleeping_routes_follow_the_deployment_ownership_rules() {
+    for page in [waking_page(), SleepingRoutePage::Unavailable] {
+        assert_sleeping_route_ownership(page).await;
+    }
+}
+
+/// Both pages share the `(sleeping)` owner line, so they follow the same rules.
+async fn assert_sleeping_route_ownership(page: SleepingRoutePage) {
     let temp = TempDir::new().expect("temp directory should be available");
     let project_id = Uuid::new_v4();
     let deployment_id = Uuid::new_v4();
     let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
     let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
     manager
-        .activate_sleeping(&sleeping(project_id, deployment_id), &NoopReporter)
+        .activate_sleeping(
+            &sleeping_with(project_id, deployment_id, page),
+            &NoopReporter,
+        )
         .await
         .expect("sleeping route");
+    let content = tokio::fs::read_to_string(&route_path).await.expect("route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {project_id} deployment {deployment_id} (sleeping).\n"
+        )),
+        "{content}"
+    );
     let identity = RouteIdentity {
         project_id,
         deployment_id: Some(deployment_id),

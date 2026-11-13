@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use sakala_agent_protocol::{AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel};
+use sakala_agent_protocol::{
+    AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel, SleepingPage,
+};
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -115,9 +117,9 @@ impl CommandDispatcher {
                 self.runtime.stop_project(request, reporter).await
             }
             CommandType::SleepProject => {
-                self.runtime
-                    .sleep_project(lifecycle_request(command, cancellation)?, reporter)
-                    .await
+                let mut request = lifecycle_request(command, cancellation)?;
+                request.sleeping_page = sleeping_page(command);
+                self.runtime.sleep_project(request, reporter).await
             }
             CommandType::WakeProject => {
                 self.runtime
@@ -249,8 +251,26 @@ fn lifecycle_request(
         project_id,
         deployment_id,
         remove_images: false,
+        sleeping_page: SleepingPage::default(),
         cancellation,
     })
+}
+
+/// A payload this build does not understand still puts the project to sleep,
+/// with the waking page every revision-4 Agent shows, because refusing the
+/// sleep would keep an idle project running.
+fn sleeping_page(command: &AgentCommand) -> SleepingPage {
+    match command.sleep_project_payload() {
+        Ok(payload) => payload.page,
+        Err(error) => {
+            tracing::warn!(
+                command_id = %command.id,
+                %error,
+                "SleepProject payload is not understood; showing the waking page"
+            );
+            SleepingPage::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,7 +287,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRuntime {
         stops: Mutex<Vec<bool>>,
-        sleeps: Mutex<Vec<bool>>,
+        sleeps: Mutex<Vec<(bool, SleepingPage)>>,
     }
 
     #[async_trait]
@@ -289,7 +309,7 @@ mod tests {
             self.sleeps
                 .lock()
                 .expect("lock")
-                .push(request.remove_images);
+                .push((request.remove_images, request.sleeping_page));
             Ok(CommandOutput::empty())
         }
     }
@@ -358,7 +378,50 @@ mod tests {
         .expect_err("a malformed stop payload is rejected");
 
         assert_eq!(*runtime.stops.lock().expect("lock"), [false, false, true]);
-        assert_eq!(*runtime.sleeps.lock().expect("lock"), [false]);
+        assert_eq!(
+            *runtime.sleeps.lock().expect("lock"),
+            [(false, SleepingPage::Waking)]
+        );
         assert_eq!(error.code(), "invalid_runtime_command");
+    }
+
+    #[tokio::test]
+    async fn sleep_shows_the_requested_page_and_never_refuses_a_payload() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let dispatcher = CommandDispatcher::new(Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>);
+
+        for payload in [
+            Value::Null,
+            json!({}),
+            json!({ "page": "waking" }),
+            json!({ "page": "unavailable" }),
+            json!({ "page": "suspended" }),
+            json!({ "page": 1 }),
+            json!("unavailable"),
+        ] {
+            dispatch(&dispatcher, CommandType::SleepProject, payload)
+                .await
+                .expect("sleep");
+        }
+
+        let pages: Vec<_> = runtime
+            .sleeps
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, page)| *page)
+            .collect();
+        assert_eq!(
+            pages,
+            [
+                SleepingPage::Waking,
+                SleepingPage::Waking,
+                SleepingPage::Waking,
+                SleepingPage::Unavailable,
+                SleepingPage::Waking,
+                SleepingPage::Waking,
+                SleepingPage::Waking,
+            ]
+        );
     }
 }

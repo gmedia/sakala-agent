@@ -31,6 +31,7 @@ use sakala_agent_core::{
 };
 use sakala_agent_protocol::{
     AgentCommand, CrashedWorkloadDetail, DeploymentBuilder, LogBounds, RuntimeCleanupTarget,
+    SleepingPage,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -2199,6 +2200,7 @@ async fn deleting_a_project_removes_its_images_and_leaves_the_other_project_alon
                 project_id: deleted,
                 deployment_id: deleted_deployment,
                 remove_images: true,
+                sleeping_page: SleepingPage::Waking,
                 cancellation: CancellationToken::new(),
             },
             reporter,
@@ -2381,6 +2383,7 @@ impl Deployment {
             project_id: self.project_id,
             deployment_id: self.deployment_id,
             remove_images: false,
+            sleeping_page: SleepingPage::Waking,
             cancellation: CancellationToken::new(),
         }
     }

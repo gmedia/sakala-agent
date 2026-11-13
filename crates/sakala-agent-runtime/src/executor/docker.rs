@@ -15,7 +15,7 @@ use sakala_agent_core::ports::{
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
     DeploymentBuilder, DeploymentLog, InspectProjectPayload, LogBounds, LogStream,
-    ReconcileWorkloadAction, RuntimeCleanupTarget, WorkloadTraffic,
+    ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -39,8 +39,8 @@ use crate::{
     railpack::{RailpackSandbox, is_pinned_image},
     routing::{
         CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, KnownRoutes,
-        RouteIdentity, RouteManager, RouteSpec, SleepingRouteSpec, traffic::TrafficTracker,
-        wake_url,
+        RouteIdentity, RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec,
+        traffic::TrafficTracker, wake_url,
     },
     telemetry::NodeTelemetryCollector,
     workspace::{
@@ -829,7 +829,8 @@ impl DockerRuntimeExecutor {
             self.containers.remove(&workload).await?;
             self.release_network(workload.project_id).await;
         } else {
-            self.sleep_route(&workload, reporter.as_ref()).await?;
+            self.sleep_route(&workload, request.sleeping_page, reporter.as_ref())
+                .await?;
         }
         let remove_images = remove && request.remove_images;
         let event_type = if remove {
@@ -903,31 +904,37 @@ impl DockerRuntimeExecutor {
             .await
     }
 
-    /// Puts the sleeping page on the project's domain in place of its route. When
-    /// that page cannot be built or the router refuses it, the route is removed
-    /// as before idle sleep existed, so the project still sleeps; the operator
-    /// log says why its domain shows the router's 404 instead.
+    /// Puts the sleeping page the control plane asked for on the project's
+    /// domain in place of its route. When that page cannot be built or the
+    /// router refuses it, the route is removed as before idle sleep existed, so
+    /// the project still sleeps; the operator log says why its domain shows the
+    /// router's 404 instead.
     async fn sleep_route(
         &self,
         workload: &ManagedWorkload,
+        page: SleepingPage,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        let sleeping = self
-            .project_domains
-            .project_label(&workload.domain)
-            .ok_or_else(|| {
-                RuntimeError::InvalidCommand(
-                    "the workload's domain is not under an allowed project domain suffix"
-                        .to_owned(),
-                )
-            })
-            .and_then(|slug| wake_url(&self.api_url, slug))
-            .map(|wake_url| SleepingRouteSpec {
-                project_id: workload.project_id,
-                deployment_id: workload.deployment_id,
-                domain: workload.domain.clone(),
-                wake_url,
-            });
+        let page = match page {
+            SleepingPage::Waking => self
+                .project_domains
+                .project_label(&workload.domain)
+                .ok_or_else(|| {
+                    RuntimeError::InvalidCommand(
+                        "the workload's domain is not under an allowed project domain suffix"
+                            .to_owned(),
+                    )
+                })
+                .and_then(|slug| wake_url(&self.api_url, slug))
+                .map(|wake_url| SleepingRoutePage::Waking { wake_url }),
+            SleepingPage::Unavailable => Ok(SleepingRoutePage::Unavailable),
+        };
+        let sleeping = page.map(|page| SleepingRouteSpec {
+            project_id: workload.project_id,
+            deployment_id: workload.deployment_id,
+            domain: workload.domain.clone(),
+            page,
+        });
         let result = match sleeping {
             Ok(route) => self.routes.activate_sleeping(&route, reporter).await,
             Err(error) => Err(error),

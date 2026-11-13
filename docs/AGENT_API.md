@@ -185,7 +185,7 @@ Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
 mengirim nama Docker, domain, port, command shell, atau credential pada payload
 lifecycle.
 
-Satu-satunya pengecualian adalah `StopProject` untuk project yang dihapus. Payload-nya
+Ada dua pengecualian. Yang pertama `StopProject` untuk project yang dihapus. Payload-nya
 boleh membawa `remove_images: true` (boolean, opsional, default `false`):
 
 ```json
@@ -204,8 +204,42 @@ yang tidak dipakai container mana pun, berapa pun umurnya. Result menambah
 event `workload.images.retained`, dan image GC menghapusnya kemudian. Payload `{}`
 atau `null` tetap mempertahankan image, dan nilai yang bukan boolean ditolak dengan
 `invalid_runtime_command`. Agent versi lama mengabaikan field ini, jadi image project
-tersebut baru hilang lewat image GC. Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route
-refresh berada di [Command Lifecycle](COMMAND_LIFECYCLE.md).
+tersebut baru hilang lewat image GC.
+
+Yang kedua `SleepProject`. Payload-nya boleh membawa `page`, yaitu halaman yang
+ditampilkan domain project selama tidur. Field ini string, opsional, dan bukan
+`null` bila dikirim:
+
+| Nilai | Arti |
+| --- | --- |
+| `waking` | Default bila `page` tidak ada. Halaman "Proyek sedang dinyalakan" meminta API membangunkan project lewat endpoint wake publik pada pemuatan pertama sebuah kunjungan, lalu memuat ulang sendiri setiap 3 detik selama paling lama 2 menit. Setelah itu halaman berhenti memuat ulang dan menawarkan tombol "Coba lagi". Dipakai untuk sleep karena sepi. |
+| `unavailable` | Halaman statis "Proyek tidak tersedia" tanpa script, tanpa permintaan wake, dan tanpa muat ulang. Dipakai untuk project yang tidak boleh bangun saat dikunjungi, misalnya yang di-suspend. Halaman ini tidak menyebut alasannya. |
+
+```json
+{
+  "type": "SleepProject",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": { "page": "unavailable" }
+}
+```
+
+Contoh lengkapnya ada di `examples/commands/sleep-project-unavailable.json`. Payload
+`{}` atau `null` menampilkan halaman `waking`, sama seperti sebelum field ini ada.
+Agent tidak pernah menolak `SleepProject` karena payload-nya: nilai `page` yang tidak
+dikenal, `page: null`, atau payload yang bukan object dibaca sebagai `waking` dan
+dicatat sebagai peringatan di log operator, karena menolak sleep berarti project yang
+sepi tetap berjalan. Keduanya menjawab HTTP 503 dengan `Cache-Control: no-store` dan
+`X-Robots-Tag: noindex`; hanya `waking` yang mengirim `Retry-After: 5`. Keduanya
+memakai penanda kepemilikan route `(sleeping)` yang sama, jadi `WakeProject`,
+`StopProject`, redeploy, dan cleanup route basi memperlakukannya sama. `WakeProject`
+tetap menulis route biasa di atas halaman `unavailable`; API yang memutuskan apakah
+sebuah wake boleh dikirim. API hanya boleh mengirim `page` ke node yang mengiklankan
+capability `idle-sleep`. Agent v0.7.0 mengiklankan capability itu tetapi belum
+membaca `page`, sehingga tetap menampilkan halaman `waking`.
+
+Semantik lengkap `Stop` versus `Sleep`, hasil health, dan route refresh berada di
+[Command Lifecycle](COMMAND_LIFECYCLE.md).
 
 `DrainNode` dan `ResumeNode` adalah command node-level. Keduanya memakai
 `project_id: null`, `deployment_id: null`, dan payload `{}`. Saat draining atau
