@@ -22,7 +22,7 @@ use sakala_agent_core::{
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, CrashedWorkloadDetail, DeploymentEvent,
     DeploymentLog, DesiredWorkloadState, LogBounds, LogStream, ReconcileWorkloadAction,
-    RuntimeCleanupTarget,
+    RuntimeCleanupTarget, SleepingPage,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -2128,7 +2128,7 @@ async fn sleep_puts_the_sleeping_page_on_the_project_domain() {
         "{content}"
     );
     assert!(content.contains(
-        "fetch(\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\""
+        "const wakeUrl=\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\";"
     ));
     // The page goes up once the container is stopped, through the same
     // validate-and-reload as any route.
@@ -2207,6 +2207,173 @@ async fn wake_replaces_the_sleeping_page_with_the_serving_route() {
     let started = command_position(&runner, |args| args.first().is_some_and(|a| a == "start"))
         .expect("docker start");
     assert!(capacity < started);
+}
+
+fn sleep_request(page: SleepingPage) -> WorkloadLifecycleRequest {
+    WorkloadLifecycleRequest {
+        sleeping_page: page,
+        ..lifecycle_request()
+    }
+}
+
+const RUNNING_WORKLOAD: &str = "sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n";
+
+/// Puts the project to sleep with `page` through the executor, as a
+/// `SleepProject` would, and returns the route file it wrote.
+async fn sleep_with_page(config: &DockerRuntimeConfig, page: SleepingPage) -> std::path::PathBuf {
+    let route = write_route(
+        config,
+        PROJECT,
+        &format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy app:3000\n}}\n"
+        ),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(
+        config.clone(),
+        Arc::new(FakeRunner::new(true).with_docker_ps(RUNNING_WORKLOAD)),
+    );
+    let output = RuntimeExecutor::sleep_project(
+        &executor,
+        sleep_request(page),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep should succeed");
+    assert_eq!(output.result["status"], "sleeping");
+    route
+}
+
+#[tokio::test]
+async fn sleep_can_put_the_unavailable_page_on_the_project_domain() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut config = runtime_config(&temp);
+    // The unavailable page asks nobody to wake the project, so it needs no
+    // wake URL and goes up even where a waking page could not be built.
+    config.api_url = "not a URL".to_owned();
+
+    let route = sleep_with_page(&config, SleepingPage::Unavailable).await;
+
+    let content = fs::read_to_string(&route).expect("the unavailable page replaces the route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT} (sleeping).\nportfolio.run.sakala.localhost:80 {{\n"
+        )),
+        "{content}"
+    );
+    assert!(
+        content.contains("\t\t<h1>Proyek tidak tersedia</h1>\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("\t\tCache-Control \"no-store\"\n"),
+        "{content}"
+    );
+    assert!(
+        content.contains("\t\tX-Robots-Tag \"noindex\"\n"),
+        "{content}"
+    );
+    assert!(
+        content.ends_with("\t\tSAKALA_SLEEPING_PAGE 503\n}\n"),
+        "{content}"
+    );
+    for active in ["Retry-After", "<script", "fetch", "reload", "reverse_proxy"] {
+        assert!(!content.contains(active), "{active} in {content}");
+    }
+}
+
+#[tokio::test]
+async fn sleep_without_a_page_still_shows_the_waking_page() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+
+    let route = sleep_with_page(&config, SleepingPage::default()).await;
+
+    let content = fs::read_to_string(&route).expect("route");
+    assert!(
+        content.contains("\t\t<title>Proyek sedang dinyalakan</title>\n"),
+        "{content}"
+    );
+    assert!(content.contains("\t\tRetry-After \"5\"\n"), "{content}");
+}
+
+#[tokio::test]
+async fn wake_replaces_the_unavailable_page_with_the_serving_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let route = sleep_with_page(&config, SleepingPage::Unavailable).await;
+    let executor = DockerRuntimeExecutor::with_runner(
+        config,
+        Arc::new(FakeRunner::new(true).with_docker_ps(EXITED_WORKLOAD)),
+    );
+
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("the control plane decided the project may wake");
+
+    let content = fs::read_to_string(&route).expect("route");
+    assert!(
+        content.starts_with(&format!(
+            "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy sakala-app-"
+        )),
+        "{content}"
+    );
+    assert!(!content.contains("Proyek tidak tersedia"), "{content}");
+}
+
+#[tokio::test]
+async fn both_sleeping_pages_stay_while_their_container_exists_and_are_cleaned_after() {
+    for page in [SleepingPage::Waking, SleepingPage::Unavailable] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let config = runtime_config(&temp);
+        let route = sleep_with_page(&config, page).await;
+
+        let stopped = DockerRuntimeExecutor::with_runner(
+            config.clone(),
+            Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+                "deadbeef\tExited (0) 2 minutes ago\t{PROJECT}\t{DEPLOYMENT}\n"
+            ))),
+        );
+        let report = RuntimeExecutor::reconcile(&stopped)
+            .await
+            .expect("reconciliation should complete");
+        assert!(report.stale_routes.is_empty(), "{page:?}");
+
+        let gone = DockerRuntimeExecutor::with_runner(
+            config,
+            Arc::new(FakeRunner::new(true).with_docker_ps(
+                "feedface\tExited (0) 1 minute ago\t55555555-5555-4555-8555-555555555555\t66666666-6666-4666-8666-666666666666\n",
+            )),
+        );
+        let report = RuntimeExecutor::reconcile(&gone)
+            .await
+            .expect("reconciliation should complete");
+        assert_eq!(report.stale_routes.len(), 1, "{page:?}");
+        assert_eq!(
+            report.stale_routes[0]
+                .deployment_id
+                .map(|id| id.to_string()),
+            Some(DEPLOYMENT.to_owned())
+        );
+        assert!(route.exists(), "discovery never deletes");
+        let output = RuntimeExecutor::cleanup_runtime(
+            &gone,
+            CleanupRuntimeRequest {
+                command_id: Uuid::new_v4(),
+                approved: true,
+                targets: vec![RuntimeCleanupTarget::StaleRoutes],
+                cancellation: CancellationToken::new(),
+            },
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect("route cleanup should complete");
+        assert_eq!(output.result["cleaned_routes"], 1, "{page:?}");
+        assert!(!route.exists(), "{page:?}");
+    }
 }
 
 #[tokio::test]
@@ -5942,6 +6109,7 @@ fn lifecycle_request() -> WorkloadLifecycleRequest {
         deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
             .expect("deployment UUID"),
         remove_images: false,
+        sleeping_page: SleepingPage::Waking,
         cancellation: CancellationToken::new(),
     }
 }

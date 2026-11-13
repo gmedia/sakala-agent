@@ -1,6 +1,6 @@
 use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
-    FinalizationDeferredReason, HeartbeatPayload, WorkloadTraffic,
+    FinalizationDeferredReason, HeartbeatPayload, SleepingPage, WorkloadTraffic,
 };
 
 #[test]
@@ -40,6 +40,25 @@ fn api_lifecycle_fixtures_identify_one_managed_workload() {
         assert!(command.deployment_id.is_some());
         assert_eq!(command.payload, serde_json::json!({}));
     }
+}
+
+#[test]
+fn api_sleep_fixture_asks_for_the_unavailable_page() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/sleep-project-unavailable.json"
+    ))
+    .expect("API SleepProject fixture must deserialize");
+
+    assert_eq!(command.command_type, CommandType::SleepProject);
+    assert!(command.project_id.is_some());
+    assert!(command.deployment_id.is_some());
+    assert_eq!(
+        command
+            .sleep_project_payload()
+            .expect("SleepProject payload must be valid")
+            .page,
+        SleepingPage::Unavailable
+    );
 }
 
 #[test]

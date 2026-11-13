@@ -13,7 +13,7 @@ pub(crate) mod traffic;
 
 pub use caddy_file::CaddyFileRouteManager;
 pub use docker_exec::{DockerExecCaddyMetrics, DockerExecCaddyReloader};
-pub use sleeping_page::{SleepingRouteSpec, wake_url};
+pub use sleeping_page::{SleepingRoutePage, SleepingRouteSpec, wake_url};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RouteIdentity {
@@ -57,8 +57,9 @@ pub trait RouteManager: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    /// Replaces the project's route with a page that says the project is waking
-    /// up and asks the control plane to wake it. Validated and reloaded like
+    /// Replaces the project's route with a sleeping page: one that says the
+    /// project is waking up and asks the control plane to wake it, or one that
+    /// says it is not available. Validated and reloaded like
     /// [`RouteManager::activate`], and restored when the router refuses it.
     async fn activate_sleeping(
         &self,

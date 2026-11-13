@@ -19,7 +19,9 @@ use sakala_agent_core::{
     ports::{RuntimeExecutionError, RuntimeExecutor, WorkloadLifecycleRequest},
     scheduler::metrics::SchedulerMetrics,
 };
-use sakala_agent_protocol::{AppliedRuntimeResources, DeploymentEvent, DeploymentLog, LogBounds};
+use sakala_agent_protocol::{
+    AppliedRuntimeResources, DeploymentEvent, DeploymentLog, LogBounds, SleepingPage,
+};
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
     ProcessRunner, ResourceSafetyConfig, RuntimeError, TokioProcessRunner,
@@ -412,6 +414,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
         project_id: project.id,
         deployment_id: project.deployment,
         remove_images: false,
+        sleeping_page: SleepingPage::Waking,
         cancellation: CancellationToken::new(),
     };
     let output = executor

@@ -51,6 +51,26 @@ pub struct StopProjectPayload {
     pub remove_images: bool,
 }
 
+/// The page a sleeping project's domain shows.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SleepingPage {
+    /// "Proyek sedang dinyalakan": asks the control plane to wake the project
+    /// and reloads until it is back. Sleep for idleness.
+    #[default]
+    Waking,
+    /// "Proyek tidak tersedia": a static page that never asks to wake. For a
+    /// project that will not wake on a visit, such as a suspended one.
+    Unavailable,
+}
+
+/// Optional payload of `SleepProject`. An empty object shows the waking page.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SleepProjectPayload {
+    #[serde(default)]
+    pub page: SleepingPage,
+}
+
 /// Operation requested by the control plane for execution on a runtime node.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -108,6 +128,16 @@ impl AgentCommand {
         }
         serde_json::from_value(self.payload.clone())
     }
+
+    /// A missing or `null` payload reads as an empty object. An unknown `page`
+    /// is an error here; the dispatcher falls back to the waking page instead
+    /// of refusing the sleep.
+    pub fn sleep_project_payload(&self) -> Result<SleepProjectPayload, serde_json::Error> {
+        if self.payload.is_null() {
+            return Ok(SleepProjectPayload::default());
+        }
+        serde_json::from_value(self.payload.clone())
+    }
 }
 
 /// Response of the control-plane polling endpoint.
@@ -134,9 +164,13 @@ mod tests {
     use super::*;
 
     fn stop(payload: Value) -> AgentCommand {
+        command(CommandType::StopProject, payload)
+    }
+
+    fn command(command_type: CommandType, payload: Value) -> AgentCommand {
         AgentCommand {
             id: Uuid::nil(),
-            command_type: CommandType::StopProject,
+            command_type,
             status: CommandStatus::Pending,
             project_id: Some(Uuid::nil()),
             deployment_id: Some(Uuid::nil()),
@@ -164,6 +198,47 @@ mod tests {
             stop(json!({ "remove_images": "yes" }))
                 .stop_project_payload()
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn sleep_shows_the_waking_page_unless_the_control_plane_asks_otherwise() {
+        let page = |payload: Value| {
+            command(CommandType::SleepProject, payload)
+                .sleep_project_payload()
+                .map(|payload| payload.page)
+        };
+        for payload in [
+            Value::Null,
+            json!({}),
+            json!({ "page": "waking" }),
+            json!({ "remove_images": true }),
+        ] {
+            assert_eq!(page(payload).expect("payload"), SleepingPage::Waking);
+        }
+        assert_eq!(
+            page(json!({ "page": "unavailable" })).expect("payload"),
+            SleepingPage::Unavailable
+        );
+        for payload in [
+            json!({ "page": "suspended" }),
+            json!({ "page": "Unavailable" }),
+            json!({ "page": 1 }),
+            json!({ "page": null }),
+            json!("unavailable"),
+        ] {
+            assert!(page(payload.clone()).is_err(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn the_sleeping_page_has_a_snake_case_wire_name() {
+        assert_eq!(
+            serde_json::to_value(SleepProjectPayload {
+                page: SleepingPage::Unavailable
+            })
+            .expect("serialize"),
+            json!({ "page": "unavailable" })
         );
     }
 }

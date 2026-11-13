@@ -137,6 +137,15 @@ else works as before. The admin endpoint stays on the container's loopback; the
 Agent reads it through `docker exec` at `127.0.0.1:2019`. See
 [Caddy Integration](CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
 
+## Revision 4 additions after v0.7.0
+
+Still revision 4, and either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `SleepProject` payload field `page` | Honoured. | Optional string, `waking` (default) or `unavailable`. `unavailable` installs a static 503 page, "Proyek tidak tersedia", with no script, no wake request, no reload, and no `Retry-After`; the API should send it when a visit must not wake the project, such as on suspension. The Agent never refuses a sleep over this field: an unknown value, `null`, or a non-object payload reads as `waking` and is logged as a warning. Example in `examples/commands/sleep-project-unavailable.json`; semantics in [Sakala Agent API](AGENT_API.md#workload-lifecycle-commands). The API should only send `page` to nodes that advertise `idle-sleep`. Agent v0.7.0 advertises that capability but ignores `page` and shows the waking page, so a suspended project on a v0.7.0 node still shows "Proyek sedang dinyalakan" until the node is upgraded. |
+| Waking page stops reloading | Behaviour change. | The page now asks to wake the project once per visit (counted in the browser's `sessionStorage`), reloads every 3 seconds for at most 2 minutes, then shows "Proyek belum bisa dinyalakan" with a "Coba lagi" button that sends one more wake request and starts another round. Without JavaScript, or when `sessionStorage` is blocked, it reloads every 15 seconds without a cap. Each open tab now calls the public wake endpoint once per visit and once per click on "Coba lagi", instead of every 3 seconds. |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

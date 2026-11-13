@@ -59,13 +59,21 @@ portfolio.run.sakala.dev:80 {
 }
 ```
 
-Halaman itu menjawab HTTP 503 dan berisi teks "Proyek sedang dinyalakan". Script kecil di dalamnya mengirim `POST <SAKALA_API_URL>/api/v1/public/projects/<slug>/wake` sekali per pemuatan dengan `mode: 'no-cors'`, tanpa membaca jawabannya, lalu memuat ulang halaman setelah 3 detik. Tanpa JavaScript, `<noscript>` memuat ulang setiap 5 detik tetapi tidak membangunkan project. `<slug>` adalah label domain sebelum suffix project, yang di `sakala-api` sama dengan slug project. Karena browser pengunjung yang memanggil endpoint itu, `SAKALA_API_URL` harus URL publik. Pada instalasi yang memakai URL internal, halaman tetap tampil tetapi tidak bisa membangunkan project.
+Isi halamannya dipilih lewat field `page` pada payload `SleepProject` (lihat [Sakala Agent API](AGENT_API.md#workload-lifecycle-commands)). Keduanya menjawab HTTP 503 dengan `Cache-Control: no-store` dan `X-Robots-Tag: noindex`, dan keduanya memakai penanda `(sleeping)` yang sama.
 
-Domain dan URL wake dibatasi ke karakter yang tidak punya arti di Caddyfile, heredoc, placeholder Caddy (`{...}`), HTML, maupun string JavaScript. Bila halaman tidak bisa dibangun, misalnya `SAKALA_API_URL` tidak valid, atau Caddy menolak route tidur, Agent menghapus route seperti sebelum fitur ini ada dan mencatat alasannya di log operator. Sleep tetap sukses.
+Halaman `waking`, default-nya, berisi teks "Proyek sedang dinyalakan" dan mengirim `Retry-After: 5`. Script kecil di dalamnya mengirim `POST <SAKALA_API_URL>/api/v1/public/projects/<slug>/wake` dengan `mode: 'no-cors'`, tanpa membaca jawabannya, hanya pada pemuatan pertama sebuah kunjungan. Setelah itu halaman memuat ulang sendiri setiap 3 detik, paling banyak 40 kali (2 menit). Jumlah muat ulang disimpan di `sessionStorage` tab itu, di kunci `sakala-wake-reloads` dan `sakala-wake-last-load`. Bila project belum juga bangun, halaman berhenti dan menampilkan "Proyek belum bisa dinyalakan" dengan tombol "Coba lagi". Tombol itu mengirim satu permintaan wake lagi dan memulai putaran baru. Pemuatan yang datang lebih dari 60 detik setelah pemuatan sebelumnya dianggap kunjungan baru, jadi membuka lagi project itu nanti di tab yang sama tetap membangunkannya.
+
+Bila `sessionStorage` diblokir browser, jumlah muat ulang tidak bisa dihitung, jadi halaman memuat ulang lebih lambat, setiap 15 detik tanpa batas, dan hanya meminta wake pada navigasi yang bukan reload. Tanpa JavaScript, `<noscript>` juga memuat ulang setiap 15 detik tanpa batas, karena batas tidak bisa ditegakkan tanpa script, dan tidak membangunkan project.
+
+`<slug>` adalah label domain sebelum suffix project, yang di `sakala-api` sama dengan slug project. Karena browser pengunjung yang memanggil endpoint itu, `SAKALA_API_URL` harus URL publik. Pada instalasi yang memakai URL internal, halaman tetap tampil tetapi tidak bisa membangunkan project.
+
+Halaman `unavailable` berisi teks "Proyek tidak tersedia" dan "Proyek ini sedang tidak tersedia.", tanpa script, tanpa permintaan wake, tanpa muat ulang, dan tanpa `Retry-After`. API memakainya untuk project yang tidak boleh bangun saat dikunjungi, misalnya yang di-suspend. Halaman ini tidak butuh URL wake, jadi tetap bisa dipasang walaupun `SAKALA_API_URL` tidak bisa dipakai untuk halaman `waking`.
+
+Domain dan URL wake dibatasi ke karakter yang tidak punya arti di Caddyfile, heredoc, placeholder Caddy (`{...}`), HTML, maupun string JavaScript. Teks dan waktu halaman adalah konstanta di `crates/sakala-agent-runtime/src/routing/sleeping_page.rs`, bukan input. Bila halaman tidak bisa dibangun, misalnya `SAKALA_API_URL` tidak valid untuk halaman `waking`, atau Caddy menolak route tidur, Agent menghapus route seperti sebelum fitur ini ada dan mencatat alasannya di log operator. Sleep tetap sukses.
 
 Route tidur ikut aturan kepemilikan yang sama dengan route biasa:
 
-- `WakeProject` menulis route biasa di atas route tidur lewat rename atomik yang sama, lalu validate dan reload. Bila Caddy menolaknya, route tidur dipulihkan.
+- `WakeProject` menulis route biasa di atas route tidur, halaman mana pun yang terpasang, lewat rename atomik yang sama, lalu validate dan reload. Bila Caddy menolaknya, route tidur dipulihkan.
 - `StopProject` dan redeploy menghapus atau menimpa route tidur. Command untuk deployment lain tidak menyentuhnya.
 - Discovery route basi menganggap route tidur masih dipakai selama container deployment-nya masih ada dalam status apa pun, biasanya `exited`. Route tidur yang containernya sudah hilang dianggap basi. Route biasa tetap butuh container yang berjalan.
 

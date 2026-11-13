@@ -1,5 +1,5 @@
 //! Proves a sleeping route against a real Caddy: Caddy accepts the generated
-//! file, answers the project's domain with the sleeping page, and counts the
+//! file for both pages, answers the project's domain with them, and counts the
 //! visit per host where the agent reads it. A route Caddy refused would break
 //! the reload of every project on the node, so a unit test is not enough.
 //!
@@ -21,7 +21,7 @@ use sakala_agent_runtime::{
     DockerRuntimeConfig, DockerRuntimeExecutor, TokioProcessRunner,
     routing::{
         CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, RouteIdentity,
-        RouteManager, RouteSpec, SleepingRouteSpec, wake_url,
+        RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec, wake_url,
     },
 };
 use tempfile::TempDir;
@@ -197,7 +197,9 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         project_id,
         deployment_id,
         domain: DOMAIN.to_owned(),
-        wake_url: wake_url("https://api.staging.sakala.dev", "portfolio").expect("wake URL"),
+        page: SleepingRoutePage::Waking {
+            wake_url: wake_url("https://api.staging.sakala.dev", "portfolio").expect("wake URL"),
+        },
     };
     routes
         .activate_sleeping(&route, &NoopReporter)
@@ -229,7 +231,18 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
     assert!(body.ends_with("</html>"), "{body}");
     assert!(body.contains("<title>Proyek sedang dinyalakan</title>"));
     assert!(body.contains(
-        "fetch(\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\",{method:\"POST\",mode:\"no-cors\",keepalive:true}).catch(()=>0);"
+        "const wakeUrl=\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\";"
+    ));
+    assert!(body.contains(
+        "fetch(wakeUrl,{method:\"POST\",mode:\"no-cors\",keepalive:true}).catch(()=>0);"
+    ));
+    // Caddy left the script's blocks alone: none of them is a placeholder.
+    assert!(
+        body.contains("const reloadMs=3000,maxReloads=40,slowReloadMs=15000,visitGapMs=60000;")
+    );
+    assert!(body.contains("if(reloads<maxReloads){reloadIn(reloadMs);return;}"));
+    assert!(body.contains(
+        "const read=(key)=>{try{return sessionStorage.getItem(key);}catch(error){return null;}};"
     ));
     assert!(body.contains(
         "body{display:flex;align-items:center;justify-content:center;background:#08413D;"
@@ -283,6 +296,88 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         .activate_sleeping(&route, &NoopReporter)
         .await
         .expect("sleeping route again");
+    assert!(
+        routes
+            .deactivate(
+                RouteIdentity {
+                    project_id,
+                    deployment_id: Some(deployment_id),
+                },
+                &NoopReporter,
+            )
+            .await
+            .expect("deactivation")
+    );
+    assert!(request(DOMAIN).starts_with("HTTP/1.0 404"));
+
+    // A suspended project gets the unavailable page through the same route
+    // mechanism: Caddy accepts it, and it answers a static 503.
+    let unavailable = SleepingRouteSpec {
+        page: SleepingRoutePage::Unavailable,
+        ..route.clone()
+    };
+    routes
+        .activate_sleeping(&unavailable, &NoopReporter)
+        .await
+        .expect("Caddy should validate and load the unavailable route");
+    let file =
+        std::fs::read_to_string(sites.join(format!("{project_id}.Caddyfile"))).expect("route file");
+    println!("\n--- unavailable route\n{file}");
+    assert!(file.starts_with(&format!(
+        "# Managed by sakala-agent for project {project_id} deployment {deployment_id} (sleeping).\n"
+    )));
+    let response = request(DOMAIN);
+    println!("--- response\n{response}");
+    let (head, body) = response.split_once("\r\n\r\n").expect("headers and body");
+    assert!(head.starts_with("HTTP/1.0 503"), "{head}");
+    for header in [
+        "Cache-Control: no-store",
+        "Content-Type: text/html; charset=utf-8",
+        "X-Robots-Tag: noindex",
+    ] {
+        assert!(
+            head.lines().any(|line| line == header),
+            "{header} in {head}"
+        );
+    }
+    assert!(
+        !head.lines().any(|line| line.starts_with("Retry-After")),
+        "{head}"
+    );
+    assert!(
+        body.contains("<title>Proyek tidak tersedia</title>"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<p>Proyek ini sedang tidak tersedia.</p>"),
+        "{body}"
+    );
+    for active in ["<script", "<noscript", "fetch", "reload"] {
+        assert!(!body.contains(active), "{active} in {body}");
+    }
+    assert!(!body.contains('\t'), "the heredoc indentation is stripped");
+
+    // Wake swaps the unavailable page for the serving route like any other.
+    routes
+        .activate(
+            &RouteSpec {
+                project_id,
+                deployment_id,
+                domain: DOMAIN.to_owned(),
+                upstream: APP.to_owned(),
+                port: 3000,
+            },
+            &NoopReporter,
+        )
+        .await
+        .expect("Caddy should accept the serving route over the unavailable one");
+    assert!(!request(DOMAIN).starts_with("HTTP/1.0 503"));
+
+    // And StopProject removes it.
+    routes
+        .activate_sleeping(&unavailable, &NoopReporter)
+        .await
+        .expect("unavailable route again");
     assert!(
         routes
             .deactivate(
