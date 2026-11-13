@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-13
+
 ### Added
 
 - Dasar untuk idle sleep. Saat `SleepProject`, domain project kini menampilkan halaman "Proyek sedang dinyalakan" dengan HTTP 503, `Retry-After: 5`, dan `Cache-Control: no-store`, bukan 404 bawaan router. Halaman itu meminta `sakala-api` membangunkan project lewat `POST <SAKALA_API_URL>/api/v1/public/projects/<slug>/wake`, lalu memuat ulang sendiri setiap 3 detik. Route tidur memakai penanda kepemilikan `(sleeping)`, tetap dipertahankan selama container deployment-nya masih ada, dan dihapus oleh `StopProject`, redeploy, atau cleanup route basi bila containernya sudah hilang. Bila halaman tidak bisa dibangun, route dihapus seperti sebelumnya. Lihat [Caddy Integration](docs/CADDY_INTEGRATION.md#route-tidur-dan-counter-request).
@@ -191,7 +193,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gmedia/sakala-agent/compare/v0.3.0...v0.4.0

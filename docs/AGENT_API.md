@@ -573,7 +573,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "idle-sleep"
   ],
   "metadata": {
-    "version": "0.6.0",
+    "version": "0.7.0",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
