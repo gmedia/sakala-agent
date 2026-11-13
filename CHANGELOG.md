@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-13
+
 ### Added
 
 - Payload `SleepProject` kini boleh membawa `page`, berisi `waking` (default) atau `unavailable`. Dengan `unavailable`, domain project menampilkan halaman statis "Proyek tidak tersedia" dengan HTTP 503, tanpa script, tanpa permintaan wake, tanpa muat ulang, dan tanpa `Retry-After`. API bisa memakainya untuk project yang di-suspend, yang sebelumnya ikut menampilkan "Proyek sedang dinyalakan" dan memuat ulang terus walaupun tidak akan pernah bangun. Route-nya memakai penanda `(sleeping)` yang sama, jadi `WakeProject`, `StopProject`, redeploy, dan cleanup route basi tidak berubah. Payload tanpa `page` berperilaku seperti sebelumnya, dan nilai yang tidak dikenal dibaca sebagai `waking` dengan peringatan di log, tanpa menolak sleep. Field ini aditif di protocol revision 4; lihat [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-after-v070).
@@ -201,7 +203,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/gmedia/sakala-agent/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/gmedia/sakala-agent/compare/v0.4.0...v0.5.0
