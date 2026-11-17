@@ -26,7 +26,7 @@ use sakala_agent_protocol::{
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
-    ProcessRunner, ProcessStream, RuntimeError,
+    ProcessRunner, ProcessStream, ProjectDomainSuffixes, RuntimeError,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -144,7 +144,7 @@ async fn docker_preflight_checks_required_runtime_dependencies() {
     assert!(
         domains
             .detail
-            .contains("run.sakala.localhost, run.staging.sakala.dev, run.sakala.dev"),
+            .contains(&ProjectDomainSuffixes::default().to_string()),
         "{}",
         domains.detail
     );

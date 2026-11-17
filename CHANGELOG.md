@@ -4,6 +4,11 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Changed
+
+- Default `SAKALA_PROJECT_DOMAIN_SUFFIXES` kini `run.sakala.localhost`, `staging.sakala.app`, dan `sakala.app`, sesuai domain project Sakala hosted yang pindah ke registrable domain terpisah (ADR-016): production `<slug>.sakala.app`, staging `<slug>.staging.sakala.app`. `run.staging.sakala.dev` dan `run.sakala.dev` tidak lagi diterima tanpa konfigurasi, jadi deploy dengan domain lama ditolak dengan `invalid_runtime_command`. Instalasi yang mengisi `SAKALA_PROJECT_DOMAIN_SUFFIXES` sendiri tidak terpengaruh. Aturan satu label tetap: node yang hanya memakai `sakala.app` menolak `x.staging.sakala.app`.
+- Setelah domain project dipindah di `sakala-api` (`projects:move-domain`), setiap project harus dideploy ulang, termasuk yang sedang tidur. `WakeProject` dan `RestartProject` membangun route dari label `dev.sakala.domain` di container, bukan dari payload baru, jadi container lama tetap memakai domain lama sampai dideploy ulang. Bila container dengan domain yang tidak lagi diizinkan ditidurkan, Agent tidak bisa membuat halaman bangun untuknya dan menghapus route-nya. Lihat [Domain project](docs/CONFIGURATION.md#domain-project).
+
 ## [0.7.1] - 2026-11-13
 
 ### Added

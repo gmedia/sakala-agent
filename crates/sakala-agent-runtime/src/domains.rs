@@ -9,12 +9,11 @@ use std::fmt;
 
 use url::Host;
 
-/// Suffixes hosted Sakala routes, kept when the operator names none.
-pub const DEFAULT_PROJECT_DOMAIN_SUFFIXES: [&str; 3] = [
-    "run.sakala.localhost",
-    "run.staging.sakala.dev",
-    "run.sakala.dev",
-];
+/// Suffixes hosted Sakala routes, kept when the operator names none: local
+/// development, hosted staging, and hosted production. Projects live on a
+/// registrable domain apart from the API and console (ADR-016).
+pub const DEFAULT_PROJECT_DOMAIN_SUFFIXES: [&str; 3] =
+    ["run.sakala.localhost", "staging.sakala.app", "sakala.app"];
 
 /// RFC 1035 section 2.3.4: a label holds at most 63 octets and a name at most
 /// 255 octets on the wire, which is 253 characters in dotted text form.
@@ -79,8 +78,9 @@ impl ProjectDomainSuffixes {
     }
 
     /// The project label of an accepted domain, `portfolio` for
-    /// `portfolio.run.sakala.dev`, which is the project's slug in the control
-    /// plane. `None` for a domain [`Self::accepts`] refuses.
+    /// `portfolio.sakala.app` or `portfolio.staging.sakala.app`, which is the
+    /// project's slug in the control plane. `None` for a domain
+    /// [`Self::accepts`] refuses.
     #[must_use]
     pub fn project_label<'a>(&self, domain: &'a str) -> Option<&'a str> {
         if !self.accepts(domain) {
@@ -156,7 +156,7 @@ mod tests {
         let hosted = ProjectDomainSuffixes::default();
 
         assert_eq!(
-            hosted.project_label("portfolio.run.sakala.dev"),
+            hosted.project_label("portfolio.sakala.app"),
             Some("portfolio")
         );
         assert_eq!(
@@ -164,9 +164,9 @@ mod tests {
             Some("web-1")
         );
         for domain in [
-            "api.portfolio.run.sakala.dev",
+            "api.portfolio.sakala.app",
             "portfolio.example.com",
-            "Portfolio.run.sakala.dev",
+            "Portfolio.sakala.app",
         ] {
             assert_eq!(hosted.project_label(domain), None, "{domain}");
         }
@@ -179,11 +179,11 @@ mod tests {
         assert_eq!(suffixes.as_slice(), DEFAULT_PROJECT_DOMAIN_SUFFIXES);
         for domain in [
             "portfolio.run.sakala.localhost",
-            "portfolio.run.staging.sakala.dev",
-            "portfolio.run.sakala.dev",
-            "a.run.sakala.dev",
-            "app-2.run.sakala.dev",
-            "2fa.run.sakala.dev",
+            "portfolio.staging.sakala.app",
+            "portfolio.sakala.app",
+            "a.sakala.app",
+            "app-2.sakala.app",
+            "2fa.sakala.app",
         ] {
             assert!(suffixes.accepts(domain), "{domain}");
         }
@@ -194,25 +194,50 @@ mod tests {
         let suffixes = ProjectDomainSuffixes::default();
 
         for domain in [
+            // The addresses before ADR-016 are switched off, not kept.
+            "portfolio.run.sakala.dev",
+            "portfolio.run.staging.sakala.dev",
             "portfolio.staging.sakala.dev",
             "portfolio.run.example.test",
-            "run.sakala.dev",
-            ".run.sakala.dev",
-            "portfolio..run.sakala.dev",
-            "portfolio.run.sakala.dev.",
-            "portfolio.run.sakala.dev.evil.test",
-            "evilrun.sakala.dev",
-            "Portfolio.run.sakala.dev",
-            "portfolio.RUN.sakala.dev",
-            "-app.run.sakala.dev",
-            "app-.run.sakala.dev",
-            "my_app.run.sakala.dev",
-            "app.run.sakala.dev:443",
-            "app.run.sakala.dev {\n}",
-            "*.run.sakala.dev",
+            "sakala.app",
+            ".sakala.app",
+            "portfolio..sakala.app",
+            "portfolio.sakala.app.",
+            "portfolio.sakala.app.evil.test",
+            "evilsakala.app",
+            "Portfolio.sakala.app",
+            "portfolio.SAKALA.app",
+            "-app.sakala.app",
+            "app-.sakala.app",
+            "my_app.sakala.app",
+            "app.sakala.app:443",
+            "app.sakala.app {\n}",
+            "*.sakala.app",
             "",
         ] {
             assert!(!suffixes.accepts(domain), "{domain:?}");
+        }
+    }
+
+    #[test]
+    fn a_staging_node_reads_the_slug_under_the_staging_suffix() {
+        let staging = ProjectDomainSuffixes::parse("staging.sakala.app").expect("valid suffix");
+
+        assert_eq!(
+            staging.project_label("portfolio.staging.sakala.app"),
+            Some("portfolio")
+        );
+        assert_eq!(staging.project_label("portfolio.sakala.app"), None);
+    }
+
+    #[test]
+    fn a_production_node_does_not_take_staging_projects_as_its_own() {
+        let production = ProjectDomainSuffixes::parse("sakala.app").expect("valid suffix");
+
+        assert!(production.accepts("portfolio.sakala.app"));
+        for domain in ["portfolio.staging.sakala.app", "x.staging.sakala.app"] {
+            assert!(!production.accepts(domain), "{domain}");
+            assert_eq!(production.project_label(domain), None, "{domain}");
         }
     }
 
@@ -221,7 +246,7 @@ mod tests {
         let suffixes = custom();
 
         assert!(suffixes.accepts("portfolio.run.example.ac.id"));
-        assert!(!suffixes.accepts("portfolio.run.sakala.dev"));
+        assert!(!suffixes.accepts("portfolio.sakala.app"));
         assert!(!suffixes.accepts("portfolio.example.ac.id"));
     }
 
@@ -246,7 +271,7 @@ mod tests {
 
         assert!(!suffixes.accepts("a.b.run.example.ac.id"));
         assert!(!suffixes.accepts("api.portfolio.run.example.ac.id"));
-        assert!(!ProjectDomainSuffixes::default().accepts("a.portfolio.run.sakala.dev"));
+        assert!(!ProjectDomainSuffixes::default().accepts("a.portfolio.sakala.app"));
     }
 
     #[test]
@@ -318,7 +343,7 @@ mod tests {
         assert!(!suffixes.accepts("münchen.run.xn--bcher-kva.example"));
         // An xn-- label that does not decode is not a hostname.
         assert!(!suffixes.accepts("xn--a.run.xn--bcher-kva.example"));
-        assert!(!ProjectDomainSuffixes::default().accepts("xn--a.run.sakala.dev"));
-        assert!(ProjectDomainSuffixes::default().accepts("xn--mnchen-3ya.run.sakala.dev"));
+        assert!(!ProjectDomainSuffixes::default().accepts("xn--a.sakala.app"));
+        assert!(ProjectDomainSuffixes::default().accepts("xn--mnchen-3ya.sakala.app"));
     }
 }
