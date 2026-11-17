@@ -1,6 +1,6 @@
 # Caddy Integration
 
-Agent menulis satu file `<project-id>.Caddyfile` pada `SAKALA_CADDY_SITES_DIR`. Domain hanya diterima bila berupa satu label di bawah suffix pada `SAKALA_PROJECT_DOMAIN_SUFFIXES` (default `run.sakala.localhost`, `run.staging.sakala.dev`, dan `run.sakala.dev`; lihat [Domain project](CONFIGURATION.md#domain-project)); upstream selalu candidate container terkelola dan port tervalidasi.
+Agent menulis satu file `<project-id>.Caddyfile` pada `SAKALA_CADDY_SITES_DIR`. Domain hanya diterima bila berupa satu label di bawah suffix pada `SAKALA_PROJECT_DOMAIN_SUFFIXES` (default `run.sakala.localhost`, `staging.sakala.app`, dan `sakala.app`; lihat [Domain project](CONFIGURATION.md#domain-project)); upstream selalu candidate container terkelola dan port tervalidasi.
 
 ```txt
 write temporary file
@@ -32,7 +32,7 @@ Untuk pilot yang memakai implementasi sekarang:
 Caddy host juga dapat dipertahankan sebagai outer edge statis:
 
 ```caddyfile
-http://*.run.sakala.dev {
+http://*.sakala.app {
 	reverse_proxy 127.0.0.1:8080
 }
 ```
@@ -45,7 +45,7 @@ Saat `SleepProject`, Agent tidak menghapus file route project, tetapi menggantin
 
 ```caddyfile
 # Managed by sakala-agent for project <project-id> deployment <deployment-id> (sleeping).
-portfolio.run.sakala.dev:80 {
+portfolio.sakala.app:80 {
 	header {
 		Content-Type "text/html; charset=utf-8"
 		Cache-Control "no-store"

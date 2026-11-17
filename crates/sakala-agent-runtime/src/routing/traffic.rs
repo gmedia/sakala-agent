@@ -224,49 +224,46 @@ mod tests {
         let text = r#"
 # HELP caddy_http_requests_total Counter of HTTP(S) requests made.
 # TYPE caddy_http_requests_total counter
-caddy_http_requests_total{handler="subroute",host="portfolio.run.sakala.dev",server="srv0"} 4
-caddy_http_requests_total{handler="reverse_proxy",host="portfolio.run.sakala.dev",server="srv0"} 1e+06
-caddy_http_requests_total{server="srv1",host="portfolio.run.sakala.dev"} 2 1700000000000
-caddy_http_requests_total_created{host="portfolio.run.sakala.dev"} 1.7e+09
-caddy_http_request_duration_seconds_count{host="portfolio.run.sakala.dev"} 99
+caddy_http_requests_total{handler="subroute",host="portfolio.sakala.app",server="srv0"} 4
+caddy_http_requests_total{handler="reverse_proxy",host="portfolio.sakala.app",server="srv0"} 1e+06
+caddy_http_requests_total{server="srv1",host="portfolio.sakala.app"} 2 1700000000000
+caddy_http_requests_total_created{host="portfolio.sakala.app"} 1.7e+09
+caddy_http_request_duration_seconds_count{host="portfolio.sakala.app"} 99
 "#;
 
         let totals = request_totals_by_host(text).expect("per-host counters");
 
-        assert_eq!(totals["portfolio.run.sakala.dev"], 1_000_006);
+        assert_eq!(totals["portfolio.sakala.app"], 1_000_006);
         assert_eq!(totals.len(), 1);
     }
 
     #[test]
     fn reads_escaped_label_values_and_normalizes_the_host() {
         let text = concat!(
-            r#"caddy_http_requests_total{handler="a\"b\\c\nd",host="Shop.Run.Sakala.Dev.:80",server="srv0"} 3"#,
+            r#"caddy_http_requests_total{handler="a\"b\\c\nd",host="Shop.Sakala.App.:80",server="srv0"} 3"#,
             "\n",
         );
 
         let totals = request_totals_by_host(text).expect("per-host counters");
 
-        assert_eq!(totals["shop.run.sakala.dev"], 3);
+        assert_eq!(totals["shop.sakala.app"], 3);
     }
 
     #[test]
     fn skips_lines_it_cannot_read_without_losing_the_others() {
         let text = r#"
-caddy_http_requests_total{host="broken.run.sakala.dev" 5
-caddy_http_requests_total{host="unterminated.run.sakala.dev} 5
-caddy_http_requests_total{host="negative.run.sakala.dev"} -1
-caddy_http_requests_total{host="fraction.run.sakala.dev"} 1.5
-caddy_http_requests_total{host="nan.run.sakala.dev"} NaN
-caddy_http_requests_total{host="infinite.run.sakala.dev"} +Inf
-caddy_http_requests_total{host="good.run.sakala.dev"} 7
+caddy_http_requests_total{host="broken.sakala.app" 5
+caddy_http_requests_total{host="unterminated.sakala.app} 5
+caddy_http_requests_total{host="negative.sakala.app"} -1
+caddy_http_requests_total{host="fraction.sakala.app"} 1.5
+caddy_http_requests_total{host="nan.sakala.app"} NaN
+caddy_http_requests_total{host="infinite.sakala.app"} +Inf
+caddy_http_requests_total{host="good.sakala.app"} 7
 "#;
 
         let totals = request_totals_by_host(text).expect("per-host counters");
 
-        assert_eq!(
-            totals,
-            HashMap::from([("good.run.sakala.dev".to_owned(), 7)])
-        );
+        assert_eq!(totals, HashMap::from([("good.sakala.app".to_owned(), 7)]));
     }
 
     #[test]
@@ -291,10 +288,9 @@ caddy_http_requests_total{host="good.run.sakala.dev"} 7
     fn first_read_dates_every_host_at_agent_start_instead_of_never() {
         let mut tracker = TrafficTracker::new(at(100));
 
-        let observed =
-            tracker.observe(HashMap::from([("a.run.sakala.dev".to_owned(), 5)]), at(160));
+        let observed = tracker.observe(HashMap::from([("a.sakala.app".to_owned(), 5)]), at(160));
 
-        assert_eq!(observed["a.run.sakala.dev"], at(100));
+        assert_eq!(observed["a.sakala.app"], at(100));
     }
 
     #[test]
@@ -302,39 +298,39 @@ caddy_http_requests_total{host="good.run.sakala.dev"} 7
         let mut tracker = TrafficTracker::new(at(100));
         tracker.observe(
             HashMap::from([
-                ("busy.run.sakala.dev".to_owned(), 5),
-                ("quiet.run.sakala.dev".to_owned(), 9),
-                ("restarted.run.sakala.dev".to_owned(), 40),
+                ("busy.sakala.app".to_owned(), 5),
+                ("quiet.sakala.app".to_owned(), 9),
+                ("restarted.sakala.app".to_owned(), 40),
             ]),
             at(110),
         );
 
         let observed = tracker.observe(
             HashMap::from([
-                ("busy.run.sakala.dev".to_owned(), 6),
-                ("quiet.run.sakala.dev".to_owned(), 9),
+                ("busy.sakala.app".to_owned(), 6),
+                ("quiet.sakala.app".to_owned(), 9),
                 // The router restarted and counted from zero again.
-                ("restarted.run.sakala.dev".to_owned(), 2),
+                ("restarted.sakala.app".to_owned(), 2),
                 // First request since the agent started counting.
-                ("new.run.sakala.dev".to_owned(), 1),
+                ("new.sakala.app".to_owned(), 1),
             ]),
             at(120),
         );
 
-        assert_eq!(observed["busy.run.sakala.dev"], at(120));
-        assert_eq!(observed["quiet.run.sakala.dev"], at(100));
-        assert_eq!(observed["restarted.run.sakala.dev"], at(120));
-        assert_eq!(observed["new.run.sakala.dev"], at(120));
+        assert_eq!(observed["busy.sakala.app"], at(120));
+        assert_eq!(observed["quiet.sakala.app"], at(100));
+        assert_eq!(observed["restarted.sakala.app"], at(120));
+        assert_eq!(observed["new.sakala.app"], at(120));
 
         let observed = tracker.observe(
             HashMap::from([
-                ("busy.run.sakala.dev".to_owned(), 6),
-                ("quiet.run.sakala.dev".to_owned(), 9),
+                ("busy.sakala.app".to_owned(), 6),
+                ("quiet.sakala.app".to_owned(), 9),
             ]),
             at(130),
         );
-        assert_eq!(observed["busy.run.sakala.dev"], at(120));
-        assert_eq!(observed["quiet.run.sakala.dev"], at(100));
-        assert!(!observed.contains_key("restarted.run.sakala.dev"));
+        assert_eq!(observed["busy.sakala.app"], at(120));
+        assert_eq!(observed["quiet.sakala.app"], at(100));
+        assert!(!observed.contains_key("restarted.sakala.app"));
     }
 }

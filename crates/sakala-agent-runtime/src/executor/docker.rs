@@ -1894,7 +1894,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "repository_url": "https://github.com/gmedia/example-app.git",
             "commit_sha": "0123456789abcdef0123456789abcdef01234567",
-            "domain": "portfolio.run.staging.sakala.dev",
+            "domain": "portfolio.staging.sakala.app",
             "container_port": 3000,
         }))
         .expect("deploy payload")
@@ -1917,19 +1917,16 @@ mod tests {
 
     #[test]
     fn rejects_domains_outside_runtime_zones() {
+        let allowed = format!("allowed suffix ({})", ProjectDomainSuffixes::default());
         for domain in [
-            "portfolio.staging.sakala.dev",
+            "portfolio.run.sakala.dev",
+            "portfolio.run.staging.sakala.dev",
             "portfolio.run.example.test",
-            "api.portfolio.run.sakala.dev",
+            "api.portfolio.sakala.app",
         ] {
             let error = validate(&with_domain(domain)).expect_err(domain);
             assert_eq!(error.code(), "invalid_runtime_command");
-            assert!(
-                error.to_string().contains(
-                    "allowed suffix (run.sakala.localhost, run.staging.sakala.dev, run.sakala.dev)"
-                ),
-                "{error}"
-            );
+            assert!(error.to_string().contains(&allowed), "{error}");
         }
     }
 

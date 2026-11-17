@@ -412,11 +412,11 @@ mod tests {
 
     #[test]
     fn the_waking_block_answers_503_with_retry_after_and_no_store() {
-        let block = site_block(&route("portfolio.run.sakala.dev", waking(WAKE))).expect("block");
+        let block = site_block(&route("portfolio.sakala.app", waking(WAKE))).expect("block");
 
         assert!(
             block.starts_with(
-                "portfolio.run.sakala.dev:80 {\n\
+                "portfolio.sakala.app:80 {\n\
                  \theader {\n\
                  \t\tContent-Type \"text/html; charset=utf-8\"\n\
                  \t\tCache-Control \"no-store\"\n\
@@ -445,14 +445,14 @@ mod tests {
     #[test]
     fn the_unavailable_block_answers_a_static_503_without_retry_after() {
         let block = site_block(&route(
-            "portfolio.run.sakala.dev",
+            "portfolio.sakala.app",
             SleepingRoutePage::Unavailable,
         ))
         .expect("block");
 
         assert!(
             block.starts_with(
-                "portfolio.run.sakala.dev:80 {\n\
+                "portfolio.sakala.app:80 {\n\
                  \theader {\n\
                  \t\tContent-Type \"text/html; charset=utf-8\"\n\
                  \t\tCache-Control \"no-store\"\n\
@@ -563,8 +563,8 @@ mod tests {
     fn refuses_a_domain_that_could_break_the_route() {
         for domain in [
             "",
-            "Portfolio.run.sakala.dev",
-            "a.run.sakala.dev {",
+            "Portfolio.sakala.app",
+            "a.sakala.app {",
             "a\nb",
             "{env.X}",
         ] {
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn refuses_a_wake_url_that_is_not_safe_in_the_page() {
         let error = site_block(&route(
-            "portfolio.run.sakala.dev",
+            "portfolio.sakala.app",
             waking("https://api.sakala.dev/it's"),
         ))
         .expect_err("a quote cannot reach the script");
