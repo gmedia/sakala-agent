@@ -9,7 +9,7 @@
 # in step with SAKALA_RAILPACK_FRONTEND, and the mise version in step with
 # core/mise/version.txt of that Railpack release. Both checksums come from the
 # upstream release (checksums.txt and SHASUMS256.txt). x86_64 only.
-FROM alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
 
 ARG RAILPACK_VERSION=v0.23.0
 ARG RAILPACK_SHA256=e8bffc181c13e68c1c78ec618f1418e60b1602ec548f3ec1054996394ce0f06a
