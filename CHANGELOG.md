@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Security
+
+- `quinn-udp` 0.5.14 → 0.5.16 (transitive) to fix RUSTSEC-2026-0538, which had turned the scheduled security audit red since 2026-11-16.
+
 ## [0.7.1] - 2026-11-13
 
 ### Added
