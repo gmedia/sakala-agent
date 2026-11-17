@@ -169,6 +169,39 @@ repository.
 
 `sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
+### Replika
+
+Payload `DeployProject` boleh membawa `replicas`, yaitu jumlah container yang melayani
+deployment itu di node yang sama. Router Caddy node membagi request ke semua replika.
+Contohnya ada di `examples/commands/deploy-project-replicas.json`.
+
+| Nilai | Perilaku Agent |
+| --- | --- |
+| Tidak ada atau `null` | Satu replika, sama seperti sebelum field ini ada. |
+| Bilangan bulat 1 sampai batas node | Sebanyak itu replika. |
+| Di atas batas node | Deploy gagal dengan `runtime_replicas_exceeded` sebelum checkout. Agent tidak diam-diam menjalankan lebih sedikit. |
+| Nilai lain: `0`, angka negatif, pecahan, string seperti `"3"`, atau tipe lain | Satu replika, dan Agent mencatat peringatan di log operator. Deploy tidak pernah ditolak karena nilai yang tidak terbaca. |
+
+Batas node berasal dari `SAKALA_MAX_REPLICAS_PER_PROJECT` (default 4) dan dikirim di
+setiap heartbeat sebagai `metadata.workloads.maximum_replicas_per_project`. API hanya
+boleh mengirim `replicas` di atas 1 ke node yang mengiklankan capability `replicas`;
+Agent lama mengabaikan field ini dan menjalankan satu container.
+
+Setiap replika adalah container sendiri dengan image, environment, resource, dan label
+yang sama, plus label `dev.sakala.replica` (indeks, mulai 0) dan `dev.sakala.replicas`
+(jumlah). Deployment satu replika memakai nama container yang sama seperti Agent
+sebelumnya, `sakala-app-<project8>-<deployment-id>`; deployment beberapa replika
+menambahkan `-r<indeks>`. `resources` berlaku per replika, dan setiap replika dihitung
+terhadap `SAKALA_MAX_ACTIVE_CONTAINERS`.
+
+Deploy berjalan bergulir: Agent menyalakan semua replika baru, menunggu setiap replika
+menjawab HTTP dalam satu batas `start_timeout_seconds`, lalu mengganti route ke set baru
+dalam satu rename atomik, baru kemudian menghentikan set lama. Bila satu replika saja
+gagal ready, deploy gagal, semua replika baru dihapus, output replika yang gagal
+dikirim sebagai log, dan route lama tetap melayani. Aplikasi dengan replika harus
+stateless: file atau sesi yang disimpan di disk satu container tidak terlihat oleh
+replika lain.
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -609,7 +642,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "railpack-info",
     "railpack-build",
     "caddy-file-routing",
-    "idle-sleep"
+    "idle-sleep",
+    "replicas"
   ],
   "metadata": {
     "version": "0.7.1",
@@ -641,6 +675,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "starting": 0,
       "unhealthy": 0,
       "stopped": 1,
+      "maximum_replicas_per_project": 4,
       "unhealthy_details": [],
       "crashed_details": [],
       "traffic": [
@@ -764,6 +799,11 @@ Cara membaca list ini:
   seperti itu; `workloads.unhealthy` juga `null` pada kondisi ini.
 - **Candidate yang sedang gagal bisa ikut muncul** sampai cleanup selesai. API
   harus mencocokkan `deployment_id` dengan deployment aktif project.
+- **Deployment dengan beberapa replika** hanya masuk list bila semua replikanya yang
+  sedang berjalan crash, dan hanya sekali, dengan data replika yang terakhir berhenti.
+  Selama satu replika masih melayani, deployment itu tidak dianggap crash; replika
+  yang crash terlihat sebagai `ready` yang lebih kecil dari `desired` di
+  [`workloads.replicas`](#replika-workload).
 - Workload berstatus `restarting` juga muncul di `unhealthy_details`, karena
   keduanya menjawab pertanyaan berbeda. Jangan menjumlahkan keduanya. Workload
   crash berulang yang sedang `running` hanya muncul di `crashed_details`.
@@ -843,6 +883,56 @@ Satu heartbeat menambah satu `docker exec` ke container Caddy dan satu listing
 `docker ps`. Pembacaan dibatasi 2 detik, dan kegagalannya hanya menghilangkan list
 ini, tidak mengubah `status` node.
 
+### Replika workload
+
+Node dengan capability `replicas` mengirim `workloads.replicas`, yaitu berapa replika
+yang sehat untuk setiap deployment berjalan yang punya lebih dari satu replika. Field
+ini opsional, aditif pada revision 4, dan contoh heartbeat lengkapnya ada di
+`examples/heartbeat/workload-replicas.json`:
+
+```json
+{
+  "workloads": {
+    "maximum_replicas_per_project": 4,
+    "replicas": [
+      {
+        "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+        "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+        "desired": 3,
+        "ready": 2
+      }
+    ]
+  },
+  "detail_counts": { "replicas": 1 }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `project_id` | UUID, wajib | Project pemilik deployment, dari label container. |
+| `deployment_id` | UUID, wajib | Deployment yang dihitung. Saat deploy bergulir, set lama dan baru bisa sama-sama muncul; API mencocokkannya dengan deployment aktif project. |
+| `desired` | integer, wajib, minimal 2 | Jumlah replika saat deployment dijalankan, dari label `dev.sakala.replicas`. |
+| `ready` | integer, wajib, 0 sampai `desired` | Replika yang menurut Docker sedang berjalan dan tidak `unhealthy`. Ini bukan probe HTTP: replika yang crash berulang bisa sebentar terhitung di antara dua crash. |
+
+Cara membaca list ini:
+
+- **Deployment satu replika tidak masuk list**, karena container tunggalnya sudah
+  terwakili di `unhealthy_details` dan `crashed_details`.
+- **Project yang sedang tidur tidak masuk list**, karena tidak ada replikanya yang
+  berjalan. Deployment yang semua replikanya `exited` juga tidak muncul.
+- **List yang tidak hadir** (`replicas` dan `detail_counts.replicas` sama-sama hilang)
+  berarti tidak ada deployment beberapa replika yang berjalan, atau snapshot kesehatan
+  gagal. API tidak boleh mengubah angka replika yang tersimpan dari heartbeat seperti
+  itu.
+- **`ready` di atas 0** berarti deployment masih melayani. Router berhenti mengirim
+  request ke replika yang tidak bisa dihubungi selama 10 detik, lalu mencobanya lagi.
+- `maximum_replicas_per_project` selalu dikirim; `null` berarti driver node tidak
+  mendukung replika.
+
+List dibatasi `SAKALA_MAX_ACTIVE_CONTAINERS` item seperti `traffic`, dan
+`detail_counts.replicas` menyimpan jumlah asli. Angkanya dihitung dari listing
+`docker ps` yang sama dengan `unhealthy_details`, tanpa query tambahan.
+
 `startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
 bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara
 eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
@@ -850,8 +940,8 @@ hasil command reconciliation eksplisit.
 
 Collection detail yang berpotensi membesar (`unhealthy_details`,
 `crashed_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
-`compatibility_issues`) dibatasi maksimal 50 item per heartbeat. `traffic` memakai
-batas `SAKALA_MAX_ACTIVE_CONTAINERS` seperti dijelaskan di atas. Agent
+`compatibility_issues`) dibatasi maksimal 50 item per heartbeat. `traffic` dan
+`replicas` memakai batas `SAKALA_MAX_ACTIVE_CONTAINERS` seperti dijelaskan di atas. Agent
 mempertahankan urutan hasil runtime dan mengirim 50 item pertama secara
 deterministik, bukan memilih item secara acak. `metadata.detail_counts` selalu
 menyimpan jumlah asli sebelum pembatasan; nilai `0` berarti collection kosong,

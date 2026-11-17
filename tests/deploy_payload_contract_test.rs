@@ -1,6 +1,7 @@
 use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
-    FinalizationDeferredReason, HeartbeatPayload, SleepingPage, WorkloadTraffic,
+    FinalizationDeferredReason, HeartbeatPayload, RequestedReplicas, SleepingPage,
+    WorkloadReplicas, WorkloadTraffic,
 };
 
 #[test]
@@ -231,4 +232,61 @@ fn poll_response_reads_cancel_requested_and_treats_absence_as_empty() {
 
     let poll: CommandPoll = serde_json::from_str(r#"{ "data": [] }"#).expect("no cancel field");
     assert!(poll.cancel_requested.is_empty());
+}
+
+#[test]
+fn deploy_payload_replicas_fixture_matches_the_contract() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-replicas.json"
+    ))
+    .expect("fixture must deserialize");
+    let payload = command.deploy_payload().expect("payload must be valid");
+
+    assert!(matches!(payload.replicas, RequestedReplicas::Count(_)));
+    assert_eq!(payload.replicas.count().get(), 3);
+    assert_eq!(
+        serde_json::to_value(&payload).expect("payload serializes")["replicas"],
+        3
+    );
+
+    let single: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("fixture must deserialize");
+    let single = single.deploy_payload().expect("payload must be valid");
+    assert_eq!(single.replicas, RequestedReplicas::Absent);
+    assert!(
+        serde_json::to_value(&single)
+            .expect("payload serializes")
+            .get("replicas")
+            .is_none()
+    );
+}
+
+#[test]
+fn workload_replicas_fixture_matches_the_heartbeat_contract() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/workload-replicas.json"))
+            .expect("heartbeat fixture must deserialize");
+    let replicas: Vec<WorkloadReplicas> =
+        serde_json::from_value(heartbeat.metadata["workloads"]["replicas"].clone())
+            .expect("replicas must match the DTO");
+
+    assert_eq!(
+        heartbeat.metadata["detail_counts"]["replicas"].as_u64(),
+        Some(replicas.len() as u64)
+    );
+    assert!(heartbeat.node.capabilities.iter().any(|c| c == "replicas"));
+    assert!(
+        replicas
+            .iter()
+            .all(|item| item.desired > 1 && item.ready <= item.desired)
+    );
+    assert_eq!(
+        heartbeat.metadata["workloads"]["maximum_replicas_per_project"],
+        4
+    );
+    assert_eq!(
+        serde_json::to_value(&replicas).expect("replicas serialize"),
+        heartbeat.metadata["workloads"]["replicas"]
+    );
 }

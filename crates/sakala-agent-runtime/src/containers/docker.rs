@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    num::NonZeroU32,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -34,6 +35,7 @@ use crate::{
             parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
         },
         network::ProjectNetworks,
+        replicas::{REPLICA_LABEL, REPLICAS_LABEL, ReplicaSlot},
     },
     logs::ReporterOutputSink,
     process::run_checked,
@@ -359,7 +361,11 @@ impl ContainerEngine for DockerContainerEngine {
         self.resource_safety.resolve(requested)
     }
 
-    async fn ensure_capacity(&self, project_id: Uuid) -> Result<(), RuntimeError> {
+    async fn ensure_capacity(
+        &self,
+        project_id: Uuid,
+        replicas: NonZeroU32,
+    ) -> Result<(), RuntimeError> {
         let command = CommandSpec::new("docker")
             .arg("ps")
             .arg("--filter")
@@ -374,19 +380,18 @@ impl ContainerEngine for DockerContainerEngine {
             )));
         }
 
-        let active_projects = output
+        let project_id = project_id.to_string();
+        let other_projects = output
             .stdout
             .lines()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>();
-        let project_id = project_id.to_string();
-        let replacement = active_projects.iter().any(|active| *active == project_id);
+            .filter(|value| !value.is_empty() && *value != project_id)
+            .count();
+        let needed = other_projects.saturating_add(replicas.get() as usize);
 
-        if !replacement && active_projects.len() >= self.max_active_containers as usize {
+        if needed > self.max_active_containers as usize {
             return Err(RuntimeError::Capacity(format!(
-                "node already runs {} managed containers; configured maximum is {}",
-                active_projects.len(),
+                "node already runs {other_projects} managed containers of other projects and this project needs {replicas}; configured maximum is {}",
                 self.max_active_containers
             )));
         }
@@ -464,6 +469,7 @@ impl ContainerEngine for DockerContainerEngine {
             maximum_active_workloads: Some(self.max_active_containers as usize),
             active_builds: None,
             maximum_concurrent_builds: None,
+            maximum_replicas_per_project: None,
         })
     }
 
@@ -506,7 +512,9 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
-            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
+            .arg(format!(
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
+            ));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
@@ -528,6 +536,7 @@ impl ContainerEngine for DockerContainerEngine {
             };
             let status = fields.get(1).copied().unwrap_or_default().to_owned();
             let (ready, reason) = health_state(&status);
+            let replica = ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied());
             snapshots.push(RuntimeHealthSnapshot {
                 workload: RuntimeWorkload {
                     container_id: fields.first().copied().unwrap_or_default().to_owned(),
@@ -537,6 +546,7 @@ impl ContainerEngine for DockerContainerEngine {
                 },
                 ready,
                 reason,
+                desired_replicas: replica.count,
             });
         }
 
@@ -606,6 +616,7 @@ impl ContainerEngine for DockerContainerEngine {
             .into_iter()
             .filter(|(_, state)| state.is_crashed(now, self.crash_stable_window))
             .collect::<Vec<_>>();
+        let crashed = whole_deployments(&listed, crashed);
         let last_exits = self.last_exits(&crashed).await;
 
         Ok(crashed
@@ -625,11 +636,11 @@ impl ContainerEngine for DockerContainerEngine {
             .collect())
     }
 
-    async fn workload(
+    async fn workloads(
         &self,
         project_id: Uuid,
         deployment_id: Uuid,
-    ) -> Result<Option<ManagedWorkload>, RuntimeError> {
+    ) -> Result<Vec<ManagedWorkload>, RuntimeError> {
         let command = CommandSpec::new("docker")
             .arg("ps")
             .arg("--all")
@@ -640,7 +651,9 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
             .arg("--format")
-            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.domain\"}}\t{{.Label \"dev.sakala.port\"}}\t{{.Label \"dev.sakala.command-id\"}}\t{{.Label \"dev.sakala.log-max-line-length\"}}\t{{.Label \"dev.sakala.log-max-batch-lines\"}}\t{{.Label \"dev.sakala.log-max-total-bytes\"}}");
+            .arg(format!(
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"dev.sakala.port\"}}}}\t{{{{.Label \"dev.sakala.command-id\"}}}}\t{{{{.Label \"dev.sakala.log-max-line-length\"}}}}\t{{{{.Label \"dev.sakala.log-max-batch-lines\"}}}}\t{{{{.Label \"dev.sakala.log-max-total-bytes\"}}}}\t{{{{.Names}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
+            ));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
@@ -648,38 +661,14 @@ impl ContainerEngine for DockerContainerEngine {
                 crate::error::describe_exit(output.code)
             )));
         }
-        let Some(line) = output.stdout.lines().find(|line| !line.trim().is_empty()) else {
-            return Ok(None);
-        };
-        let fields = line.split('\t').collect::<Vec<_>>();
-        let domain = fields
-            .get(2)
-            .copied()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                RuntimeError::Container("managed workload is missing its domain label".to_owned())
-            })?;
-        let port = fields
-            .get(3)
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|port| *port > 0)
-            .ok_or_else(|| {
-                RuntimeError::Container("managed workload has an invalid port label".to_owned())
-            })?;
-        Ok(Some(ManagedWorkload {
-            container_id: fields.first().copied().unwrap_or_default().to_owned(),
-            status: fields.get(1).copied().unwrap_or_default().to_owned(),
-            project_id,
-            deployment_id,
-            domain: domain.to_owned(),
-            port,
-            command_id: fields.get(4).and_then(|value| Uuid::parse_str(value).ok()),
-            log_bounds: sakala_agent_protocol::LogBounds {
-                max_line_length: parse_optional_label(fields.get(5).copied()),
-                max_batch_lines: parse_optional_label(fields.get(6).copied()),
-                max_total_bytes: parse_optional_label(fields.get(7).copied()),
-            },
-        }))
+        let mut workloads = output
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| parse_workload(line, project_id, deployment_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        workloads.sort_by_key(|workload| workload.replica.index);
+        Ok(workloads)
     }
 
     async fn restart(
@@ -701,22 +690,24 @@ impl ContainerEngine for DockerContainerEngine {
 
     async fn stop(
         &self,
-        workload: &ManagedWorkload,
+        workloads: &[ManagedWorkload],
         grace_seconds: u64,
     ) -> Result<(), RuntimeError> {
-        if !workload.status.to_ascii_lowercase().starts_with("up") {
+        let running = workloads
+            .iter()
+            .filter(|workload| workload.is_running())
+            .collect::<Vec<_>>();
+        if running.is_empty() {
             return Ok(());
         }
-        run_container_command(
-            self.runner.as_ref(),
-            CommandSpec::new("docker")
-                .arg("stop")
-                .arg("--time")
-                .arg(grace_seconds.to_string())
-                .arg(&workload.container_id),
-            "docker-stop",
-        )
-        .await
+        let mut command = CommandSpec::new("docker")
+            .arg("stop")
+            .arg("--time")
+            .arg(grace_seconds.to_string());
+        for workload in running {
+            command = command.arg(&workload.container_id);
+        }
+        run_container_command(self.runner.as_ref(), command, "docker-stop").await
     }
 
     async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
@@ -808,6 +799,9 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(WORKLOAD_KIND_LABEL)
             .arg("--label")
             .arg(format!("{AGENT_ID_LABEL}={}", self.agent_id));
+        for label in request.replica.labels() {
+            command = command.arg("--label").arg(label);
+        }
         for (label, value) in [
             (LOG_MAX_LINE_LABEL, request.log_bounds.max_line_length),
             (LOG_MAX_BATCH_LABEL, request.log_bounds.max_batch_lines),
@@ -967,7 +961,7 @@ impl ContainerEngine for DockerContainerEngine {
     async fn cleanup_previous(
         &self,
         project_id: Uuid,
-        current: &str,
+        current: &[String],
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         let list = CommandSpec::new("docker")
@@ -986,6 +980,7 @@ impl ContainerEngine for DockerContainerEngine {
             )));
         }
 
+        let mut previous = Vec::new();
         for container_id in output.stdout.lines().filter(|id| !id.trim().is_empty()) {
             let inspect = CommandSpec::new("docker")
                 .arg("inspect")
@@ -1002,23 +997,36 @@ impl ContainerEngine for DockerContainerEngine {
             let mut fields = inspected_name.stdout.trim().split('\t');
             let running = matches!(fields.next(), Some("true"));
             let name = fields.next().unwrap_or_default().trim_start_matches('/');
-            if name == current {
+            if current.iter().any(|current| current == name) {
                 continue;
             }
-            if running {
-                let stop = CommandSpec::new("docker")
-                    .arg("stop")
-                    .arg("--time")
-                    .arg("10")
-                    .arg(container_id);
-                run_checked(
-                    self.runner.as_ref(),
-                    &stop,
-                    "docker-stop-previous",
-                    reporter,
-                )
-                .await?;
+            previous.push((container_id, running));
+        }
+
+        // One call stops every old replica side by side, so they share one
+        // grace period instead of waiting it out one after another.
+        let running = previous
+            .iter()
+            .filter(|(_, running)| *running)
+            .map(|(container_id, _)| *container_id)
+            .collect::<Vec<_>>();
+        if !running.is_empty() {
+            let mut stop = CommandSpec::new("docker")
+                .arg("stop")
+                .arg("--time")
+                .arg("10");
+            for container_id in running {
+                stop = stop.arg(container_id);
             }
+            run_checked(
+                self.runner.as_ref(),
+                &stop,
+                "docker-stop-previous",
+                reporter,
+            )
+            .await?;
+        }
+        for (container_id, _) in previous {
             let remove = CommandSpec::new("docker").arg("rm").arg(container_id);
             run_checked(
                 self.runner.as_ref(),
@@ -1032,16 +1040,18 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(())
     }
 
-    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError> {
+    async fn cleanup_candidate(
+        &self,
+        containers: &[String],
+        image: &str,
+    ) -> Result<(), RuntimeError> {
         let mut failures = Vec::new();
+        let mut remove_containers = CommandSpec::new("docker").arg("rm").arg("--force");
+        for container in containers {
+            remove_containers = remove_containers.arg(container);
+        }
         for (artifact, command) in [
-            (
-                "candidate container",
-                CommandSpec::new("docker")
-                    .arg("rm")
-                    .arg("--force")
-                    .arg(container),
-            ),
+            ("candidate container", remove_containers),
             (
                 "candidate image",
                 CommandSpec::new("docker")
@@ -1114,6 +1124,94 @@ impl ContainerEngine for DockerContainerEngine {
             let _ = follower.await;
         }
     }
+}
+
+/// One line of the workload lookup. The name and the replica labels come last,
+/// so a line without them reads as the single replica it then is.
+fn parse_workload(
+    line: &str,
+    project_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<ManagedWorkload, RuntimeError> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    let domain = fields
+        .get(2)
+        .copied()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RuntimeError::Container("managed workload is missing its domain label".to_owned())
+        })?;
+    let port = fields
+        .get(3)
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            RuntimeError::Container("managed workload has an invalid port label".to_owned())
+        })?;
+    let replica = ReplicaSlot::from_labels(fields.get(9).copied(), fields.get(10).copied());
+    let name = fields
+        .get(8)
+        .map(|names| names.split(',').next().unwrap_or_default().trim())
+        .filter(|name| !name.is_empty())
+        .map_or_else(
+            || replica.container_name(project_id, deployment_id),
+            str::to_owned,
+        );
+    Ok(ManagedWorkload {
+        container_id: fields.first().copied().unwrap_or_default().to_owned(),
+        name,
+        replica,
+        status: fields.get(1).copied().unwrap_or_default().to_owned(),
+        project_id,
+        deployment_id,
+        domain: domain.to_owned(),
+        port,
+        command_id: fields.get(4).and_then(|value| Uuid::parse_str(value).ok()),
+        log_bounds: sakala_agent_protocol::LogBounds {
+            max_line_length: parse_optional_label(fields.get(5).copied()),
+            max_batch_lines: parse_optional_label(fields.get(6).copied()),
+            max_total_bytes: parse_optional_label(fields.get(7).copied()),
+        },
+    })
+}
+
+/// Keeps the crashed containers of deployments whose every listed container
+/// crashed, one per deployment: the one that ended last, as the freshest
+/// account of the crash. A deployment with a replica still up is serving, and
+/// its crashed replicas show up as `ready` below `desired` instead.
+fn whole_deployments<'a>(
+    listed: &[&RuntimeHealthSnapshot],
+    crashed: Vec<(&'a RuntimeHealthSnapshot, CrashState)>,
+) -> Vec<(&'a RuntimeHealthSnapshot, CrashState)> {
+    let deployment = |snapshot: &RuntimeHealthSnapshot| {
+        (
+            snapshot.workload.project_id,
+            snapshot.workload.deployment_id,
+        )
+    };
+    let mut listed_per_deployment = HashMap::<(Uuid, Uuid), usize>::new();
+    for snapshot in listed {
+        *listed_per_deployment
+            .entry(deployment(snapshot))
+            .or_default() += 1;
+    }
+    let mut per_deployment =
+        BTreeMap::<(Uuid, Uuid), Vec<(&'a RuntimeHealthSnapshot, CrashState)>>::new();
+    for entry in crashed {
+        per_deployment
+            .entry(deployment(entry.0))
+            .or_default()
+            .push(entry);
+    }
+    per_deployment
+        .into_iter()
+        .filter(|(key, entries)| listed_per_deployment.get(key) == Some(&entries.len()))
+        .filter_map(|(_, entries)| {
+            entries
+                .into_iter()
+                .max_by_key(|(_, state)| state.finished_at)
+        })
+        .collect()
 }
 
 fn parse_optional_label(value: Option<&str>) -> Option<u64> {

@@ -7,6 +7,9 @@ use crate::{containers::ResourceSafetyConfig, domains::ProjectDomainSuffixes};
 /// throughout, and short enough that an app that recovered clears soon.
 pub const DEFAULT_CRASH_STABLE_WINDOW: Duration = Duration::from_secs(300);
 
+/// Default of `SAKALA_MAX_REPLICAS_PER_PROJECT`.
+pub const DEFAULT_MAX_REPLICAS_PER_PROJECT: u32 = 4;
+
 /// Node-level deadline ceilings. Product policy comes from the command payload;
 /// these values protect the runtime node from excessive requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +118,10 @@ pub struct DockerRuntimeConfig {
     pub timeout_safety: TimeoutSafetyConfig,
     pub max_concurrent_builds: usize,
     pub max_active_containers: u32,
+    /// The most replicas one deployment may ask for. A deployment asking for
+    /// more fails with `runtime_replicas_exceeded`, and every replica still
+    /// counts against `max_active_containers`.
+    pub max_replicas_per_project: u32,
     /// With `health_interval`, sets how long a `HealthCheck` command waits for
     /// the app: `health_attempts * health_interval`. Deployments and other
     /// lifecycle commands wait for their start deadline instead.
@@ -150,6 +157,7 @@ impl Default for DockerRuntimeConfig {
             timeout_safety: TimeoutSafetyConfig::default(),
             max_concurrent_builds: 1,
             max_active_containers: 20,
+            max_replicas_per_project: DEFAULT_MAX_REPLICAS_PER_PROJECT,
             health_attempts: 10,
             health_interval: Duration::from_secs(1),
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,

@@ -1,0 +1,41 @@
+{
+  "status": "ready",
+  "hostname": "runtime-01",
+  "runtime_network": "sakala-runtime",
+  "capabilities": ["docker-runtime", "caddy-file-routing", "idle-sleep", "replicas"],
+  "metadata": {
+    "version": "0.7.1",
+    "protocol_version": 4,
+    "runtime_driver": "docker",
+    "detail_counts": {
+      "crashed_details": 0,
+      "replicas": 1
+    },
+    "workloads": {
+      "active": 4,
+      "starting": 0,
+      "unhealthy": 1,
+      "stopped": 0,
+      "maximum_replicas_per_project": 4,
+      "unhealthy_details": [
+        {
+          "container_id": "9c1d2e3f4a5b",
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "status": "Restarting (1) 2 seconds ago",
+          "reason": "container is not running: Restarting (1) 2 seconds ago"
+        }
+      ],
+      "crashed_details": [],
+      "replicas": [
+        {
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "desired": 3,
+          "ready": 2
+        }
+      ]
+    }
+  },
+  "sent_at": "2026-11-18T05:58:20Z"
+}

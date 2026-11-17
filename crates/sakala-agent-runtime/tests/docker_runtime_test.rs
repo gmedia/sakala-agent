@@ -3632,7 +3632,13 @@ const CRASHED_PROJECT: &str = "ff66ed4a-6303-4be6-8ef4-63c28b112680";
 const CRASHED_DEPLOYMENT: &str = "4f1f21ef-730d-42d5-a46d-d965353cb993";
 
 fn listed(id: &str, status: &str) -> String {
-    format!("{id}\t{status}\t{CRASHED_PROJECT}\t{CRASHED_DEPLOYMENT}\n")
+    listed_in(id, status, CRASHED_DEPLOYMENT, 1)
+}
+
+/// A `docker ps` row of the health snapshot for one replica of `deployment`,
+/// a deployment of `replicas` replicas.
+fn listed_in(id: &str, status: &str, deployment: &str, replicas: u32) -> String {
+    format!("{id}\t{status}\t{CRASHED_PROJECT}\t{deployment}\t0\t{replicas}\n")
 }
 
 fn seconds_ago(seconds: i64) -> String {
@@ -3941,11 +3947,27 @@ async fn stopped_workload_is_not_a_crash_even_after_earlier_restarts() {
 #[tokio::test]
 async fn crash_report_uses_one_batched_inspect_and_one_batched_history_query() {
     let temp = TempDir::new().expect("temp directory should be available");
+    // Three single-replica deployments, in the order the report sorts them.
     let rows = format!(
         "{}{}{}",
-        listed("first123", "Up 3 seconds"),
-        listed("second45", "Up 2 minutes"),
-        listed("third678", "Up 2 seconds"),
+        listed_in(
+            "first123",
+            "Up 3 seconds",
+            "00000000-0000-4000-8000-000000000001",
+            1
+        ),
+        listed_in(
+            "second45",
+            "Up 2 minutes",
+            "00000000-0000-4000-8000-000000000002",
+            1
+        ),
+        listed_in(
+            "third678",
+            "Up 2 seconds",
+            "00000000-0000-4000-8000-000000000003",
+            1
+        ),
     );
     let states = format!(
         "{}{}{}",
@@ -6208,6 +6230,8 @@ struct FakeRunner {
     build_delay: Option<Duration>,
     inspect_delay: Option<Duration>,
     previous_container_inspection: Option<String>,
+    /// `docker inspect` of a previous container by ID, overriding the one above.
+    previous_containers: HashMap<String, String>,
     fail_previous_stop: bool,
     image_list_stdout: String,
     image_inspect_stdout: String,
@@ -6400,6 +6424,7 @@ impl FakeRunner {
             build_delay: None,
             inspect_delay: None,
             previous_container_inspection: None,
+            previous_containers: HashMap::new(),
             fail_previous_stop: false,
             image_list_stdout: String::new(),
             image_inspect_stdout: String::new(),
@@ -6575,6 +6600,20 @@ impl FakeRunner {
 
     fn with_previous_container_inspection(mut self, stdout: impl Into<String>) -> Self {
         self.previous_container_inspection = Some(stdout.into());
+        self
+    }
+
+    /// The project's containers as the cleanup after a cutover lists them:
+    /// `(id, running, name)`.
+    fn with_previous_containers(mut self, containers: &[(&str, bool, &str)]) -> Self {
+        self.docker_ps_stdout = containers
+            .iter()
+            .map(|(id, _, _)| format!("{id}\n"))
+            .collect();
+        self.previous_containers = containers
+            .iter()
+            .map(|(id, running, name)| ((*id).to_owned(), format!("{running}\t/{name}\n")))
+            .collect();
         self
     }
 
@@ -6864,9 +6903,11 @@ impl ProcessRunner for FakeRunner {
                 .iter()
                 .any(|argument| argument == "{{.State.Running}}\t{{.Name}}")
         {
-            self.previous_container_inspection
-                .as_deref()
-                .unwrap_or("true\t/running\n")
+            spec.args
+                .last()
+                .and_then(|id| self.previous_containers.get(id.to_string_lossy().as_ref()))
+                .or(self.previous_container_inspection.as_ref())
+                .map_or("true\t/running\n", String::as_str)
         } else if spec.program == "docker"
             && spec
                 .args
@@ -7111,4 +7152,655 @@ impl RuntimeReporter for FailingReadyReporter {
         self.logs.lock().expect("log lock").push(log);
         Ok(())
     }
+}
+
+// --- Replicas -------------------------------------------------------------
+
+const BASE_NAME: &str = "sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993";
+
+fn deploy_with_replicas(replicas: serde_json::Value) -> AgentCommand {
+    let mut command = deploy_command("auto");
+    command.payload["replicas"] = replicas;
+    command
+}
+
+fn workload_runs(runner: &FakeRunner) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| is_workload_run(command))
+        .map(string_arguments)
+        .collect()
+}
+
+fn run_name(args: &[String]) -> String {
+    let position = args.iter().position(|arg| arg == "--name").expect("--name");
+    args[position + 1].clone()
+}
+
+fn replica_names(count: u32) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{BASE_NAME}-r{index}"))
+        .collect()
+}
+
+/// A workload lookup row of one replica, with its name and replica labels.
+fn replica_row(index: u32, count: u32, status: &str) -> String {
+    format!(
+        "replica{index}\t{status}\tportfolio.run.sakala.localhost\t3000\tb3c8cb55-3bc8-4725-a004-e69d9917d40b\t\t\t\t{BASE_NAME}-r{index}\t{index}\t{count}\n"
+    )
+}
+
+fn replica_rows(count: u32, status: &str) -> String {
+    (0..count)
+        .map(|index| replica_row(index, count, status))
+        .collect()
+}
+
+fn balanced_route(upstreams: &[String]) -> String {
+    let upstreams = upstreams
+        .iter()
+        .map(|name| format!(" {name}:3000"))
+        .collect::<String>();
+    format!(
+        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy{upstreams} {{\n\t\tlb_policy least_conn\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t\tfail_duration 10s\n\t}}\n}}\n"
+    )
+}
+
+fn commands_starting_with(runner: &FakeRunner, verb: &str) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| command.program == "docker")
+        .map(string_arguments)
+        .filter(|args| args.first().is_some_and(|arg| arg == verb))
+        .collect()
+}
+
+#[tokio::test]
+async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_replicas(json!(3)),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("three replicas should deploy");
+
+    let runs = workload_runs(&runner);
+    assert_eq!(
+        runs.iter().map(|args| run_name(args)).collect::<Vec<_>>(),
+        replica_names(3)
+    );
+    for (index, args) in runs.iter().enumerate() {
+        assert!(
+            args.contains(&format!("dev.sakala.replica={index}")),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"dev.sakala.replicas=3".to_owned()),
+            "{args:?}"
+        );
+        assert!(args.contains(&"dev.sakala.domain=portfolio.run.sakala.localhost".to_owned()));
+    }
+    // Each replica answered before the route moved to the set.
+    let probes = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| is_probe(command))
+        .map(|command| {
+            command
+                .args
+                .last()
+                .expect("url")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    for name in replica_names(3) {
+        assert!(
+            probes.contains(&format!("http://{name}:3000/")),
+            "{probes:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(route_file(&config)).expect("route"),
+        balanced_route(&replica_names(3))
+    );
+    let events = reporter.events.lock().expect("event lock");
+    let ready = events
+        .iter()
+        .find(|event| event.event_type == "deployment.runtime.ready")
+        .expect("ready event");
+    assert_eq!(ready.metadata["replicas"], 3);
+    assert_eq!(ready.metadata["containers"], json!(replica_names(3)));
+    // One log follower per replica, all under the deployment command.
+    assert_eq!(
+        runner.count_commands(|command| command.args.iter().any(|a| a == "--follow")),
+        3
+    );
+}
+
+#[tokio::test]
+async fn one_replica_keeps_the_container_name_and_route_of_earlier_agents() {
+    for replicas in [None, Some(json!(1))] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let config = runtime_config(&temp);
+        let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+        let command = match &replicas {
+            Some(value) => deploy_with_replicas(value.clone()),
+            None => deploy_command("auto"),
+        };
+
+        dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+            .await
+            .expect("one replica should deploy");
+
+        let runs = workload_runs(&runner);
+        assert_eq!(runs.len(), 1, "{replicas:?}");
+        assert_eq!(run_name(&runs[0]), BASE_NAME);
+        assert!(runs[0].contains(&"dev.sakala.replica=0".to_owned()));
+        assert!(runs[0].contains(&"dev.sakala.replicas=1".to_owned()));
+        assert_eq!(
+            fs::read_to_string(route_file(&config)).expect("route"),
+            format!(
+                "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy {BASE_NAME}:3000\n}}\n"
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_replica_count_still_deploys_one_replica() {
+    for replicas in [json!("3"), json!(0), json!(-1), json!(2.5), json!(null)] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+        dispatch(
+            executor,
+            &deploy_with_replicas(replicas.clone()),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{replicas} must not refuse the deployment: {error}"));
+
+        let runs = workload_runs(&runner);
+        assert_eq!(runs.len(), 1, "{replicas}");
+        assert_eq!(run_name(&runs[0]), BASE_NAME, "{replicas}");
+    }
+}
+
+#[tokio::test]
+async fn more_replicas_than_the_node_allows_fail_before_anything_runs() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let mut config = runtime_config(&temp);
+    config.max_replicas_per_project = 4;
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_replicas(json!(5)),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("five replicas exceed the node maximum");
+
+    assert_eq!(error.code(), "runtime_replicas_exceeded");
+    assert_eq!(
+        error.to_string(),
+        "the deployment asks for 5 replicas, but this node runs at most 4 replicas per project"
+    );
+    assert!(workload_runs(&runner).is_empty());
+    assert_eq!(runner.count_commands(|command| command.program == "git"), 0);
+}
+
+#[tokio::test]
+async fn capacity_counts_every_new_replica_but_not_the_ones_they_replace() {
+    const OTHER: &str = "11111111-1111-4111-8111-111111111111";
+    // Two containers of another project and three of this one are running.
+    let listing = format!("{OTHER}\n{OTHER}\n{PROJECT}\n{PROJECT}\n{PROJECT}\n");
+    for (replicas, maximum, admitted) in [(3, 4, false), (2, 4, true), (3, 5, true)] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true).with_docker_ps(listing.clone()));
+        let mut config = runtime_config(&temp);
+        config.max_active_containers = maximum;
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+        let result = dispatch(
+            executor,
+            &deploy_with_replicas(json!(replicas)),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await;
+
+        match (admitted, result) {
+            (true, Ok(_)) => assert_eq!(workload_runs(&runner).len(), replicas as usize),
+            (false, Err(error)) => {
+                assert_eq!(error.code(), "runtime_capacity_exceeded");
+                assert!(error.to_string().contains("needs 3"), "{error}");
+                assert!(workload_runs(&runner).is_empty());
+            }
+            (admitted, result) => panic!(
+                "{replicas} replicas with maximum {maximum}: expected admitted={admitted}, got {result:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_replica_failing_readiness_fails_the_deploy_and_keeps_the_old_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    // The first replica answers; the second never does.
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_probe_results(&[(0, OK_PROBE_STDERR), (1, REFUSED_PROBE_STDERR)]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let previous = format!(
+        "# Managed by sakala-agent for project {PROJECT} deployment 11111111-1111-4111-8111-111111111111.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy previous:3000\n}}\n"
+    );
+    let route = write_route(&config, PROJECT, &previous);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(
+        executor,
+        &{
+            let mut command = deploy_with_start_timeout(1);
+            command.payload["replicas"] = json!(3);
+            command
+        },
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("a replica that never answers fails the deployment");
+
+    assert_eq!(error.code(), "runtime_app_not_listening", "{error}");
+    assert_eq!(fs::read_to_string(&route).expect("route"), previous);
+    // Every new replica and the image go, in one removal.
+    let removals = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| is_candidate_removal(command))
+        .map(string_arguments)
+        .collect::<Vec<_>>();
+    assert_eq!(removals.len(), 1, "{removals:?}");
+    for name in replica_names(3) {
+        assert!(removals[0].contains(&name), "{name} in {removals:?}");
+    }
+    // The output shown is the failing replica's.
+    let logs = runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|command| is_app_logs(command))
+        .map(string_arguments)
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert_eq!(logs[0].last(), Some(&replica_names(3)[1]));
+    // The old deployment was never touched.
+    assert!(commands_starting_with(&runner, "stop").is_empty());
+}
+
+#[tokio::test]
+async fn redeploying_three_replicas_as_two_leaves_exactly_the_two_new_ones() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let old = "sakala-app-ff66ed4a-99999999-9999-4999-8999-999999999999";
+    let new = replica_names(2);
+    let runner = Arc::new(FakeRunner::new(true).with_previous_containers(&[
+        ("old0", true, &format!("{old}-r0")),
+        ("old1", true, &format!("{old}-r1")),
+        ("old2", false, &format!("{old}-r2")),
+        ("new0", true, &new[0]),
+        ("new1", true, &new[1]),
+    ]));
+    let config = runtime_config(&temp);
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_replicas(json!(2)),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("two replicas should replace three");
+
+    assert_eq!(
+        fs::read_to_string(route_file(&config)).expect("route"),
+        balanced_route(&new)
+    );
+    assert_eq!(
+        commands_starting_with(&runner, "stop"),
+        [["stop", "--time", "10", "old0", "old1"]],
+        "only the running old replicas stop, in one call"
+    );
+    let removed = commands_starting_with(&runner, "rm")
+        .into_iter()
+        .map(|args| args.last().cloned().expect("container"))
+        .collect::<Vec<_>>();
+    assert_eq!(removed, ["old0", "old1", "old2"]);
+}
+
+#[tokio::test]
+async fn sleep_stops_every_replica_and_puts_up_the_sleeping_page() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(replica_rows(3, "Up 1 minute")));
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &balanced_route(&replica_names(3)));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep should succeed");
+
+    assert_eq!(output.result["status"], "sleeping");
+    // One call, so the replicas share one grace period.
+    assert_eq!(
+        stops_of(&runner),
+        [["stop", "--time", "10", "replica0", "replica1", "replica2"]]
+    );
+    assert!(
+        commands_starting_with(&runner, "rm").is_empty(),
+        "containers stay"
+    );
+    let content = fs::read_to_string(&route).expect("sleeping route");
+    assert!(content.contains("(sleeping)"), "{content}");
+    assert!(!content.contains("reverse_proxy"), "{content}");
+}
+
+#[tokio::test]
+async fn wake_starts_every_replica_and_restores_the_balanced_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true).with_workload_lookup(replica_rows(3, "Exited (0) 1 minute ago")),
+    );
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake should restore every replica");
+
+    assert_eq!(output.result["status"], "ready");
+    assert_eq!(
+        commands_starting_with(&runner, "start")
+            .into_iter()
+            .map(|args| args.last().cloned().expect("container"))
+            .collect::<Vec<_>>(),
+        ["replica0", "replica1", "replica2"]
+    );
+    assert_eq!(
+        fs::read_to_string(&route).expect("route"),
+        balanced_route(&replica_names(3))
+    );
+}
+
+#[tokio::test]
+async fn a_wake_needs_room_for_every_replica() {
+    const OTHER: &str = "11111111-1111-4111-8111-111111111111";
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(replica_rows(3, "Exited (0) 1 minute ago"))
+            .with_docker_ps(format!("{OTHER}\n{OTHER}\n")),
+    );
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 4;
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("two running and three more exceed four");
+
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+    assert!(commands_starting_with(&runner, "start").is_empty());
+}
+
+#[tokio::test]
+async fn a_wake_where_no_replica_becomes_ready_stops_them_all_again() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(replica_rows(3, "Exited (0) 1 minute ago"))
+            .with_inspect_states(&[CRASHING_STATE]),
+    );
+    let config = runtime_config(&temp);
+    let sleeping = sleeping_route(PROJECT, DEPLOYMENT);
+    let route = write_route(&config, PROJECT, &sleeping);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("no replica comes up");
+
+    assert_eq!(error.code(), "runtime_app_crashed", "{error}");
+    assert_eq!(fs::read_to_string(&route).expect("route"), sleeping);
+    assert_eq!(
+        stops_of(&runner),
+        [["stop", "--time", "10", "replica0", "replica1", "replica2"]]
+    );
+}
+
+#[tokio::test]
+async fn a_wake_is_served_once_one_replica_answers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    // One replica is still crashing; the others answer.
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(replica_rows(3, "Exited (0) 1 minute ago"))
+            .with_inspect_states(&[CRASHING_STATE, RUNNING_STATE]),
+    );
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("one ready replica is enough to serve");
+
+    assert_eq!(
+        fs::read_to_string(&route).expect("route"),
+        balanced_route(&replica_names(3)),
+        "the route lists every replica; the router skips the one that is not up"
+    );
+    assert!(stops_of(&runner).is_empty());
+}
+
+#[tokio::test]
+async fn stop_removes_every_replica_and_the_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(replica_rows(3, "Up 1 minute")));
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &balanced_route(&replica_names(3)));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let output = RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop should succeed");
+
+    assert_eq!(output.result["status"], "stopped");
+    assert_eq!(
+        stops_of(&runner),
+        [["stop", "--time", "10", "replica0", "replica1", "replica2"]]
+    );
+    assert_eq!(
+        commands_starting_with(&runner, "rm")
+            .into_iter()
+            .map(|args| args.last().cloned().expect("container"))
+            .collect::<Vec<_>>(),
+        ["replica0", "replica1", "replica2"]
+    );
+    assert!(!route.exists());
+}
+
+#[tokio::test]
+async fn health_check_reports_every_replica_and_is_ready_while_one_is() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut rows = replica_row(0, 2, "Up 1 minute");
+    rows.push_str(&replica_row(1, 2, "Exited (137) 5 seconds ago"));
+    let runner = Arc::new(FakeRunner::new(true).with_workload_lookup(rows));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let output = RuntimeExecutor::health_check(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("health check should report");
+
+    assert_eq!(output.result["ready"], true);
+    assert_eq!(output.result["container_id"], "replica0");
+    assert_eq!(output.result["desired_replicas"], 2);
+    assert_eq!(output.result["ready_replicas"], 1);
+    let replicas = output.result["replicas"].as_array().expect("replicas");
+    assert_eq!(replicas[1]["ready"], false);
+    assert_eq!(replicas[1]["error_code"], "runtime_workload_not_running");
+}
+
+#[tokio::test]
+async fn a_deployment_is_crashed_only_when_every_replica_is() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let rows = format!(
+        "{}{}{}",
+        listed_in("rep0aaaa", "Up 2 seconds", CRASHED_DEPLOYMENT, 3),
+        listed_in("rep1aaaa", "Up 3 seconds", CRASHED_DEPLOYMENT, 3),
+        listed_in("rep2aaaa", "Up 9 minutes", CRASHED_DEPLOYMENT, 3),
+    );
+    let partly = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(rows)
+            .with_crash_inspect(format!(
+                "{}{}{}",
+                crash_state("rep0aaaa", "running", 4, 0, false, 2),
+                crash_state("rep1aaaa", "running", 5, 0, false, 3),
+                crash_state("rep2aaaa", "running", 0, 0, false, 540),
+            )),
+    );
+    assert!(
+        crashes_reported(partly, &temp).await.is_empty(),
+        "one replica serves, so the deployment is not crashed"
+    );
+
+    let rows = format!(
+        "{}{}",
+        listed_in(
+            "rep0aaaa",
+            "Restarting (1) 1 second ago",
+            CRASHED_DEPLOYMENT,
+            2
+        ),
+        listed_in("rep1aaaa", "Up 2 seconds", CRASHED_DEPLOYMENT, 2),
+    );
+    let wholly = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(rows)
+            .with_crash_inspect(format!(
+                "{}{}",
+                crash_state("rep0aaaa", "restarting", 6, 1, false, 30),
+                crash_state("rep1aaaa", "running", 4, 0, false, 2),
+            ))
+            .with_events("rep1aaaaaaaaaaaa\tdie\t1\n"),
+    );
+    let crashed = crashes_reported(wholly, &temp).await;
+    assert_eq!(crashed.len(), 1, "one entry per deployment: {crashed:?}");
+    assert_eq!(crashed[0].deployment_id.to_string(), CRASHED_DEPLOYMENT);
+}
+
+#[tokio::test]
+async fn health_snapshot_carries_the_replica_count_of_each_deployment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut rows = format!(
+        "{}{}",
+        listed_in("rep0aaaa", "Up 2 minutes", CRASHED_DEPLOYMENT, 3),
+        listed("legacy12", "Up 2 minutes"),
+    );
+    // A container of an older Agent has no replica labels at all.
+    rows.push_str(&format!(
+        "older123\tUp 1 minute\t{CRASHED_PROJECT}\t00000000-0000-4000-8000-000000000009\n"
+    ));
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(rows));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let snapshots = RuntimeExecutor::health_snapshot(&executor)
+        .await
+        .expect("snapshot");
+
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.desired_replicas.get())
+            .collect::<Vec<_>>(),
+        [3, 1, 1]
+    );
+}
+
+#[tokio::test]
+async fn traffic_lists_a_deployment_once_whatever_its_replica_count() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let rows = format!(
+        "r0\tUp 3 minutes\t{PROJECT}\t{DEPLOYMENT}\tportfolio.run.sakala.localhost\nr1\tUp 3 minutes\t{PROJECT}\t{DEPLOYMENT}\tportfolio.run.sakala.localhost\n"
+    );
+    let runner = Arc::new(CounterRunner::new(
+        FakeRunner::new(true).with_docker_ps(rows),
+        Some(
+            "caddy_http_requests_total{handler=\"subroute\",host=\"portfolio.run.sakala.localhost\",server=\"srv0\"} 3\n",
+        ),
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+
+    let traffic = RuntimeExecutor::workload_traffic(&executor)
+        .await
+        .expect("counters are readable");
+
+    assert_eq!(traffic.len(), 1, "{traffic:?}");
+    assert_eq!(traffic[0].deployment_id.to_string(), DEPLOYMENT);
 }

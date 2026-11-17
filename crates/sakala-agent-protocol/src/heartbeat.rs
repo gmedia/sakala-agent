@@ -55,3 +55,18 @@ pub struct WorkloadTraffic {
     #[serde(with = "time::serde::rfc3339")]
     pub last_request_at: OffsetDateTime,
 }
+
+/// One entry of `metadata.workloads.replicas`: how many containers of a running
+/// deployment with more than one replica the runtime sees serving.
+///
+/// `ready` counts the replicas Docker reports running and not unhealthy. The
+/// router stops sending requests to a replica it cannot reach, so the
+/// deployment serves while `ready` is above zero.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkloadReplicas {
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    /// The replica count the deployment was started with.
+    pub desired: u32,
+    pub ready: u32,
+}

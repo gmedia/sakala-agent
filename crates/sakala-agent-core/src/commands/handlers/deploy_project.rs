@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sakala_agent_protocol::AgentCommand;
+use sakala_agent_protocol::{AgentCommand, RequestedReplicas};
 use tokio_util::sync::CancellationToken;
 
 use crate::ports::{
@@ -24,6 +24,15 @@ pub async fn handle(
     let payload = command.deploy_payload().map_err(|error| {
         RuntimeExecutionError::invalid_command(format!("DeployProject payload is invalid: {error}"))
     })?;
+    // Refusing the deployment over this field would leave the project without
+    // a new release; one replica is what every older Agent runs anyway.
+    if payload.replicas == RequestedReplicas::Unreadable {
+        tracing::warn!(
+            command_id = %command.id,
+            %project_id,
+            "DeployProject replicas is not a positive integer; running one replica"
+        );
+    }
     let repository_credential = repository_credentials
         .credential(command.id, payload.repository_access)
         .await?;

@@ -1,16 +1,18 @@
 use std::{
+    collections::BTreeMap,
     sync::{Arc, RwLock},
     time::Duration,
 };
 
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION,
-    WorkloadTraffic,
+    WorkloadReplicas, WorkloadTraffic,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
@@ -29,8 +31,9 @@ pub struct HeartbeatRuntimeContext {
     pub reconciliation: Arc<RwLock<RuntimeReconciliationReport>>,
     pub startup_reconciliation_at: OffsetDateTime,
     pub minimum_workspace_free_bytes: u64,
-    /// Bound of `workloads.traffic`, the node's `SAKALA_MAX_ACTIVE_CONTAINERS`:
-    /// at most that many workloads can be running and served at once.
+    /// Bound of `workloads.traffic` and `workloads.replicas`, the node's
+    /// `SAKALA_MAX_ACTIVE_CONTAINERS`: at most that many workloads can be
+    /// running and served at once.
     pub max_traffic_items: usize,
 }
 
@@ -108,6 +111,7 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
             "starting": workloads.starting,
             "unhealthy": workloads.unhealthy,
             "stopped": workloads.stopped,
+            "maximum_replicas_per_project": workloads.maximum_replicas_per_project,
             "unhealthy_details": bounded_values(&workloads.unhealthy_details, |snapshot| json!({
                 "container_id": snapshot.workload.container_id,
                 "project_id": snapshot.workload.project_id,
@@ -176,6 +180,11 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
     });
     insert_crashed_details(&mut metadata, workloads.crashed_details.as_deref());
     insert_traffic(&mut metadata, traffic.as_deref(), context.max_traffic_items);
+    insert_replicas(
+        &mut metadata,
+        &workloads.replicas,
+        context.max_traffic_items,
+    );
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
@@ -235,6 +244,46 @@ fn insert_traffic(metadata: &mut Value, traffic: Option<&[WorkloadTraffic]>, bou
     metadata["detail_counts"]["traffic"] = json!(traffic.len());
 }
 
+/// Adds the replica counts of running deployments with more than one replica.
+/// Both keys are left out when there is none, including when the health
+/// snapshot failed, so an absent list says nothing about any deployment.
+fn insert_replicas(metadata: &mut Value, replicas: &[WorkloadReplicas], bound: usize) {
+    if replicas.is_empty() {
+        return;
+    }
+    metadata["workloads"]["replicas"] = Value::Array(
+        replicas
+            .iter()
+            .take(bound)
+            .map(|item| serde_json::to_value(item).unwrap_or(Value::Null))
+            .collect(),
+    );
+    metadata["detail_counts"]["replicas"] = json!(replicas.len());
+}
+
+/// Groups the snapshot of running containers by deployment. A deployment of
+/// one replica is left out: its single container already speaks for it.
+fn deployment_replicas(snapshots: &[crate::ports::RuntimeHealthSnapshot]) -> Vec<WorkloadReplicas> {
+    let mut deployments = BTreeMap::<(Uuid, Uuid), WorkloadReplicas>::new();
+    for snapshot in snapshots {
+        let workload = &snapshot.workload;
+        let entry = deployments
+            .entry((workload.project_id, workload.deployment_id))
+            .or_insert_with(|| WorkloadReplicas {
+                project_id: workload.project_id,
+                deployment_id: workload.deployment_id,
+                desired: snapshot.desired_replicas.get(),
+                ready: 0,
+            });
+        entry.desired = entry.desired.max(snapshot.desired_replicas.get());
+        entry.ready += u32::from(snapshot.ready);
+    }
+    deployments
+        .into_values()
+        .filter(|deployment| deployment.desired > 1)
+        .collect()
+}
+
 fn bounded_values<T>(items: &[T], mapper: impl Fn(&T) -> Value) -> Vec<Value> {
     items
         .iter()
@@ -259,8 +308,10 @@ struct WorkloadStatistics {
     unhealthy: Option<usize>,
     active_builds: Option<usize>,
     maximum_concurrent_builds: Option<usize>,
+    maximum_replicas_per_project: Option<u32>,
     unhealthy_details: Vec<crate::ports::RuntimeHealthSnapshot>,
     crashed_details: Option<Vec<CrashedWorkloadDetail>>,
+    replicas: Vec<WorkloadReplicas>,
     capacity_available: bool,
     health_available: bool,
 }
@@ -277,11 +328,15 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
     let maximum_concurrent_builds = capacity
         .as_ref()
         .and_then(|value| value.maximum_concurrent_builds);
+    let maximum_replicas_per_project = capacity
+        .as_ref()
+        .and_then(|value| value.maximum_replicas_per_project);
     let health_unavailable = || WorkloadStatistics {
         active,
         stopped,
         active_builds,
         maximum_concurrent_builds,
+        maximum_replicas_per_project,
         capacity_available,
         ..WorkloadStatistics::default()
     };
@@ -304,6 +359,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
                 .contains("starting")
         })
         .count();
+    let replicas = deployment_replicas(&snapshots);
     let unhealthy_details = snapshots
         .into_iter()
         .filter(|snapshot| {
@@ -320,10 +376,12 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         stopped,
         active_builds,
         maximum_concurrent_builds,
+        maximum_replicas_per_project,
         starting: Some(starting),
         unhealthy: Some(unhealthy_details.len()),
         unhealthy_details,
         crashed_details: Some(crashed_details),
+        replicas,
         capacity_available,
         health_available: true,
     }
@@ -344,6 +402,7 @@ fn probe_timeout() -> Duration {
 mod tests {
     use std::{
         collections::HashMap,
+        num::NonZeroU32,
         sync::{Arc, RwLock},
     };
 
@@ -605,6 +664,7 @@ mod tests {
                 workload,
                 ready: false,
                 reason: Some("health check failed".to_owned()),
+                desired_replicas: NonZeroU32::MIN,
             }],
         };
         let heartbeat = payload(
@@ -689,6 +749,7 @@ mod tests {
                 workload,
                 ready: false,
                 reason: Some("health check failed".to_owned()),
+                desired_replicas: NonZeroU32::MIN,
             })
             .collect();
         let reconciliation = RuntimeReconciliationReport {
@@ -974,6 +1035,138 @@ mod tests {
         assert_eq!(
             silent.metadata["detail_counts"]["traffic"].as_u64(),
             Some(0)
+        );
+    }
+
+    struct ReplicaRuntime {
+        snapshots: Vec<RuntimeHealthSnapshot>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for ReplicaRuntime {
+        async fn capacity(&self) -> Result<crate::ports::RuntimeCapacity, RuntimeExecutionError> {
+            Ok(crate::ports::RuntimeCapacity {
+                maximum_replicas_per_project: Some(4),
+                ..crate::ports::RuntimeCapacity::default()
+            })
+        }
+
+        async fn health_snapshot(
+            &self,
+        ) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeExecutionError> {
+            Ok(self.snapshots.clone())
+        }
+    }
+
+    fn replica(
+        project_id: Uuid,
+        deployment_id: Uuid,
+        desired: u32,
+        ready: bool,
+    ) -> RuntimeHealthSnapshot {
+        RuntimeHealthSnapshot {
+            workload: RuntimeWorkload {
+                container_id: Uuid::new_v4().to_string(),
+                project_id,
+                deployment_id,
+                status: if ready {
+                    "Up 1 minute"
+                } else {
+                    "Restarting (1)"
+                }
+                .to_owned(),
+            },
+            ready,
+            reason: None,
+            desired_replicas: NonZeroU32::new(desired).expect("non-zero"),
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_ready_replicas_of_deployments_with_several() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let (balanced, balanced_deployment) = (Uuid::new_v4(), Uuid::new_v4());
+        let (single, single_deployment) = (Uuid::new_v4(), Uuid::new_v4());
+        let runtime = ReplicaRuntime {
+            snapshots: vec![
+                replica(balanced, balanced_deployment, 3, true),
+                replica(balanced, balanced_deployment, 3, false),
+                replica(balanced, balanced_deployment, 3, true),
+                replica(single, single_deployment, 1, true),
+            ],
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        assert_eq!(
+            heartbeat.metadata["workloads"]["replicas"],
+            json!([{
+                "project_id": balanced,
+                "deployment_id": balanced_deployment,
+                "desired": 3,
+                "ready": 2,
+            }])
+        );
+        assert_eq!(heartbeat.metadata["detail_counts"]["replicas"], 1);
+        assert_eq!(
+            heartbeat.metadata["workloads"]["maximum_replicas_per_project"],
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn replicas_are_bounded_like_traffic_and_omitted_when_there_are_none() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let snapshots = (0..7)
+            .flat_map(|_| {
+                let (project_id, deployment_id) = (Uuid::new_v4(), Uuid::new_v4());
+                [
+                    replica(project_id, deployment_id, 2, true),
+                    replica(project_id, deployment_id, 2, true),
+                ]
+            })
+            .collect();
+        let mut context = heartbeat_context(
+            Arc::new(ReplicaRuntime { snapshots }),
+            RuntimeReconciliationReport::default(),
+        );
+        context.max_traffic_items = 5;
+        let bounded = payload(&config, &context).await;
+        assert_eq!(
+            bounded.metadata["workloads"]["replicas"]
+                .as_array()
+                .expect("replicas")
+                .len(),
+            5
+        );
+        assert_eq!(bounded.metadata["detail_counts"]["replicas"], 7);
+
+        let single = ReplicaRuntime {
+            snapshots: vec![replica(Uuid::new_v4(), Uuid::new_v4(), 1, true)],
+        };
+        let none = payload(
+            &config,
+            &heartbeat_context(Arc::new(single), RuntimeReconciliationReport::default()),
+        )
+        .await;
+        assert!(none.metadata["workloads"].get("replicas").is_none());
+        assert!(none.metadata["detail_counts"].get("replicas").is_none());
+
+        let unknown = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(FailedHealthRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        assert!(unknown.metadata["workloads"].get("replicas").is_none());
+        assert!(
+            unknown.metadata["workloads"]["maximum_replicas_per_project"].is_null(),
+            "a driver without replicas reports no limit"
         );
     }
 

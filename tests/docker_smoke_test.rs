@@ -54,8 +54,9 @@ const OUTSIDE: &str = "sakala-agent-sm-outside";
 const SANDBOX_NETWORK: &str = "sakala-agent-sm-railpack";
 const HOST_NETWORK_BUILDER: &str = "sakala-agent-sm-builder";
 const PREFIX: &str = "sakala-agent-sm";
-/// Stands in for `sakala-app-` and keeps the name inside one 63-octet DNS label.
-const APP_NAME_PREFIX: &str = "sakala-agent-sm-";
+/// Stands in for `sakala-app-`. As long as it, so a replica name, which adds
+/// `-r<index>`, stays inside one 63-octet DNS label exactly as on a node.
+const APP_NAME_PREFIX: &str = "sakala-asm-";
 /// Stands in for `sakala-project-`, the network of each project.
 const PROJECT_NETWORK_PREFIX: &str = "sakala-agent-sm-project-";
 const SECRET: &str = "sk-smoke-secret-value";
@@ -690,6 +691,196 @@ async fn root_directory_and_start_command_work_with_a_real_dockerfile_build() {
 
 /// Exits with code 5 on its first `crashes` runs, each after serving for two
 /// seconds so that the deployment goes live, then serves for good.
+/// The runtime Caddyfile of a node, so routes written by the agent serve.
+const ROUTING_CADDYFILE: &str = "{
+	admin localhost:2019
+	auto_https off
+}
+
+import /etc/caddy/sites/*.Caddyfile
+
+:80 {
+	respond \"Not found\" 404
+}
+";
+
+/// Status line and body of one request through the router. BusyBox `nc`
+/// half-closes the connection, which makes Caddy cancel a proxied request, so
+/// this uses `wget`.
+fn routed_request(host: &str) -> (String, String) {
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            ROUTER,
+            "wget",
+            "-S",
+            "-O-",
+            "-T",
+            "10",
+            "--header",
+            &format!("Host: {host}"),
+            "http://127.0.0.1/",
+        ])
+        .output()
+        .expect("docker should be installed");
+    let status = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("HTTP/"))
+        .unwrap_or("no answer")
+        .to_owned();
+    (
+        status,
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    )
+}
+
+fn running_containers_of(run: &Deployment) -> Vec<String> {
+    let mut names = docker(&[
+        "ps",
+        "--filter",
+        &format!("name=^/{}", run.project_prefix()),
+        "--format",
+        "{{.Names}}",
+    ])
+    .lines()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, caddy:2.11.3-alpine, and node:24-alpine"]
+async fn a_rolling_replica_deploy_never_drops_a_request() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    let temp = TempDir::new().expect("temp directory");
+    let sites = temp.path().join("sites");
+    std::fs::create_dir_all(&sites).expect("sites directory");
+    let caddyfile = temp.path().join("Caddyfile");
+    std::fs::write(&caddyfile, ROUTING_CADDYFILE).expect("router Caddyfile");
+    docker(&["network", "create", NETWORK]);
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        ROUTER,
+        "--network",
+        NETWORK,
+        "--pull=never",
+        "-v",
+        &format!("{}:/etc/caddy/Caddyfile:ro", caddyfile.display()),
+        "-v",
+        &format!("{}:/etc/caddy/sites:ro", sites.display()),
+        ROUTER_IMAGE,
+    ]);
+    let harness = Harness::start(&temp).await;
+    let host = "replicas.run.sakala.localhost";
+    // Each replica answers with its own container hostname.
+    prepare_image(
+        "replicas",
+        &node_app(
+            "s.end(require('os').hostname())",
+            "process.env.PORT,'0.0.0.0'",
+            "",
+        ),
+        &[],
+    );
+    harness.runner.select_image("replicas");
+    let project_id = Uuid::new_v4();
+    let deploy = |deployment_id: Uuid, replicas: Value| {
+        harness.run_payload(
+            "replicas",
+            project_id,
+            deployment_id,
+            256,
+            json!({}),
+            json!({ "replicas": replicas }),
+            CancellationToken::new(),
+        )
+    };
+
+    let first = deploy(Uuid::new_v4(), json!(3)).await;
+    first.print("three replicas");
+    first.assert_completed();
+    assert_eq!(running_containers_of(&first).len(), 3);
+    let route =
+        std::fs::read_to_string(sites.join(format!("{project_id}.Caddyfile"))).expect("route file");
+    println!("{route}");
+    let answered = (0..30)
+        .map(|_| {
+            let (status, body) = routed_request(host);
+            assert!(status.ends_with("200 OK"), "{status}");
+            body
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    println!("30 requests reached {} replicas", answered.len());
+    assert_eq!(answered.len(), 3, "{answered:?}");
+
+    // Requests keep coming while two new replicas replace the three.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let load = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut statuses = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                statuses.push(routed_request(host).0);
+            }
+            statuses
+        })
+    };
+    let second = deploy(Uuid::new_v4(), json!(2)).await;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let statuses = load.join().expect("load thread");
+    second.print("two replicas replace three");
+    second.assert_completed();
+    let failed = statuses
+        .iter()
+        .filter(|status| !status.ends_with("200 OK"))
+        .collect::<Vec<_>>();
+    println!(
+        "{} requests during the rolling deploy, {} failed",
+        statuses.len(),
+        failed.len()
+    );
+    assert!(failed.is_empty(), "{failed:?}");
+    assert!(!statuses.is_empty());
+    let survivors = running_containers_of(&second);
+    println!("left running: {survivors:?}");
+    assert_eq!(survivors.len(), 2, "{survivors:?}");
+    assert!(
+        survivors
+            .iter()
+            .all(|name| name.contains(&second.deployment_id.to_string()))
+    );
+    let all = docker(&[
+        "ps",
+        "-a",
+        "--filter",
+        &format!("name=^/{}", second.project_prefix()),
+        "--format",
+        "{{.Names}}",
+    ]);
+    assert_eq!(all.lines().count(), 2, "the old set is removed: {all}");
+
+    // A new set that never comes up leaves the serving set and its route alone.
+    prepare_image("replicas-broken", "echo boom >&2; exit 3", &[]);
+    harness.runner.select_image("replicas-broken");
+    let broken = deploy(Uuid::new_v4(), json!(2)).await;
+    broken.print("a new set that crashes");
+    broken.assert_failed("runtime_app_crashed", &["exit code 3"]);
+    assert_eq!(running_containers_of(&broken), survivors);
+    let (status, _) = routed_request(host);
+    assert!(status.ends_with("200 OK"), "{status}");
+
+    // More than the node allows fails before anything runs.
+    let too_many = deploy(Uuid::new_v4(), json!(5)).await;
+    too_many.assert_failed("runtime_replicas_exceeded", &["5 replicas", "at most 4"]);
+    assert_eq!(running_containers_of(&too_many), survivors);
+}
+
 fn crashes_then_serves(name: &str, crashes: u32) -> String {
     format!(
         "n=$(cat /tmp/{name} 2>/dev/null || echo 0); echo $((n+1)) > /tmp/{name}; if [ \"$n\" -ge {crashes} ]; then {}; else {}; fi",
@@ -2738,6 +2929,17 @@ impl ProcessRunner for SmokeRunner {
                     .into()
             })
             .collect();
+        // Routes are files the agent writes itself, so they name a workload by
+        // its real name. An alias on its network lets the router resolve that.
+        if real.args.first().is_some_and(|argument| argument == "run")
+            && let Some(position) = spec.args.iter().position(|argument| argument == "--name")
+            && let Some(name) = spec.args.get(position + 1)
+            && name.to_string_lossy().starts_with("sakala-app-")
+        {
+            real.args
+                .insert(position + 2, std::ffi::OsString::from("--network-alias"));
+            real.args.insert(position + 3, name.clone());
+        }
         let replace_build =
             !real_git && self.real_build_files.lock().expect("files lock").is_none();
         if replace_build
@@ -2835,21 +3037,20 @@ impl Cleanup {
                 .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                 .unwrap_or_default()
         };
-        for name in list(&[
-            "ps",
-            "-a",
-            "--filter",
-            "name=^/sakala-agent-sm-",
-            "--format",
-            "{{.Names}}",
-        ])
-        .lines()
-        {
-            assert!(
-                name.starts_with("sakala-agent-sm-"),
-                "refusing to remove {name}"
-            );
-            quiet(&["rm", "-f", "-v", name]);
+        for prefix in ["sakala-agent-sm-", APP_NAME_PREFIX] {
+            for name in list(&[
+                "ps",
+                "-a",
+                "--filter",
+                &format!("name=^/{prefix}"),
+                "--format",
+                "{{.Names}}",
+            ])
+            .lines()
+            {
+                assert!(name.starts_with(prefix), "refusing to remove {name}");
+                quiet(&["rm", "-f", "-v", name]);
+            }
         }
         for image in list(&["images", "--format", "{{.Repository}}:{{.Tag}}"]).lines() {
             let deployment_named =

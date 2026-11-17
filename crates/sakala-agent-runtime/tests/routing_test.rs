@@ -364,7 +364,7 @@ fn route(project_id: Uuid) -> RouteSpec {
         project_id,
         deployment_id: Uuid::new_v4(),
         domain: "portfolio.run.sakala.localhost".to_owned(),
-        upstream: "sakala-app-project-deployment".to_owned(),
+        upstreams: vec!["sakala-app-project-deployment".to_owned()],
         port: 3000,
     }
 }
@@ -441,6 +441,50 @@ async fn caddy_output_never_reaches_the_deployment_log() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn a_balanced_route_is_one_site_for_every_replica_and_rolls_back_as_a_whole() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let route_path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let spec = RouteSpec {
+        upstreams: (0..3).map(|index| format!("app-r{index}")).collect(),
+        ..route(project_id)
+    };
+
+    CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader))
+        .activate(&spec, &NoopReporter)
+        .await
+        .expect("balanced route");
+    let content = std::fs::read_to_string(&route_path).expect("route file");
+    assert_eq!(content.matches(":80 {").count(), 1, "{content}");
+    assert!(
+        content.contains(
+            "\treverse_proxy app-r0:3000 app-r1:3000 app-r2:3000 {\n\t\tlb_policy least_conn\n"
+        ),
+        "{content}"
+    );
+    for directive in ["lb_try_duration", "lb_try_interval", "fail_duration"] {
+        assert!(content.contains(directive), "{directive} in {content}");
+    }
+    // No active health check: Caddy 2.11 cannot express "any status below 500".
+    assert!(!content.contains("health_uri"), "{content}");
+
+    // A refused balanced route puts the previous file back, like any route.
+    let reloader = Arc::new(FailingReloader::default());
+    let refused = RouteSpec {
+        upstreams: vec!["app-r0".to_owned(), "app-r1".to_owned()],
+        ..spec
+    };
+    CaddyFileRouteManager::new(temp.path().to_owned(), reloader.clone())
+        .activate(&refused, &NoopReporter)
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        std::fs::read_to_string(&route_path).expect("route file"),
+        content
+    );
 }
 
 #[derive(Default)]

@@ -15,8 +15,11 @@ pub mod routing;
 mod telemetry;
 pub mod workspace;
 
-pub use config::{DEFAULT_CRASH_STABLE_WINDOW, DockerRuntimeConfig, TimeoutSafetyConfig};
-pub use containers::ResourceSafetyConfig;
+pub use config::{
+    DEFAULT_CRASH_STABLE_WINDOW, DEFAULT_MAX_REPLICAS_PER_PROJECT, DockerRuntimeConfig,
+    TimeoutSafetyConfig,
+};
+pub use containers::{MAX_REPLICAS_PER_PROJECT_CEILING, ResourceSafetyConfig};
 pub use domains::{DEFAULT_PROJECT_DOMAIN_SUFFIXES, ProjectDomainSuffixes};
 pub use error::RuntimeError;
 pub use executor::{DockerRuntimeExecutor, NoopRuntimeExecutor};

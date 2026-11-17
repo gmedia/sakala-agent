@@ -21,12 +21,15 @@ pub struct RouteIdentity {
     pub deployment_id: Option<Uuid>,
 }
 
+/// A serving route: the project's domain, proxied to its deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteSpec {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub domain: String,
-    pub upstream: String,
+    /// The container name of every replica, in replica order. One name gives
+    /// the plain proxy every earlier Agent wrote; several are balanced.
+    pub upstreams: Vec<String>,
     pub port: u16,
 }
 

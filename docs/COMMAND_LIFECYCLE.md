@@ -55,6 +55,21 @@ dapat drift dari deployment aktif.
 | `DrainNode` | Mengubah node ke `draining`: workload aktif tetap berjalan, tetapi scheduler tidak mengklaim command workload baru. Setelah command aktif habis, node menjadi `drained`. | Aman diulang. |
 | `ResumeNode` | Menjalankan runtime preflight; hanya bila tidak ada kegagalan fatal scheduler kembali menerima command workload. | Aman diulang saat node sudah active. |
 
+### Deployment dengan beberapa replika
+
+Semua command di atas bekerja pada seluruh replika sebuah deployment, yang ditemukan
+lewat label `dev.sakala.project-id` dan `dev.sakala.deployment-id` yang sama. Deployment
+satu replika berperilaku persis seperti sebelumnya.
+
+| Command | Perbedaan untuk beberapa replika |
+| --- | --- |
+| `DeployProject` | Semua replika baru dinyalakan, lalu masing-masing harus ready dalam satu batas start sebelum route pindah. Satu replika gagal berarti deploy gagal, semua replika baru dihapus, dan route lama tetap. Kapasitas dicek untuk semua replika baru. Setelah route pindah, container lama yang masih berjalan dihentikan dalam satu `docker stop`, lalu dihapus. |
+| `SleepProject`, `StopProject` | Semua replika dihentikan dalam satu `docker stop`, sehingga berbagi satu masa tenggang 10 detik. Sleep mempertahankan container; stop menghapus semuanya. |
+| `WakeProject` | Kapasitas dicek untuk semua replika, lalu semuanya di-start. Route aktif begitu satu replika ready, karena router melewati replika yang belum bisa dihubungi. Bila tidak ada replika yang ready, semua replika yang di-start wake ini dihentikan lagi. |
+| `RestartProject` | Ditolak bila tidak ada replika yang berjalan. Selain itu semua replika di-restart, termasuk yang berhenti sendiri, lalu route ditulis ulang begitu satu replika ready. |
+| `HealthCheck` | `ready` bernilai `true` selama satu replika menjawab. Result menambah `desired_replicas`, `ready_replicas`, dan `replicas` berisi hasil tiap replika; field level atas mengikuti replika pertama yang ready, atau replika pertama bila tidak ada. |
+| `RefreshRoute`, `ReconcileWorkload` | `running` berarti minimal satu replika berjalan. `cleanup_failed_candidate` hanya berlaku bila tidak ada replika yang berjalan, lalu menghapus semuanya. `restart_log_follower` menyalakan follower untuk setiap replika yang berjalan. |
+
 `StopProject` dan `SleepProject` sengaja berbeda pada retensi: stop menghapus
 container (namun bukan image, kecuali project dihapus dan API mengirim
 `remove_images: true`), sedangkan sleep mempertahankan container supaya wake

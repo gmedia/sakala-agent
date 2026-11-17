@@ -3,7 +3,8 @@ use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError};
 use sakala_agent_runtime::{
-    DockerRuntimeConfig, ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
+    DEFAULT_MAX_REPLICAS_PER_PROJECT, DockerRuntimeConfig, MAX_REPLICAS_PER_PROJECT_CEILING,
+    ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -144,6 +145,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_MAX_ACTIVE_CONTAINERS")]
     max_active_containers: Option<String>,
 
+    #[arg(long, env = "SAKALA_MAX_REPLICAS_PER_PROJECT")]
+    max_replicas_per_project: Option<String>,
+
     #[arg(long, env = "SAKALA_DEFAULT_CONTAINER_MEMORY_MB")]
     default_container_memory_mb: Option<String>,
 
@@ -278,6 +282,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
     );
     insert(
         &mut values,
+        "SAKALA_MAX_REPLICAS_PER_PROJECT",
+        cli.max_replicas_per_project,
+    );
+    insert(
+        &mut values,
         "SAKALA_DEFAULT_CONTAINER_MEMORY_MB",
         cli.default_container_memory_mb,
     );
@@ -388,6 +397,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             },
             max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
+            max_replicas_per_project: max_replicas_per_project(values)?,
             api_url: agent.api_url.clone(),
             ..DockerRuntimeConfig::default()
         },
@@ -456,6 +466,8 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             "caddy-file-routing",
             // Sleeping routes, wake capacity checks, and `workloads.traffic`.
             "idle-sleep",
+            // `DeployProject.replicas`, balanced routes, and `workloads.replicas`.
+            "replicas",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -525,6 +537,17 @@ fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
         .get(key)
         .cloned()
         .unwrap_or_else(|| default.to_owned())
+}
+
+fn max_replicas_per_project(values: &HashMap<String, String>) -> Result<u32, CoreError> {
+    const KEY: &str = "SAKALA_MAX_REPLICAS_PER_PROJECT";
+    let maximum = positive_u32(values, KEY, DEFAULT_MAX_REPLICAS_PER_PROJECT)?;
+    if maximum > MAX_REPLICAS_PER_PROJECT_CEILING {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{KEY} must be at most {MAX_REPLICAS_PER_PROJECT_CEILING}"
+        )));
+    }
+    Ok(maximum)
 }
 
 fn positive_u32(
@@ -734,6 +757,33 @@ mod tests {
                 .contains(&"railpack-info".to_owned())
         );
         assert!(config.agent.capabilities.contains(&"idle-sleep".to_owned()));
+        assert!(config.agent.capabilities.contains(&"replicas".to_owned()));
+    }
+
+    #[test]
+    fn replicas_are_advertised_only_by_the_docker_runtime() {
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(!noop.agent.capabilities.contains(&"replicas".to_owned()));
+    }
+
+    #[test]
+    fn the_replica_limit_defaults_to_four_and_stays_inside_the_ceiling() {
+        let replicas = |value: Option<&str>| {
+            let mut values = HashMap::new();
+            if let Some(value) = value {
+                values.insert(
+                    "SAKALA_MAX_REPLICAS_PER_PROJECT".to_owned(),
+                    value.to_owned(),
+                );
+            }
+            from_values(&values).map(|config| config.docker_runtime.max_replicas_per_project)
+        };
+        assert_eq!(replicas(None).expect("default"), 4);
+        assert_eq!(replicas(Some("1")).expect("one"), 1);
+        assert_eq!(replicas(Some("64")).expect("ceiling"), 64);
+        for invalid in ["0", "65", "-1", "four"] {
+            assert!(replicas(Some(invalid)).is_err(), "{invalid}");
+        }
     }
 
     #[test]

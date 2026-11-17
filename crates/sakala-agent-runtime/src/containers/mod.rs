@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
@@ -16,10 +16,12 @@ mod docker;
 pub(crate) mod images;
 pub(crate) mod limits;
 pub(crate) mod network;
+pub(crate) mod replicas;
 
 pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
 pub use limits::ResourceSafetyConfig;
 pub use network::project_network_name;
+pub use replicas::{MAX_REPLICAS_PER_PROJECT_CEILING, ReplicaSlot};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunContainerRequest {
@@ -27,6 +29,7 @@ pub struct RunContainerRequest {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub name: String,
+    pub replica: ReplicaSlot,
     pub image: String,
     pub workspace: PathBuf,
     pub environment: BTreeMap<String, String>,
@@ -39,9 +42,13 @@ pub struct RunContainerRequest {
     pub start_command: Option<String>,
 }
 
+/// One container of a managed deployment, as Docker lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedWorkload {
     pub container_id: String,
+    /// The container name, which the router uses as the upstream host.
+    pub name: String,
+    pub replica: ReplicaSlot,
     pub status: String,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
@@ -49,6 +56,13 @@ pub struct ManagedWorkload {
     pub port: u16,
     pub command_id: Option<Uuid>,
     pub log_bounds: LogBounds,
+}
+
+impl ManagedWorkload {
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.status.to_ascii_lowercase().starts_with("up")
+    }
 }
 
 /// A running managed workload and the domain it is routed under.
@@ -66,7 +80,15 @@ pub trait ContainerEngine: Send + Sync {
         requested: RuntimeResourceLimits,
     ) -> Result<AppliedRuntimeResources, RuntimeError>;
 
-    async fn ensure_capacity(&self, project_id: Uuid) -> Result<(), RuntimeError>;
+    /// Refuses `replicas` more running containers for `project_id` when the
+    /// node would then run more than its maximum. The project's own running
+    /// containers are not counted: a new deployment replaces them, and the
+    /// overlap while it starts is the same one a single container always had.
+    async fn ensure_capacity(
+        &self,
+        project_id: Uuid,
+        replicas: NonZeroU32,
+    ) -> Result<(), RuntimeError>;
 
     async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
 
@@ -83,11 +105,13 @@ pub trait ContainerEngine: Send + Sync {
         snapshots: &[RuntimeHealthSnapshot],
     ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeError>;
 
-    async fn workload(
+    /// Every container of one deployment, running or not, in replica order.
+    /// Empty when the deployment has none on this node.
+    async fn workloads(
         &self,
         project_id: Uuid,
         deployment_id: Uuid,
-    ) -> Result<Option<ManagedWorkload>, RuntimeError>;
+    ) -> Result<Vec<ManagedWorkload>, RuntimeError>;
 
     async fn restart(
         &self,
@@ -95,9 +119,11 @@ pub trait ContainerEngine: Send + Sync {
         grace_seconds: u64,
     ) -> Result<(), RuntimeError>;
 
+    /// Stops the running ones among `workloads` in one Docker call, which
+    /// stops them side by side, so replicas share one grace period.
     async fn stop(
         &self,
-        workload: &ManagedWorkload,
+        workloads: &[ManagedWorkload],
         grace_seconds: u64,
     ) -> Result<(), RuntimeError>;
 
@@ -154,17 +180,24 @@ pub trait ContainerEngine: Send + Sync {
     /// follower was registered.
     fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool;
 
+    /// Stops and removes every container of the project except `current`, the
+    /// replicas of the deployment that just went live.
     async fn cleanup_previous(
         &self,
         project_id: Uuid,
-        current: &str,
+        current: &[String],
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    /// Attempts every candidate cleanup action. A failure is returned only
-    /// after all owned artifacts have been attempted, so callers can report
-    /// partial cleanup without replacing the primary deployment error.
-    async fn cleanup_candidate(&self, container: &str, image: &str) -> Result<(), RuntimeError>;
+    /// Attempts every candidate cleanup action, for all replicas of the
+    /// candidate. A failure is returned only after all owned artifacts have
+    /// been attempted, so callers can report partial cleanup without replacing
+    /// the primary deployment error.
+    async fn cleanup_candidate(
+        &self,
+        containers: &[String],
+        image: &str,
+    ) -> Result<(), RuntimeError>;
 
     /// Lists the Sakala images that [`Self::cleanup_stale_images`] would remove,
     /// without removing anything.
