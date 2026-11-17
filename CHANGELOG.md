@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+
 ### Changed
 
 - Default `SAKALA_PROJECT_DOMAIN_SUFFIXES` kini `run.sakala.localhost`, `staging.sakala.app`, dan `sakala.app`, sesuai domain project Sakala hosted yang pindah ke registrable domain terpisah (ADR-016): production `<slug>.sakala.app`, staging `<slug>.staging.sakala.app`. `run.staging.sakala.dev` dan `run.sakala.dev` tidak lagi diterima tanpa konfigurasi, jadi deploy dengan domain lama ditolak dengan `invalid_runtime_command`. Instalasi yang mengisi `SAKALA_PROJECT_DOMAIN_SUFFIXES` sendiri tidak terpengaruh. Aturan satu label tetap: node yang hanya memakai `sakala.app` menolak `x.staging.sakala.app`.
@@ -212,7 +214,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/gmedia/sakala-agent/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/gmedia/sakala-agent/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...v0.6.0
