@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-18
+
 ### Added
 
 - Replika dan load balancing di satu node. Payload `DeployProject` boleh membawa `replicas` (bilangan bulat, default 1), dan Agent menjalankan sebanyak itu container dari image yang sama di network project. Router Caddy node membagi request ke semuanya dengan `lb_policy least_conn`, mengulang request ke replika lain selama 5 detik, dan tidak mengirim request ke replika yang gagal selama 10 detik. Deploy berjalan bergulir: semua replika baru harus ready sebelum route pindah, lalu set lama dihentikan; satu replika gagal berarti deploy gagal dan route lama tetap. Sleep, wake, stop, restart, health check, dan reconcile bekerja pada seluruh replika. Uji Docker nyata: dari 30 request ketiga replika menerima bagian, mematikan satu replika dengan `docker kill` tidak menggagalkan satu request pun, dan redeploy dari 3 ke 2 replika melayani 78 request tanpa gagal. Lihat [Replika](docs/AGENT_API.md#replika).
@@ -224,7 +226,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/gmedia/sakala-agent/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/gmedia/sakala-agent/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/gmedia/sakala-agent/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/gmedia/sakala-agent/compare/v0.5.0...v0.6.0
