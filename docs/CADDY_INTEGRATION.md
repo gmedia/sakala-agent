@@ -52,12 +52,16 @@ portfolio.sakala.app:80 {
 		lb_try_duration 5s
 		lb_try_interval 250ms
 		fail_duration 10s
+		header_down Set-Cookie "(?i);\s*domain\s*=[^;]*" ""
 	}
 }
 ```
 
-Deployment satu replika tetap mendapat `reverse_proxy <container>:<port>` tanpa blok,
-byte demi byte sama dengan Agent sebelumnya. Nilai di atas adalah konstanta di
+Deployment satu replika mendapat `reverse_proxy <container>:<port>` dengan blok yang
+hanya berisi baris `header_down`. Baris itu ada di setiap route project dan membuat
+cookie dari aplikasi menjadi host-only; alasannya ada di
+[Cookie host-only](RUNTIME_HARDENING.md#cookie-host-only-di-route-project). Opsi load
+balancing di atas adalah konstanta di
 `crates/sakala-agent-runtime/src/routing/caddy_file.rs`:
 
 - `least_conn` mengirim request baru ke replika dengan request aktif paling sedikit.

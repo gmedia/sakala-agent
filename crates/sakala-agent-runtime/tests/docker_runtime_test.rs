@@ -7199,13 +7199,16 @@ fn replica_rows(count: u32, status: &str) -> String {
         .collect()
 }
 
+/// The line every serving route carries to make upstream cookies host-only.
+const COOKIE_DOMAIN_STRIP: &str = "\t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n";
+
 fn balanced_route(upstreams: &[String]) -> String {
     let upstreams = upstreams
         .iter()
         .map(|name| format!(" {name}:3000"))
         .collect::<String>();
     format!(
-        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy{upstreams} {{\n\t\tlb_policy least_conn\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t\tfail_duration 10s\n\t}}\n}}\n"
+        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy{upstreams} {{\n\t\tlb_policy least_conn\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t\tfail_duration 10s\n{COOKIE_DOMAIN_STRIP}\t}}\n}}\n"
     )
 }
 
@@ -7294,7 +7297,7 @@ async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
 }
 
 #[tokio::test]
-async fn one_replica_keeps_the_container_name_and_route_of_earlier_agents() {
+async fn one_replica_keeps_the_container_name_of_earlier_agents() {
     for replicas in [None, Some(json!(1))] {
         let temp = TempDir::new().expect("temp directory should be available");
         let runner = Arc::new(FakeRunner::new(true));
@@ -7317,7 +7320,7 @@ async fn one_replica_keeps_the_container_name_and_route_of_earlier_agents() {
         assert_eq!(
             fs::read_to_string(route_file(&config)).expect("route"),
             format!(
-                "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy {BASE_NAME}:3000\n}}\n"
+                "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy {BASE_NAME}:3000 {{\n{COOKIE_DOMAIN_STRIP}\t}}\n}}\n"
             )
         );
     }

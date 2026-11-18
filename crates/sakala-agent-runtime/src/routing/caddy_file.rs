@@ -41,6 +41,20 @@ const LB_TRY_INTERVAL: Duration = Duration::from_millis(250);
 /// at once, such as a DNS hiccup, makes the site answer 503 for this long.
 const FAIL_DURATION: Duration = Duration::from_secs(10);
 
+/// The response header whose values lose their `Domain` attribute.
+const SET_COOKIE_HEADER: &str = "Set-Cookie";
+/// One `Domain` attribute of a `Set-Cookie` value, in any case, with the `;`
+/// before it, optional spaces around the name, and the value up to the next `;`
+/// or the end. Removing it makes the cookie host-only. Every project shares the
+/// registrable domain `sakala.app` until it is on the Public Suffix List, so a
+/// cookie one app sets for `Domain=sakala.app` would otherwise reach every other
+/// app. The leading `;` keeps cookie values such as `pref=domain%3Dx` and a
+/// cookie named `domain` untouched, and the trailing attributes keep their own
+/// `;`. Caddy applies the replacement to each `Set-Cookie` value separately.
+/// Written for Go's RE2 inside a double-quoted Caddyfile token, so it holds no
+/// `"`, and no `{`, which Caddy would read as a placeholder.
+const COOKIE_DOMAIN_ATTRIBUTE_PATTERN: &str = r"(?i);\s*domain\s*=[^;]*";
+
 /// What the first line of a route file says about its owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteOwner {
@@ -132,17 +146,23 @@ fn serving_route(route: &RouteSpec) -> String {
     for upstream in &route.upstreams {
         let _ = write!(content, " {upstream}:{}", route.port);
     }
-    // One replica keeps the route every earlier Agent wrote, byte for byte.
+    content.push_str(" {\n");
     if route.upstreams.len() > 1 {
         let _ = write!(
             content,
-            " {{\n\t\tlb_policy {LB_POLICY}\n\t\tlb_try_duration {}\n\t\tlb_try_interval {}\n\t\tfail_duration {}\n\t}}",
+            "\t\tlb_policy {LB_POLICY}\n\t\tlb_try_duration {}\n\t\tlb_try_interval {}\n\t\tfail_duration {}\n",
             caddy_duration(LB_TRY_DURATION),
             caddy_duration(LB_TRY_INTERVAL),
             caddy_duration(FAIL_DURATION),
         );
     }
-    content.push_str("\n}\n");
+    // Every upstream cookie becomes host-only; the empty replacement deletes
+    // the attribute.
+    let _ = writeln!(
+        content,
+        "\t\theader_down {SET_COOKIE_HEADER} \"{COOKIE_DOMAIN_ATTRIBUTE_PATTERN}\" \"\""
+    );
+    content.push_str("\t}\n}\n");
     content
 }
 
@@ -380,14 +400,24 @@ mod tests {
     }
 
     #[test]
-    fn one_replica_keeps_the_plain_proxy() {
+    fn one_replica_proxies_and_makes_cookies_host_only() {
         assert_eq!(
             serving_route(&route(&["app"])),
             "# Managed by sakala-agent for project ff66ed4a-6303-4be6-8ef4-63c28b112680 deployment 4f1f21ef-730d-42d5-a46d-d965353cb993.\n\
              portfolio.sakala.app:80 {\n\
-             \treverse_proxy app:3000\n\
+             \treverse_proxy app:3000 {\n\
+             \t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n\
+             \t}\n\
              }\n"
         );
+    }
+
+    #[test]
+    fn the_cookie_pattern_fits_a_quoted_caddyfile_token() {
+        // A `"` would end the token early and a `{` would turn the pattern into
+        // a Caddy placeholder, so Caddy would match something else.
+        assert!(!COOKIE_DOMAIN_ATTRIBUTE_PATTERN.contains(['"', '{', '}']));
+        assert!(COOKIE_DOMAIN_ATTRIBUTE_PATTERN.starts_with("(?i)"));
     }
 
     #[test]
@@ -401,6 +431,7 @@ mod tests {
              \t\tlb_try_duration 5s\n\
              \t\tlb_try_interval 250ms\n\
              \t\tfail_duration 10s\n\
+             \t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n\
              \t}\n\
              }\n"
         );
