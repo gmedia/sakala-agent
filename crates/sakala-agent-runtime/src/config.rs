@@ -136,9 +136,10 @@ pub struct DockerRuntimeConfig {
     pub crash_stable_window: Duration,
     /// See [`DEFAULT_RELEASE_COMMAND_TIMEOUT`].
     pub release_command_timeout: Duration,
-    /// `SAKALA_API_URL`. A sleeping project's page sends visitors' browsers to
-    /// the control plane's public wake endpoint under it.
-    pub api_url: String,
+    /// `SAKALA_PUBLIC_API_URL`, or `SAKALA_API_URL` when unset: the control
+    /// plane as visitors' browsers reach it. A sleeping project's page sends
+    /// them to the public wake endpoint under it. Used for nothing else.
+    pub public_api_url: String,
 }
 
 impl Default for DockerRuntimeConfig {
@@ -168,7 +169,7 @@ impl Default for DockerRuntimeConfig {
             health_interval: Duration::from_secs(1),
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,
             release_command_timeout: DEFAULT_RELEASE_COMMAND_TIMEOUT,
-            api_url: "http://localhost:8000".to_owned(),
+            public_api_url: "http://localhost:8000".to_owned(),
         }
     }
 }

@@ -2083,7 +2083,7 @@ async fn sleep_puts_the_sleeping_page_on_the_project_domain() {
             .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
     );
     let mut config = runtime_config(&temp);
-    config.api_url = "https://api.staging.sakala.dev/".to_owned();
+    config.public_api_url = "https://api.staging.sakala.dev/".to_owned();
     let route = write_route(
         &config,
         PROJECT,
@@ -2136,7 +2136,7 @@ async fn sleep_removes_the_route_when_the_sleeping_page_cannot_be_built() {
             .with_docker_ps("sleeping\tUp 1 minute\tportfolio.run.sakala.localhost\t3000\n"),
     );
     let mut config = runtime_config(&temp);
-    config.api_url = "not a URL".to_owned();
+    config.public_api_url = "not a URL".to_owned();
     let route = write_route(
         &config,
         PROJECT,
@@ -2236,7 +2236,7 @@ async fn sleep_can_put_the_unavailable_page_on_the_project_domain() {
     let mut config = runtime_config(&temp);
     // The unavailable page asks nobody to wake the project, so it needs no
     // wake URL and goes up even where a waking page could not be built.
-    config.api_url = "not a URL".to_owned();
+    config.public_api_url = "not a URL".to_owned();
 
     let route = sleep_with_page(&config, SleepingPage::Unavailable).await;
 

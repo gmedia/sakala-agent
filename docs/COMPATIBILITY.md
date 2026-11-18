@@ -128,7 +128,7 @@ the new capability, and an older Agent never sends them.
 | --- | --- | --- |
 | Node capability `idle-sleep` | Advertised by the `docker` driver only. | The API should only put a project to sleep for idleness on a node that advertises it. |
 | `metadata.workloads.traffic` and `metadata.detail_counts.traffic` | Sent on heartbeat, bound `SAKALA_MAX_ACTIVE_CONTAINERS`. | Items `{ project_id, deployment_id, last_request_at }`. Both keys are omitted while traffic is unknown, and a heartbeat without them must not make any project look idle. Shape and semantics in [Sakala Agent API](AGENT_API.md#traffic-workload). |
-| `SleepProject` installs a sleeping route | Behaviour change. | The project's domain answers a 503 page that asks `POST /api/v1/public/projects/<slug>/wake` (under `SAKALA_API_URL`) and reloads itself, instead of the router's 404. Suspension uses the same command, so the API must refuse wake requests for a suspended project. |
+| `SleepProject` installs a sleeping route | Behaviour change. | The project's domain answers a 503 page that asks `POST /api/v1/public/projects/<slug>/wake` (under `SAKALA_PUBLIC_API_URL`, which defaults to `SAKALA_API_URL`) and reloads itself, instead of the router's 404. Suspension uses the same command, so the API must refuse wake requests for a suspended project. |
 | `WakeProject` checks node capacity | Behaviour change. | A full node fails the wake with `runtime_capacity_exceeded`, an existing code, and keeps the sleeping route. |
 
 Host requirement: the runtime Caddyfile needs `metrics { per_host }` in its global

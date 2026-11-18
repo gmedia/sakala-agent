@@ -80,7 +80,7 @@ pub struct DockerRuntimeExecutor {
     project_domains: crate::ProjectDomainSuffixes,
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
-    api_url: String,
+    public_api_url: String,
     router_metrics: DockerExecCaddyMetrics,
     traffic: std::sync::Mutex<TrafficTracker>,
     /// Keeps a router without readable counters to one warning, not one per heartbeat.
@@ -149,7 +149,7 @@ impl DockerRuntimeExecutor {
         let release_command_timeout = config.release_command_timeout;
         let restore_policy = RestorePolicy::new(config.crash_stable_window);
         let router_container = config.caddy_container.clone();
-        let api_url = config.api_url.clone();
+        let public_api_url = config.public_api_url.clone();
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -203,7 +203,7 @@ impl DockerRuntimeExecutor {
             image_retention,
             min_workspace_free_bytes,
             preflight,
-            api_url,
+            public_api_url,
             restore_policy,
         )
     }
@@ -226,7 +226,7 @@ impl DockerRuntimeExecutor {
         image_retention: ImageRetention,
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
-        api_url: String,
+        public_api_url: String,
         restore_policy: RestorePolicy,
     ) -> Self {
         let telemetry = NodeTelemetryCollector::new(
@@ -261,7 +261,7 @@ impl DockerRuntimeExecutor {
             project_domains: preflight.project_domains.clone(),
             preflight,
             telemetry,
-            api_url,
+            public_api_url,
             router_metrics,
             traffic: std::sync::Mutex::new(TrafficTracker::new(OffsetDateTime::now_utc())),
             traffic_unreadable: AtomicBool::new(false),
@@ -1230,7 +1230,7 @@ impl DockerRuntimeExecutor {
                             .to_owned(),
                     )
                 })
-                .and_then(|slug| wake_url(&self.api_url, slug))
+                .and_then(|slug| wake_url(&self.public_api_url, slug))
                 .map(|wake_url| SleepingRoutePage::Waking { wake_url }),
             SleepingPage::Unavailable => Ok(SleepingRoutePage::Unavailable),
         };
