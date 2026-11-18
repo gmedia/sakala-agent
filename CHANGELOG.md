@@ -4,6 +4,11 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- Binary baru `sakala-edge`, service sinkronisasi route untuk Sakala Edge (ADR-019, tahap 2). Service ini memoll `GET {SAKALA_API_URL}/api/edge/v1/routes` dengan `SAKALA_EDGE_TOKEN` setiap 5 detik (`SAKALA_EDGE_POLL_INTERVAL_SECONDS`), dengan backoff berlipat dua sampai 60 detik (`SAKALA_EDGE_MAX_BACKOFF_SECONDS`) saat gagal. Tabel ditolak seluruhnya, dan route yang sedang dilayani tetap, bila API tidak menjawab `200`, JSON rusak, tabel kosong, route lebih sedikit dari `expected_minimum_routes`, host di luar `SAKALA_EDGE_DOMAIN_SUFFIXES` (aturan satu label yang sama dengan Agent), host ganda, atau upstream yang bukan `IP:port` di dalam `SAKALA_EDGE_UPSTREAM_CIDRS` (default jaringan privat RFC 1918 dan `fc00::/7`). Tabel valid dirender menjadi `routes.caddy` (satu matcher host dan `reverse_proxy` per project, `lb_policy least_conn` dengan passive health seperti route replika), lalu divalidasi dan di-reload dengan `SAKALA_EDGE_CADDY_VALIDATE_CMD` dan `SAKALA_EDGE_CADDY_RELOAD_CMD`; bila Caddy menolak, file lama dikembalikan dan Caddy di-reload lagi. Tabel yang diterima disimpan di `routes.json` dan dirender lagi saat start sebelum polling pertama, jadi restart saat API mati tetap melayani semua route. Status untuk monitoring ditulis ke `status.json`, tanpa listener jaringan. Contoh unit systemd, aturan polkit, env file, dan Caddyfile host ada di `examples/edge/`. Uji Docker dengan `caddy:2.11.3-alpine` memvalidasi file hasil render, membagi request ke dua upstream, dan tidak menggagalkan satu pun dari 20 request setelah satu upstream dimatikan. Lihat [Sakala Edge](docs/EDGE.md).
+- Rilis kini menerbitkan `sakala-edge-linux-x86_64` di samping `sakala-agent-linux-x86_64`. `SHA256SUMS` memuat satu baris per asset dalam format yang sama seperti sebelumnya.
+
 ## [0.8.0] - 2026-11-18
 
 ### Added

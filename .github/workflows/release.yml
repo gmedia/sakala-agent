@@ -29,15 +29,19 @@ jobs:
           package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "sakala-agent") | .version')"
           test "$tag_version" = "$package_version"
 
-      - name: Build release binary
-        run: cargo build --release --locked -p sakala-agent
+      - name: Build release binaries
+        run: cargo build --release --locked -p sakala-agent -p sakala-edge
 
       - name: Package and checksum
         run: |
           mkdir -p dist
-          cp target/release/sakala-agent dist/sakala-agent-linux-x86_64
-          chmod 0755 dist/sakala-agent-linux-x86_64
-          sha256sum dist/sakala-agent-linux-x86_64 > dist/SHA256SUMS
+          for binary in sakala-agent sakala-edge; do
+            cp "target/release/$binary" "dist/$binary-linux-x86_64"
+            chmod 0755 "dist/$binary-linux-x86_64"
+          done
+          # One line per asset, in the same `dist/<asset>` form as before, so
+          # installers that grep for their asset name keep working.
+          sha256sum dist/sakala-agent-linux-x86_64 dist/sakala-edge-linux-x86_64 > dist/SHA256SUMS
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
@@ -45,4 +49,5 @@ jobs:
           generate_release_notes: true
           files: |
             dist/sakala-agent-linux-x86_64
+            dist/sakala-edge-linux-x86_64
             dist/SHA256SUMS

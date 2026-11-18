@@ -1,0 +1,11 @@
+// Install as /etc/polkit-1/rules.d/50-sakala-edge.rules. Lets the sakala-edge
+// user reload caddy.service, the default SAKALA_EDGE_CADDY_RELOAD_CMD, and no
+// other unit or action.
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "caddy.service" &&
+        action.lookup("verb") == "reload" &&
+        subject.user == "sakala-edge") {
+        return polkit.Result.YES;
+    }
+});

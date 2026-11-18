@@ -1521,6 +1521,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sakala-edge"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "ipnet",
+ "reqwest",
+ "sakala-agent-core",
+ "sakala-agent-runtime",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

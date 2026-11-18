@@ -1,0 +1,47 @@
+[package]
+name = "sakala-edge"
+description = "Route-sync service of Sakala Edge: keeps a host Caddy in step with the control plane route table."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+ipnet = "2.12"
+reqwest.workspace = true
+sakala-agent-core.workspace = true
+sakala-agent-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
+sakala-agent-core.workspace = true
+sakala-agent-runtime.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
+wiremock.workspace = true
+
+[[test]]
+name = "edge_sync_test"
+path = "../../tests/edge_sync_test.rs"
+
+[[test]]
+name = "edge_caddy_smoke_test"
+path = "../../tests/edge_caddy_smoke_test.rs"

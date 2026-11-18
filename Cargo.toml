@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/sakala-agent",
+    "apps/sakala-edge",
     "crates/sakala-agent-core",
     "crates/sakala-agent-protocol",
     "crates/sakala-agent-runtime",

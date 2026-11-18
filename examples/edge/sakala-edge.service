@@ -1,0 +1,49 @@
+# Example unit for the route-sync service of Sakala Edge. The deployment
+# repository installs and adapts it; see docs/EDGE.md.
+#
+# Install as /etc/systemd/system/sakala-edge.service, with the binary at
+# /usr/local/bin/sakala-edge and the environment file from
+# sakala-edge.env.example. The polkit rule in sakala-edge.polkit.rules lets
+# this user run `systemctl reload caddy` and nothing else.
+[Unit]
+Description=Sakala Edge route sync
+Documentation=https://github.com/gmedia/sakala-agent/blob/main/docs/EDGE.md
+Wants=network-online.target
+After=network-online.target caddy.service
+
+[Service]
+Type=simple
+User=sakala-edge
+Group=sakala-edge
+EnvironmentFile=/etc/sakala-edge/sakala-edge.env
+ExecStart=/usr/local/bin/sakala-edge
+Restart=always
+RestartSec=5s
+
+# /var/lib/sakala-edge, owned by sakala-edge and readable by Caddy.
+StateDirectory=sakala-edge
+StateDirectoryMode=0755
+UMask=0022
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
