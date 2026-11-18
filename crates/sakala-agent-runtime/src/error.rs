@@ -70,6 +70,19 @@ pub enum RuntimeError {
         "root_directory {reason}; it must be a relative path to a directory inside the repository"
     )]
     RootDirectoryInvalid { reason: &'static str },
+    /// The release command ran and exited with a non-zero code, so nothing of
+    /// the deployment was started.
+    #[error("{}", describe_release_failure(*.exit_code, *.out_of_memory_limit_mb))]
+    ReleaseCommandFailed {
+        exit_code: i32,
+        /// The memory limit, when Docker reports the release container was
+        /// killed for running out of memory.
+        out_of_memory_limit_mb: Option<u64>,
+    },
+    #[error(
+        "the release command did not finish within {seconds} seconds and was stopped, so this deployment was not started"
+    )]
+    ReleaseCommandTimeout { seconds: u64 },
     #[error("runtime routing failed: {0}")]
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
@@ -120,6 +133,8 @@ impl RuntimeError {
             Self::AppOutOfMemory { .. } => "runtime_app_out_of_memory",
             Self::PortConflict { .. } => "runtime_port_conflict",
             Self::RootDirectoryInvalid { .. } => "runtime_root_directory_invalid",
+            Self::ReleaseCommandFailed { .. } => "release_command_failed",
+            Self::ReleaseCommandTimeout { .. } => "release_command_timeout",
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
             Self::ReplicasExceeded { .. } => "runtime_replicas_exceeded",
@@ -292,6 +307,17 @@ fn describe_exit_code(exit_code: Option<i32>) -> String {
     )
 }
 
+fn describe_release_failure(exit_code: i32, out_of_memory_limit_mb: Option<u64>) -> String {
+    match out_of_memory_limit_mb {
+        Some(limit) => format!(
+            "the release command ran out of memory (limit {limit} MB) and exited with exit code {exit_code}, so this deployment was not started"
+        ),
+        None => format!(
+            "the release command exited with exit code {exit_code}, so this deployment was not started"
+        ),
+    }
+}
+
 fn describe_memory_limit(memory_limit_mb: Option<u64>) -> String {
     memory_limit_mb.map_or_else(
         || "Docker reports no memory limit for it".to_owned(),
@@ -353,6 +379,34 @@ mod tests {
             assert!(stopped.contains("no exit code"), "{stopped}");
             assert_reads_as_words(&stopped);
         }
+    }
+
+    #[test]
+    fn release_failures_name_the_exit_code_and_their_own_codes() {
+        let failed = RuntimeError::ReleaseCommandFailed {
+            exit_code: 3,
+            out_of_memory_limit_mb: None,
+        };
+        assert_eq!(failed.code(), "release_command_failed");
+        assert!(failed.to_string().contains("exit code 3"), "{failed}");
+        assert_reads_as_words(&failed.to_string());
+
+        let out_of_memory = RuntimeError::ReleaseCommandFailed {
+            exit_code: 137,
+            out_of_memory_limit_mb: Some(256),
+        };
+        assert_eq!(out_of_memory.code(), "release_command_failed");
+        assert!(
+            out_of_memory
+                .to_string()
+                .contains("ran out of memory (limit 256 MB)")
+                && out_of_memory.to_string().contains("exit code 137"),
+            "{out_of_memory}"
+        );
+
+        let timeout = RuntimeError::ReleaseCommandTimeout { seconds: 600 };
+        assert_eq!(timeout.code(), "release_command_timeout");
+        assert!(timeout.to_string().contains("600 seconds"), "{timeout}");
     }
 
     #[test]

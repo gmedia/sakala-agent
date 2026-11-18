@@ -41,7 +41,8 @@ use crate::{
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
         ContainerEngine, DockerContainerEngine, FailureOutput, ImageCleanup, ImageRetention,
-        ManagedWorkload, ReplicaSlot, RunContainerRequest, image_name, replicas::resolve_replicas,
+        ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ReplicaSlot, RunContainerRequest,
+        image_name, release_container_name, replicas::resolve_replicas,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -68,6 +69,7 @@ pub struct DockerRuntimeExecutor {
     routes: Arc<dyn RouteManager>,
     timeout_safety: crate::TimeoutSafetyConfig,
     health_check_window: std::time::Duration,
+    release_command_timeout: std::time::Duration,
     build_permits: Arc<Semaphore>,
     container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
@@ -144,6 +146,7 @@ impl DockerRuntimeExecutor {
         };
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let health_check_window = config.health_interval * config.health_attempts;
+        let release_command_timeout = config.release_command_timeout;
         let restore_policy = RestorePolicy::new(config.crash_stable_window);
         let router_container = config.caddy_container.clone();
         let api_url = config.api_url.clone();
@@ -193,6 +196,7 @@ impl DockerRuntimeExecutor {
             Arc::new(CaddyFileRouteManager::new(config.caddy_sites_dir, reloader)),
             config.timeout_safety,
             health_check_window,
+            release_command_timeout,
             max_concurrent_builds,
             max_replicas_per_project,
             workspace_gc_max_age,
@@ -215,6 +219,7 @@ impl DockerRuntimeExecutor {
         routes: Arc<dyn RouteManager>,
         timeout_safety: crate::TimeoutSafetyConfig,
         health_check_window: std::time::Duration,
+        release_command_timeout: std::time::Duration,
         max_concurrent_builds: usize,
         max_replicas_per_project: u32,
         workspace_gc_max_age: std::time::Duration,
@@ -245,6 +250,7 @@ impl DockerRuntimeExecutor {
             routes,
             timeout_safety,
             health_check_window,
+            release_command_timeout,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
@@ -387,6 +393,10 @@ impl DockerRuntimeExecutor {
             .iter()
             .map(|(_, name)| name.clone())
             .collect::<Vec<_>>();
+        let release = ReleaseContainer::new(
+            Arc::clone(&self.containers),
+            release_container_name(project_id, deployment_id),
+        );
         let route_activated = AtomicBool::new(false);
         let candidate_started = AtomicBool::new(false);
         let cutover_started = AtomicBool::new(false);
@@ -407,6 +417,7 @@ impl DockerRuntimeExecutor {
                 candidate_started: &candidate_started,
                 cutover_started: &cutover_started,
                 failed_replica: &failed_replica,
+                release: &release,
             },
             Arc::clone(&reporter),
         );
@@ -426,6 +437,17 @@ impl DockerRuntimeExecutor {
                 }
             },
         };
+
+        // A release container never outlives its deployment command. The release
+        // step removes it itself; this covers a cancellation in the middle of it.
+        if let Err(error) = release.remove().await {
+            let _ = reporter
+                .log(system_log(format!(
+                    "release container cleanup warning for {}: {error}",
+                    release.name
+                )))
+                .await;
+        }
 
         // The app's output only exists in the container, so it must be read before
         // cleanup removes it. A cancelled command is not an app failure, and its
@@ -592,6 +614,29 @@ impl DockerRuntimeExecutor {
         // Build concurrency protects builder capacity only; start/readiness and routing
         // must not prevent another deployment from entering the build phase.
         drop(build_permit);
+
+        // Once per deployment, before anything of the new version starts: until
+        // the route moves, the previous deployment keeps serving.
+        if let Some(command) = command_field(payload.release_command.as_deref()) {
+            self.run_release_command(
+                &ReleaseContainerRequest {
+                    command_id,
+                    project_id,
+                    deployment_id,
+                    name: progress.release.name.clone(),
+                    image: image.to_owned(),
+                    workspace: workspace.root().to_owned(),
+                    environment: payload.environment.clone(),
+                    resources: applied_resources,
+                    port: payload.container_port,
+                    command,
+                },
+                replicas,
+                progress.release,
+                reporter_ref,
+            )
+            .await?;
+        }
 
         emit_event(
             reporter_ref,
@@ -773,6 +818,86 @@ impl DockerRuntimeExecutor {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Runs the deployment's release command in its own container and waits for
+    /// it, then removes the container whatever happened. Only a zero exit lets
+    /// the deployment go on to start its replicas.
+    async fn run_release_command(
+        &self,
+        request: &ReleaseContainerRequest,
+        replicas: NonZeroU32,
+        release: &ReleaseContainer,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        emit_event(
+            reporter,
+            "deployment.release.started",
+            "Running the release command before the new version starts.",
+            json!({
+                "container": request.name,
+                "timeout_seconds": self.release_command_timeout.as_secs(),
+            }),
+        )
+        .await?;
+        let started = Instant::now();
+        let outcome = self
+            .execute_release(request, replicas, release, reporter)
+            .await;
+        if let Err(error) = release.remove().await {
+            let _ = reporter
+                .log(system_log(format!(
+                    "release container cleanup warning for {}: {error}",
+                    request.name
+                )))
+                .await;
+        }
+        let exit = outcome?;
+        if !exit.succeeded() {
+            return Err(RuntimeError::ReleaseCommandFailed {
+                exit_code: exit.exit_code,
+                out_of_memory_limit_mb: exit.oom_killed.then_some(request.resources.memory_mb),
+            });
+        }
+        emit_event(
+            reporter,
+            "deployment.release.completed",
+            "Release command finished; starting the new version.",
+            json!({ "duration_ms": started.elapsed().as_millis() }),
+        )
+        .await
+    }
+
+    /// The release container is admitted like the replicas it precedes, under
+    /// the same serialized check and for the deployment's whole replica count:
+    /// a node that could not start the new version then refuses before the
+    /// command changes anything, such as a database schema. While it runs it
+    /// is one more container of this project, the way the previous replicas
+    /// are during a rolling deploy, and other projects count it as one slot.
+    async fn execute_release(
+        &self,
+        request: &ReleaseContainerRequest,
+        replicas: NonZeroU32,
+        release: &ReleaseContainer,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<ReleaseExit, RuntimeError> {
+        let admission = self.container_admission.lock().await;
+        self.containers
+            .ensure_capacity(request.project_id, replicas)
+            .await?;
+        // Before `docker run`, which can leave a created container behind
+        // even when it fails.
+        release.arm();
+        self.containers.start_release(request, reporter).await?;
+        drop(admission);
+        tokio::time::timeout(
+            self.release_command_timeout,
+            self.containers.wait_release(&request.name, reporter),
+        )
+        .await
+        .map_err(|_| RuntimeError::ReleaseCommandTimeout {
+            seconds: self.release_command_timeout.as_secs(),
+        })?
     }
 
     /// Every replica of the request's deployment, in replica order.
@@ -1649,6 +1774,18 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.reconcile().await?;
+        // A release container belongs to a deployment command, and none of
+        // those survived the restart. Removed first, so its network can go too.
+        match self.containers.remove_stale_releases().await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(
+                removed,
+                "release containers of interrupted deployments removed"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "release containers of interrupted deployments could not be removed")
+            }
+        }
         // Unlike containers, a network holds no state, so one without containers
         // is removed here instead of only reported.
         if let Err(error) = self.containers.reconcile_networks(true).await {
@@ -2083,6 +2220,61 @@ struct DeploymentProgress<'a> {
     cutover_started: &'a AtomicBool,
     /// The first replica that failed readiness, whose output explains why.
     failed_replica: &'a OnceLock<String>,
+    release: &'a ReleaseContainer,
+}
+
+/// The release container of one deployment, removed on every path: by the
+/// release step once the command ended or timed out, by the deployment's
+/// cleanup after a cancellation, and in the background when the command is
+/// dropped before either could run, such as after the shutdown grace.
+struct ReleaseContainer {
+    containers: Arc<dyn ContainerEngine>,
+    name: String,
+    /// Set from just before `docker run` until a removal succeeded.
+    started: AtomicBool,
+}
+
+impl ReleaseContainer {
+    fn new(containers: Arc<dyn ContainerEngine>, name: String) -> Self {
+        Self {
+            containers,
+            name,
+            started: AtomicBool::new(false),
+        }
+    }
+
+    fn arm(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    /// Does nothing when no release container was started, or it is gone.
+    async fn remove(&self) -> Result<(), RuntimeError> {
+        if !self.started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.containers.remove_release(&self.name).await?;
+        self.started.store(false, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl Drop for ReleaseContainer {
+    fn drop(&mut self) {
+        if !self.started.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(container = %self.name, "release container left behind; the next start removes it");
+            return;
+        };
+        let containers = Arc::clone(&self.containers);
+        let name = std::mem::take(&mut self.name);
+        runtime.spawn(async move {
+            if let Err(error) = containers.remove_release(&name).await {
+                tracing::warn!(container = %name, %error, "release container could not be removed; the next start removes it");
+            }
+        });
+    }
 }
 
 /// Adds every replica's container to an event of a deployment with several.
@@ -2147,6 +2339,22 @@ fn validate_command_field(name: &str, command: Option<&str>) -> Result<(), Runti
     Ok(())
 }
 
+/// Stricter than the other command fields, like the control plane: no ASCII
+/// control character at all, so the line shown in the deployment log is the
+/// line that runs.
+fn validate_release_command(command: Option<&str>) -> Result<(), RuntimeError> {
+    let Some(command) = command else {
+        return Ok(());
+    };
+    if command.chars().count() > MAX_COMMAND_CHARS || command.chars().any(|c| c.is_ascii_control())
+    {
+        return Err(RuntimeError::InvalidCommand(format!(
+            "release_command must be one line of at most {MAX_COMMAND_CHARS} characters without control characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_payload(
     payload: &DeployProjectPayload,
     project_domains: &crate::ProjectDomainSuffixes,
@@ -2157,6 +2365,7 @@ fn validate_payload(
     }
     validate_command_field("build_command", payload.build_command.as_deref())?;
     validate_command_field("start_command", payload.start_command.as_deref())?;
+    validate_release_command(payload.release_command.as_deref())?;
     if payload.container_port == 0 {
         return Err(RuntimeError::InvalidCommand(
             "container_port must be greater than zero".to_owned(),
@@ -2330,6 +2539,50 @@ mod tests {
                 .contains("(run.example.ac.id), such as portfolio.run.example.ac.id"),
             "{error}"
         );
+    }
+
+    fn with_release_command(command: &str) -> DeployProjectPayload {
+        let mut payload = payload();
+        payload.release_command = Some(command.to_owned());
+        payload
+    }
+
+    #[test]
+    fn accepts_a_release_command_of_one_line_up_to_the_limit() {
+        for command in [
+            "php artisan migrate --force",
+            "npx prisma migrate deploy && node scripts/seed.js",
+            &"a".repeat(1_000),
+            &"é".repeat(1_000),
+            "",
+        ] {
+            assert!(
+                validate(&with_release_command(command)).is_ok(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_release_command_that_is_too_long_or_holds_control_characters() {
+        for command in [
+            "a".repeat(1_001),
+            "php artisan migrate\nrm -rf /".to_owned(),
+            "php artisan migrate\r".to_owned(),
+            "php\tartisan migrate".to_owned(),
+            "migrate\0".to_owned(),
+            "migrate\u{1b}[2J".to_owned(),
+            "migrate\u{7f}".to_owned(),
+        ] {
+            let error = validate(&with_release_command(&command)).expect_err(&command);
+            assert_eq!(error.code(), "invalid_runtime_command");
+            assert!(
+                error
+                    .to_string()
+                    .contains("release_command must be one line"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

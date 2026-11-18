@@ -5571,6 +5571,15 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
             environment_port: None,
             container_port: 3000,
         },
+        RuntimeError::ReleaseCommandFailed {
+            exit_code: 3,
+            out_of_memory_limit_mb: None,
+        },
+        RuntimeError::ReleaseCommandFailed {
+            exit_code: 137,
+            out_of_memory_limit_mb: Some(256),
+        },
+        RuntimeError::ReleaseCommandTimeout { seconds: 600 },
     ];
     let expected = fixture.as_array().expect("fixture is a list");
     assert_eq!(expected.len(), errors.len());
@@ -6162,6 +6171,27 @@ fn is_workload_run(spec: &CommandSpec) -> bool {
     spec.program == "docker"
         && spec.args.first().is_some_and(|argument| argument == "run")
         && !is_sandbox(spec)
+        && !is_release_run(spec)
+}
+
+fn is_release_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument == "dev.sakala.role=release")
+}
+
+fn is_release_removal(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && string_arguments(spec)
+            == [
+                "rm",
+                "--force",
+                "--volumes",
+                "sakala-release-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993",
+            ]
 }
 
 fn is_probe(spec: &CommandSpec) -> bool {
@@ -6253,6 +6283,13 @@ struct FakeRunner {
     router_networks_stdout: String,
     address_pools_stdout: String,
     network_create_stderr: Option<String>,
+    /// `docker ps` of release containers, for capacity and startup cleanup.
+    release_ps_stdout: String,
+    /// What `docker wait` prints for the release container.
+    release_exit_stdout: String,
+    release_oom_killed: bool,
+    /// Exit code of a `docker run` of the release container that fails.
+    release_run_failure: Option<(i32, &'static str)>,
 }
 
 /// Fails a test that would otherwise hang: how long a test waits for spawned
@@ -6344,6 +6381,10 @@ impl ProcessRunner for AdmissionRunner {
         let capacity_probe = spec.program == "docker"
             && spec.args.first().is_some_and(|argument| argument == "ps")
             && !spec.args.iter().any(|argument| argument == "--all")
+            && !spec
+                .args
+                .iter()
+                .any(|argument| argument == "label=dev.sakala.role=release")
             && spec
                 .args
                 .iter()
@@ -6509,6 +6550,68 @@ impl FakeRunner {
             router_networks_stdout: String::new(),
             address_pools_stdout: r#"[{"Base":"172.16.0.0/12","Size":24}]"#.to_owned(),
             network_create_stderr: None,
+            release_ps_stdout: String::new(),
+            release_exit_stdout: "0\n".to_owned(),
+            release_oom_killed: false,
+            release_run_failure: None,
+        }
+    }
+
+    fn with_release_exit(mut self, exit_code: i32, oom_killed: bool) -> Self {
+        self.release_exit_stdout = format!("{exit_code}\n");
+        self.release_oom_killed = oom_killed;
+        self
+    }
+
+    fn with_release_ps(mut self, stdout: impl Into<String>) -> Self {
+        self.release_ps_stdout = stdout.into();
+        self
+    }
+
+    fn with_release_run_failure(mut self, code: i32, stderr: &'static str) -> Self {
+        self.release_run_failure = Some((code, stderr));
+        self
+    }
+
+    /// Answers the release container commands, which the generic branches
+    /// would otherwise mistake for workload commands. Its log follower is left
+    /// to the generic `--follow` branch, so follow lines and delays apply.
+    fn release_output(&self, spec: &CommandSpec) -> Option<ProcessOutput> {
+        if spec.program != "docker" {
+            return None;
+        }
+        let args = string_arguments(spec);
+        let output = |success: bool, code: i32, stdout: &str, stderr: &str| ProcessOutput {
+            success,
+            code: Some(code),
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+        };
+        match args.first().map(String::as_str) {
+            Some("ps")
+                if args
+                    .iter()
+                    .any(|arg| arg == "label=dev.sakala.role=release") =>
+            {
+                Some(output(true, 0, &self.release_ps_stdout, ""))
+            }
+            Some("wait") => Some(output(true, 0, &self.release_exit_stdout, "")),
+            Some("inspect") if args.iter().any(|arg| arg == "{{.State.OOMKilled}}") => {
+                Some(output(
+                    true,
+                    0,
+                    if self.release_oom_killed {
+                        "true\n"
+                    } else {
+                        "false\n"
+                    },
+                    "",
+                ))
+            }
+            Some("run") if is_release_run(spec) => self
+                .release_run_failure
+                .map(|(code, stderr)| output(false, code, "", stderr)),
+            _ => None,
         }
     }
 
@@ -6754,6 +6857,9 @@ impl ProcessRunner for FakeRunner {
             });
         }
         if let Some(output) = self.network_output(spec) {
+            return Ok(output);
+        }
+        if let Some(output) = self.release_output(spec) {
             return Ok(output);
         }
         let previous_stop = spec.program == "docker"
@@ -7950,6 +8056,14 @@ impl ProcessRunner for ReplicaRestoreRunner {
         }
         let statuses = self.statuses.lock().expect("status lock").clone();
         match args.first().map(String::as_str) {
+            // No release container runs during a restore.
+            Some("ps")
+                if args
+                    .iter()
+                    .any(|arg| arg == "label=dev.sakala.role=release") =>
+            {
+                success(String::new())
+            }
             Some("ps")
                 if args
                     .iter()
@@ -8147,4 +8261,568 @@ async fn replica_restore_gives_way_to_a_command_of_the_same_project() {
     let after = executor.restore_replicas().await.expect("restore pass");
     assert_eq!((after.restored, after.failed), (0, 0));
     assert!(runner.started().is_empty());
+}
+
+// Release command: one container from the new image, before any replica.
+
+const RELEASE_CONTAINER: &str = "sakala-release-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993";
+
+fn deploy_with_release(command: &str) -> AgentCommand {
+    let mut deploy = deploy_command("auto");
+    deploy.payload["release_command"] = json!(command);
+    deploy
+}
+
+fn event_position(reporter: &RecordingReporter, event_type: &str) -> Option<usize> {
+    reporter
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .position(|event| event.event_type == event_type)
+}
+
+fn is_release_wait(spec: &CommandSpec) -> bool {
+    spec.program == "docker" && string_arguments(spec) == ["wait", RELEASE_CONTAINER]
+}
+
+#[tokio::test]
+async fn a_release_command_runs_once_from_the_new_image_before_any_replica_starts() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_follow_lines(&["Migrated: 2026_11_18_add_orders"]));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = DockerRuntimeConfig {
+        container_runtime: Some("runsc".to_owned()),
+        container_dns: vec!["1.1.1.1".parse().expect("IP")],
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+    let mut deploy = deploy_with_release("php artisan migrate --force");
+    deploy.payload["replicas"] = json!(2);
+
+    dispatch(executor, &deploy, Arc::clone(&reporter))
+        .await
+        .expect("the deployment completes after its release command");
+
+    assert_eq!(
+        runner.count_commands(is_release_run),
+        1,
+        "once per deployment, not per replica"
+    );
+    assert_eq!(runner.count_commands(is_workload_run), 2);
+    let release_run = runner
+        .command_position(is_release_run)
+        .expect("release run");
+    let wait = runner
+        .command_position(is_release_wait)
+        .expect("release wait");
+    let removal = runner
+        .command_position(is_release_removal)
+        .expect("release removal");
+    let first_replica = runner
+        .command_position(is_workload_run)
+        .expect("replica run");
+    assert!(release_run < wait && wait < removal && removal < first_replica);
+
+    let release = string_arguments(&find_command(&runner, is_release_run));
+    let workload = string_arguments(&find_command(&runner, is_workload_run));
+    // The same isolation and limits as a replica.
+    for flag in [
+        "--network",
+        "--runtime",
+        "--mount",
+        "--security-opt",
+        "--memory",
+        "--memory-swap",
+        "--cpus",
+        "--pids-limit",
+    ] {
+        let value = |args: &[String]| {
+            args.windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+        };
+        assert!(value(&release).is_some(), "{flag} missing: {release:?}");
+        assert_eq!(value(&release), value(&workload), "{flag}");
+    }
+    let capabilities = |args: &[String]| {
+        args.windows(2)
+            .filter(|pair| pair[0] == "--cap-drop" || pair[0] == "--cap-add")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(capabilities(&release), capabilities(&workload));
+    assert!(
+        release
+            .windows(2)
+            .any(|pair| pair == ["--runtime", "runsc"])
+    );
+    assert!(
+        release
+            .windows(2)
+            .any(|pair| pair == ["--name", RELEASE_CONTAINER])
+    );
+    assert!(release.iter().any(|argument| argument == "--env-file"));
+    // Shell form, from the image the build just tagged.
+    let image = workload
+        .iter()
+        .find(|argument| argument.starts_with("sakala/project-"))
+        .expect("workload image");
+    assert!(
+        release.ends_with(&[
+            image.clone(),
+            "-c".to_owned(),
+            "php artisan migrate --force".to_owned()
+        ]),
+        "{release:?}"
+    );
+    assert!(
+        release
+            .windows(2)
+            .any(|pair| pair == ["--entrypoint", "sh"])
+    );
+    // Marked as the release container, and nothing that would route or restart it.
+    for label in [
+        "dev.sakala.role=release",
+        "dev.sakala.project-id=ff66ed4a-6303-4be6-8ef4-63c28b112680",
+        "dev.sakala.deployment-id=4f1f21ef-730d-42d5-a46d-d965353cb993",
+        "dev.sakala.command-id=b3c8cb55-3bc8-4725-a004-e69d9917d40b",
+        "dev.sakala.agent-id=local-agent-01",
+    ] {
+        assert!(release.iter().any(|argument| argument == label), "{label}");
+    }
+    for absent in ["--restart", "--publish", "-p", "--network-alias"] {
+        assert!(
+            !release.iter().any(|argument| argument == absent),
+            "{absent}"
+        );
+    }
+    assert!(!release.iter().any(|argument| {
+        argument == "dev.sakala.managed=true"
+            || argument.starts_with("dev.sakala.domain=")
+            || argument.starts_with("dev.sakala.port=")
+            || argument.starts_with("dev.sakala.replica")
+    }));
+
+    let started = event_position(&reporter, "deployment.release.started").expect("release start");
+    let completed =
+        event_position(&reporter, "deployment.release.completed").expect("release completed");
+    let container =
+        event_position(&reporter, "deployment.container.started").expect("container start");
+    assert!(started < completed && completed < container);
+    let logs = reporter.logs.lock().expect("log lock");
+    assert!(
+        logs.iter()
+            .any(|log| log.message == "[release] Migrated: 2026_11_18_add_orders"),
+        "{:?}",
+        logs.iter().map(|log| &log.message).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_without_a_release_command_runs_no_release_container() {
+    for release_command in [None, Some(json!(null)), Some(json!("")), Some(json!("   "))] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let reporter = Arc::new(RecordingReporter::default());
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+        let mut deploy = deploy_command("auto");
+        if let Some(value) = &release_command {
+            deploy.payload["release_command"] = value.clone();
+        }
+
+        dispatch(executor, &deploy, Arc::clone(&reporter))
+            .await
+            .expect("deployment completes");
+
+        assert_eq!(
+            runner.count_commands(is_release_run),
+            0,
+            "{release_command:?}"
+        );
+        assert_eq!(runner.count_commands(is_release_removal), 0);
+        assert!(event_position(&reporter, "deployment.release.started").is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_release_command_that_exits_non_zero_fails_before_anything_of_the_new_version_starts() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_release_exit(3, false));
+    let config = runtime_config(&temp);
+    let route_path = config
+        .caddy_sites_dir
+        .join("ff66ed4a-6303-4be6-8ef4-63c28b112680.Caddyfile");
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_release("npm run migrate"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a failed release command fails the deployment");
+
+    assert_eq!(error.code(), "release_command_failed");
+    assert!(error.to_string().contains("exit code 3"), "{error}");
+    assert_eq!(
+        runner.count_commands(is_workload_run),
+        0,
+        "no replica starts"
+    );
+    assert_eq!(runner.count_commands(is_release_removal), 1);
+    assert!(!route_path.exists(), "the route is never written");
+    // The previous deployment is not touched: nothing stops it.
+    assert!(
+        runner
+            .command_position(|spec| {
+                spec.program == "docker" && spec.args.first().is_some_and(|arg| arg == "stop")
+            })
+            .is_none()
+    );
+    // The image that was built for nothing is removed with the candidate.
+    assert!(runner.command_position(is_candidate_removal).is_some());
+}
+
+#[tokio::test]
+async fn a_release_command_killed_for_memory_says_so() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_release_exit(137, true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_with_release("npm run migrate"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the release command was killed");
+
+    assert_eq!(error.code(), "release_command_failed");
+    let message = error.to_string();
+    assert!(
+        message.contains("ran out of memory (limit 256 MB)"),
+        "{message}"
+    );
+    assert!(message.contains("exit code 137"), "{message}");
+    assert_eq!(runner.count_commands(is_release_removal), 1);
+}
+
+#[tokio::test]
+async fn a_release_command_past_its_timeout_is_stopped_and_removed() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_follow_delay(Duration::from_secs(30)));
+    let config = DockerRuntimeConfig {
+        release_command_timeout: Duration::from_millis(100),
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+    let started = std::time::Instant::now();
+
+    let error = dispatch(
+        executor,
+        &deploy_with_release("sleep 999"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the release command times out");
+
+    assert_eq!(error.code(), "release_command_timeout");
+    assert!(
+        error
+            .to_string()
+            .contains("the release command did not finish within"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(runner.count_commands(is_release_removal), 1);
+    assert_eq!(runner.count_commands(is_workload_run), 0);
+    assert_eq!(
+        runner.count_commands(is_release_wait),
+        0,
+        "the wait never started"
+    );
+}
+
+#[tokio::test]
+async fn a_release_container_docker_cannot_run_is_still_removed() {
+    // 127: the image has no `sh`, which the project can fix.
+    // 125: Docker itself failed, which it cannot.
+    for (code, stderr, expected) in [
+        (
+            127,
+            "exec: \"sh\": executable file not found in $PATH",
+            "release_command_failed",
+        ),
+        (
+            125,
+            "docker: unknown or invalid runtime name: runsc",
+            "runtime_container_failed",
+        ),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true).with_release_run_failure(code, stderr));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+        let error = dispatch(
+            executor,
+            &deploy_with_release("./migrate"),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("the release container did not run");
+
+        assert_eq!(error.code(), expected, "{error}");
+        assert!(
+            error.to_string().contains(&format!("exit code {code}")),
+            "{error}"
+        );
+        assert_eq!(runner.count_commands(is_release_removal), 1, "{code}");
+        assert_eq!(runner.count_commands(is_workload_run), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_deployment_removes_its_running_release_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_follow_delay(Duration::from_secs(30)));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let cancellation = CancellationToken::new();
+    let deploy = deploy_with_release("php artisan migrate --force");
+    let dispatcher = CommandDispatcher::new(Arc::new(executor));
+    let deployment = dispatcher.dispatch(
+        &deploy,
+        Arc::new(RecordingReporter::default()),
+        cancellation.clone(),
+    );
+    tokio::pin!(deployment);
+
+    let wait_for_release = async {
+        while runner.command_position(is_release_run).is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        result = &mut deployment => panic!("finished before its release command: {result:?}"),
+        () = wait_for_release => {}
+    }
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), deployment)
+        .await
+        .expect("cancellation ends the deployment")
+        .expect_err("cancelled");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert_eq!(runner.count_commands(is_release_removal), 1);
+    assert_eq!(runner.count_commands(is_workload_run), 0);
+}
+
+#[tokio::test]
+async fn a_deployment_dropped_mid_release_still_removes_the_container() {
+    // What happens when shutdown aborts a command after its grace period.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_follow_delay(Duration::from_secs(30)));
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let deploy = deploy_with_release("php artisan migrate --force");
+    let task = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &deploy,
+                    Arc::new(RecordingReporter::default()),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    while runner.command_position(is_release_run).is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    task.abort();
+    let _ = task.await;
+    for _ in 0..200 {
+        if runner.count_commands(is_release_removal) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    assert_eq!(runner.count_commands(is_release_removal), 1);
+}
+
+#[tokio::test]
+async fn release_containers_of_other_projects_take_a_slot_while_they_run() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001\n")
+            .with_release_ps("0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d002\n"),
+    );
+    let config = DockerRuntimeConfig {
+        max_active_containers: 2,
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the other project's release container fills the node");
+
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert!(
+        error.to_string().contains("2 managed containers"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn the_projects_own_release_container_does_not_take_a_slot_from_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001\n")
+            .with_release_ps("ff66ed4a-6303-4be6-8ef4-63c28b112680\n"),
+    );
+    let config = DockerRuntimeConfig {
+        max_active_containers: 2,
+        ..runtime_config(&temp)
+    };
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_release("npm run migrate"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("one other container plus this project's one replica fit");
+}
+
+#[tokio::test]
+async fn startup_removes_release_containers_an_interrupted_agent_left_behind() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_release_ps("1f2e3d4c5b6a\n"));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::recover(&executor, None)
+        .await
+        .expect("recovery runs");
+
+    let listing = string_arguments(&find_command(&runner, |spec| {
+        string_arguments(spec)
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.role=release")
+    }));
+    assert!(
+        listing.iter().any(|argument| argument == "--all"),
+        "{listing:?}"
+    );
+    assert!(
+        listing
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.agent-id=local-agent-01"),
+        "only this Agent's: {listing:?}"
+    );
+    assert_eq!(
+        runner.count_commands(|spec| {
+            string_arguments(spec) == ["rm", "--force", "--volumes", "1f2e3d4c5b6a"]
+        }),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_commands_never_run_a_release_command() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let sleeping = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "sleeping\tExited (0) 1 minute ago\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), sleeping.clone());
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake");
+
+    let running =
+        Arc::new(FakeRunner::new(true).with_docker_ps(
+            "running\tUp 1 minute (healthy)\tportfolio.run.sakala.localhost\t3000\n",
+        ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), running.clone());
+    RuntimeExecutor::restart_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("restart");
+    RuntimeExecutor::refresh_route(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("refresh route");
+    RuntimeExecutor::reconcile_workload(
+        &executor,
+        ReconcileWorkloadRequest {
+            project_id: Uuid::parse_str(PROJECT).expect("project UUID"),
+            deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
+                .expect("deployment UUID"),
+            desired_state: DesiredWorkloadState::Running,
+            actions: vec![ReconcileWorkloadAction::RestoreRoute],
+            reporter_factory: None,
+            cancellation: CancellationToken::new(),
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("reconcile");
+
+    for runner in [&sleeping, &running] {
+        assert_eq!(runner.count_commands(is_release_run), 0);
+        assert_eq!(runner.count_commands(is_release_wait), 0);
+        assert_eq!(
+            runner.count_commands(is_workload_run),
+            0,
+            "nothing is recreated"
+        );
+    }
+
+    let restore = Arc::new(ReplicaRestoreRunner::new([
+        "Up 5 minutes",
+        "Exited (137) 3 seconds ago",
+        "Up 5 minutes",
+    ]));
+    let executor = replica_restore_executor(&temp, Arc::clone(&restore), 20);
+    let outcome = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!(outcome.restored, 1);
+    assert!(
+        !restore
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|spec| {
+                let args = string_arguments(spec);
+                args.first()
+                    .is_some_and(|arg| arg == "run" || arg == "wait")
+            })
+    );
 }

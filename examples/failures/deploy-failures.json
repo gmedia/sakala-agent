@@ -30,5 +30,17 @@
   {
     "error_code": "runtime_port_conflict",
     "error_message": "environment PORT is not a valid port number and must match container_port 3000; remove PORT or set it to 3000"
+  },
+  {
+    "error_code": "release_command_failed",
+    "error_message": "the release command exited with exit code 3, so this deployment was not started"
+  },
+  {
+    "error_code": "release_command_failed",
+    "error_message": "the release command ran out of memory (limit 256 MB) and exited with exit code 137, so this deployment was not started"
+  },
+  {
+    "error_code": "release_command_timeout",
+    "error_message": "the release command did not finish within 600 seconds and was stopped, so this deployment was not started"
   }
 ]

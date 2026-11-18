@@ -42,6 +42,45 @@ pub struct RunContainerRequest {
     pub start_command: Option<String>,
 }
 
+/// The one container that runs a deployment's release command.
+///
+/// It runs from the deployment's new image with the same environment,
+/// resources, runtime, and security options as a replica, on the project's
+/// network, but it serves nothing: it has no route, no domain or port label,
+/// and no restart policy. It is not a managed workload either, so listings,
+/// health checks, replica restore, and orphan detection never see it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseContainerRequest {
+    pub command_id: Uuid,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub name: String,
+    pub image: String,
+    pub workspace: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub resources: AppliedRuntimeResources,
+    /// Exported as `PORT`, as for the replicas, so a command reading the same
+    /// configuration as the app sees the same value.
+    pub port: u16,
+    /// Runs in the container's own `sh -c`, like a start command.
+    pub command: String,
+}
+
+/// How a release container ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReleaseExit {
+    pub exit_code: i32,
+    /// Docker killed the container for exceeding its memory limit.
+    pub oom_killed: bool,
+}
+
+impl ReleaseExit {
+    #[must_use]
+    pub fn succeeded(self) -> bool {
+        self.exit_code == 0
+    }
+}
+
 /// One container of a managed deployment, as Docker lists it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedWorkload {
@@ -109,6 +148,8 @@ pub trait ContainerEngine: Send + Sync {
     /// node would then run more than its maximum. The project's own running
     /// containers are not counted: a new deployment replaces them, and the
     /// overlap while it starts is the same one a single container always had.
+    /// A running release container of another project counts as one, for as
+    /// long as its command runs.
     async fn ensure_capacity(
         &self,
         project_id: Uuid,
@@ -167,6 +208,33 @@ pub trait ContainerEngine: Send + Sync {
         request: &RunContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
+
+    /// Creates and starts the release container, detached, on the project's
+    /// network. A command Docker cannot start at all, such as one in an image
+    /// without `sh`, is a [`RuntimeError::ReleaseCommandFailed`]; the container
+    /// may then exist in `Created` state and still needs [`Self::remove_release`].
+    async fn start_release(
+        &self,
+        request: &ReleaseContainerRequest,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError>;
+
+    /// Reports the release container's output as it is written, until the
+    /// container exits, and returns how it ended. Has no deadline of its own.
+    async fn wait_release(
+        &self,
+        name: &str,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<ReleaseExit, RuntimeError>;
+
+    /// Kills the release container when it still runs and removes it with its
+    /// anonymous volumes. A container that is already gone is not an error.
+    async fn remove_release(&self, name: &str) -> Result<(), RuntimeError>;
+
+    /// Removes every release container this Agent left behind, running or
+    /// not. Called at startup: a release container only lives as long as the
+    /// deployment command that started it. Returns how many were removed.
+    async fn remove_stale_releases(&self) -> Result<usize, RuntimeError>;
 
     /// Connects the router to the project's network again, when the project has
     /// one. A workload started by an older Agent lives on the shared network.
@@ -302,6 +370,14 @@ pub fn image_name(project_id: Uuid, deployment_id: Uuid, commit_sha: &str) -> St
 pub fn container_name(project_id: Uuid, deployment_id: Uuid) -> String {
     let project = project_id.to_string();
     format!("sakala-app-{}-{deployment_id}", &project[..8])
+}
+
+/// Names the release container of a deployment. Nothing resolves it, but it
+/// stays as short as a workload name so `docker ps` groups it with them.
+#[must_use]
+pub fn release_container_name(project_id: Uuid, deployment_id: Uuid) -> String {
+    let project = project_id.to_string();
+    format!("sakala-release-{}-{deployment_id}", &project[..8])
 }
 
 #[cfg(test)]

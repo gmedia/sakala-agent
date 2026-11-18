@@ -90,6 +90,10 @@ pub struct DeployProjectPayload {
     /// Replaces the image's start command. Runs only inside the container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_command: Option<String>,
+    /// Runs once per deployment, in a container of the new image, after the
+    /// build and before any replica starts. A non-zero exit fails the deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_command: Option<String>,
     /// Build context relative to the repository root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_directory: Option<String>,
@@ -216,6 +220,62 @@ mod tests {
             assert_eq!(requested, RequestedReplicas::Unreadable, "{value}");
             assert_eq!(requested.count().get(), 1, "{value}");
         }
+    }
+
+    fn release_command(value: Option<Value>) -> Option<String> {
+        let mut payload = json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.sakala.app",
+        });
+        if let Some(value) = value {
+            payload["release_command"] = value;
+        }
+        serde_json::from_value::<DeployProjectPayload>(payload)
+            .expect("payload")
+            .release_command
+    }
+
+    #[test]
+    fn release_command_is_absent_when_missing_or_null() {
+        assert_eq!(release_command(None), None);
+        assert_eq!(release_command(Some(Value::Null)), None);
+    }
+
+    #[test]
+    fn release_command_is_read_as_given() {
+        assert_eq!(
+            release_command(Some(json!("php artisan migrate --force"))).as_deref(),
+            Some("php artisan migrate --force")
+        );
+    }
+
+    #[test]
+    fn a_release_command_that_is_not_a_string_fails_the_payload() {
+        let payload = json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.sakala.app",
+            "release_command": ["php", "artisan", "migrate"],
+        });
+        assert!(serde_json::from_value::<DeployProjectPayload>(payload).is_err());
+    }
+
+    #[test]
+    fn release_command_is_written_back_only_when_set() {
+        let mut payload: DeployProjectPayload = serde_json::from_value(json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.sakala.app",
+        }))
+        .expect("payload");
+        let written = serde_json::to_value(&payload).expect("serialize");
+        assert!(written.get("release_command").is_none());
+        payload.release_command = Some("npm run migrate".to_owned());
+        assert_eq!(
+            serde_json::to_value(&payload).expect("serialize")["release_command"],
+            json!("npm run migrate")
+        );
     }
 
     #[test]

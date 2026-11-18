@@ -209,6 +209,51 @@ batas 5 kali percobaan. Project yang tidur, deployment satu replika, dan project
 sedang menjalankan command tidak disentuh. Aturan lengkapnya ada di
 [Runtime Hardening](RUNTIME_HARDENING.md#pemulihan-replika).
 
+### Release command
+
+Payload `DeployProject` boleh membawa `release_command`, yaitu perintah yang dijalankan
+Agent satu kali per deployment sebelum versi baru dinyalakan, misalnya
+`php artisan migrate --force`. Contohnya ada di
+`examples/commands/deploy-project-release-command.json`. Polanya sama dengan release phase
+Heroku dan pre-deploy command Railway.
+
+| Nilai | Perilaku Agent |
+| --- | --- |
+| Tidak ada, `null`, string kosong, atau hanya spasi | Tidak ada release command. Deploy berjalan seperti sebelumnya. |
+| String 1 sampai 1000 karakter tanpa control character | Dijalankan satu kali, setelah build dan sebelum replika pertama. |
+| Lebih dari 1000 karakter, atau memuat control character ASCII (`\x00` sampai `\x1F` dan `\x7F`, termasuk newline dan tab) | Ditolak dengan `invalid_runtime_command` sebelum checkout. Aturannya sama dengan validasi `start_command` di API. |
+| Bukan string, misalnya array | Payload ditolak dengan `invalid_runtime_command`. |
+
+Panjang dihitung dalam karakter, bukan byte. API hanya boleh mengirim field ini ke node
+yang mengiklankan capability `release-command`. Agent lama mengabaikannya dan langsung
+menyalakan versi baru tanpa menjalankan perintah itu, jadi migrasi tidak akan berjalan.
+
+Urutannya di dalam satu `DeployProject`:
+
+1. Build image, tidak berubah.
+2. Agent menjalankan satu container release dari image baru dan menunggu container itu
+   selesai, paling lama `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS` (default 600 detik).
+3. Container release selalu dihapus, apa pun hasilnya.
+4. Exit code 0: deploy berlanjut seperti biasa, yaitu menyalakan replika baru, menunggu
+   readiness, lalu memindahkan route. Selain itu deploy gagal, dan tidak ada bagian versi
+   baru yang dinyalakan. Deployment sebelumnya tetap melayani.
+
+Container release mendapat environment (termasuk secret dan `PORT`), network project,
+batas resource, runtime container (`runsc` bila dikonfigurasi), dan opsi keamanan yang
+sama dengan replika. Bedanya, container ini tidak punya route, tidak punya restart
+policy, dan tidak dihitung sebagai workload. Detailnya ada di
+[Release command](DOCKER_RUNTIME.md#release-command).
+
+Output perintah dikirim sebagai log deployment dengan awalan `[release]`, setara `[build]`
+dan `[runtime]`, melewati redaksi yang sama. Agent juga mengirim event
+`deployment.release.started` (metadata `container` dan `timeout_seconds`) sebelum
+container release dijalankan, dan `deployment.release.completed` (metadata `duration_ms`)
+setelah exit code 0. Kedua event ini hanya muncul bila ada release command.
+
+Release command hanya dijalankan oleh `DeployProject`. `WakeProject`, `RestartProject`,
+`RefreshRoute`, `ReconcileWorkload`, dan pemulihan replika tidak pernah menjalankannya,
+karena semuanya memakai container deployment yang sudah ada.
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -650,7 +695,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "railpack-build",
     "caddy-file-routing",
     "idle-sleep",
-    "replicas"
+    "replicas",
+    "release-command"
   ],
   "metadata": {
     "version": "0.9.1",
@@ -1160,6 +1206,12 @@ di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh te
 | `runtime_app_out_of_memory` | Container keluar dengan `State.OOMKilled` atau event `oom`, atau masih hidup dengan flag itu tetapi tidak pernah menjawab. | Batas memory yang diterapkan. |
 | `runtime_port_conflict` | `PORT` dari environment berbeda dari `container_port`. Menggantikan `invalid_runtime_command` untuk kasus ini. | Kedua nilai. `PORT` yang bukan nomor port tidak diulang, hanya disebut tidak valid. |
 | `runtime_root_directory_invalid` | `root_directory` tidak aman atau tidak menunjuk direktori di dalam repository. | Alasannya, tanpa mengulang path. |
+| `release_command_failed` | Release command keluar dengan exit code selain 0, termasuk 126 atau 127 saat Docker tidak bisa menjalankan `sh` di image. Tidak ada replika yang dinyalakan. | Exit code. Bila Docker melaporkan container dibunuh karena kehabisan memory, juga batas memory yang diterapkan. |
+| `release_command_timeout` | Release command belum selesai sampai `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS`. Container dibunuh dan dihapus, dan tidak ada replika yang dinyalakan. | Batas waktu dalam detik. |
+
+Kedua code release bisa diperbaiki user: perintahnya, migrasinya, atau batas waktunya.
+Saran pemetaan di API: kategori tersendiri sebelum start, dengan hint untuk membaca log
+`[release]`. Pesannya tidak menyebut perintah atau output-nya.
 
 `runtime_app_exec_denied` dideteksi dari output aplikasi sendiri, jadi aplikasi bisa
 memicunya dengan mencetak baris yang sama. Akibatnya hanya pesan untuk deployment itu
