@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Replika yang berhenti kini dinyalakan lagi oleh Agent tanpa menunggu deploy berikutnya. Di bawah `--restart unless-stopped`, Docker tidak menyalakan lagi container yang dihentikan dengan `docker stop` atau `docker kill`, sehingga pada uji staging v0.9.0 replika yang di-kill tetap `Exited (137)` sekitar 4,5 menit sampai deploy berikutnya. Setiap interval health worker (`SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS`) kini menjalankan `docker start` untuk replika `exited` dari deployment yang masih punya replika lain yang `Up` dan merupakan satu-satunya deployment project itu yang melayani. Project yang tidur, deployment satu replika, project yang sedang deploy bergulir atau menjalankan command lain, dan node yang penuh (`SAKALA_MAX_ACTIVE_CONTAINERS`) tidak disentuh; command project dan pemulihan saling menunggu lewat kunci per project. Setiap replika mendapat paling banyak 5 kali start (langsung, lalu setelah 30, 60, 120, dan 240 detik), hitungan direset setelah replika bertahan 5 menit, dan setelah itu Agent mencatat `WARN` dan berhenti mencoba. Route tidak berubah. Container replika yang hilang tidak dibuat ulang dan kembali pada deploy berikutnya. Uji Docker nyata: replika yang di-`docker kill` kembali menerima request 10,5 dan 11,7 detik (dua run) setelah putaran pemulihan tanpa satu request pun gagal. Lihat [Pemulihan replika](docs/RUNTIME_HARDENING.md#pemulihan-replika).
+
 ## [0.9.0] - 2026-11-18
 
 ### Added

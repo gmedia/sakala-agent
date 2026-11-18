@@ -65,6 +65,31 @@ impl ManagedWorkload {
     }
 }
 
+/// One managed container as a node-wide listing shows it, running or not.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListedReplica {
+    pub container_id: String,
+    pub project_id: Uuid,
+    pub deployment_id: Uuid,
+    pub replica: ReplicaSlot,
+    /// Docker's status column, such as `Up 3 minutes` or `Exited (137) 1 minute ago`.
+    pub status: String,
+}
+
+impl ListedReplica {
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.status.to_ascii_lowercase().starts_with("up")
+    }
+
+    /// Stopped by `docker stop`, `docker kill`, or a sleep, so Docker's restart
+    /// policy does not bring it back. `docker start` can.
+    #[must_use]
+    pub fn is_exited(&self) -> bool {
+        self.status.to_ascii_lowercase().starts_with("exited")
+    }
+}
+
 /// A running managed workload and the domain it is routed under.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutedWorkload {
@@ -104,6 +129,9 @@ pub trait ContainerEngine: Send + Sync {
         &self,
         snapshots: &[RuntimeHealthSnapshot],
     ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeError>;
+
+    /// Every managed container on the node, running or not, in one listing.
+    async fn replica_listing(&self) -> Result<Vec<ListedReplica>, RuntimeError>;
 
     /// Every container of one deployment, running or not, in replica order.
     /// Empty when the deployment has none on this node.

@@ -27,8 +27,8 @@ use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
     containers::{
-        ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ManagedWorkload,
-        ResourceSafetyConfig, RoutedWorkload, RunContainerRequest,
+        ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
+        ManagedWorkload, ResourceSafetyConfig, RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT,
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
@@ -507,50 +507,29 @@ impl ContainerEngine for DockerContainerEngine {
     async fn health_snapshot(&self) -> Result<Vec<RuntimeHealthSnapshot>, RuntimeError> {
         // `docker ps` deliberately excludes stopped workloads. Mereka tidak
         // seharusnya terus diperiksa oleh worker kesehatan runtime.
-        let command = CommandSpec::new("docker")
-            .arg("ps")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
-            ));
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "docker health inspection failed with {}",
-                crate::error::describe_exit(output.code)
-            )));
-        }
+        Ok(self
+            .list_replicas(false, "docker health inspection")
+            .await?
+            .into_iter()
+            .map(|listed| {
+                let (ready, reason) = health_state(&listed.status);
+                RuntimeHealthSnapshot {
+                    workload: RuntimeWorkload {
+                        container_id: listed.container_id,
+                        project_id: listed.project_id,
+                        deployment_id: listed.deployment_id,
+                        status: listed.status,
+                    },
+                    ready,
+                    reason,
+                    desired_replicas: listed.replica.count,
+                }
+            })
+            .collect())
+    }
 
-        let mut snapshots = Vec::new();
-        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            let Some(project_id) = fields.get(2).and_then(|value| Uuid::parse_str(value).ok())
-            else {
-                continue;
-            };
-            let Some(deployment_id) = fields.get(3).and_then(|value| Uuid::parse_str(value).ok())
-            else {
-                continue;
-            };
-            let status = fields.get(1).copied().unwrap_or_default().to_owned();
-            let (ready, reason) = health_state(&status);
-            let replica = ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied());
-            snapshots.push(RuntimeHealthSnapshot {
-                workload: RuntimeWorkload {
-                    container_id: fields.first().copied().unwrap_or_default().to_owned(),
-                    project_id,
-                    deployment_id,
-                    status,
-                },
-                ready,
-                reason,
-                desired_replicas: replica.count,
-            });
-        }
-
-        Ok(snapshots)
+    async fn replica_listing(&self) -> Result<Vec<ListedReplica>, RuntimeError> {
+        self.list_replicas(true, "docker replica listing").await
     }
 
     /// A workload counts as crashed while Docker is restarting it, and while it
@@ -1126,6 +1105,21 @@ impl ContainerEngine for DockerContainerEngine {
     }
 }
 
+/// One line of [`DockerContainerEngine::list_replicas`].
+fn parse_listed_replica(line: &str) -> Option<ListedReplica> {
+    if line.trim().is_empty() {
+        return None;
+    }
+    let fields = line.split('\t').collect::<Vec<_>>();
+    Some(ListedReplica {
+        container_id: fields.first().copied().unwrap_or_default().to_owned(),
+        status: fields.get(1).copied().unwrap_or_default().to_owned(),
+        project_id: Uuid::parse_str(fields.get(2)?).ok()?,
+        deployment_id: Uuid::parse_str(fields.get(3)?).ok()?,
+        replica: ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied()),
+    })
+}
+
 /// One line of the workload lookup. The name and the replica labels come last,
 /// so a line without them reads as the single replica it then is.
 fn parse_workload(
@@ -1296,6 +1290,29 @@ impl CrashState {
 }
 
 impl DockerContainerEngine {
+    /// Managed containers with their identity and replica labels, in one
+    /// `docker ps`. `all` includes the stopped ones. A container without a
+    /// readable project or deployment ID is left out.
+    async fn list_replicas(
+        &self,
+        all: bool,
+        what: &str,
+    ) -> Result<Vec<ListedReplica>, RuntimeError> {
+        let mut command = CommandSpec::new("docker").arg("ps");
+        if all {
+            command = command.arg("--all");
+        }
+        let command = command
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(format!(
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
+            ));
+        let stdout = self.read_docker(&command, what).await?;
+        Ok(stdout.lines().filter_map(parse_listed_replica).collect())
+    }
+
     /// A restart that is not reported as a crash must still leave a trace.
     fn log_new_restarts(&self, states: &[(&RuntimeHealthSnapshot, CrashState)]) {
         let counts = states

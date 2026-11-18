@@ -14,7 +14,8 @@ use sakala_agent_core::ports::{
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
     RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
     RuntimeNetworkReconciliation, RuntimePreflightCheck, RuntimePreflightReport,
-    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
+    RuntimeReconciliationReport, RuntimeReplicaRestoration, RuntimeReporter,
+    RuntimeReporterFactory, WorkloadLifecycleRequest,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
@@ -31,6 +32,10 @@ use tokio::{
 use url::Url;
 use uuid::Uuid;
 
+use super::{
+    project_locks::ProjectLocks,
+    replica_restore::{ReplicaRestorer, RestorePolicy, RestoreTarget},
+};
 use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
@@ -78,6 +83,9 @@ pub struct DockerRuntimeExecutor {
     traffic: std::sync::Mutex<TrafficTracker>,
     /// Keeps a router without readable counters to one warning, not one per heartbeat.
     traffic_unreadable: AtomicBool,
+    /// Held by every project command, and tried by replica restore.
+    project_locks: ProjectLocks,
+    restorer: std::sync::Mutex<ReplicaRestorer>,
 }
 
 pub(crate) struct DockerPreflight {
@@ -136,6 +144,7 @@ impl DockerRuntimeExecutor {
         };
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let health_check_window = config.health_interval * config.health_attempts;
+        let restore_policy = RestorePolicy::new(config.crash_stable_window);
         let router_container = config.caddy_container.clone();
         let api_url = config.api_url.clone();
         let reloader = Arc::new(DockerExecCaddyReloader::new(
@@ -191,6 +200,7 @@ impl DockerRuntimeExecutor {
             min_workspace_free_bytes,
             preflight,
             api_url,
+            restore_policy,
         )
     }
 
@@ -212,6 +222,7 @@ impl DockerRuntimeExecutor {
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
         api_url: String,
+        restore_policy: RestorePolicy,
     ) -> Self {
         let telemetry = NodeTelemetryCollector::new(
             Arc::clone(&preflight.runner),
@@ -248,6 +259,8 @@ impl DockerRuntimeExecutor {
             router_metrics,
             traffic: std::sync::Mutex::new(TrafficTracker::new(OffsetDateTime::now_utc())),
             traffic_unreadable: AtomicBool::new(false),
+            project_locks: ProjectLocks::default(),
+            restorer: std::sync::Mutex::new(ReplicaRestorer::new(restore_policy)),
         }
     }
 
@@ -1248,6 +1261,98 @@ impl DockerRuntimeExecutor {
             .await?;
         Ok(CommandOutput::with_result(json!({ "status": "ready" })))
     }
+
+    /// One pass of replica restore; see [`super::replica_restore`] for which
+    /// replicas qualify. The route is left as it is: it already lists every
+    /// replica, and the router sends requests to one again once it answers.
+    async fn run_restore_replicas(&self) -> Result<RuntimeReplicaRestoration, RuntimeError> {
+        let listing = self.containers.replica_listing().await?;
+        let targets = self.restorer.lock().expect("replica restorer lock").plan(
+            &listing,
+            Instant::now(),
+            |project_id| self.project_locks.is_locked(project_id),
+        );
+        let mut outcome = RuntimeReplicaRestoration::default();
+        for target in targets {
+            // A command that started since the listing goes first.
+            let Some(_project) = self.project_locks.try_lock(target.project_id) else {
+                continue;
+            };
+            match self.restore_replica(&target).await {
+                Ok(true) => outcome.restored += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    outcome.failed += 1;
+                    tracing::warn!(
+                        container_id = %target.container_id,
+                        project_id = %target.project_id,
+                        deployment_id = %target.deployment_id,
+                        replica = target.replica.index,
+                        attempt = target.attempt,
+                        %error,
+                        "stopped replica could not be restored; the agent retries after a delay"
+                    );
+                }
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Starts one stopped replica with its own container, image, and settings,
+    /// under the project lock the caller holds. Returns `false` when a fresh
+    /// look shows there is nothing to do any more.
+    async fn restore_replica(&self, target: &RestoreTarget) -> Result<bool, RuntimeError> {
+        // The listing may be stale: look again now that no command can interfere.
+        // A lookup that fails counts as an attempt, so it cannot repeat every pass.
+        let workloads = match self
+            .containers
+            .workloads(target.project_id, target.deployment_id)
+            .await
+        {
+            Ok(workloads) => workloads,
+            Err(error) => {
+                self.record_restore_attempt(target);
+                return Err(error);
+            }
+        };
+        let Some(replica) = workloads
+            .iter()
+            .find(|workload| workload.container_id == target.container_id)
+        else {
+            return Ok(false);
+        };
+        if replica.is_running() || !workloads.iter().any(ManagedWorkload::is_running) {
+            return Ok(false);
+        }
+        self.record_restore_attempt(target);
+        tracing::info!(
+            container_id = %target.container_id,
+            container = %replica.name,
+            project_id = %target.project_id,
+            deployment_id = %target.deployment_id,
+            replica = target.replica.index,
+            replicas = target.replica.count,
+            attempt = target.attempt,
+            status = %replica.status,
+            "restoring a stopped replica of a serving deployment"
+        );
+        // Same admission as a deploy or wake. The deployment was admitted with
+        // all its replicas, so asking for all of them again only refuses when
+        // other projects took the freed slot in the meantime.
+        let _admission = self.container_admission.lock().await;
+        self.containers
+            .ensure_capacity(target.project_id, replica.replica.count)
+            .await?;
+        self.containers.start_existing(replica).await?;
+        Ok(true)
+    }
+
+    fn record_restore_attempt(&self, target: &RestoreTarget) {
+        self.restorer
+            .lock()
+            .expect("replica restorer lock")
+            .record_attempt(&target.container_id, Instant::now());
+    }
 }
 
 impl DockerPreflight {
@@ -1639,6 +1744,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .map_err(Into::into)
     }
 
+    async fn restore_replicas(&self) -> Result<RuntimeReplicaRestoration, RuntimeExecutionError> {
+        self.run_restore_replicas().await.map_err(Into::into)
+    }
+
     async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {
         let counters = match self.router_metrics.read().await {
             Ok(counters) => {
@@ -1697,6 +1806,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         if request.cancellation.is_cancelled() {
             return Err(RuntimeError::Cancelled.into());
         }
+        let _project = self.project_locks.lock(request.project_id).await;
         let workloads = self
             .containers
             .workloads(request.project_id, request.deployment_id)
@@ -1892,6 +2002,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: DeployProjectRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_deployment(request, reporter)
             .await
             .map_err(Into::into)
@@ -1902,6 +2013,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_restart(request, reporter)
             .await
             .map_err(Into::into)
@@ -1912,6 +2024,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_stop(request, reporter, true)
             .await
             .map_err(Into::into)
@@ -1922,6 +2035,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_stop(request, reporter, false)
             .await
             .map_err(Into::into)
@@ -1932,6 +2046,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_wake(request, reporter).await.map_err(Into::into)
     }
 
@@ -1940,6 +2055,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         _reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_health_check(request).await.map_err(Into::into)
     }
 
@@ -1948,6 +2064,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
         self.run_refresh_route(request, reporter)
             .await
             .map_err(Into::into)

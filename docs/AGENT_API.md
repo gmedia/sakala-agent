@@ -202,6 +202,13 @@ dikirim sebagai log, dan route lama tetap melayani. Aplikasi dengan replika haru
 stateless: file atau sesi yang disimpan di disk satu container tidak terlihat oleh
 replika lain.
 
+Replika yang berhenti sementara replika lain dari deployment yang sama masih
+melayani, misalnya karena `docker kill`, dinyalakan lagi oleh Agent sendiri dengan
+`docker start` pada interval health worker berikutnya, dengan backoff per replika dan
+batas 5 kali percobaan. Project yang tidur, deployment satu replika, dan project yang
+sedang menjalankan command tidak disentuh. Aturan lengkapnya ada di
+[Runtime Hardening](RUNTIME_HARDENING.md#pemulihan-replika).
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -931,6 +938,11 @@ Cara membaca list ini:
   itu.
 - **`ready` di atas 0** berarti deployment masih melayani. Router berhenti mengirim
   request ke replika yang tidak bisa dihubungi selama 10 detik, lalu mencobanya lagi.
+- **`ready` di bawah `desired`** biasanya sementara: Agent menyalakan lagi replika
+  `exited` dari deployment yang masih melayani dalam satu atau dua interval health
+  worker. Angka yang bertahan berarti replika itu gagal start 5 kali, container-nya
+  hilang, atau sedang crash berulang di bawah restart policy Docker; lihat
+  [Pemulihan replika](RUNTIME_HARDENING.md#pemulihan-replika).
 - `maximum_replicas_per_project` selalu dikirim; `null` berarti driver node tidak
   mendukung replika.
 

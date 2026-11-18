@@ -24,7 +24,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` | `86400` | Umur minimum image milik project yang tidak punya container sama sekali, misalnya project yang sudah dihapus, sebelum image GC menghapusnya, termasuk image terbarunya. Dihitung dari waktu image dibuat. Minimal sama dengan `SAKALA_COMMAND_TIMEOUT_SECONDS`, supaya image deploy yang belum sempat dijalankan tidak ikut terhapus. |
 | `SAKALA_IMAGE_GC_INTERVAL_SECONDS` | `3600` | Jarak antar-putaran image GC otomatis. Putaran pertama berjalan satu interval setelah start, dan putaran dilewati selama ada command aktif. Aturannya sama dengan target `stale_images` pada `CleanupRuntime`. |
 | `SAKALA_MIN_WORKSPACE_FREE_MB` | `1024` | Ruang bebas minimum filesystem workspace sebelum Agent menerima checkout/build baru. Nilai di bawah batas lokal ditolak sebagai disk pressure. |
-| `SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS` | `30` | Interval pemeriksaan batch workload aktif berlabel Sakala. Agent mencatat perubahan state lokal saja sampai kontrak pelaporan health ke API disepakati. |
+| `SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS` | `30` | Interval pemeriksaan batch workload aktif berlabel Sakala. Agent mencatat perubahan state lokal saja sampai kontrak pelaporan health ke API disepakati. Interval yang sama menjalankan [pemulihan replika](RUNTIME_HARDENING.md#pemulihan-replika). |
 | `SAKALA_CADDY_SITES_DIR` | `/var/lib/sakala/caddy/sites` | Folder route host yang dimount ke Caddy. |
 | `SAKALA_CADDY_CONTAINER` | `sakala-caddy` | Container Caddy yang divalidasi dan direload. |
 | `SAKALA_RAILPACK_FRONTEND` | `ghcr.io/railwayapp/railpack-frontend:v0.23.0` | BuildKit frontend; pin sesuai Railpack di `SAKALA_RAILPACK_IMAGE`. |

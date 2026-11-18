@@ -165,6 +165,15 @@ pub struct RuntimeHealthSnapshot {
     pub desired_replicas: NonZeroU32,
 }
 
+/// What one pass over the replicas of running deployments changed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeReplicaRestoration {
+    /// Stopped replicas started again.
+    pub restored: usize,
+    /// Restore attempts that failed, for example because the node was full.
+    pub failed: usize,
+}
+
 /// Kapasitas workload yang diketahui runtime lokal saat snapshot diambil.
 ///
 /// Nilai `None` berarti driver tidak dapat menentukan kapasitas dengan aman;
@@ -389,6 +398,15 @@ pub trait RuntimeExecutor: Send + Sync {
         _snapshots: &[RuntimeHealthSnapshot],
     ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeExecutionError> {
         Ok(Vec::new())
+    }
+
+    /// Starts again the stopped replicas of deployments that still serve with at
+    /// least one other replica, with a bounded backoff per replica. A deployment
+    /// with no running replica, such as a sleeping project, is never touched, and
+    /// neither is a project with a command in flight. The health worker calls it
+    /// once per interval.
+    async fn restore_replicas(&self) -> Result<RuntimeReplicaRestoration, RuntimeExecutionError> {
+        Ok(RuntimeReplicaRestoration::default())
     }
 
     /// When the router last served each running workload, for idle sleep.

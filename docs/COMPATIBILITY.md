@@ -194,6 +194,17 @@ only difference is stricter on the Agent side: a value ending in a newline is re
 while the API's PHP regex accepts it. An admin override stored in the API wins over
 both heartbeat values. Shape in [Sakala Agent API](AGENT_API.md#lokasi-dan-kapasitas-node).
 
+## Revision 4 behaviour change: replica restore
+
+Still revision 4, with no wire change: no new command, payload field, heartbeat key,
+or capability. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Stopped replicas of a serving deployment | Started again by the Agent. | A replica that is `exited` while another replica of the same deployment is `Up`, and that deployment is the only one of its project with a replica `Up`, is started with `docker start` on the next health worker interval. Up to 5 starts per replica, the first at once, then after 30, 60, 120, and 240 s; staying up for 5 minutes resets the count. Sleeping projects, one-replica deployments, projects with a command in flight, and a full node are left alone. Details in [Runtime Hardening](RUNTIME_HARDENING.md#pemulihan-replika). |
+| `metadata.workloads.replicas` | Same shape. | `ready < desired` now usually clears within one or two health intervals. A value that stays low means the replica failed 5 starts, its container is gone (it returns with the next deployment), or Docker is restarting it in a crash loop. |
+| `crashed_details` | Unchanged. | A one-replica deployment whose container stopped is still not restored by the Agent and is reported and reconciled as before. |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.
