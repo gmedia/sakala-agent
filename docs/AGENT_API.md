@@ -699,7 +699,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "release-command"
   ],
   "metadata": {
-    "version": "0.9.1",
+    "version": "0.10.0",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
