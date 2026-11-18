@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
     DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
-    RuntimeCleanupTarget, SleepingPage, WorkloadTraffic,
+    RuntimeCleanupTarget, SleepingPage, WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -414,6 +414,15 @@ pub trait RuntimeExecutor: Send + Sync {
     /// could not be read, which the heartbeat must not report as "no traffic".
     async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {
         None
+    }
+
+    /// CPU, memory, and restart count of every running container of a managed
+    /// workload, one entry per replica, from one batched sample. An error means
+    /// the sample failed as a whole, which the heartbeat reports by leaving the
+    /// list out; it never sends part of a sample. A runtime that runs no
+    /// containers has nothing to sample.
+    async fn workload_metrics(&self) -> Result<Vec<WorkloadMetrics>, RuntimeExecutionError> {
+        Ok(Vec::new())
     }
 
     async fn node_telemetry(&self) -> Result<NodeTelemetry, RuntimeExecutionError> {

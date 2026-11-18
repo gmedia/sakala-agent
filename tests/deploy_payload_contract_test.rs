@@ -1,7 +1,7 @@
 use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
     FinalizationDeferredReason, HeartbeatPayload, NodePlacement, RequestedReplicas, SleepingPage,
-    WorkloadReplicas, WorkloadTraffic,
+    WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
 
 #[test]
@@ -349,5 +349,53 @@ fn node_placement_fixture_matches_the_heartbeat_contract() {
     assert_eq!(
         serde_json::to_value(&placement).expect("placement serializes"),
         heartbeat.metadata["runtime"]
+    );
+}
+
+#[test]
+fn workload_metrics_fixture_matches_the_heartbeat_contract() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/workload-metrics.json"))
+            .expect("heartbeat fixture must deserialize");
+    let metrics: Vec<WorkloadMetrics> =
+        serde_json::from_value(heartbeat.metadata["workloads"]["metrics"].clone())
+            .expect("metrics must match the DTO");
+
+    assert_eq!(
+        heartbeat.metadata["detail_counts"]["metrics"].as_u64(),
+        Some(metrics.len() as u64)
+    );
+    assert!(
+        heartbeat
+            .node
+            .capabilities
+            .iter()
+            .any(|c| c == "workload-metrics")
+    );
+    // One sample: every entry shares its time, which precedes the heartbeat.
+    assert!(
+        metrics
+            .iter()
+            .all(|item| item.sampled_at == metrics[0].sampled_at)
+    );
+    assert!(metrics[0].sampled_at < heartbeat.sent_at);
+    assert!(metrics.iter().all(|item| item.cpu_percent >= 0.0));
+    // Percent of one core, so a busy multi-threaded replica passes 100.
+    assert!(metrics.iter().any(|item| item.cpu_percent > 100.0));
+    assert!(metrics.iter().any(|item| item.memory_limit_bytes.is_none()));
+    // Each replica of a deployment has its own entry.
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|item| item.deployment_id == metrics[1].deployment_id)
+            .map(|item| item.replica)
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+
+    // A DTO round trip keeps the exact wire shape, `null` limit included.
+    assert_eq!(
+        serde_json::to_value(&metrics).expect("metrics serialize"),
+        heartbeat.metadata["workloads"]["metrics"]
     );
 }

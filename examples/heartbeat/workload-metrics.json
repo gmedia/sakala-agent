@@ -1,0 +1,54 @@
+{
+  "status": "ready",
+  "hostname": "runtime-01",
+  "runtime_network": "sakala-runtime",
+  "capabilities": ["docker-runtime", "caddy-file-routing", "replicas", "workload-metrics"],
+  "metadata": {
+    "version": "0.10.0",
+    "protocol_version": 4,
+    "runtime_driver": "docker",
+    "detail_counts": {
+      "metrics": 3
+    },
+    "workloads": {
+      "active": 3,
+      "starting": 0,
+      "unhealthy": 0,
+      "stopped": 0,
+      "unhealthy_details": [],
+      "metrics": [
+        {
+          "project_id": "11111111-1111-4111-8111-111111111111",
+          "deployment_id": "22222222-2222-4222-8222-222222222222",
+          "replica": 0,
+          "sampled_at": "2026-11-18T09:15:02Z",
+          "cpu_percent": 3.1,
+          "memory_bytes": 1610612736,
+          "memory_limit_bytes": null,
+          "restart_count": 0
+        },
+        {
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "replica": 0,
+          "sampled_at": "2026-11-18T09:15:02Z",
+          "cpu_percent": 0.0,
+          "memory_bytes": 37539021,
+          "memory_limit_bytes": 268435456,
+          "restart_count": 3
+        },
+        {
+          "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+          "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+          "replica": 1,
+          "sampled_at": "2026-11-18T09:15:02Z",
+          "cpu_percent": 112.5,
+          "memory_bytes": 209715200,
+          "memory_limit_bytes": 268435456,
+          "restart_count": 0
+        }
+      ]
+    }
+  },
+  "sent_at": "2026-11-18T09:15:03Z"
+}

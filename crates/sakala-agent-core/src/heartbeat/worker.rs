@@ -14,6 +14,7 @@ use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::metrics::{WorkloadMetricsSampler, insert_metrics};
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
     api::ApiClient,
@@ -42,6 +43,10 @@ pub struct HeartbeatRuntimeContext {
     /// `SAKALA_MAX_ACTIVE_CONTAINERS`: at most that many workloads can be
     /// running and served at once.
     pub max_traffic_items: usize,
+    /// Takes `workloads.metrics` samples, at most once per its interval.
+    /// `None` on a runtime without the `workload-metrics` capability, whose
+    /// heartbeats never carry the list.
+    pub metrics: Option<WorkloadMetricsSampler>,
 }
 
 pub async fn run(
@@ -83,7 +88,18 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         Ok(resources) => (resources, true),
         Err(_) => (NodeTelemetry::default(), false),
     };
-    let workloads = workload_statistics(context.runtime.as_ref()).await;
+    // `docker stats` takes about two seconds, so the sample runs next to the
+    // health probes instead of after them.
+    let sample_metrics = async {
+        match &context.metrics {
+            Some(sampler) => sampler.sample_if_due(context.runtime.as_ref()).await,
+            None => None,
+        }
+    };
+    let (workloads, metrics) = tokio::join!(
+        workload_statistics(context.runtime.as_ref()),
+        sample_metrics,
+    );
     let traffic = tokio::time::timeout(probe_timeout(), context.runtime.workload_traffic())
         .await
         .ok()
@@ -192,6 +208,9 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         &workloads.replicas,
         context.max_traffic_items,
     );
+    if let Some(sampler) = &context.metrics {
+        insert_metrics(&mut metadata, metrics.as_deref(), sampler.max_items());
+    }
     insert_maximum_active_workloads(&mut metadata, workloads.maximum_active_workloads);
     insert_placement(&mut metadata, &config.placement);
     HeartbeatPayload {
@@ -442,6 +461,7 @@ mod tests {
         collections::HashMap,
         num::NonZeroU32,
         sync::{Arc, RwLock},
+        time::Duration,
     };
 
     use sakala_agent_protocol::{
@@ -461,7 +481,7 @@ mod tests {
         scheduler::metrics::SchedulerMetrics,
     };
 
-    use super::{HeartbeatRuntimeContext, disk_pressure_state, payload};
+    use super::{HeartbeatRuntimeContext, WorkloadMetricsSampler, disk_pressure_state, payload};
 
     struct EmptyRuntime;
 
@@ -580,6 +600,7 @@ mod tests {
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
+            metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
         }
     }
 
@@ -604,6 +625,7 @@ mod tests {
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
+            metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
         };
         let heartbeat = payload(&config, &context).await;
 
@@ -1366,6 +1388,102 @@ mod tests {
         }
     }
 
+    struct MetricsRuntime {
+        result: Result<Vec<sakala_agent_protocol::WorkloadMetrics>, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for MetricsRuntime {
+        async fn workload_metrics(
+            &self,
+        ) -> Result<Vec<sakala_agent_protocol::WorkloadMetrics>, RuntimeExecutionError> {
+            self.result
+                .clone()
+                .map_err(|()| RuntimeExecutionError::new("runtime_container_failed", "no stats"))
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_sends_a_fresh_metrics_sample_once_and_omits_it_until_the_next() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let project_id = Uuid::new_v4();
+        let deployment_id = Uuid::new_v4();
+        let sampled_at = OffsetDateTime::parse("2026-11-18T09:15:00Z", &Rfc3339).expect("time");
+        let context = heartbeat_context(
+            Arc::new(MetricsRuntime {
+                result: Ok(vec![sakala_agent_protocol::WorkloadMetrics {
+                    project_id,
+                    deployment_id,
+                    replica: 1,
+                    sampled_at,
+                    cpu_percent: 112.5,
+                    memory_bytes: 37_538_611,
+                    memory_limit_bytes: Some(268_435_456),
+                    restart_count: 2,
+                }]),
+            }),
+            RuntimeReconciliationReport::default(),
+        );
+
+        let fresh = payload(&config, &context).await;
+        assert_eq!(
+            fresh.metadata["workloads"]["metrics"],
+            json!([{
+                "project_id": project_id,
+                "deployment_id": deployment_id,
+                "replica": 1,
+                "sampled_at": "2026-11-18T09:15:00Z",
+                "cpu_percent": 112.5,
+                "memory_bytes": 37_538_611,
+                "memory_limit_bytes": 268_435_456,
+                "restart_count": 2,
+            }])
+        );
+        assert_eq!(fresh.metadata["detail_counts"]["metrics"], 1);
+
+        // The interval (60 seconds in this context) has not passed yet.
+        let between = payload(&config, &context).await;
+        assert!(between.metadata["workloads"].get("metrics").is_none());
+        assert!(between.metadata["detail_counts"].get("metrics").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_the_capability_never_samples_metrics() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let mut context = heartbeat_context(
+            Arc::new(MetricsRuntime {
+                result: Ok(Vec::new()),
+            }),
+            RuntimeReconciliationReport::default(),
+        );
+        context.metrics = None;
+
+        let heartbeat = payload(&config, &context).await;
+
+        assert!(heartbeat.metadata["workloads"].get("metrics").is_none());
+        assert!(heartbeat.metadata["detail_counts"].get("metrics").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_metrics_sample_leaves_both_keys_out_and_keeps_the_node_ready() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(MetricsRuntime { result: Err(()) }),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert!(heartbeat.metadata["workloads"].get("metrics").is_none());
+        assert!(heartbeat.metadata["detail_counts"].get("metrics").is_none());
+        assert_eq!(heartbeat.status, NodeStatus::Ready);
+    }
+
     fn collect_timestamp_fields(
         value: &serde_json::Value,
         found: &mut Vec<(String, serde_json::Value)>,
@@ -1408,6 +1526,7 @@ mod tests {
             startup_reconciliation_at: OffsetDateTime::now_utc(),
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
+            metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
         };
 
         assert_eq!(

@@ -1,7 +1,12 @@
 use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
 use clap::Parser;
-use sakala_agent_core::{AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV};
+use sakala_agent_core::{
+    AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV,
+    heartbeat::metrics::{
+        DEFAULT_METRICS_INTERVAL, MAX_METRICS_INTERVAL, METRICS_INTERVAL_ENV, MIN_METRICS_INTERVAL,
+    },
+};
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
@@ -52,6 +57,8 @@ pub struct AppConfig {
     pub runtime_health_interval: Duration,
     /// How often the image GC removes stale Sakala images.
     pub image_gc_interval: Duration,
+    /// How often heartbeats sample `workloads.metrics`.
+    pub metrics_interval: Duration,
     pub log_level: String,
 }
 
@@ -121,6 +128,9 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS")]
     runtime_health_interval_seconds: Option<String>,
+
+    #[arg(long, env = METRICS_INTERVAL_ENV)]
+    metrics_interval_seconds: Option<String>,
 
     #[arg(long, env = "SAKALA_MIN_WORKSPACE_FREE_MB")]
     min_workspace_free_mb: Option<String>,
@@ -256,6 +266,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS",
         cli.runtime_health_interval_seconds,
+    );
+    insert(
+        &mut values,
+        METRICS_INTERVAL_ENV,
+        cli.metrics_interval_seconds,
     );
     insert(
         &mut values,
@@ -441,6 +456,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             "SAKALA_IMAGE_GC_INTERVAL_SECONDS",
             3_600,
         )?),
+        metrics_interval: metrics_interval(values)?,
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -503,6 +519,25 @@ fn release_command_timeout(
     Ok(Duration::from_secs(seconds))
 }
 
+/// One sample keeps Docker busy for about two seconds and the control plane
+/// aggregates per minute, so the interval stays between the two bounds.
+fn metrics_interval(values: &HashMap<String, String>) -> Result<Duration, CoreError> {
+    let seconds = positive_u64(
+        values,
+        METRICS_INTERVAL_ENV,
+        DEFAULT_METRICS_INTERVAL.as_secs(),
+    )?;
+    let interval = Duration::from_secs(seconds);
+    if !(MIN_METRICS_INTERVAL..=MAX_METRICS_INTERVAL).contains(&interval) {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{METRICS_INTERVAL_ENV} must be between {} and {} seconds, received {seconds}",
+            MIN_METRICS_INTERVAL.as_secs(),
+            MAX_METRICS_INTERVAL.as_secs()
+        )));
+    }
+    Ok(interval)
+}
+
 fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
     match runtime_driver {
         RuntimeDriver::Noop => vec!["noop-runtime".to_owned()],
@@ -519,6 +554,8 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             "replicas",
             // `DeployProject.release_command`, run once before the new version starts.
             "release-command",
+            // `workloads.metrics`: CPU, memory, and restarts per workload container.
+            "workload-metrics",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1140,6 +1177,51 @@ mod tests {
 
         let error = from_values(&values).expect_err("zero interval must be rejected");
         assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn metrics_interval_defaults_to_a_minute_and_stays_within_its_bounds() {
+        let config = from_values(&HashMap::new()).expect("defaults are valid");
+        assert_eq!(config.metrics_interval, Duration::from_secs(60));
+
+        for accepted in ["10", "3600"] {
+            let values = HashMap::from([(METRICS_INTERVAL_ENV.to_owned(), accepted.to_owned())]);
+            let config = from_values(&values).expect("a bound itself is accepted");
+            assert_eq!(config.metrics_interval.as_secs().to_string(), accepted);
+        }
+        for (rejected, message) in [
+            ("0", "must be greater than zero"),
+            ("9", "between 10 and 3600 seconds"),
+            ("3601", "between 10 and 3600 seconds"),
+            ("60s", "must be a number"),
+        ] {
+            let values = HashMap::from([(METRICS_INTERVAL_ENV.to_owned(), rejected.to_owned())]);
+            let error = from_values(&values).expect_err("out-of-range interval must be rejected");
+            assert!(error.to_string().contains(message), "{rejected}: {error}");
+        }
+    }
+
+    #[test]
+    fn only_the_docker_runtime_advertises_workload_metrics() {
+        let docker = from_values(&HashMap::from([(
+            "SAKALA_RUNTIME_DRIVER".to_owned(),
+            "docker".to_owned(),
+        )]))
+        .expect("docker config is valid");
+        let noop = from_values(&HashMap::new()).expect("noop config is valid");
+
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&"workload-metrics".to_owned())
+        );
+        assert!(
+            !noop
+                .agent
+                .capabilities
+                .contains(&"workload-metrics".to_owned())
+        );
     }
 
     #[test]
