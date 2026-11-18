@@ -11,6 +11,7 @@ pub use runtime::{
     NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
     RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
     RuntimeNetworkReconciliation, RuntimeOrphan, RuntimePreflightCheck, RuntimePreflightReport,
-    RuntimeReconciliationReport, RuntimeReporter, RuntimeReporterFactory, RuntimeStaleImage,
-    RuntimeStaleRoute, RuntimeWorkload, WorkloadLifecycleRequest,
+    RuntimeReconciliationReport, RuntimeReplicaRestoration, RuntimeReporter,
+    RuntimeReporterFactory, RuntimeStaleImage, RuntimeStaleRoute, RuntimeWorkload,
+    WorkloadLifecycleRequest,
 };

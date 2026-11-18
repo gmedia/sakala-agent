@@ -1,7 +1,8 @@
 //! Proves replicas against a real Docker and a real Caddy: the balanced route
 //! the agent writes is accepted, requests reach every replica, a killed replica
-//! does not cost a single failed request, and sleep, wake, and stop handle the
-//! whole set through the executor's own lifecycle code.
+//! does not cost a single failed request and is started again by replica
+//! restore, and sleep, wake, and stop handle the whole set through the
+//! executor's own lifecycle code.
 //!
 //! Opt-in, because it needs a daemon plus `caddy:2.11.3-alpine` and
 //! `busybox:1.37` locally:
@@ -46,6 +47,9 @@ const DOMAIN: &str = "portfolio.run.sakala.localhost";
 const PORT: u16 = 3000;
 const REPLICAS: u32 = 3;
 const REQUESTS: usize = 30;
+/// How long a restored replica may take to get requests again. Caddy skips an
+/// upstream for `fail_duration` (10 s) after it failed, then tries it again.
+const BACK_IN_ROTATION_BOUND: Duration = Duration::from_secs(30);
 
 /// What the runtime Caddyfile of a node looks like.
 const ROUTER_CADDYFILE: &str = "{
@@ -300,6 +304,37 @@ async fn real_caddy_balances_replicas_and_survives_a_killed_one() {
     );
     assert!(!survivors.contains("r1"), "{survivors:?}");
     assert!(!survivors.is_empty());
+    assert_eq!(status_of(&replica_name(1)), "exited");
+
+    // Docker leaves a killed container stopped. One restore pass starts it
+    // again, without touching the route, and a second pass has nothing to do.
+    let restore_started = Instant::now();
+    let restored = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((restored.restored, restored.failed), (1, 0));
+    assert_eq!(status_of(&replica_name(1)), "running");
+    let again = executor
+        .restore_replicas()
+        .await
+        .expect("second restore pass");
+    assert_eq!((again.restored, again.failed), (0, 0));
+    assert_eq!(
+        std::fs::read_to_string(&route_path).expect("route file"),
+        route,
+        "the route already lists r1"
+    );
+    let back = loop {
+        let (reached, _) = answering_replicas();
+        if reached == all {
+            break restore_started.elapsed();
+        }
+        assert!(
+            restore_started.elapsed() < BACK_IN_ROTATION_BOUND,
+            "r1 is not back in rotation after {:?}: {reached:?}",
+            restore_started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    println!("--- r1 restored and back in rotation after {back:?}, no request failed");
 
     // Sleep stops every replica and puts up the sleeping page. BusyBox httpd
     // ignores SIGTERM, so this waits out one shared grace period.

@@ -59,6 +59,72 @@ sedikit dan berakhir dengan aplikasi berjalan hanya dicatat pada log operator. C
 dengan exit code apa pun. Semantik lengkapnya ada di
 [Sakala Agent API](AGENT_API.md#heartbeat-payload).
 
+### Pemulihan replika
+
+Di bawah `--restart unless-stopped`, Docker menyalakan lagi replika yang crash atau
+di-kill karena kehabisan memory, tetapi tidak replika yang dihentikan dengan
+`docker stop` atau `docker kill`. Replika seperti itu tetap `exited` (misalnya
+`Exited (137)`), dan sebelum fitur ini baru kembali pada deploy berikutnya. Pada
+Docker 29.9.3 sudah dicek: container yang di-`docker kill` tetap `exited` dengan
+`RestartCount` 0, sedangkan container yang kena OOM kill langsung `restarting`.
+
+Setelah snapshot, setiap interval health worker yang sama menjalankan satu putaran
+pemulihan: satu listing `docker ps --all` untuk seluruh container Sakala, lalu
+`docker start` untuk replika yang memenuhi syarat. Container, image, environment,
+resource, dan label yang dipakai tetap milik replika itu; tidak ada build ulang. Satu
+replika memenuhi syarat bila semua hal ini benar:
+
+- Statusnya `Exited`. Replika `Restarting` sedang ditangani Docker, sedangkan
+  `Created` dan `Dead` adalah sisa yang tidak bisa dibantu `docker start`.
+- Deployment-nya masih melayani: minimal satu replika lain berstatus `Up`, dan itu
+  satu-satunya deployment project tersebut yang punya replika `Up`. Project yang
+  sedang tidur (tidak ada replika yang `Up`), deployment satu replika yang
+  container-nya berhenti, dan project yang sedang deploy bergulir (dua deployment
+  `Up`) tidak disentuh.
+- Tidak ada command yang sedang berjalan untuk project itu. Setiap command project
+  (deploy, restart, stop, sleep, wake, health check, refresh route, reconcile)
+  memegang kunci per project di runtime, dan pemulihan hanya mengambil kunci yang
+  bebas. Sebaliknya, command menunggu sampai pemulihan project-nya selesai. Status
+  replika dibaca ulang setelah kunci didapat, jadi sleep yang baru selesai tidak
+  pernah dibatalkan oleh pemulihan.
+- Node masih punya kapasitas. Pemeriksaannya sama dengan deploy dan wake:
+  container berjalan milik project lain ditambah semua replika deployment itu tidak
+  boleh melebihi `SAKALA_MAX_ACTIVE_CONTAINERS`. Deployment itu sudah diterima
+  dengan seluruh replikanya, jadi pemeriksaan ini hanya menolak bila project lain
+  mengambil slot yang dilepas replika tadi.
+
+Setiap replika mendapat paling banyak 5 kali start. Start pertama langsung pada
+putaran yang menemukannya, berikutnya setelah jeda 30, 60, 120, lalu 240 detik
+(berlipat dua, paling lama 300 detik). Karena putaran berjalan per
+`SAKALA_RUNTIME_HEALTH_INTERVAL_SECONDS`, jeda nyata dibulatkan ke atas ke interval
+itu. Replika yang bertahan `Up` selama 5 menit (jendela stabil yang sama dengan
+laporan crash) mulai dari hitungan nol lagi. Start yang ditolak karena kapasitas
+atau gagal di Docker juga dihitung. Setelah start kelima, Agent berhenti mencoba
+dan mencatat `WARN` "replica keeps stopping"; heartbeat tetap melaporkan `ready`
+di bawah `desired`, dan replika itu kembali lewat deploy ulang atau `RestartProject`.
+Hitungan disimpan di memori, jadi restart Agent memberi satu putaran percobaan lagi.
+
+Agent mencatat `INFO` "restoring a stopped replica of a serving deployment" untuk
+setiap start, dan `WARN` bila start gagal. Route tidak ditulis ulang, karena sudah
+memuat semua replika. Caddy kembali mengirim request ke replika itu setelah
+`fail_duration` (10 detik) sejak kegagalan terakhirnya lewat. Pada uji Docker nyata,
+replika yang di-`docker kill` kembali menerima request 10,5 dan 11,7 detik (dua
+run) setelah putaran pemulihan, tanpa satu request pun gagal.
+
+Batasan yang disengaja:
+
+- **Container replika yang hilang** (misalnya dihapus dengan `docker rm`) tidak
+  dibuat ulang. Agent tidak menyimpan salinan environment deployment untuk
+  membuatnya, dan menyalinnya dari replika lain berarti menulis ulang secret ke
+  disk di luar alur deploy. Agent mencatat `WARN` sekali per replika, dan replika
+  itu kembali pada deploy berikutnya.
+- **Deployment satu replika** tidak dipulihkan, karena container yang berhenti tidak
+  bisa dibedakan dari project yang tidur. Perilakunya sama seperti sebelumnya:
+  control plane yang memutuskan lewat heartbeat dan `ReconcileWorkload`.
+- **Log follower** replika yang dipulihkan tidak dipasang ulang, sama seperti
+  setelah `WakeProject`. Control plane bisa memintanya dengan aksi
+  `restart_log_follower` pada `ReconcileWorkload`.
+
 Worker ini **tidak** melakukan restart otomatis, dan Agent tidak memutuskan
 recovery. Docker sendiri yang terus me-restart container yang crash sesuai policy.
 Keputusan produk atas laporan itu berada di `sakala-api`.

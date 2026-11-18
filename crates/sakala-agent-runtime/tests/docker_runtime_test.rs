@@ -7804,3 +7804,278 @@ async fn traffic_lists_a_deployment_once_whatever_its_replica_count() {
     assert_eq!(traffic.len(), 1, "{traffic:?}");
     assert_eq!(traffic[0].deployment_id.to_string(), DEPLOYMENT);
 }
+
+const RESTORE_PROJECT: &str = "ff66ed4a-6303-4be6-8ef4-63c28b112680";
+const RESTORE_DEPLOYMENT: &str = "4f1f21ef-730d-42d5-a46d-d965353cb993";
+
+/// A node with one deployment of three replicas, where `docker start` and
+/// `docker stop` change what later listings show.
+struct ReplicaRestoreRunner {
+    commands: Mutex<Vec<CommandSpec>>,
+    /// Status per replica index.
+    statuses: Mutex<Vec<String>>,
+    /// Running containers of other projects, for the capacity probe.
+    other_running: usize,
+    /// When set, `docker stop` reports that it started and then waits to be released.
+    stop_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+}
+
+impl ReplicaRestoreRunner {
+    fn new(statuses: [&str; 3]) -> Self {
+        Self {
+            commands: Mutex::new(Vec::new()),
+            statuses: Mutex::new(statuses.iter().map(|status| (*status).to_owned()).collect()),
+            other_running: 0,
+            stop_gate: None,
+        }
+    }
+
+    fn container_id(index: usize) -> String {
+        format!("replica{index}")
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .filter(|command| {
+                command.program == "docker"
+                    && command.args.first().is_some_and(|arg| arg == "start")
+            })
+            .map(|command| command.args[1].to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn status(&self, index: usize) -> String {
+        self.statuses.lock().expect("status lock")[index].clone()
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for ReplicaRestoreRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        _sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        self.commands
+            .lock()
+            .expect("command lock")
+            .push(spec.clone());
+        let args = spec
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let success = |stdout: String| {
+            Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        };
+        if spec.program != "docker" {
+            return success(String::new());
+        }
+        let statuses = self.statuses.lock().expect("status lock").clone();
+        match args.first().map(String::as_str) {
+            Some("ps")
+                if args
+                    .iter()
+                    .any(|arg| arg.starts_with("label=dev.sakala.project-id=")) =>
+            {
+                // The workload lookup of one deployment.
+                success(
+                    statuses
+                        .iter()
+                        .enumerate()
+                        .map(|(index, status)| {
+                            format!(
+                                "{}\t{status}\tportfolio.run.sakala.localhost\t3000\t\t\t\t\tsakala-app-ff66ed4a-{RESTORE_DEPLOYMENT}-r{index}\t{index}\t3",
+                                Self::container_id(index)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            Some("ps") if args.iter().any(|arg| arg == "--all") => success(
+                // The node-wide replica listing.
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, status)| {
+                        format!(
+                            "{}\t{status}\t{RESTORE_PROJECT}\t{RESTORE_DEPLOYMENT}\t{index}\t3",
+                            Self::container_id(index)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            Some("ps") => {
+                // The capacity probe: project IDs of running containers.
+                let mut lines = statuses
+                    .iter()
+                    .filter(|status| status.starts_with("Up"))
+                    .map(|_| RESTORE_PROJECT.to_owned())
+                    .collect::<Vec<_>>();
+                lines.extend(
+                    (0..self.other_running)
+                        .map(|_| "0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001".to_owned()),
+                );
+                success(lines.join("\n"))
+            }
+            Some("start") => {
+                let index = (0..3)
+                    .find(|index| args[1] == Self::container_id(*index))
+                    .expect("known container");
+                self.statuses.lock().expect("status lock")[index] =
+                    "Up Less than a second".to_owned();
+                success(args[1].clone())
+            }
+            Some("stop") => {
+                if let Some((entered, release)) = &self.stop_gate {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                let mut statuses = self.statuses.lock().expect("status lock");
+                for (index, status) in statuses.iter_mut().enumerate() {
+                    if args.contains(&Self::container_id(index)) {
+                        *status = "Exited (0) Less than a second ago".to_owned();
+                    }
+                }
+                success(String::new())
+            }
+            _ => success(String::new()),
+        }
+    }
+}
+
+fn replica_restore_executor(
+    temp: &TempDir,
+    runner: Arc<ReplicaRestoreRunner>,
+    max_active_containers: u32,
+) -> DockerRuntimeExecutor {
+    DockerRuntimeExecutor::with_runner(
+        DockerRuntimeConfig {
+            max_active_containers,
+            ..runtime_config(temp)
+        },
+        runner,
+    )
+}
+
+#[tokio::test]
+async fn replica_restore_starts_the_stopped_replica_of_a_serving_deployment_once() {
+    let temp = TempDir::new().expect("temp directory");
+    let runner = Arc::new(ReplicaRestoreRunner::new([
+        "Up 5 minutes",
+        "Exited (137) 3 seconds ago",
+        "Up 5 minutes",
+    ]));
+    let executor = replica_restore_executor(&temp, Arc::clone(&runner), 20);
+
+    let first = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((first.restored, first.failed), (1, 0));
+    assert_eq!(runner.started(), ["replica1"]);
+    assert!(runner.status(1).starts_with("Up"));
+
+    let second = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((second.restored, second.failed), (0, 0));
+    assert_eq!(runner.started(), ["replica1"], "nothing left to restore");
+    // The route is not rewritten: it already lists every replica.
+    assert!(
+        !temp
+            .path()
+            .join("sites")
+            .join(format!("{RESTORE_PROJECT}.Caddyfile"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn replica_restore_keeps_to_the_node_capacity() {
+    let temp = TempDir::new().expect("temp directory");
+    let mut runner =
+        ReplicaRestoreRunner::new(["Up 5 minutes", "Exited (137) 3 seconds ago", "Up 5 minutes"]);
+    // Another project took the slot the stopped replica freed.
+    runner.other_running = 2;
+    let runner = Arc::new(runner);
+    let executor = replica_restore_executor(&temp, Arc::clone(&runner), 4);
+
+    let outcome = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((outcome.restored, outcome.failed), (0, 1));
+    assert!(runner.started().is_empty());
+    assert!(runner.status(1).starts_with("Exited"));
+
+    // The next attempt waits out its backoff instead of retrying every pass.
+    let again = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((again.restored, again.failed), (0, 0));
+}
+
+#[tokio::test]
+async fn replica_restore_never_wakes_a_sleeping_project() {
+    let temp = TempDir::new().expect("temp directory");
+    let runner = Arc::new(ReplicaRestoreRunner::new([
+        "Exited (0) 1 hour ago",
+        "Exited (137) 1 hour ago",
+        "Exited (0) 1 hour ago",
+    ]));
+    let executor = replica_restore_executor(&temp, Arc::clone(&runner), 20);
+
+    let outcome = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((outcome.restored, outcome.failed), (0, 0));
+    assert!(runner.started().is_empty());
+}
+
+#[tokio::test]
+async fn replica_restore_gives_way_to_a_command_of_the_same_project() {
+    let temp = TempDir::new().expect("temp directory");
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut runner =
+        ReplicaRestoreRunner::new(["Up 5 minutes", "Exited (137) 3 seconds ago", "Up 5 minutes"]);
+    runner.stop_gate = Some((Arc::clone(&entered), Arc::clone(&release)));
+    let runner = Arc::new(runner);
+    let executor = Arc::new(replica_restore_executor(&temp, Arc::clone(&runner), 20));
+
+    // A sleep is halfway: it has listed the replicas and is stopping them.
+    let sleep = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            executor
+                .sleep_project(
+                    WorkloadLifecycleRequest {
+                        command_id: Uuid::new_v4(),
+                        project_id: Uuid::parse_str(RESTORE_PROJECT).expect("project UUID"),
+                        deployment_id: Uuid::parse_str(RESTORE_DEPLOYMENT)
+                            .expect("deployment UUID"),
+                        remove_images: false,
+                        sleeping_page: SleepingPage::Waking,
+                        cancellation: CancellationToken::new(),
+                    },
+                    Arc::new(RecordingReporter::default()),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("sleep reaches docker stop");
+
+    let during = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((during.restored, during.failed), (0, 0));
+    assert!(runner.started().is_empty(), "the sleep owns the project");
+
+    release.notify_one();
+    let slept = sleep.await.expect("sleep task").expect("sleep");
+    assert_eq!(slept.result["status"], "sleeping");
+
+    // Asleep now: every replica stopped, so there is nothing to restore.
+    let after = executor.restore_replicas().await.expect("restore pass");
+    assert_eq!((after.restored, after.failed), (0, 0));
+    assert!(runner.started().is_empty());
+}

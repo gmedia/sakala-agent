@@ -5,6 +5,10 @@ use tracing::{info, warn};
 
 use crate::ports::{RuntimeExecutor, RuntimeHealthSnapshot};
 
+/// Bounds one replica restore pass. Each `docker start` is bounded by the process
+/// runner, so this only stops a pass that keeps going far too long.
+const REPLICA_RESTORE_DEADLINE: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HealthState {
     ready: bool,
@@ -16,7 +20,9 @@ struct HealthState {
 ///
 /// Satu panggilan batch menjaga pemeriksaan tetap bounded dan menghindari
 /// stampede per-container. Jitter deterministik dari agent ID menyebarkan
-/// pemeriksaan antar-node tanpa menyulitkan shutdown.
+/// pemeriksaan antar-node tanpa menyulitkan shutdown. Setiap interval juga
+/// menyalakan lagi replika yang berhenti dari deployment yang masih melayani;
+/// runtime yang memutuskan replika mana dan kapan.
 pub async fn run(
     runtime: Arc<dyn RuntimeExecutor>,
     agent_id: String,
@@ -43,6 +49,21 @@ pub async fn run(
             Ok(Ok(snapshots)) => observe(&mut known, snapshots),
             Ok(Err(error)) => warn!(%error, "runtime health snapshot failed"),
             Err(_) => warn!(?probe_deadline, "runtime health snapshot timed out"),
+        }
+
+        tokio::select! {
+            outcome = tokio::time::timeout(REPLICA_RESTORE_DEADLINE, runtime.restore_replicas()) => {
+                match outcome {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(%error, "replica restore pass failed"),
+                    Err(_) => warn!(deadline = ?REPLICA_RESTORE_DEADLINE, "replica restore pass timed out"),
+                }
+            }
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
         }
 
         tokio::select! {
@@ -161,6 +182,45 @@ mod tests {
         observe(&mut known, vec![snapshot("second", true)]);
         assert_eq!(known.len(), 1);
         assert!(known.contains_key("second"));
+    }
+
+    #[derive(Default)]
+    struct RestoreCountingRuntime {
+        restores: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for RestoreCountingRuntime {
+        async fn restore_replicas(
+            &self,
+        ) -> Result<crate::ports::RuntimeReplicaRestoration, crate::ports::RuntimeExecutionError>
+        {
+            self.restores
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::ports::RuntimeReplicaRestoration::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_interval_runs_one_replica_restore_pass() {
+        let runtime = Arc::new(RestoreCountingRuntime::default());
+        let (shutdown, receiver) = watch::channel(false);
+        let worker = tokio::spawn(run(
+            Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>,
+            String::new(),
+            Duration::from_millis(10),
+            receiver,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runtime.restores.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("restore runs on every interval");
+        shutdown.send(true).expect("worker listens");
+        worker.await.expect("worker stops");
     }
 
     #[test]
