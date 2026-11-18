@@ -1,6 +1,6 @@
 use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
-    FinalizationDeferredReason, HeartbeatPayload, RequestedReplicas, SleepingPage,
+    FinalizationDeferredReason, HeartbeatPayload, NodePlacement, RequestedReplicas, SleepingPage,
     WorkloadReplicas, WorkloadTraffic,
 };
 
@@ -288,5 +288,35 @@ fn workload_replicas_fixture_matches_the_heartbeat_contract() {
     assert_eq!(
         serde_json::to_value(&replicas).expect("replicas serialize"),
         heartbeat.metadata["workloads"]["replicas"]
+    );
+}
+
+#[test]
+fn node_placement_fixture_matches_the_heartbeat_contract() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/node-placement.json"))
+            .expect("heartbeat fixture must deserialize");
+    // Parsing through the DTO applies the API's region and edge address rules.
+    let placement: NodePlacement = serde_json::from_value(heartbeat.metadata["runtime"].clone())
+        .expect("runtime must match the DTO");
+
+    assert_eq!(
+        placement.region.as_ref().map(|region| region.as_str()),
+        Some("id-jog-1")
+    );
+    assert_eq!(
+        placement
+            .edge_address
+            .as_ref()
+            .map(|address| address.as_str()),
+        Some("10.0.47.201:8180")
+    );
+    assert_eq!(
+        heartbeat.metadata["workloads"]["maximum_active_workloads"].as_u64(),
+        Some(20)
+    );
+    assert_eq!(
+        serde_json::to_value(&placement).expect("placement serializes"),
+        heartbeat.metadata["runtime"]
     );
 }

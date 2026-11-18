@@ -173,6 +173,27 @@ A one-replica deployment keeps the container name and the route every earlier Ag
 wrote, so existing and sleeping workloads keep working across the upgrade, and a
 node rolled back to an older Agent still finds them.
 
+## Revision 4 additions for placement
+
+Still revision 4: only additive heartbeat fields, read by `sakala-api` since PR #163
+(region and capacity placement, Edge route table). Deploy `sakala-api` first. An older
+API ignores the new keys, and an older Agent never sends them, which the API treats as
+"no region, no edge address, unknown capacity".
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `metadata.runtime.region` | Sent when `SAKALA_AGENT_REGION` is set. | Matches `^[a-z0-9]+(?:-[a-z0-9]+)*$`, at most 32 characters, the API's `RegionSlug` rule. |
+| `metadata.runtime.edge_address` | Sent when `SAKALA_AGENT_EDGE_ADDRESS` is set. | `host:port` where Sakala Edge reaches the node's runtime router: IPv4, bracketed IPv6, or a DNS name, port 1 to 65535 without leading zeros, at most 255 characters, the API's `EdgeAddress` rule. |
+| `metadata.runtime` | Sent only when at least one of the two keys above is. | A new object; earlier heartbeats had no `runtime` key. Never sent empty. |
+| `metadata.workloads.maximum_active_workloads` | Sent whenever the runtime reports its capacity. | Integer ≥ 0 from `SAKALA_MAX_ACTIVE_CONTAINERS`. Omitted, not `null`, on the `noop` driver and when the capacity probe fails. |
+
+The API rejects the whole heartbeat with `422` over one malformed `region` or
+`edge_address`. The Agent validates both variables at startup with the same rules and
+refuses to start on a value the API would reject; an empty variable means unset. The
+only difference is stricter on the Agent side: a value ending in a newline is refused,
+while the API's PHP regex accepts it. An admin override stored in the API wins over
+both heartbeat values. Shape in [Sakala Agent API](AGENT_API.md#lokasi-dan-kapasitas-node).
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

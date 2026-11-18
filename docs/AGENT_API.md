@@ -651,6 +651,10 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "runtime_driver": "docker",
     "lifecycle_state": "active",
     "uptime_seconds": 86400,
+    "runtime": {
+      "region": "id-jog-1",
+      "edge_address": "10.0.47.201:8180"
+    },
     "detail_counts": {
       "unhealthy_details": 0,
       "recovered_workloads": 0,
@@ -676,6 +680,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "unhealthy": 0,
       "stopped": 1,
       "maximum_replicas_per_project": 4,
+      "maximum_active_workloads": 20,
       "unhealthy_details": [],
       "crashed_details": [],
       "traffic": [
@@ -932,6 +937,45 @@ Cara membaca list ini:
 List dibatasi `SAKALA_MAX_ACTIVE_CONTAINERS` item seperti `traffic`, dan
 `detail_counts.replicas` menyimpan jumlah asli. Angkanya dihitung dari listing
 `docker ps` yang sama dengan `unhealthy_details`, tanpa query tambahan.
+
+### Lokasi dan kapasitas node
+
+Tiga field membantu API menempatkan project berdasarkan region dan kapasitas, serta
+menyusun tabel route Sakala Edge. Ketiganya opsional dan aditif pada revision 4. Field
+yang tidak dikonfigurasi atau tidak diketahui tidak dikirim sama sekali, bukan dikirim
+kosong atau `null`. Contoh heartbeat lengkapnya ada di
+`examples/heartbeat/node-placement.json`:
+
+```json
+{
+  "runtime": {
+    "region": "id-jog-1",
+    "edge_address": "10.0.47.201:8180"
+  },
+  "workloads": {
+    "maximum_active_workloads": 20
+  }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `runtime` | object, opsional | Hanya dikirim bila minimal satu dari dua key di bawah dikonfigurasi. |
+| `runtime.region` | string, opsional | `SAKALA_AGENT_REGION`. Cocok dengan `^[a-z0-9]+(?:-[a-z0-9]+)*$`, paling panjang 32 karakter, misalnya `jkt` atau `id-jog-1`. |
+| `runtime.edge_address` | string, opsional | `SAKALA_AGENT_EDGE_ADDRESS`. Alamat router runtime node yang bisa dijangkau Sakala Edge, berbentuk `host:port` tanpa skema atau path. Host berupa IPv4, IPv6 dalam kurung siku, atau nama DNS; port 1 sampai 65535 tanpa nol di depan; paling panjang 255 karakter. Contoh: `10.0.47.201:8180`, `[fd00::21]:8180`, `runtime-01.internal:8180`. Edge memakainya apa adanya sebagai upstream. |
+| `workloads.maximum_active_workloads` | integer ≥ 0, opsional | `SAKALA_MAX_ACTIVE_CONTAINERS`, yaitu jumlah container terbanyak yang dijalankan node sekaligus. Dikirim setiap kali runtime melaporkan kapasitasnya; driver `noop` tidak punya batas ini, jadi tidak mengirimnya, begitu juga saat pembacaan kapasitas gagal. Bandingkan dengan `workloads.active`, yang juga menghitung setiap replika. |
+
+API menolak seluruh heartbeat dengan `422` bila `region` atau `edge_address` tidak valid.
+Karena itu Agent memeriksa kedua env var dengan aturan yang sama saat start dan menolak
+berjalan bila salah satunya tidak valid, sehingga node tidak pernah mengirim heartbeat
+yang pasti ditolak. Env var yang kosong dianggap tidak dikonfigurasi. Agent sedikit lebih
+ketat daripada API di satu hal: nilai yang diakhiri newline ditolak, sedangkan regex PHP
+di API menerimanya.
+
+Override admin di API untuk region dan alamat Edge node menang atas nilai heartbeat.
+Bila node tidak mengirim `edge_address` dan tidak punya override, project di node itu
+tidak masuk tabel route Edge (`node_without_edge_address`, lihat `docs/EDGE_API.md`
+di `sakala-api`).
 
 `startup_reconciliation` adalah snapshot recovery saat process Agent dimulai,
 bukan inventaris runtime live. `captured_at` menjelaskan umur snapshot secara

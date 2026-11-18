@@ -1,6 +1,15 @@
 use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
+use sakala_agent_protocol::{EdgeAddress, NodePlacement, Region};
+
 use crate::CoreError;
+
+/// Where the node is, reported as `metadata.runtime.region`.
+pub const REGION_ENV: &str = "SAKALA_AGENT_REGION";
+
+/// Where Sakala Edge reaches the node's runtime router, reported as
+/// `metadata.runtime.edge_address`.
+pub const EDGE_ADDRESS_ENV: &str = "SAKALA_AGENT_EDGE_ADDRESS";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AgentMode {
@@ -45,6 +54,9 @@ pub struct AgentConfig {
     pub shutdown_grace_seconds: u64,
     pub runtime_network: String,
     pub capabilities: Vec<String>,
+    /// `SAKALA_AGENT_REGION` and `SAKALA_AGENT_EDGE_ADDRESS`, already checked
+    /// against the control plane's rules. Unset values stay `None`.
+    pub placement: NodePlacement,
 }
 
 impl AgentConfig {
@@ -91,6 +103,7 @@ impl AgentConfig {
             shutdown_grace_seconds: positive_number(values, "SAKALA_SHUTDOWN_GRACE_SECONDS", 30)?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
             capabilities: vec!["noop-runtime".to_owned()],
+            placement: placement(values)?,
         })
     }
 
@@ -113,6 +126,30 @@ impl AgentConfig {
     pub fn shutdown_grace(&self) -> Duration {
         Duration::from_secs(self.shutdown_grace_seconds)
     }
+}
+
+/// Reads the optional placement values. An unset or empty variable means "not
+/// configured". Anything else must pass the API's own rule, because the API
+/// rejects the whole heartbeat over one malformed value: the agent refuses to
+/// start rather than send heartbeats that never land.
+fn placement(values: &HashMap<String, String>) -> Result<NodePlacement, CoreError> {
+    Ok(NodePlacement {
+        region: optional(values, REGION_ENV, Region::parse)?,
+        edge_address: optional(values, EDGE_ADDRESS_ENV, EdgeAddress::parse)?,
+    })
+}
+
+fn optional<T, E: fmt::Display>(
+    values: &HashMap<String, String>,
+    key: &str,
+    parse: impl FnOnce(&str) -> Result<T, E>,
+) -> Result<Option<T>, CoreError> {
+    let Some(value) = values.get(key).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    parse(value).map(Some).map_err(|reason| {
+        CoreError::InvalidConfiguration(format!("{key} {reason}, received {value:?}"))
+    })
 }
 
 fn positive_usize(
