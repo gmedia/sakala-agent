@@ -14,7 +14,7 @@ use crate::{
     caddy::{CaddyControl, CaddyError},
     files::EdgeFiles,
     render::render,
-    source::{FetchError, Fetched, RouteSource},
+    source::{AppliedState, FetchError, Fetched, RouteSource, STATUS_OK},
     table::{RoutePolicy, RouteTable, TableRejection},
 };
 
@@ -261,14 +261,29 @@ impl EdgeSync {
         info!("route sync stopped");
     }
 
+    /// The revision Caddy serves and how the last cycle ended, as reported to
+    /// the API. `current` only moves once Caddy accepted a table (or the
+    /// snapshot was served at start), so a rejected table or a rollback leaves
+    /// the reported revision where it was.
+    #[must_use]
+    pub fn applied_state(&self) -> AppliedState<'_> {
+        AppliedState {
+            revision: self.current.as_ref().map(RouteTable::revision),
+            status: self
+                .status
+                .last_error
+                .as_ref()
+                .map_or(STATUS_OK, |error| error.code),
+        }
+    }
+
     async fn fetch_and_apply(
         &mut self,
         shutdown: &CancellationToken,
     ) -> Option<Result<SyncOutcome, SyncError>> {
-        let revision = self.current.as_ref().map(RouteTable::revision);
         let fetched = tokio::select! {
             () = shutdown.cancelled() => return None,
-            fetched = self.source.fetch(revision) => fetched,
+            fetched = self.source.fetch(self.applied_state()) => fetched,
         };
         Some(self.apply_fetched(fetched).await)
     }

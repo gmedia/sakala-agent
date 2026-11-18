@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- `sakala-edge` kini melaporkan keadaannya di setiap request tabel route, supaya `sakala-api` bisa memberi tahu admin saat sebuah Edge basi atau terus gagal. Header `Sakala-Edge-Applied-Revision` berisi revision yang sedang dilayani Caddy (tabel terakhir yang berhasil ditulis, divalidasi, dan di-reload, atau snapshot yang diterima saat start), `none` sebelum ada yang diterapkan. Header `Sakala-Edge-Status` berisi `ok` bila siklus terakhir berhasil, termasuk `304`, atau kode error siklus terakhir yang sama dengan `last_error.code` di `status.json`. Tabel yang ditolak atau di-rollback tidak menggeser revision yang dilaporkan. `User-Agent` tetap `sakala-edge/<versi>`. `status.json` tidak berubah. Lihat [Laporan ke API](docs/EDGE.md#laporan-ke-api).
+
 ### Security
 
 - Setiap route project di router node kini menghapus atribut `Domain` dari setiap header `Set-Cookie` aplikasi (`header_down Set-Cookie "(?i);\s*domain\s*=[^;]*" ""`), baik untuk satu replika maupun beberapa. Selama `sakala.app` belum ada di Public Suffix List, browser menganggap semua `<slug>.sakala.app` satu site, sehingga cookie `Domain=sakala.app` dari satu aplikasi ikut terkirim ke aplikasi lain (cookie tossing dan session fixation antar-aplikasi). Nilai dan atribut cookie lainnya tidak berubah, termasuk nilai yang memuat kata domain seperti `pref=domain%3Dx`. Cookie yang ditulis JavaScript lewat `document.cookie` tidak tertangani; perbaikan sebenarnya tetap pendaftaran ke PSL. Route yang sudah ada di node mendapat baris ini setelah project dideploy, di-restart, dibangunkan, atau menerima `RefreshRoute`/`restore_route`; restart Agent saja tidak menulis ulang route. Uji Docker dengan `caddy:2.11.3-alpine` memastikan sembilan variasi cookie diterima klien tanpa `Domain` dan atribut lain utuh. Lihat [Cookie host-only](docs/RUNTIME_HARDENING.md#cookie-host-only-di-route-project).

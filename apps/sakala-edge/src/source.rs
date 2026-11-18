@@ -16,6 +16,18 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest response body Edge reads. A table at the route limit with a few
 /// upstreams each is well below this.
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// `User-Agent` of every request, so the API can tell Edge versions apart.
+pub const USER_AGENT: &str = concat!("sakala-edge/", env!("CARGO_PKG_VERSION"));
+/// Request header carrying the revision Caddy currently serves.
+pub const APPLIED_REVISION_HEADER: &str = "Sakala-Edge-Applied-Revision";
+/// [`APPLIED_REVISION_HEADER`] value before any table was applied.
+pub const NO_APPLIED_REVISION: &str = "none";
+/// Request header carrying the outcome of the last sync cycle.
+pub const STATUS_HEADER: &str = "Sakala-Edge-Status";
+/// [`STATUS_HEADER`] value when the last cycle succeeded, a 304 or an
+/// unchanged revision included. Otherwise the header carries the error code
+/// `status.json` records as `last_error.code`.
+pub const STATUS_OK: &str = "ok";
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -37,6 +49,17 @@ impl FetchError {
             Self::BodyTooLarge => "body_too_large",
         }
     }
+}
+
+/// What Edge reports about itself with every request, so the API can alert
+/// when an Edge serves a stale table or keeps failing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppliedState<'a> {
+    /// The revision Caddy serves, `None` before any table was applied. Also
+    /// sent as the `If-None-Match` entity tag.
+    pub revision: Option<&'a str>,
+    /// [`STATUS_OK`] or the error code of the last cycle.
+    pub status: &'a str,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -66,7 +89,7 @@ impl RouteSource {
             // leave through an ambient proxy, same as the Agent's client.
             .no_proxy()
             .timeout(REQUEST_TIMEOUT)
-            .user_agent(concat!("sakala-edge/", env!("CARGO_PKG_VERSION")))
+            .user_agent(USER_AGENT)
             .build()?;
         Ok(Self { http, url, token })
     }
@@ -76,16 +99,23 @@ impl RouteSource {
         &self.url
     }
 
-    /// Fetches the table. With `revision`, sends it as an `If-None-Match`
-    /// entity tag (`"<revision>"`), so an API that supports conditional
-    /// requests can answer 304 instead of the whole table. An API that ignores
-    /// the header answers 200 as usual.
-    pub async fn fetch(&self, revision: Option<&str>) -> Result<Fetched, FetchError> {
+    /// Fetches the table, reporting `applied` in the Edge headers. With an
+    /// applied revision, also sends it as an `If-None-Match` entity tag
+    /// (`"<revision>"`), so an API that supports conditional requests can
+    /// answer 304 instead of the whole table. An API that ignores the header
+    /// answers 200 as usual.
+    pub async fn fetch(&self, applied: AppliedState<'_>) -> Result<Fetched, FetchError> {
+        let revision = applied.revision;
         let mut request = self
             .http
             .get(self.url.clone())
             .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, format!("Bearer {}", self.token.expose()));
+            .header(AUTHORIZATION, format!("Bearer {}", self.token.expose()))
+            .header(
+                APPLIED_REVISION_HEADER,
+                revision.unwrap_or(NO_APPLIED_REVISION),
+            )
+            .header(STATUS_HEADER, applied.status);
         if let Some(revision) = revision {
             request = request.header(IF_NONE_MATCH, format!("\"{revision}\""));
         }

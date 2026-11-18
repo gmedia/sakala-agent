@@ -18,7 +18,10 @@ use sakala_agent_runtime::{
 use sakala_edge::{
     caddy::CaddyControl,
     files::EdgeFiles,
-    source::{ROUTES_PATH, RouteSource},
+    source::{
+        APPLIED_REVISION_HEADER, NO_APPLIED_REVISION, ROUTES_PATH, RouteSource, STATUS_HEADER,
+        STATUS_OK, USER_AGENT,
+    },
     sync::{EdgeSync, SyncOutcome, SyncTiming},
     table::{RoutePolicy, UpstreamAllowlist},
 };
@@ -233,6 +236,175 @@ async fn an_api_error_keeps_the_routes_and_records_the_failure() {
 
 fn status_of(dir: &Path, key: &str) -> Value {
     status(dir)[key].clone()
+}
+
+/// The applied revision and status the last request reported, after checking
+/// the user agent and that the status is a code the API can store.
+async fn reported(server: &MockServer) -> (String, String) {
+    let requests = server.received_requests().await.expect("recorded");
+    let request = requests.last().expect("one request");
+    let value = |name: &str| {
+        request
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_else(|| panic!("{name} is sent"))
+            .to_owned()
+    };
+    assert_eq!(value("user-agent"), USER_AGENT);
+    assert_eq!(
+        USER_AGENT,
+        format!("sakala-edge/{}", env!("CARGO_PKG_VERSION"))
+    );
+    let status = value(STATUS_HEADER);
+    assert!(
+        !status.is_empty()
+            && status.len() <= 64
+            && status
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+        "{status} is a lowercase snake_case code of at most 64 characters"
+    );
+    (value(APPLIED_REVISION_HEADER), status)
+}
+
+fn report(revision: &str, status: &str) -> (String, String) {
+    (revision.to_owned(), status.to_owned())
+}
+
+#[tokio::test]
+async fn every_fetch_reports_the_applied_revision_and_the_last_outcome() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+
+    // Nothing applied yet, and no cycle has failed.
+    let mut sync = synced(&server, dir.path(), &caddy).await;
+    assert_eq!(
+        reported(&server).await,
+        report(NO_APPLIED_REVISION, STATUS_OK)
+    );
+
+    // After a successful apply, the next request reports its revision.
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(reported(&server).await, report("rev-1", STATUS_OK));
+
+    // A rejected table leaves the applied revision and reports its code.
+    let shrunk = table(
+        "rev-2",
+        2,
+        json!([{ "host": "blog.sakala.app", "project_id": PROJECT_A, "upstreams": ["10.0.47.201:8180"] }]),
+    );
+    serve(&server, ResponseTemplate::new(200).set_body_json(shrunk)).await;
+    sync.sync_once().await.expect_err("rejected");
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(
+        reported(&server).await,
+        report("rev-1", "below_expected_minimum")
+    );
+
+    // A 304 is a successful cycle: the status is back to ok.
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(reported(&server).await, report("rev-1", STATUS_OK));
+
+    // A new table Caddy accepts moves the applied revision.
+    let moved = table(
+        "rev-3",
+        1,
+        json!([{ "host": "blog.sakala.app", "project_id": PROJECT_A, "upstreams": ["10.0.48.9:8180"] }]),
+    );
+    serve(&server, ResponseTemplate::new(200).set_body_json(moved)).await;
+    assert_eq!(sync.sync_once().await.expect("apply"), SyncOutcome::Applied);
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(reported(&server).await, report("rev-3", STATUS_OK));
+}
+
+#[tokio::test]
+async fn a_rolled_back_table_keeps_the_applied_revision_and_reports_the_caddy_code() {
+    for failing_action in ["validate", "reload"] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let caddy = Arc::new(FakeCaddy::default());
+        let mut sync = synced(&server, dir.path(), &caddy).await;
+
+        serve(
+            &server,
+            ResponseTemplate::new(200).set_body_json(table(
+                "rev-2",
+                1,
+                json!([{ "host": "new.sakala.app", "project_id": PROJECT_B, "upstreams": ["10.0.48.9:8180"] }]),
+            )),
+        )
+        .await;
+        caddy.fail(Some(failing_action));
+        let error = sync.sync_once().await.expect_err("Caddy refuses");
+        assert_eq!(error.code(), "caddy_refused", "{failing_action}");
+
+        // The refused fetch itself still reported the state before it.
+        assert_eq!(
+            reported(&server).await,
+            report("rev-1", STATUS_OK),
+            "{failing_action}"
+        );
+
+        // The next poll reports the rollback code, still serving rev-1.
+        caddy.fail(None);
+        assert_eq!(sync.sync_once().await.expect("retry"), SyncOutcome::Applied);
+        assert_eq!(
+            reported(&server).await,
+            report("rev-1", "caddy_refused"),
+            "{failing_action}"
+        );
+        serve(&server, ResponseTemplate::new(304)).await;
+        sync.sync_once().await.expect("unchanged");
+        assert_eq!(
+            reported(&server).await,
+            report("rev-2", STATUS_OK),
+            "{failing_action}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restart_reports_the_snapshot_revision_it_serves() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    drop(synced(&server, dir.path(), &caddy).await);
+
+    let caddy = Arc::new(FakeCaddy::default());
+    let mut restarted = edge(&server.uri(), dir.path(), &caddy);
+    assert!(restarted.restore_snapshot().await.expect("snapshot served"));
+    serve(&server, ResponseTemplate::new(304)).await;
+    restarted.sync_once().await.expect("unchanged");
+
+    assert_eq!(reported(&server).await, report("rev-1", STATUS_OK));
+}
+
+#[tokio::test]
+async fn a_refused_snapshot_reports_no_applied_revision_and_its_code() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    drop(synced(&server, dir.path(), &caddy).await);
+    let mut snapshot: Value =
+        serde_json::from_str(&read(dir.path().join("routes.json"))).expect("json");
+    snapshot["routes"][0]["upstreams"] = json!(["8.8.8.8:80"]);
+    std::fs::write(dir.path().join("routes.json"), snapshot.to_string()).expect("write");
+
+    let mut restarted = edge(&server.uri(), dir.path(), &caddy);
+    restarted.restore_snapshot().await.expect_err("refused");
+    serve(&server, ResponseTemplate::new(500)).await;
+    restarted.sync_once().await.expect_err("API error");
+
+    assert_eq!(
+        reported(&server).await,
+        report(NO_APPLIED_REVISION, "upstream_not_allowed")
+    );
 }
 
 #[tokio::test]
