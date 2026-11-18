@@ -258,9 +258,76 @@ untuk route satu replika dan route dua replika:
 cargo test -p sakala-agent-runtime --test cookie_domain_smoke_test -- --ignored --nocapture
 ```
 
+## Egress workload
+
+Agent tidak memfilter lalu lintas keluar workload. Filternya dipasang di host oleh
+`sakala-deployment` (`scripts/egress-firewall.sh`, unit `sakala-egress-firewall`),
+karena aturannya bergantung pada jaringan node, bukan pada command. Detail pemasangan,
+audit mode, dan rollback ada di README `sakala-deployment`, bagian "Restricting
+workload egress".
+
+Tanpa filter, container workload dan container release bisa menjangkau semua yang
+dijangkau node. Di staging sebelum filter dipasang (2026-11-19), container `runsc` di
+network project bisa membuka SSH node lewat gateway bridge maupun IP publik, dan
+tersambung ke SMTP port 25 di internet. Di production, control plane berada di LAN
+privat yang sama dengan runtime node.
+
+Kebijakan yang berlaku untuk lalu lintas dari workload dan release:
+
+| Tujuan | Hasil |
+| --- | --- |
+| Balasan koneksi yang dibuka pihak lain (Caddy, Edge, probe Agent) | diizinkan |
+| Network project-nya sendiri: deployment lain saat redeploy, router | diizinkan |
+| Internet publik di port apa pun selain TCP 25, termasuk DNS ke `SAKALA_CONTAINER_DNS` | diizinkan |
+| IP publik platform dan node sendiri di TCP 80/443 dan UDP 443 | diizinkan, supaya aplikasi bisa memanggil URL publiknya sendiri |
+| IP publik platform dan node sendiri di port lain, misalnya SSH | ditolak |
+| Rentang privat, CGNAT, loopback, link-local termasuk metadata cloud, multicast, rentang reserved | ditolak |
+| TCP 25 ke mana pun, dan semua IPv6 di luar bridge-nya | ditolak |
+
+Penolakan langsung mengembalikan TCP reset atau ICMP *administratively prohibited*,
+jadi aplikasi menerima error koneksi dalam puluhan milidetik, bukan menunggu timeout.
+
+Hubungannya dengan Agent:
+
+- Filter mengenali workload dari interface bridge. Setiap network bridge (`br-<id>`)
+  dihitung workload, kecuali `sakala-runtime` dan `sakala-railpack`. Network
+  `sakala-project-<id>` yang dibuat Agent setelah filter terpasang langsung tercakup
+  tanpa perubahan Agent, jadi pencocokan ini gagal tertutup. Mengganti nama atau
+  driver network project, atau menaruh workload di network yang dikecualikan, berarti
+  mengubah cakupan filter. Perubahan seperti itu harus disertai perubahan di
+  `sakala-deployment`.
+- Build lewat BuildKit bawaan dockerd berjalan di bridge default `docker0` dan tidak
+  tercakup. Sandbox Railpack di `sakala-railpack` dikecualikan, jadi unduhan
+  dependency tetap jalan.
+- Container release memakai network project, jadi tunduk pada kebijakan yang sama.
+  Database eksternal di internet publik tetap terjangkau. Database di alamat privat
+  tidak terjangkau, kecuali operator menambahkannya ke `SAKALA_EGRESS_ALLOWED_CIDRS`.
+- Probe readiness (`docker exec <caddy> wget`), wake, sleep, dan metrik Caddy tidak
+  terpengaruh. Probe berjalan di dalam bridge yang sama, dan endpoint admin Caddy
+  hanya diakses lewat `docker exec`.
+- gVisor mengirim paket workload lewat veth dan bridge yang sama dengan `runc`, jadi
+  aturan host berlaku untuk keduanya. Hal ini terlihat di log kernel, dengan
+  `PHYSIN=veth...` pada paket yang ditolak dari container `runsc`.
+- Router (`sakala-caddy`) dikecualikan lewat `sakala-runtime`, tetapi default route-nya
+  saat ini lewat salah satu network project. Lalu lintas keluar router ikut tunduk pada
+  kebijakan ini. Hari ini router tidak membutuhkannya, karena ia hanya mem-proxy ke
+  container di network project. Kalau kelak router perlu menghubungi alamat privat,
+  sambungkan `sakala-runtime` dengan `gw_priority` lebih tinggi.
+
+Yang diuji di staging pada 2026-11-19 (Docker 29.5.2, `runsc` systrap): HTTPS dan DNS
+publik berjalan; SSH node, alamat privat, `169.254.169.254`, container project lain,
+dan SMTP 25 ditolak; URL publik project tetap 200 dari dalam workload; project yang
+tidur bisa dibangunkan; build dan deploy project baru berhasil; release command
+menjangkau Postgres publik di 5432 dan ditolak ke `10.0.0.1:5432`;
+`systemctl restart docker` tidak menghapus aturan; rollback mengembalikan keadaan
+semula.
+
+Yang tidak dibatasi: laju koneksi baru per workload, dan penyalahgunaan tujuan publik
+di port yang diizinkan, seperti scanning, flood, atau spam HTTP.
+
 ## Isolation Decision
 
-Maintainer memutuskan runtime node memakai Docker rootful dengan `runsc`, dengan alasan dan pembuktian di [gVisor](#gvisor). Untuk workload publik tidak tepercaya, target berikutnya adalah isolated builder yang terpisah dari runtime daemon, karena `runsc` hanya berlaku pada workload. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.
+Maintainer memutuskan runtime node memakai Docker rootful dengan `runsc`, dengan alasan dan pembuktian di [gVisor](#gvisor). Untuk workload publik tidak tepercaya, target berikutnya adalah isolated builder yang terpisah dari runtime daemon, karena `runsc` hanya berlaku pada workload. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary. Pembatasan lalu lintas keluar workload dijelaskan di [Egress workload](#egress-workload).
 
 ## Batas versi dan riset isolasi lanjut
 
