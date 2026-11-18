@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- `sakala-edge` kini melaporkan keadaannya di setiap request tabel route, supaya `sakala-api` bisa memberi tahu admin saat sebuah Edge basi atau terus gagal. Header `Sakala-Edge-Applied-Revision` berisi revision yang sedang dilayani Caddy (tabel terakhir yang berhasil ditulis, divalidasi, dan di-reload, atau snapshot yang diterima saat start), `none` sebelum ada yang diterapkan. Header `Sakala-Edge-Status` berisi `ok` bila siklus terakhir berhasil, termasuk `304`, atau kode error siklus terakhir yang sama dengan `last_error.code` di `status.json`. Tabel yang ditolak atau di-rollback tidak menggeser revision yang dilaporkan. `User-Agent` tetap `sakala-edge/<versi>`. `status.json` tidak berubah. Lihat [Laporan ke API](docs/EDGE.md#laporan-ke-api).
+
 ### Fixed
 
 - Project yang tidur kini bisa dibangunkan dari URL-nya pada instalasi yang menghubungi API lewat alamat internal. Halaman route tidur sebelumnya selalu menyuruh browser pengunjung memanggil endpoint wake di bawah `SAKALA_API_URL`; pada self-host nilainya alamat internal seperti `http://127.0.0.1:8100`, sehingga browser tidak bisa menjangkaunya dan project tetap tidur. Konfigurasi opsional baru `SAKALA_PUBLIC_API_URL` (URL absolut `http` atau `https` tanpa kredensial, query, atau fragment) kini dipakai khusus untuk URL yang dibuka browser, dan defaultnya `SAKALA_API_URL`, jadi instalasi hosted tidak berubah. Nilai yang tidak valid membuat Agent berhenti saat start. Lihat [Configuration](docs/CONFIGURATION.md).

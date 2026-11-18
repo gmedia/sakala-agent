@@ -630,21 +630,20 @@ async fn concurrent_new_projects_cannot_exceed_container_admission_limit() {
 #[tokio::test]
 async fn build_permit_is_released_before_container_readiness() {
     let temp = TempDir::new().expect("temp directory should be available");
-    let runner = Arc::new(
-        FakeRunner::new(true)
-            .with_build_delay(Duration::from_millis(50))
-            .with_inspect_delay(Duration::from_millis(200)),
-    );
+    // Each readiness check waits until both deployments have started their
+    // build. With one build slot, that only completes when the first
+    // deployment gave its slot back before waiting for readiness; holding it
+    // instead deadlocks both until the gate gives up.
+    let runner = Arc::new(ReadinessAfterBuildsRunner::new(2));
     let mut config = runtime_config(&temp);
     config.max_concurrent_builds = 1;
-    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner));
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(config, runner.clone()));
     let first = deploy_command("auto");
     let mut second = deploy_command("auto");
     second.id = Uuid::new_v4();
     second.project_id = Some(Uuid::new_v4());
     second.deployment_id = Some(Uuid::new_v4());
     second.payload["domain"] = json!("second.run.sakala.localhost");
-    let started = tokio::time::Instant::now();
     let first_dispatcher = CommandDispatcher::new(executor.clone());
     let second_dispatcher = CommandDispatcher::new(executor);
 
@@ -663,7 +662,7 @@ async fn build_permit_is_released_before_container_readiness() {
 
     first_result.expect("first deployment should complete");
     second_result.expect("second deployment should complete");
-    assert!(started.elapsed() < Duration::from_millis(425));
+    assert_eq!(*runner.builds_started.borrow(), 2);
 }
 
 #[tokio::test]
@@ -1025,7 +1024,7 @@ async fn failed_previous_cleanup_becomes_a_post_commit_finalization_error() {
     let error = dispatch(executor, &command, Arc::clone(&reporter))
         .await
         .expect_err("failed cleanup must enter post-commit repair machinery");
-    tokio::task::yield_now().await;
+    runner.wait_for_followers(1).await;
 
     assert_eq!(error.code(), "runtime_container_failed");
     assert!(reporter.deployment_committed());
@@ -1208,20 +1207,8 @@ async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
     assert_eq!(second.recovered_execution_records, 1);
     assert_eq!(second.reattached_log_followers, 0);
     assert_eq!(factory.created.load(Ordering::SeqCst), 2);
-    // The follower runs as a spawned task; give it a moment to issue its
-    // `docker logs --follow` before counting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let followers = runner
-        .commands
-        .lock()
-        .expect("command lock")
-        .iter()
-        .filter(|command| {
-            command.program == "docker"
-                && command.args.iter().any(|argument| argument == "--follow")
-        })
-        .count();
-    assert_eq!(followers, 1);
+    runner.wait_for_followers(1).await;
+    assert_eq!(runner.count_commands(is_log_follower), 1);
     RuntimeExecutor::shutdown(&executor)
         .await
         .expect("recovered follower should stop during shutdown");
@@ -2892,7 +2879,7 @@ async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
         .dispatch(&deploy_command("auto"), reporter, CancellationToken::new())
         .await
         .expect("deployment should start a log follower");
-    tokio::task::yield_now().await;
+    runner.wait_for_followers(1).await;
     executor
         .shutdown()
         .await
@@ -2948,6 +2935,7 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
             .await
             .expect("soak deployment should complete");
     }
+    runner.wait_for_followers(ITERATIONS).await;
     let reconciliation = RuntimeExecutor::reconcile(executor.as_ref())
         .await
         .expect("soak reconciliation should complete");
@@ -6267,6 +6255,71 @@ struct FakeRunner {
     network_create_stderr: Option<String>,
 }
 
+/// Fails a test that would otherwise hang: how long a test waits for spawned
+/// log followers to issue their command. Only reached when they never do.
+const FOLLOWER_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn is_log_follower(command: &CommandSpec) -> bool {
+    command.program == "docker" && command.args.iter().any(|argument| argument == "--follow")
+}
+
+/// Fails a test that would otherwise hang: how long a readiness check waits
+/// for the builds it expects. Only reached when the ordering under test breaks.
+const READINESS_GATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Holds every readiness check (`docker inspect` with the health state format)
+/// until `builds_before_readiness` builds have started, and panics when they
+/// do not start within [`READINESS_GATE_TIMEOUT`].
+struct ReadinessAfterBuildsRunner {
+    inner: FakeRunner,
+    builds_before_readiness: usize,
+    builds_started: tokio::sync::watch::Sender<usize>,
+}
+
+impl ReadinessAfterBuildsRunner {
+    fn new(builds_before_readiness: usize) -> Self {
+        Self {
+            inner: FakeRunner::new(true),
+            builds_before_readiness,
+            builds_started: tokio::sync::watch::Sender::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for ReadinessAfterBuildsRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        let is_docker = spec.program == "docker";
+        if is_docker && spec.args.iter().any(|argument| argument == "buildx") {
+            self.builds_started.send_modify(|started| *started += 1);
+        }
+        let readiness_check = is_docker
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "inspect")
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument.to_string_lossy().starts_with("{{.State.Status}}"));
+        if readiness_check {
+            let mut builds = self.builds_started.subscribe();
+            tokio::time::timeout(
+                READINESS_GATE_TIMEOUT,
+                builds.wait_for(|started| *started >= self.builds_before_readiness),
+            )
+            .await
+            .expect("another deployment should build while this one waits for readiness")
+            .expect("the build counter lives as long as the runner");
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
 struct AdmissionRunner {
     inner: FakeRunner,
     active: Mutex<HashSet<String>>,
@@ -6561,6 +6614,24 @@ impl FakeRunner {
             .iter()
             .filter(|command| matches(command))
             .count()
+    }
+
+    /// Log followers run as spawned tasks, so a command that started them can
+    /// return before they issued `docker logs --follow`: nothing guarantees
+    /// the runtime polled them in between. Yields to the runtime until at
+    /// least `expected` have, and panics after [`FOLLOWER_START_TIMEOUT`].
+    async fn wait_for_followers(&self, expected: usize) {
+        let started = tokio::time::timeout(FOLLOWER_START_TIMEOUT, async {
+            while self.count_commands(is_log_follower) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            started.is_ok(),
+            "expected {expected} log followers, {} started",
+            self.count_commands(is_log_follower)
+        );
     }
 
     fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
@@ -7236,6 +7307,7 @@ async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
     )
     .await
     .expect("three replicas should deploy");
+    runner.wait_for_followers(3).await;
 
     let runs = workload_runs(&runner);
     assert_eq!(
@@ -7287,10 +7359,7 @@ async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
     assert_eq!(ready.metadata["replicas"], 3);
     assert_eq!(ready.metadata["containers"], json!(replica_names(3)));
     // One log follower per replica, all under the deployment command.
-    assert_eq!(
-        runner.count_commands(|command| command.args.iter().any(|a| a == "--follow")),
-        3
-    );
+    assert_eq!(runner.count_commands(is_log_follower), 3);
 }
 
 #[tokio::test]
