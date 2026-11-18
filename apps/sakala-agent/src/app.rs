@@ -24,6 +24,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         agent_id = %config.agent.agent_id,
         mode = %config.agent.mode,
         api_url = %config.agent.api_url,
+        public_api_url = %config.docker_runtime.public_api_url,
         runtime_network = %config.agent.runtime_network,
         runtime_driver = %config.runtime_driver,
         "starting Sakala agent"
