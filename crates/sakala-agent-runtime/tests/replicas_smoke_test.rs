@@ -259,7 +259,7 @@ async fn real_caddy_balances_replicas_and_survives_a_killed_one() {
         DockerRuntimeConfig {
             caddy_container: ROUTER.to_owned(),
             caddy_sites_dir: sites.clone(),
-            api_url: "https://api.staging.sakala.dev".to_owned(),
+            public_api_url: "https://api.staging.sakala.dev".to_owned(),
             ..DockerRuntimeConfig::default()
         },
         runner,

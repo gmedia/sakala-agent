@@ -13,7 +13,7 @@ pub(crate) mod traffic;
 
 pub use caddy_file::CaddyFileRouteManager;
 pub use docker_exec::{DockerExecCaddyMetrics, DockerExecCaddyReloader};
-pub use sleeping_page::{SleepingRoutePage, SleepingRouteSpec, wake_url};
+pub use sleeping_page::{SleepingRoutePage, SleepingRouteSpec, check_public_api_url, wake_url};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RouteIdentity {
