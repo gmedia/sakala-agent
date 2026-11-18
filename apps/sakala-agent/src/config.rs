@@ -5,7 +5,12 @@ use sakala_agent_core::{AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV};
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DockerRuntimeConfig, MAX_REPLICAS_PER_PROJECT_CEILING,
     ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
+    routing::check_public_api_url,
 };
+
+/// The control plane as visitors' browsers reach it, for browser-facing URLs
+/// such as the sleeping page's wake request. Defaults to `SAKALA_API_URL`.
+pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
@@ -66,6 +71,9 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_API_URL")]
     api_url: Option<String>,
+
+    #[arg(long, env = PUBLIC_API_URL_ENV)]
+    public_api_url: Option<String>,
 
     #[arg(long, env = "SAKALA_POLL_INTERVAL_SECONDS")]
     poll_interval_seconds: Option<String>,
@@ -184,6 +192,7 @@ pub fn load() -> Result<AppConfig, CoreError> {
     insert(&mut values, "SAKALA_AGENT_ID", cli.agent_id);
     insert(&mut values, "SAKALA_AGENT_TOKEN", cli.agent_token);
     insert(&mut values, "SAKALA_API_URL", cli.api_url);
+    insert(&mut values, PUBLIC_API_URL_ENV, cli.public_api_url);
     insert(
         &mut values,
         "SAKALA_POLL_INTERVAL_SECONDS",
@@ -406,7 +415,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             max_replicas_per_project: max_replicas_per_project(values)?,
-            api_url: agent.api_url.clone(),
+            public_api_url: public_api_url(values, &agent.api_url)?,
             ..DockerRuntimeConfig::default()
         },
         runtime_health_interval: Duration::from_secs(positive_u64(
@@ -545,6 +554,23 @@ fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
         .get(key)
         .cloned()
         .unwrap_or_else(|| default.to_owned())
+}
+
+/// `SAKALA_PUBLIC_API_URL` when set, checked at start so a typo stops the agent
+/// instead of breaking every sleeping page later; otherwise `SAKALA_API_URL`,
+/// as before the setting existed. An empty value counts as unset.
+fn public_api_url(values: &HashMap<String, String>, api_url: &str) -> Result<String, CoreError> {
+    let Some(value) = values
+        .get(PUBLIC_API_URL_ENV)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(api_url.to_owned());
+    };
+    check_public_api_url(value).map_err(|reason| {
+        CoreError::InvalidConfiguration(format!("{PUBLIC_API_URL_ENV} {reason}"))
+    })?;
+    Ok(value.to_owned())
 }
 
 fn max_replicas_per_project(values: &HashMap<String, String>) -> Result<u32, CoreError> {
@@ -884,11 +910,51 @@ mod tests {
             ),
         ]);
         let docker = from_values(&values).expect("Docker app config should load");
-        // The sleeping page sends visitors to the same API the agent uses.
+        assert!(docker.agent.capabilities.contains(&"idle-sleep".to_owned()));
+    }
+
+    #[test]
+    fn the_sleeping_page_uses_the_api_url_unless_a_public_one_is_set() {
+        let public_api_url = |public: Option<&str>| {
+            let mut values = HashMap::from([(
+                "SAKALA_API_URL".to_owned(),
+                "http://127.0.0.1:8100".to_owned(),
+            )]);
+            if let Some(public) = public {
+                values.insert(PUBLIC_API_URL_ENV.to_owned(), public.to_owned());
+            }
+            from_values(&values).map(|config| config.docker_runtime.public_api_url)
+        };
+
+        // Unset or empty: the API URL the agent uses, as before.
         assert_eq!(
-            docker.docker_runtime.api_url,
-            "https://api.staging.sakala.dev"
+            public_api_url(None).expect("default"),
+            "http://127.0.0.1:8100"
         );
+        assert_eq!(
+            public_api_url(Some("  ")).expect("empty"),
+            "http://127.0.0.1:8100"
+        );
+        for public in [
+            "https://api.example.ac.id",
+            "https://example.ac.id/sakala/",
+            "http://192.0.2.10:8000",
+        ] {
+            assert_eq!(public_api_url(Some(public)).expect(public), public);
+        }
+        for invalid in [
+            "api.example.ac.id",
+            "ftp://api.example.ac.id",
+            "https://user:secret@api.example.ac.id",
+            "https://api.example.ac.id/?a=1",
+            "https://api.example.ac.id/#x",
+            "https://api.example.ac.id/it's",
+        ] {
+            let error = public_api_url(Some(invalid))
+                .expect_err(invalid)
+                .to_string();
+            assert!(error.contains(PUBLIC_API_URL_ENV), "{invalid}: {error}");
+        }
     }
 
     #[test]

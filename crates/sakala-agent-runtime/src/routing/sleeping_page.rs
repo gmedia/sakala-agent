@@ -43,10 +43,33 @@ pub enum SleepingRoutePage {
     Unavailable,
 }
 
+/// Checks the base URL browsers reach the control plane at
+/// (`SAKALA_PUBLIC_API_URL`, or `SAKALA_API_URL` when unset): an absolute
+/// `http` or `https` URL without credentials, query, or fragment, made only of
+/// characters that are safe in the sleeping page. A path is kept as the prefix
+/// the API is served under. The error is the reason, for the caller to name
+/// its setting.
+pub fn check_public_api_url(api_url: &str) -> Result<Url, &'static str> {
+    let base = Url::parse(api_url.trim_end_matches('/')).map_err(|_| "is not a URL")?;
+    if !matches!(base.scheme(), "http" | "https")
+        || base.host_str().is_none()
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return Err("must be an http or https URL without credentials, query, or fragment");
+    }
+    if !page_safe(base.as_str()) {
+        return Err("holds characters that are not safe in the sleeping page");
+    }
+    Ok(base)
+}
+
 /// The control plane's public wake endpoint for the project with `slug`, under
-/// the API URL the agent talks to. Visitors' browsers call it, so that URL must
-/// be reachable from the internet for a sleeping page to wake its project.
-pub fn wake_url(api_url: &str, slug: &str) -> Result<Url, RuntimeError> {
+/// the public API URL. Visitors' browsers call it, so that URL must be
+/// reachable from the internet for a sleeping page to wake its project.
+pub fn wake_url(public_api_url: &str, slug: &str) -> Result<Url, RuntimeError> {
     let invalid = |reason: &str| {
         RuntimeError::InvalidCommand(format!(
             "cannot build the wake URL of a sleeping project: {reason}"
@@ -62,27 +85,16 @@ pub fn wake_url(api_url: &str, slug: &str) -> Result<Url, RuntimeError> {
     if !slug_is_label {
         return Err(invalid("the project label is not a DNS label"));
     }
-    let base = Url::parse(api_url.trim_end_matches('/'))
-        .map_err(|_| invalid("SAKALA_API_URL is not a URL"))?;
-    if !matches!(base.scheme(), "http" | "https")
-        || base.host_str().is_none()
-        || !base.username().is_empty()
-        || base.password().is_some()
-        || base.query().is_some()
-        || base.fragment().is_some()
-    {
-        return Err(invalid(
-            "SAKALA_API_URL must be an http or https URL without credentials, query, or fragment",
-        ));
-    }
+    let base = check_public_api_url(public_api_url)
+        .map_err(|reason| invalid(&format!("the public API URL {reason}")))?;
     let url = Url::parse(&format!(
         "{}/api/v1/public/projects/{slug}/wake",
         base.as_str().trim_end_matches('/')
     ))
-    .map_err(|_| invalid("SAKALA_API_URL does not combine with the wake path"))?;
+    .map_err(|_| invalid("the public API URL does not combine with the wake path"))?;
     if !page_safe(url.as_str()) {
         return Err(invalid(
-            "SAKALA_API_URL holds characters that are not safe in the page",
+            "the public API URL holds characters that are not safe in the page",
         ));
     }
     Ok(url)
@@ -326,7 +338,7 @@ mod tests {
     use super::{
         HEREDOC_MARKER, MAX_RELOADS, NOT_WAKING_TEXT, NOT_WAKING_TITLE, RETRY_LABEL,
         SleepingRoutePage, SleepingRouteSpec, UNAVAILABLE_TEXT, UNAVAILABLE_TITLE, WAKING_TEXT,
-        WAKING_TITLE, site_block, unavailable_page, wake_url, waking_page,
+        WAKING_TITLE, check_public_api_url, site_block, unavailable_page, wake_url, waking_page,
     };
 
     const WAKE: &str = "https://api.sakala.dev/api/v1/public/projects/portfolio/wake";
@@ -372,6 +384,26 @@ mod tests {
                 .expect("wake URL")
                 .as_str(),
             "https://example.ac.id/sakala/api/v1/public/projects/web/wake"
+        );
+    }
+
+    #[test]
+    fn the_public_api_url_check_keeps_a_path_prefix_and_names_the_reason() {
+        assert_eq!(
+            check_public_api_url("https://example.ac.id/sakala/")
+                .expect("prefix")
+                .as_str(),
+            "https://example.ac.id/sakala"
+        );
+        assert_eq!(
+            check_public_api_url("http://127.0.0.1:8100"),
+            Ok(Url::parse("http://127.0.0.1:8100").expect("URL"))
+        );
+        assert_eq!(check_public_api_url("api.sakala.dev"), Err("is not a URL"));
+        assert!(
+            check_public_api_url("https://api.sakala.dev/it's")
+                .expect_err("quote")
+                .contains("not safe")
         );
     }
 
