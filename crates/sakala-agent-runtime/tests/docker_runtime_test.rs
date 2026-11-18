@@ -1024,7 +1024,7 @@ async fn failed_previous_cleanup_becomes_a_post_commit_finalization_error() {
     let error = dispatch(executor, &command, Arc::clone(&reporter))
         .await
         .expect_err("failed cleanup must enter post-commit repair machinery");
-    tokio::task::yield_now().await;
+    runner.wait_for_followers(1).await;
 
     assert_eq!(error.code(), "runtime_container_failed");
     assert!(reporter.deployment_committed());
@@ -1207,20 +1207,8 @@ async fn agent_restart_restores_bounded_log_follower_without_duplicates() {
     assert_eq!(second.recovered_execution_records, 1);
     assert_eq!(second.reattached_log_followers, 0);
     assert_eq!(factory.created.load(Ordering::SeqCst), 2);
-    // The follower runs as a spawned task; give it a moment to issue its
-    // `docker logs --follow` before counting.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let followers = runner
-        .commands
-        .lock()
-        .expect("command lock")
-        .iter()
-        .filter(|command| {
-            command.program == "docker"
-                && command.args.iter().any(|argument| argument == "--follow")
-        })
-        .count();
-    assert_eq!(followers, 1);
+    runner.wait_for_followers(1).await;
+    assert_eq!(runner.count_commands(is_log_follower), 1);
     RuntimeExecutor::shutdown(&executor)
         .await
         .expect("recovered follower should stop during shutdown");
@@ -2891,7 +2879,7 @@ async fn ready_deployment_starts_log_follower_that_runtime_shutdown_can_stop() {
         .dispatch(&deploy_command("auto"), reporter, CancellationToken::new())
         .await
         .expect("deployment should start a log follower");
-    tokio::task::yield_now().await;
+    runner.wait_for_followers(1).await;
     executor
         .shutdown()
         .await
@@ -2947,6 +2935,7 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
             .await
             .expect("soak deployment should complete");
     }
+    runner.wait_for_followers(ITERATIONS).await;
     let reconciliation = RuntimeExecutor::reconcile(executor.as_ref())
         .await
         .expect("soak reconciliation should complete");
@@ -6266,6 +6255,14 @@ struct FakeRunner {
     network_create_stderr: Option<String>,
 }
 
+/// Fails a test that would otherwise hang: how long a test waits for spawned
+/// log followers to issue their command. Only reached when they never do.
+const FOLLOWER_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn is_log_follower(command: &CommandSpec) -> bool {
+    command.program == "docker" && command.args.iter().any(|argument| argument == "--follow")
+}
+
 /// Fails a test that would otherwise hang: how long a readiness check waits
 /// for the builds it expects. Only reached when the ordering under test breaks.
 const READINESS_GATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -6617,6 +6614,24 @@ impl FakeRunner {
             .iter()
             .filter(|command| matches(command))
             .count()
+    }
+
+    /// Log followers run as spawned tasks, so a command that started them can
+    /// return before they issued `docker logs --follow`: nothing guarantees
+    /// the runtime polled them in between. Yields to the runtime until at
+    /// least `expected` have, and panics after [`FOLLOWER_START_TIMEOUT`].
+    async fn wait_for_followers(&self, expected: usize) {
+        let started = tokio::time::timeout(FOLLOWER_START_TIMEOUT, async {
+            while self.count_commands(is_log_follower) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            started.is_ok(),
+            "expected {expected} log followers, {} started",
+            self.count_commands(is_log_follower)
+        );
     }
 
     fn with_docker_ps(mut self, stdout: impl Into<String>) -> Self {
@@ -7292,6 +7307,7 @@ async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
     )
     .await
     .expect("three replicas should deploy");
+    runner.wait_for_followers(3).await;
 
     let runs = workload_runs(&runner);
     assert_eq!(
@@ -7343,10 +7359,7 @@ async fn three_replicas_start_labelled_containers_behind_one_balanced_route() {
     assert_eq!(ready.metadata["replicas"], 3);
     assert_eq!(ready.metadata["containers"], json!(replica_names(3)));
     // One log follower per replica, all under the deployment command.
-    assert_eq!(
-        runner.count_commands(|command| command.args.iter().any(|a| a == "--follow")),
-        3
-    );
+    assert_eq!(runner.count_commands(is_log_follower), 3);
 }
 
 #[tokio::test]
