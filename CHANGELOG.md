@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-19
+
 ### Added
 
 - Metrik dasar per container workload di heartbeat, untuk grafik memori, CPU, dan restart per project (gmedia/sakala-api#128). Node dengan capability baru `workload-metrics` mengirim `metadata.workloads.metrics` dan `metadata.detail_counts.metrics`: satu entri per container workload yang berjalan, termasuk setiap replika, berisi `project_id`, `deployment_id`, `replica`, `sampled_at`, `cpu_percent` (persen dari satu core, bisa di atas 100), `memory_bytes`, `memory_limit_bytes` (`null` tanpa batas), dan `restart_count` (`RestartCount` Docker). Agent mengambil satu sampel `docker stats --no-stream` paling sering sekali per `SAKALA_METRICS_INTERVAL_SECONDS` (baru, default 60, antara 10 dan 3600) dan mengirimnya sekali di heartbeat berikutnya. Sampel yang gagal tidak pernah dikirim sebagian: kedua key dihilangkan dan Agent mencatat satu `WARN` per rentetan kegagalan. Container release dan container lain di node tidak masuk. List dibatasi `SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT` item. Aditif di protocol revision 4; lihat [Metrik workload](docs/AGENT_API.md#metrik-workload) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-workload-metrics).
@@ -262,7 +264,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/gmedia/sakala-agent/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/gmedia/sakala-agent/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/gmedia/sakala-agent/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/gmedia/sakala-agent/compare/v0.8.0...v0.9.0
