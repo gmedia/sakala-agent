@@ -205,6 +205,33 @@ or capability. Either side can be deployed first.
 | `metadata.workloads.replicas` | Same shape. | `ready < desired` now usually clears within one or two health intervals. A value that stays low means the replica failed 5 starts, its container is gone (it returns with the next deployment), or Docker is restarting it in a crash loop. |
 | `crashed_details` | Unchanged. | A one-replica deployment whose container stopped is still not restored by the Agent and is reported and reconciled as before. |
 
+## Revision 4 additions for release commands
+
+Still revision 4: no new command type, only an optional payload field, two failure
+codes, two events, and a new capability. Either side can be deployed first. An older
+Agent ignores `release_command` and starts the new version without running it, so the
+API must only send the field to a node that advertises `release-command`.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `release-command` | Advertised by the `docker` driver only. | The node's deadline is `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS` (default 600). It is not sent on the heartbeat. |
+| `DeployProject` payload field `release_command` | Honoured. | Optional string, 1 to 1000 characters, no ASCII control character (`\x00` to `\x1F`, `\x7F`), the rules the API applies to `start_command`. Absent, `null`, empty, or only spaces means no release command. A longer value or one with a control character fails with `invalid_runtime_command` before checkout. Runs once per deployment, after the build and before any replica, in a container of the new image with the deployment's environment, project network, resources, runtime, and security options. Example in `examples/commands/deploy-project-release-command.json`; semantics in [Sakala Agent API](AGENT_API.md#release-command). |
+| `error_code` value `release_command_failed` | Sent on `fail`. | Additive and user-fixable. The message names the exit code, and the memory limit when Docker reports an out-of-memory kill. Nothing of the new deployment started; the previous one keeps serving. |
+| `error_code` value `release_command_timeout` | Sent on `fail`. | Additive and user-fixable. The container was killed and removed; nothing of the new deployment started. |
+| Events `deployment.release.started` and `deployment.release.completed` | Sent only for deployments with a release command. | Additive. An API that does not map them stores them on the timeline without changing status. To show a stage, map `deployment.release.started` to a status ranked after `Building` and before `HealthChecking`. |
+| Log lines prefixed `[release]` | Sent on the existing logs endpoint. | The release container's output, redacted like runtime output. |
+
+Capacity: the release container is admitted under the same serialized check as the
+replicas that follow it, asking for the deployment's full replica count, so a node that
+could not start the new version refuses before the command changes anything. While it
+runs, other projects count it as one container. It does not appear in
+`metadata.workloads` or any other heartbeat field.
+
+The release command never runs on `WakeProject`, `RestartProject`, `RefreshRoute`,
+`ReconcileWorkload`, or replica restore. Migrations must stay backward compatible with
+the previous version, which keeps serving while the command runs and until the route
+switches.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

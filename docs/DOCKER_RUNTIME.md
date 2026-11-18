@@ -11,6 +11,7 @@ validate command
 -> enforce build deadline
 -> docker buildx build --load
 -> buat network project bila belum ada, sambungkan container Caddy ke sana
+-> bila ada release_command: jalankan satu container release, tunggu exit, hapus
 -> docker run candidate pada network project
 -> deployment.health.started: tunggu state Docker, lalu probe HTTP dari dalam container Caddy
 -> deployment.route.started
@@ -240,6 +241,60 @@ container, jadi image-nya harus punya `sh`. Image `scratch` dan distroless gagal
 
 Semua perintah ini hanya berjalan di dalam build atau container, tidak pernah di shell
 host. Agent tidak memakai `sh -c` di host; argumen dikirim terstruktur ke Docker.
+
+## Release command
+
+Release command adalah perintah satu kali per deployment untuk pekerjaan yang harus
+selesai sebelum versi baru menerima request, terutama migrasi database. Agent
+menjalankannya dari image hasil build, setelah build dan sebelum replika pertama.
+
+**Migrasi harus tetap kompatibel dengan versi sebelumnya.** Versi lama tetap melayani
+request selama release command berjalan dan sampai route pindah ke versi baru. Bila
+deploy gagal setelah release command, misalnya karena replika baru tidak pernah ready,
+versi lama juga tetap melayani dengan skema yang sudah berubah. Jadi tambahkan kolom atau
+tabel dulu, dan hapus atau ganti nama yang lama di deploy berikutnya.
+
+Container release dijalankan dengan:
+
+- image deployment baru, `--entrypoint sh` dan `-c <release_command>`, sama seperti
+  `start_command` pada Dockerfile, jadi image harus punya `sh`;
+- env file yang sama dengan replika, termasuk secret dan `PORT`;
+- network project, jadi container ini menjangkau database luar dengan cara yang sama
+  seperti aplikasinya, dan tidak menjangkau project lain;
+- `--memory`, `--memory-swap`, `--cpus`, `--pids-limit`, `--runtime` (misalnya `runsc`),
+  mount `resolv.conf` dari `SAKALA_CONTAINER_DNS`, `--security-opt no-new-privileges:true`,
+  `--cap-drop ALL`, dan [allowlist capability](#capability-workload) yang sama dengan replika;
+- tanpa `--restart`, tanpa port yang dipublikasikan, dan tanpa route;
+- nama `sakala-release-<project8>-<deployment-id>` dan label `dev.sakala.role=release`,
+  `dev.sakala.project-id`, `dev.sakala.deployment-id`, `dev.sakala.command-id`, serta
+  `dev.sakala.agent-id`. Label `dev.sakala.managed=true` sengaja tidak dipasang, jadi
+  listing workload, health check, laporan crash, pemulihan replika, dan deteksi orphan
+  tidak pernah melihat container ini.
+
+Agent mengikuti output-nya dengan `docker logs --follow` ke log deployment berawalan
+`[release]`, lalu membaca exit code dengan `docker wait`. Exit code 0 melanjutkan deploy.
+Exit code lain menggagalkan deploy dengan `release_command_failed`. Bila `docker run`
+sendiri keluar dengan 126 atau 127, artinya Docker tidak bisa menjalankan `sh` di image,
+hasilnya juga `release_command_failed`; kegagalan Docker lain, misalnya runtime yang
+tidak terdaftar, tetap `runtime_container_failed`. Melewati
+`SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS` menggagalkan deploy dengan
+`release_command_timeout`.
+
+Container release dihapus dengan `docker rm --force --volumes` di setiap jalur: setelah
+exit, setelah timeout, setelah `docker run` gagal (container bisa tertinggal dalam status
+`Created`), dan saat deploy dibatalkan atau Agent shutdown. Bila task command di-abort
+setelah `SAKALA_SHUTDOWN_GRACE_SECONDS`, penghapusan berjalan di background. Container
+release yang masih tertinggal milik Agent ini, misalnya setelah Agent mati mendadak,
+dihapus saat Agent start berikutnya. Setelah kegagalan, image candidate dan network
+project yang tidak dipakai lagi dibersihkan seperti kegagalan deploy lainnya.
+
+Kapasitas: container release diterima lewat pengecekan yang sama dengan replika, di
+bawah lock admission yang sama, dan meminta jumlah replika deployment itu. Node yang
+tidak muat untuk versi baru menolak sebelum release command mengubah apa pun. Selama
+berjalan, container release adalah satu container tambahan project itu, seperti replika
+lama selama deploy bergulir: tidak dihitung untuk project-nya sendiri, tetapi dihitung
+satu slot oleh project lain. Lock admission dilepas begitu container release berjalan,
+jadi deploy dan wake project lain tidak menunggu migrasi selesai.
 
 ## Isolasi antar-project saat build
 

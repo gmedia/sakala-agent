@@ -7,6 +7,10 @@ use crate::{containers::ResourceSafetyConfig, domains::ProjectDomainSuffixes};
 /// throughout, and short enough that an app that recovered clears soon.
 pub const DEFAULT_CRASH_STABLE_WINDOW: Duration = Duration::from_secs(300);
 
+/// Default of `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS`: how long the release
+/// command of a deployment may run before it is stopped.
+pub const DEFAULT_RELEASE_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Default of `SAKALA_MAX_REPLICAS_PER_PROJECT`.
 pub const DEFAULT_MAX_REPLICAS_PER_PROJECT: u32 = 4;
 
@@ -130,6 +134,8 @@ pub struct DockerRuntimeConfig {
     pub health_interval: Duration,
     /// See [`DEFAULT_CRASH_STABLE_WINDOW`].
     pub crash_stable_window: Duration,
+    /// See [`DEFAULT_RELEASE_COMMAND_TIMEOUT`].
+    pub release_command_timeout: Duration,
     /// `SAKALA_PUBLIC_API_URL`, or `SAKALA_API_URL` when unset: the control
     /// plane as visitors' browsers reach it. A sleeping project's page sends
     /// them to the public wake endpoint under it. Used for nothing else.
@@ -162,6 +168,7 @@ impl Default for DockerRuntimeConfig {
             health_attempts: 10,
             health_interval: Duration::from_secs(1),
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,
+            release_command_timeout: DEFAULT_RELEASE_COMMAND_TIMEOUT,
             public_api_url: "http://localhost:8000".to_owned(),
         }
     }

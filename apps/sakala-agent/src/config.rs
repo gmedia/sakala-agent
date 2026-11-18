@@ -3,14 +3,16 @@ use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 use clap::Parser;
 use sakala_agent_core::{AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV};
 use sakala_agent_runtime::{
-    DEFAULT_MAX_REPLICAS_PER_PROJECT, DockerRuntimeConfig, MAX_REPLICAS_PER_PROJECT_CEILING,
-    ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
-    routing::check_public_api_url,
+    DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
+    MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
+    TimeoutSafetyConfig, routing::check_public_api_url,
 };
 
 /// The control plane as visitors' browsers reach it, for browser-facing URLs
 /// such as the sleeping page's wake request. Defaults to `SAKALA_API_URL`.
 pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
+
+const RELEASE_COMMAND_TIMEOUT_ENV: &str = "SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
@@ -153,6 +155,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_START_TIMEOUT_SECONDS")]
     start_timeout_seconds: Option<String>,
 
+    #[arg(long, env = RELEASE_COMMAND_TIMEOUT_ENV)]
+    release_command_timeout_seconds: Option<String>,
+
     #[arg(long, env = "SAKALA_MAX_CONCURRENT_BUILDS")]
     max_concurrent_builds: Option<String>,
 
@@ -289,6 +294,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
     );
     insert(
         &mut values,
+        RELEASE_COMMAND_TIMEOUT_ENV,
+        cli.release_command_timeout_seconds,
+    );
+    insert(
+        &mut values,
         "SAKALA_MAX_CONCURRENT_BUILDS",
         cli.max_concurrent_builds,
     );
@@ -360,6 +370,8 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         )));
     }
 
+    let release_command_timeout = release_command_timeout(values, agent.command_timeout_seconds)?;
+
     // A deploy builds its image before it creates the container, so an image
     // younger than one command can still be about to run.
     let orphaned_image_grace_seconds =
@@ -415,6 +427,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             max_concurrent_builds: positive_usize(values, "SAKALA_MAX_CONCURRENT_BUILDS", 1)?,
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             max_replicas_per_project: max_replicas_per_project(values)?,
+            release_command_timeout,
             public_api_url: public_api_url(values, &agent.api_url)?,
             ..DockerRuntimeConfig::default()
         },
@@ -471,6 +484,25 @@ fn resource_safety(values: &HashMap<String, String>) -> Result<ResourceSafetyCon
     Ok(config)
 }
 
+/// A release command runs inside the deployment command, so it must end
+/// before that command's deadline, like a build or a start.
+fn release_command_timeout(
+    values: &HashMap<String, String>,
+    command_timeout_seconds: u64,
+) -> Result<Duration, CoreError> {
+    let seconds = positive_u64(
+        values,
+        RELEASE_COMMAND_TIMEOUT_ENV,
+        DEFAULT_RELEASE_COMMAND_TIMEOUT.as_secs(),
+    )?;
+    if seconds >= command_timeout_seconds {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{RELEASE_COMMAND_TIMEOUT_ENV} ({seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({command_timeout_seconds})"
+        )));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
     match runtime_driver {
         RuntimeDriver::Noop => vec!["noop-runtime".to_owned()],
@@ -485,6 +517,8 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             "idle-sleep",
             // `DeployProject.replicas`, balanced routes, and `workloads.replicas`.
             "replicas",
+            // `DeployProject.release_command`, run once before the new version starts.
+            "release-command",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -875,6 +909,62 @@ mod tests {
     fn replicas_are_advertised_only_by_the_docker_runtime() {
         let noop = from_values(&HashMap::new()).expect("default app config should load");
         assert!(!noop.agent.capabilities.contains(&"replicas".to_owned()));
+    }
+
+    #[test]
+    fn release_commands_are_advertised_only_by_the_docker_runtime() {
+        let docker = HashMap::from([("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned())]);
+        let docker = from_values(&docker).expect("Docker app config should load");
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&"release-command".to_owned())
+        );
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(
+            !noop
+                .agent
+                .capabilities
+                .contains(&"release-command".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_release_command_timeout_defaults_to_ten_minutes_and_ends_before_the_command() {
+        let timeout = |values: &[(&str, &str)]| {
+            let values = values
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<HashMap<_, _>>();
+            from_values(&values).map(|config| config.docker_runtime.release_command_timeout)
+        };
+        assert_eq!(
+            timeout(&[]).expect("default"),
+            Duration::from_secs(600),
+            "the documented default"
+        );
+        assert_eq!(
+            timeout(&[(RELEASE_COMMAND_TIMEOUT_ENV, "30")]).expect("custom"),
+            Duration::from_secs(30)
+        );
+        for invalid in ["0", "-1", "ten", "900"] {
+            assert!(
+                timeout(&[(RELEASE_COMMAND_TIMEOUT_ENV, invalid)]).is_err(),
+                "{invalid}"
+            );
+        }
+        let error = timeout(&[
+            (RELEASE_COMMAND_TIMEOUT_ENV, "600"),
+            ("SAKALA_COMMAND_TIMEOUT_SECONDS", "600"),
+        ])
+        .expect_err("must end before the command");
+        assert!(
+            error
+                .to_string()
+                .contains("must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS"),
+            "{error}"
+        );
     }
 
     #[test]

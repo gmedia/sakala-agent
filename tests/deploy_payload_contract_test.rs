@@ -222,6 +222,37 @@ fn deploy_payload_build_config_fixture_matches_the_contract() {
 }
 
 #[test]
+fn deploy_payload_release_command_fixture_matches_the_contract() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-release-command.json"
+    ))
+    .expect("fixture must deserialize");
+    let payload = command.deploy_payload().expect("payload must be valid");
+
+    assert_eq!(
+        payload.release_command.as_deref(),
+        Some("php artisan migrate --force")
+    );
+    assert_eq!(
+        serde_json::to_value(&payload).expect("payload serializes")["release_command"],
+        "php artisan migrate --force"
+    );
+
+    let plain: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("fixture must deserialize");
+    let plain = plain.deploy_payload().expect("payload must be valid");
+    assert_eq!(plain.release_command, None);
+    assert!(
+        serde_json::to_value(&plain)
+            .expect("payload serializes")
+            .get("release_command")
+            .is_none(),
+        "absent stays absent"
+    );
+}
+
+#[test]
 fn poll_response_reads_cancel_requested_and_treats_absence_as_empty() {
     let poll: CommandPoll = serde_json::from_str(include_str!(
         "../examples/commands/poll-cancel-requested.json"

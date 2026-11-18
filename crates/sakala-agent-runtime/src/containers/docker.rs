@@ -28,7 +28,8 @@ use crate::{
     containers::limits::docker_cpu_value,
     containers::{
         ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
-        ManagedWorkload, ResourceSafetyConfig, RoutedWorkload, RunContainerRequest,
+        ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ResourceSafetyConfig,
+        RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT,
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
@@ -50,6 +51,21 @@ const COMMAND_ID_LABEL: &str = "dev.sakala.command-id";
 const LOG_MAX_LINE_LABEL: &str = "dev.sakala.log-max-line-length";
 const LOG_MAX_BATCH_LABEL: &str = "dev.sakala.log-max-batch-lines";
 const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
+const PROJECT_ID_LABEL: &str = "dev.sakala.project-id";
+const DEPLOYMENT_ID_LABEL: &str = "dev.sakala.deployment-id";
+/// Marks the container of a release command. It never carries
+/// `MANAGED_LABEL`, so nothing that lists workloads sees it.
+const RELEASE_ROLE_LABEL: &str = "dev.sakala.role=release";
+/// Prefix of the release container's output in the deployment log, next to
+/// `build` and `runtime`.
+const RELEASE_LOG_PHASE: &str = "release";
+/// Restart policy of a workload. A release container keeps Docker's default,
+/// which never restarts: it runs once.
+const WORKLOAD_RESTART_POLICY: &str = "unless-stopped";
+/// What `docker run` exits with when it cannot invoke the command (126) or
+/// cannot find it (127), such as `sh` missing from the image.
+const COMMAND_NOT_RUNNABLE_EXIT_CODES: [i32; 2] = [126, 127];
+const RELEASE_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_LOG_TAIL_LINES: u64 = 100;
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const CRASH_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -327,6 +343,56 @@ impl DockerContainerEngine {
         effective
     }
 
+    /// `docker run --detach` with what every container of a deployment gets:
+    /// its name, the project's network, the node's runtime and name servers,
+    /// the security options, and the resource limits. `restart` is the restart
+    /// policy; `None` keeps Docker's default, which never restarts.
+    async fn isolated_run(
+        &self,
+        name: &str,
+        network: &str,
+        resources: AppliedRuntimeResources,
+        restart: Option<&str>,
+    ) -> Result<CommandSpec, RuntimeError> {
+        let mut command = CommandSpec::new("docker")
+            .arg("run")
+            .arg("--detach")
+            .arg("--name")
+            .arg(name)
+            .arg("--network")
+            .arg(network);
+        // Docker refuses an unknown runtime, and the failure stays a failure: a
+        // workload must not end up on a weaker runtime than the node promises.
+        if let Some(container_runtime) = &self.container_runtime {
+            command = command.arg("--runtime").arg(container_runtime);
+        }
+        if let Some(container_dns) = &self.container_dns {
+            command = command
+                .arg("--mount")
+                .arg(container_dns.ensure_mount().await?);
+        }
+        if let Some(restart) = restart {
+            command = command.arg("--restart").arg(restart);
+        }
+        command = command
+            .arg("--security-opt")
+            .arg("no-new-privileges:true")
+            .arg("--cap-drop")
+            .arg("ALL");
+        for capability in WORKLOAD_CAPABILITIES {
+            command = command.arg("--cap-add").arg(capability);
+        }
+        Ok(command
+            .arg("--memory")
+            .arg(format!("{}m", resources.memory_mb))
+            .arg("--memory-swap")
+            .arg(format!("{}m", resources.memory_mb))
+            .arg("--cpus")
+            .arg(docker_cpu_value(resources.cpu_millis))
+            .arg("--pids-limit")
+            .arg(resources.pids_limit.to_string()))
+    }
+
     async fn write_env_file(
         workspace: &Path,
         environment: &BTreeMap<String, String>,
@@ -380,10 +446,23 @@ impl ContainerEngine for DockerContainerEngine {
             )));
         }
 
+        // A release container is not a managed workload, but it runs on the
+        // node like one until its command exits, so other projects count it.
+        let releases = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={RELEASE_ROLE_LABEL}"))
+            .arg("--format")
+            .arg(format!("{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}"));
+        let releases = self
+            .read_docker(&releases, "docker release capacity inspection")
+            .await?;
+
         let project_id = project_id.to_string();
         let other_projects = output
             .stdout
             .lines()
+            .chain(releases.lines())
             .map(str::trim)
             .filter(|value| !value.is_empty() && *value != project_id)
             .count();
@@ -723,42 +802,14 @@ impl ContainerEngine for DockerContainerEngine {
         let network = self.networks.prepare(request.project_id).await?;
         let environment = Self::effective_environment(&request.environment, request.port);
         let env_file = Self::write_env_file(&request.workspace, &environment).await?;
-        let mut command = CommandSpec::new("docker")
-            .arg("run")
-            .arg("--detach")
-            .arg("--name")
-            .arg(&request.name)
-            .arg("--network")
-            .arg(&network);
-        // Docker refuses an unknown runtime, and the failure stays a failure: a
-        // workload must not end up on a weaker runtime than the node promises.
-        if let Some(container_runtime) = &self.container_runtime {
-            command = command.arg("--runtime").arg(container_runtime);
-        }
-        if let Some(container_dns) = &self.container_dns {
-            command = command
-                .arg("--mount")
-                .arg(container_dns.ensure_mount().await?);
-        }
-        command = command
-            .arg("--restart")
-            .arg("unless-stopped")
-            .arg("--security-opt")
-            .arg("no-new-privileges:true")
-            .arg("--cap-drop")
-            .arg("ALL");
-        for capability in WORKLOAD_CAPABILITIES {
-            command = command.arg("--cap-add").arg(capability);
-        }
-        command = command
-            .arg("--memory")
-            .arg(format!("{}m", request.resources.memory_mb))
-            .arg("--memory-swap")
-            .arg(format!("{}m", request.resources.memory_mb))
-            .arg("--cpus")
-            .arg(docker_cpu_value(request.resources.cpu_millis))
-            .arg("--pids-limit")
-            .arg(request.resources.pids_limit.to_string())
+        let mut command = self
+            .isolated_run(
+                &request.name,
+                &network,
+                request.resources,
+                Some(WORKLOAD_RESTART_POLICY),
+            )
+            .await?
             .arg("--label")
             .arg(MANAGED_LABEL)
             .arg("--label")
@@ -811,6 +862,155 @@ impl ContainerEngine for DockerContainerEngine {
             }
         }
         result.map(|_| ())
+    }
+
+    async fn start_release(
+        &self,
+        request: &ReleaseContainerRequest,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        let _start = self.networks.start_guard().await;
+        let network = self.networks.prepare(request.project_id).await?;
+        let environment = Self::effective_environment(&request.environment, request.port);
+        let env_file = Self::write_env_file(&request.workspace, &environment).await?;
+        let mut command = self
+            .isolated_run(&request.name, &network, request.resources, None)
+            .await?;
+        for label in [
+            RELEASE_ROLE_LABEL.to_owned(),
+            format!("{PROJECT_ID_LABEL}={}", request.project_id),
+            format!("{DEPLOYMENT_ID_LABEL}={}", request.deployment_id),
+            format!("{COMMAND_ID_LABEL}={}", request.command_id),
+            format!("{AGENT_ID_LABEL}={}", self.agent_id),
+        ] {
+            command = command.arg("--label").arg(label);
+        }
+        if let Some(env_file) = &env_file {
+            command = command.arg("--env-file").arg(env_file.as_os_str());
+        }
+        // Shell form, exactly like a start command, and never a shell on the host.
+        let command = command
+            .arg("--entrypoint")
+            .arg("sh")
+            .arg(&request.image)
+            .arg("-c")
+            .arg(&request.command);
+
+        let sink = ReporterOutputSink::new(reporter, "docker-run");
+        let result = self.runner.run(&command, &sink).await;
+        if let Some(env_file) = env_file {
+            let remove_result = fs::remove_file(env_file).await;
+            if matches!(result, Ok(ref output) if output.success) {
+                remove_result?;
+            }
+        }
+        let output = result?;
+        if output.success {
+            return Ok(());
+        }
+        match output.code {
+            Some(code) if COMMAND_NOT_RUNNABLE_EXIT_CODES.contains(&code) => {
+                Err(RuntimeError::ReleaseCommandFailed {
+                    exit_code: code,
+                    out_of_memory_limit_mb: None,
+                })
+            }
+            code => Err(RuntimeError::failed_process(
+                "docker-run-release",
+                code,
+                &output.stderr,
+            )),
+        }
+    }
+
+    async fn wait_release(
+        &self,
+        name: &str,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<ReleaseExit, RuntimeError> {
+        // Ends when the container exits. A follower that fails early loses
+        // output, not the result, which `docker wait` reads on its own.
+        let follow = CommandSpec::new("docker")
+            .arg("logs")
+            .arg("--follow")
+            .arg(name)
+            .without_timeout();
+        let sink = ReporterOutputSink::new(reporter, RELEASE_LOG_PHASE);
+        match self.runner.run(&follow, &sink).await {
+            Ok(output) if output.success => {}
+            Ok(output) => warn!(
+                container = name,
+                status = %crate::error::describe_exit(output.code),
+                "release container output could not be followed"
+            ),
+            Err(error) => warn!(
+                container = name,
+                %error,
+                "release container output could not be followed"
+            ),
+        }
+        let wait = CommandSpec::new("docker")
+            .arg("wait")
+            .arg(name)
+            .without_timeout();
+        let exit_code = self
+            .read_docker(&wait, "docker release wait")
+            .await?
+            .trim()
+            .parse::<i32>()
+            .map_err(|_| RuntimeError::Container("docker wait returned no exit code".to_owned()))?;
+        // Enrichment only: without it a failure still reports its exit code.
+        let inspect = CommandSpec::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{.State.OOMKilled}}")
+            .arg(name)
+            .timeout(RELEASE_INSPECT_TIMEOUT);
+        let oom_killed = match self.runner.run(&inspect, &NullOutputSink).await {
+            Ok(output) if output.success => output.stdout.trim() == "true",
+            _ => false,
+        };
+        Ok(ReleaseExit {
+            exit_code,
+            oom_killed,
+        })
+    }
+
+    async fn remove_release(&self, name: &str) -> Result<(), RuntimeError> {
+        let remove = CommandSpec::new("docker")
+            .arg("rm")
+            .arg("--force")
+            .arg("--volumes")
+            .arg(name);
+        let output = self.runner.run(&remove, &NullOutputSink).await?;
+        if output.success || output.stderr.contains("No such container") {
+            Ok(())
+        } else {
+            Err(RuntimeError::failed_process(
+                "docker-remove-release",
+                output.code,
+                &output.stderr,
+            ))
+        }
+    }
+
+    async fn remove_stale_releases(&self) -> Result<usize, RuntimeError> {
+        let list = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--quiet")
+            .arg("--no-trunc")
+            .arg("--filter")
+            .arg(format!("label={RELEASE_ROLE_LABEL}"))
+            .arg("--filter")
+            .arg(format!("label={AGENT_ID_LABEL}={}", self.agent_id));
+        let listed = self.read_docker(&list, "docker release listing").await?;
+        let mut removed = 0;
+        for container in listed.split_whitespace() {
+            self.remove_release(container).await?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     async fn attach_router(&self, project_id: Uuid) -> Result<(), RuntimeError> {

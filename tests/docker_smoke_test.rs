@@ -59,6 +59,8 @@ const PREFIX: &str = "sakala-agent-sm";
 const APP_NAME_PREFIX: &str = "sakala-asm-";
 /// Stands in for `sakala-project-`, the network of each project.
 const PROJECT_NETWORK_PREFIX: &str = "sakala-agent-sm-project-";
+/// Stands in for `sakala-release-`, the container of a release command.
+const RELEASE_NAME_PREFIX: &str = "sakala-agent-sm-release-";
 const SECRET: &str = "sk-smoke-secret-value";
 /// Shortened from five minutes, and longer than the crash loop's run time.
 const STABLE_WINDOW: Duration = Duration::from_secs(10);
@@ -906,6 +908,174 @@ fn restart_count_of(run: &Deployment) -> u32 {
         .trim()
         .parse()
         .expect("restart count")
+}
+
+/// Short, so the timeout case does not take ten minutes.
+const SMOKE_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, caddy:2.11.3-alpine, and node:24-alpine"]
+async fn real_docker_release_commands_run_once_and_guard_the_previous_version() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start_full(
+        &temp,
+        "sha256:unused-by-this-test",
+        None,
+        None,
+        SMOKE_RELEASE_TIMEOUT,
+    )
+    .await;
+    let project_id = Uuid::new_v4();
+    let release_names = || {
+        docker(&[
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=^/{RELEASE_NAME_PREFIX}"),
+            "--format",
+            "{{.Names}}",
+        ])
+    };
+    let environment =
+        json!({ "DATABASE_URL": format!("postgres://app:{SECRET}@db.example.test/app") });
+
+    // Exit 0: the marker is in the deployment log, under its own phase,
+    // before anything of the new version starts, and the app then serves.
+    prepare_image("rel-v1", &serve(200), &[]);
+    harness.runner.select_image("rel-v1");
+    let v1_deployment = Uuid::new_v4();
+    let v1 = harness
+        .run_payload(
+            "rel-v1",
+            project_id,
+            v1_deployment,
+            256,
+            environment.clone(),
+            json!({
+                "release_command": format!(
+                    "echo release-marker; echo connecting to $DATABASE_URL; \
+                     wget -S -T 5 -O /dev/null http://{ROUTER}/ 2>&1 | grep -q HTTP/ && echo reached-the-project-network"
+                ),
+            }),
+            CancellationToken::new(),
+        )
+        .await;
+    v1.print("release command exits 0");
+    v1.assert_completed();
+    v1.assert_logged("[release] release-marker");
+    v1.assert_logged("[release] reached-the-project-network");
+    assert!(
+        !v1.sent.contains(SECRET),
+        "the secret must not reach the control plane"
+    );
+    println!("stages: {:?}", v1.stages);
+    assert_eq!(
+        v1.stages,
+        [
+            "deployment.checkout.started",
+            "deployment.build.started",
+            "deployment.release.started",
+            "deployment.container.started",
+            "deployment.health.started",
+            "deployment.route.started",
+            "deployment.runtime.ready",
+        ],
+    );
+    assert!(
+        release_names().trim().is_empty(),
+        "release container left: {}",
+        release_names()
+    );
+    let v1_container = format!(
+        "{APP_NAME_PREFIX}{}-{v1_deployment}",
+        &project_id.to_string()[..8]
+    );
+    let v1_running =
+        || docker(&["inspect", "--format", "{{.State.Running}}", &v1_container]).trim() == "true";
+    assert!(v1_running());
+    let route = temp
+        .path()
+        .join("sites")
+        .join(format!("{project_id}.Caddyfile"));
+    let v1_upstream = format!(
+        "sakala-app-{}-{v1_deployment}",
+        &project_id.to_string()[..8]
+    );
+    let routes_to_v1 = || {
+        std::fs::read_to_string(&route)
+            .expect("route file")
+            .contains(&v1_upstream)
+    };
+    assert!(routes_to_v1());
+
+    // Exit 3: the deployment fails, nothing of it starts, and v1 keeps serving.
+    prepare_image("rel-v2", &serve(200), &[]);
+    harness.runner.select_image("rel-v2");
+    let v2_deployment = Uuid::new_v4();
+    let v2 = harness
+        .run_payload(
+            "rel-v2",
+            project_id,
+            v2_deployment,
+            256,
+            environment.clone(),
+            json!({ "release_command": "echo migration 2026_11_18 failed >&2; exit 3" }),
+            CancellationToken::new(),
+        )
+        .await;
+    v2.print("release command exits 3");
+    v2.assert_failed("release_command_failed", &["exit code 3"]);
+    v2.assert_logged("[release] migration 2026_11_18 failed");
+    assert!(
+        !v2.stages
+            .iter()
+            .any(|stage| stage == "deployment.container.started")
+    );
+    assert_no_containers_named(&format!(
+        "{APP_NAME_PREFIX}{}-{v2_deployment}",
+        &project_id.to_string()[..8]
+    ));
+    assert!(
+        release_names().trim().is_empty(),
+        "release container left: {}",
+        release_names()
+    );
+    assert!(v1_running(), "the previous version keeps running");
+    assert!(routes_to_v1(), "and keeps its route");
+
+    // Past the timeout: killed, removed, and v1 still serves.
+    prepare_image("rel-v3", &serve(200), &[]);
+    harness.runner.select_image("rel-v3");
+    let v3 = harness
+        .run_payload(
+            "rel-v3",
+            project_id,
+            Uuid::new_v4(),
+            256,
+            environment,
+            json!({ "release_command": "echo waiting forever; sleep 999" }),
+            CancellationToken::new(),
+        )
+        .await;
+    v3.print("release command sleeps past its timeout");
+    v3.assert_failed("release_command_timeout", &["5 seconds"]);
+    v3.assert_logged("[release] waiting forever");
+    assert!(
+        v3.elapsed < SMOKE_RELEASE_TIMEOUT + Duration::from_secs(15),
+        "stopped at its deadline: {:?}",
+        v3.elapsed
+    );
+    assert!(
+        release_names().trim().is_empty(),
+        "release container left: {}",
+        release_names()
+    );
+    assert!(v1_running(), "the previous version keeps running");
+    assert!(routes_to_v1(), "and keeps its route");
 }
 
 fn start_router() {
@@ -2601,6 +2771,23 @@ impl Harness {
         builder: Option<&str>,
         container_runtime: Option<&str>,
     ) -> Self {
+        Self::start_full(
+            temp,
+            railpack_image,
+            builder,
+            container_runtime,
+            DockerRuntimeConfig::default().release_command_timeout,
+        )
+        .await
+    }
+
+    async fn start_full(
+        temp: &TempDir,
+        railpack_image: &str,
+        builder: Option<&str>,
+        container_runtime: Option<&str>,
+        release_command_timeout: Duration,
+    ) -> Self {
         let (server, requests) = recording_api().await;
         let runner = Arc::new(SmokeRunner {
             builder: builder.map(str::to_owned),
@@ -2620,6 +2807,7 @@ impl Harness {
             railpack_image: railpack_image.to_owned(),
             railpack_network: SANDBOX_NETWORK.to_owned(),
             container_runtime: container_runtime.map(str::to_owned),
+            release_command_timeout,
             ..DockerRuntimeConfig::default()
         };
         let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
@@ -2924,6 +3112,7 @@ impl ProcessRunner for SmokeRunner {
                     .to_string_lossy()
                     .replace("sakala-app-", APP_NAME_PREFIX)
                     .replace("sakala-project-", PROJECT_NETWORK_PREFIX)
+                    .replace("sakala-release-", RELEASE_NAME_PREFIX)
                     .replace("sakala-agent-railpack-", APP_NAME_PREFIX)
                     .replace("sakala/project-", &format!("{PREFIX}/project-"))
                     .into()
@@ -2969,6 +3158,7 @@ impl ProcessRunner for SmokeRunner {
         output.stdout = output
             .stdout
             .replace(PROJECT_NETWORK_PREFIX, "sakala-project-")
+            .replace(RELEASE_NAME_PREFIX, "sakala-release-")
             .replace(APP_NAME_PREFIX, "sakala-app-");
         Ok(output)
     }
