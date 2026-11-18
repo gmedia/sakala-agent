@@ -20,7 +20,7 @@ Binary `sakala-edge` dibangun dari workspace yang sama dengan Agent dan memakai 
 
 ## Kontrak dengan API
 
-Edge memanggil `GET {SAKALA_API_URL}/api/edge/v1/routes` dengan header `Authorization: Bearer <SAKALA_EDGE_TOKEN>` dan `Accept: application/json`. Endpoint ini belum ada di `sakala-api`; kontrak di bawah adalah yang diharapkan Edge.
+Edge memanggil `GET {SAKALA_API_URL}/api/edge/v1/routes` dengan header `Authorization: Bearer <SAKALA_EDGE_TOKEN>` dan `Accept: application/json`, ditambah tiga header yang melaporkan keadaannya (lihat [Laporan ke API](#laporan-ke-api)). Sisi API dijelaskan di `docs/EDGE_API.md` milik `sakala-api`; kontrak di bawah adalah yang diharapkan Edge.
 
 ```json
 {
@@ -53,7 +53,21 @@ Edge memanggil `GET {SAKALA_API_URL}/api/edge/v1/routes` dengan header `Authoriz
 
 Field lain diabaikan, jadi API boleh menambah field tanpa memutus Edge versi lama.
 
-**Conditional request (opsional).** Setelah punya tabel, Edge mengirim `If-None-Match: "<revision>"`. API yang mendukungnya menjawab `304 Not Modified` tanpa body bila revision-nya masih sama; API yang tidak mendukung cukup menjawab `200` seperti biasa, dan Edge membandingkan revision sendiri. Jadi ETag yang dipakai API, bila ada, adalah revision dalam tanda kutip.
+### Laporan ke API
+
+Setiap request tabel membawa keadaan Edge, supaya API bisa memberi tahu admin saat sebuah Edge melayani tabel basi atau terus gagal:
+
+| Header | Nilai |
+| --- | --- |
+| `User-Agent` | `sakala-edge/<versi>`, misalnya `sakala-edge/0.9.1`. |
+| `Sakala-Edge-Applied-Revision` | Revision yang sedang dilayani Caddy: tabel terakhir yang berhasil ditulis, divalidasi, dan di-reload, revision baru yang route-nya sama persis dengan yang sudah dilayani (tanpa reload), atau snapshot yang diterima saat start. `none` sebelum ada tabel yang diterapkan, termasuk setelah snapshot ditolak saat start. |
+| `Sakala-Edge-Status` | `ok` bila siklus sinkronisasi terakhir berhasil, termasuk `304` dan revision yang sama. Selain itu, kode error siklus terakhir, sama dengan `last_error.code` di `status.json` (lihat [Kapan tabel ditolak](#kapan-tabel-ditolak)): huruf kecil `snake_case`, paling panjang 64 karakter. |
+
+Tabel yang ditolak atau di-rollback tidak menggeser `Sakala-Edge-Applied-Revision`; yang berubah hanya `Sakala-Edge-Status`. Header dikirim sebelum siklus itu berjalan, jadi hasil sebuah siklus baru terlihat di request berikutnya. Revision yang sama juga dipakai untuk `If-None-Match` di bawah.
+
+### Conditional request
+
+Fitur ini opsional bagi API. Setelah punya tabel, Edge mengirim `If-None-Match: "<revision>"`. API yang mendukungnya menjawab `304 Not Modified` tanpa body bila revision-nya masih sama; API yang tidak mendukung cukup menjawab `200` seperti biasa, dan Edge membandingkan revision sendiri. Jadi ETag yang dipakai API, bila ada, adalah revision dalam tanda kutip.
 
 ## Kapan tabel ditolak
 
@@ -208,6 +222,8 @@ Edge tidak membuka port. Kondisinya dibaca dari `status.json`, yang ditulis sete
 ```
 
 `source` bernilai `snapshot` setelah start dari `routes.json` sampai API berhasil dihubungi, lalu `api`. Edge yang sehat punya `last_success_at` yang baru (beberapa kali poll interval). Tabel basi terlihat sebagai `last_success_at` yang makin lama bersama `last_error` berisi kode dari tabel di atas. Waktu ditulis dalam UTC.
+
+API juga memantau setiap Edge dari [laporan di setiap request](#laporan-ke-api): admin mendapat peringatan bila sebuah Edge basi (revision yang dilayaninya tertinggal) atau terus gagal. Aturan dan ambangnya ada di `docs/EDGE_API.md` milik `sakala-api`. Edge yang sama sekali tidak bisa menghubungi API tidak mengirim laporan apa pun, jadi detail penyebabnya tetap hanya ada di `status.json` di host.
 
 ## Instalasi dengan systemd
 

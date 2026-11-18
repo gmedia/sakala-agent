@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- `sakala-edge` kini melaporkan keadaannya di setiap request tabel route, supaya `sakala-api` bisa memberi tahu admin saat sebuah Edge basi atau terus gagal. Header `Sakala-Edge-Applied-Revision` berisi revision yang sedang dilayani Caddy (tabel terakhir yang berhasil ditulis, divalidasi, dan di-reload, atau snapshot yang diterima saat start), `none` sebelum ada yang diterapkan. Header `Sakala-Edge-Status` berisi `ok` bila siklus terakhir berhasil, termasuk `304`, atau kode error siklus terakhir yang sama dengan `last_error.code` di `status.json`. Tabel yang ditolak atau di-rollback tidak menggeser revision yang dilaporkan. `User-Agent` tetap `sakala-edge/<versi>`. `status.json` tidak berubah. Lihat [Laporan ke API](docs/EDGE.md#laporan-ke-api).
+
 ## [0.9.1] - 2026-11-18
 
 ### Fixed
