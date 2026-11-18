@@ -21,6 +21,7 @@ Sakala API membuat command. Agent melakukan polling outbound ke API. Agent tidak
 
 ```txt
 apps/sakala-agent/              Binary, config, telemetry, shutdown
+apps/sakala-edge/               Binary sinkronisasi route Sakala Edge
 crates/sakala-agent-protocol/   Tipe payload control-plane-agent
 crates/sakala-agent-core/       HTTP client, workers, lifecycle, ports, redaction
 crates/sakala-agent-runtime/    Implementasi noop, inspection, Docker, Railpack, Caddy
@@ -41,6 +42,10 @@ Untuk node MVP, Sakala Agent dijalankan sebagai binary Rust melalui service host
 Repository deployment akan menangani instalasi binary, service `systemd`, permission runtime, environment, dan integrasi Caddy pada node. Sakala Agent tidak membawa konfigurasi deployment host tersebut.
 
 `.env.example` merupakan referensi variable. Binary membaca environment atau CLI flag dan sengaja tidak menambahkan loader file dotenv pada foundation ini.
+
+## Sakala Edge
+
+Workspace ini juga membangun `sakala-edge`, service sinkronisasi route untuk Sakala Edge (ADR-019). Service itu berjalan di host Edge di samping Caddy host, bukan di runtime node: ia menarik tabel route dari `GET /api/edge/v1/routes`, menolak tabel kosong atau tidak valid, menulis potongan Caddyfile, lalu memvalidasi dan me-reload Caddy. Tabel terakhir yang diterima Caddy disimpan di disk, jadi API yang mati atau restart Edge tidak menghapus route. Binary-nya dirilis bersama Agent sebagai `sakala-edge-linux-x86_64`. Lihat [docs/EDGE.md](docs/EDGE.md).
 
 ## Mode
 

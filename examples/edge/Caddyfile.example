@@ -1,0 +1,27 @@
+# Host Caddyfile for an Edge host. TLS and the answer for unknown hosts stay
+# here; sakala-edge only writes the imported routes file. Create an empty
+# /var/lib/sakala-edge/routes.caddy at install so Caddy starts before the
+# first sync. See docs/EDGE.md.
+{
+	admin localhost:2019
+}
+
+*.sakala.app {
+	tls {
+		dns cloudflare {env.CF_TOKEN}
+	}
+	import /var/lib/sakala-edge/routes.caddy
+	handle {
+		respond "Not found" 404
+	}
+}
+
+*.staging.sakala.app {
+	tls {
+		dns cloudflare {env.CF_TOKEN}
+	}
+	import /var/lib/sakala-edge/routes.caddy
+	handle {
+		respond "Not found" 404
+	}
+}
