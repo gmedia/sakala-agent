@@ -20,7 +20,7 @@ use sakala_agent_core::ports::{
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
     DeploymentBuilder, DeploymentLog, InspectProjectPayload, LogBounds, LogStream,
-    ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadTraffic,
+    ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -1883,6 +1883,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
 
     async fn restore_replicas(&self) -> Result<RuntimeReplicaRestoration, RuntimeExecutionError> {
         self.run_restore_replicas().await.map_err(Into::into)
+    }
+
+    async fn workload_metrics(&self) -> Result<Vec<WorkloadMetrics>, RuntimeExecutionError> {
+        self.containers.workload_metrics().await.map_err(Into::into)
     }
 
     async fn workload_traffic(&self) -> Option<Vec<WorkloadTraffic>> {

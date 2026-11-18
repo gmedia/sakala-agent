@@ -36,6 +36,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     };
     let minimum_workspace_free_bytes = config.docker_runtime.min_workspace_free_bytes;
     let max_traffic_items = config.docker_runtime.max_active_containers as usize;
+    // One entry per container: every replica of every running deployment, as
+    // many as the node could run if each project used its maximum replicas.
+    let max_metric_items =
+        max_traffic_items.saturating_mul(config.docker_runtime.max_replicas_per_project as usize);
     let reconciliation = Arc::new(RwLock::new(RuntimeReconciliationReport::default()));
     let runtime: Arc<dyn RuntimeExecutor> = match config.runtime_driver {
         RuntimeDriver::Noop => Arc::new(NoopRuntimeExecutor),
@@ -144,6 +148,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             startup_reconciliation_at,
             minimum_workspace_free_bytes,
             max_traffic_items,
+            metrics: (config.runtime_driver == RuntimeDriver::Docker).then(|| {
+                heartbeat::metrics::WorkloadMetricsSampler::new(
+                    config.metrics_interval,
+                    max_metric_items,
+                )
+            }),
         },
         shutdown_rx.clone(),
     ));

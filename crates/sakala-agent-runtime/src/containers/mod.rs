@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf, sync::Arc};
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
+    WorkloadMetrics,
 };
 use uuid::Uuid;
 
@@ -15,6 +16,7 @@ use sakala_agent_core::ports::{
 mod docker;
 pub(crate) mod images;
 pub(crate) mod limits;
+pub(crate) mod metrics;
 pub(crate) mod network;
 pub(crate) mod replicas;
 
@@ -170,6 +172,11 @@ pub trait ContainerEngine: Send + Sync {
         &self,
         snapshots: &[RuntimeHealthSnapshot],
     ) -> Result<Vec<CrashedWorkloadDetail>, RuntimeError>;
+
+    /// Samples CPU, memory, and restart count of every running managed
+    /// workload container, one entry per replica, in one batch. Fails as a
+    /// whole when Docker cannot be read or reports no usable values.
+    async fn workload_metrics(&self) -> Result<Vec<WorkloadMetrics>, RuntimeError>;
 
     /// Every managed container on the node, running or not, in one listing.
     async fn replica_listing(&self) -> Result<Vec<ListedReplica>, RuntimeError>;

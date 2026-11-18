@@ -696,7 +696,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "caddy-file-routing",
     "idle-sleep",
     "replicas",
-    "release-command"
+    "release-command",
+    "workload-metrics"
   ],
   "metadata": {
     "version": "0.10.0",
@@ -996,6 +997,82 @@ List dibatasi `SAKALA_MAX_ACTIVE_CONTAINERS` item seperti `traffic`, dan
 `detail_counts.replicas` menyimpan jumlah asli. Angkanya dihitung dari listing
 `docker ps` yang sama dengan `unhealthy_details`, tanpa query tambahan.
 
+### Metrik workload
+
+Node dengan capability `workload-metrics` mengirim `workloads.metrics`, yaitu pemakaian
+CPU, memori, dan jumlah restart setiap container workload yang sedang berjalan. Setiap
+replika punya entri sendiri. Capability ini hanya diiklankan driver `docker`. Field-nya
+opsional, aditif pada revision 4, dan contoh heartbeat lengkapnya ada di
+`examples/heartbeat/workload-metrics.json`:
+
+```json
+{
+  "workloads": {
+    "metrics": [
+      {
+        "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+        "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+        "replica": 1,
+        "sampled_at": "2026-11-18T09:15:02Z",
+        "cpu_percent": 112.5,
+        "memory_bytes": 209715200,
+        "memory_limit_bytes": 268435456,
+        "restart_count": 0
+      }
+    ]
+  },
+  "detail_counts": { "metrics": 1 }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `project_id` | UUID, wajib | Project pemilik container, dari label `dev.sakala.project-id`. |
+| `deployment_id` | UUID, wajib | Deployment pemilik container. Saat redeploy, container lama dan baru bisa sama-sama muncul; API mencocokkannya dengan deployment aktif project. |
+| `replica` | integer ≥ 0, wajib | Indeks container di antara replika deployment-nya, dari label `dev.sakala.replica`. Deployment tanpa replika, termasuk container dari Agent lama, selalu `0`. |
+| `sampled_at` | RFC 3339 UTC, wajib | Waktu `docker stats` selesai membaca. Semua entri dalam satu sampel memakai nilai yang sama. |
+| `cpu_percent` | number ≥ 0, wajib | Pemakaian CPU dalam **persen dari satu core**, seperti dihitung `docker stats`: selisih waktu CPU container dibagi selisih waktu CPU host selama sekitar satu detik, dikali jumlah core online. Container yang sibuk di dua core melaporkan sekitar 200, jadi nilainya bisa di atas 100. Ini bacaan sesaat saat sampel diambil, bukan rata-rata satu menit. |
+| `memory_bytes` | integer ≥ 0, wajib | Memori yang dipakai cgroup container menurut `docker stats`, dalam byte. Docker mencetaknya dengan empat angka penting (misalnya `35.8MiB`), jadi nilainya bisa meleset sampai sekitar 0,05%. |
+| `memory_limit_bytes` | integer > 0 atau `null`, wajib | Batas memori yang diberikan ke Docker (`HostConfig.Memory`), dalam byte dan tepat. `null` berarti container berjalan tanpa batas memori. |
+| `restart_count` | integer ≥ 0, wajib | `RestartCount` Docker: berapa kali restart policy Docker menyalakan ulang container sejak terakhir di-start dengan sengaja. Docker mengembalikannya ke 0 pada `docker start` dan `docker restart`, yang dipakai wake, `RestartProject`, dan pemulihan replika. Deployment baru selalu mulai dari 0 karena container-nya baru. |
+
+Cara membaca list ini:
+
+- **Satu sampel dikirim satu kali.** Agent mengambil sampel paling sering sekali per
+  `SAKALA_METRICS_INTERVAL_SECONDS` (default 60 detik) dan menyertakannya hanya di
+  heartbeat yang mengikuti sampel itu. Heartbeat di antaranya tidak membawa list ini.
+  Jadi setiap entri adalah bacaan baru dan API tidak perlu membuang duplikat. Sampel di
+  heartbeat yang gagal terkirim hilang; Agent tidak mengirimnya ulang.
+- **List yang tidak hadir** (`metrics` dan `detail_counts.metrics` sama-sama hilang)
+  berarti tidak ada sampel baru: interval belum lewat, atau sampel gagal. API tidak
+  boleh membacanya sebagai pemakaian nol atau sebagai tanda workload berhenti.
+- **List kosong** berarti sampel berhasil dan tidak ada container workload yang
+  berjalan, misalnya karena semua project sedang tidur.
+- **Sampel gagal utuh, tidak pernah sebagian.** Bila Docker tidak bisa dibaca, sampel
+  melewati batas waktu, keluaran `docker stats` tidak dikenali, atau tidak satu pun
+  container yang berjalan punya nilai yang bisa dibaca, list ini dihilangkan. Agent
+  mencatat satu WARN di awal rentetan kegagalan dan satu INFO saat sampel kembali
+  berhasil. Kegagalan sampel tidak mengubah `status` node.
+- **Container yang berhenti atau dihapus di tengah sampel dilewati**, karena Docker
+  tidak lagi punya angka untuknya. Container yang sedang `restarting` juga dilewati;
+  crash-nya terlihat di `crashed_details`.
+- **Container release tidak masuk list.** Container itu tidak membawa label
+  `dev.sakala.managed`, dan listing metrik juga membuang container apa pun yang punya
+  label `dev.sakala.role`. Router dan container lain di node juga tidak masuk.
+
+Satu sampel memakai tiga panggilan Docker: `docker ps` untuk container berlabel
+`dev.sakala.managed=true`, satu `docker stats --no-stream --format '{{json .}}'`, dan
+satu `docker inspect` untuk `RestartCount` serta `HostConfig.Memory`. `docker stats`
+sengaja dipanggil tanpa ID container sehingga membaca semua container yang berjalan:
+bila diberi satu ID yang sudah hilang, ia gagal seluruhnya tanpa mencetak apa pun.
+`docker stats --no-stream` butuh sekitar 2 detik karena menunggu bacaan kedua untuk
+menghitung CPU. Sampel dibatasi 12 detik dan berjalan bersamaan dengan probe kesehatan
+heartbeat, bukan setelahnya.
+
+List diurutkan menurut `project_id`, `deployment_id`, lalu `replica`, dan dibatasi
+`SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT` item (default 20 × 4,
+yaitu 80 item, sekitar 25 KiB). `detail_counts.metrics` menyimpan jumlah asli.
+
 ### Lokasi dan kapasitas node
 
 Tiga field membantu API menempatkan project berdasarkan region dan kapasitas, serta
@@ -1043,7 +1120,9 @@ hasil command reconciliation eksplisit.
 Collection detail yang berpotensi membesar (`unhealthy_details`,
 `crashed_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
 `compatibility_issues`) dibatasi maksimal 50 item per heartbeat. `traffic` dan
-`replicas` memakai batas `SAKALA_MAX_ACTIVE_CONTAINERS` seperti dijelaskan di atas. Agent
+`replicas` memakai batas `SAKALA_MAX_ACTIVE_CONTAINERS`, dan `metrics` memakai batas
+`SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT`, seperti dijelaskan
+di atas. Agent
 mempertahankan urutan hasil runtime dan mengirim 50 item pertama secara
 deterministik, bukan memilih item secara acak. `metadata.detail_counts` selalu
 menyimpan jumlah asli sebelum pembatasan; nilai `0` berarti collection kosong,

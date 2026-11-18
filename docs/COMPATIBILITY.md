@@ -232,6 +232,20 @@ The release command never runs on `WakeProject`, `RestartProject`, `RefreshRoute
 the previous version, which keeps serving while the command runs and until the route
 switches.
 
+## Revision 4 additions for workload metrics
+
+Still revision 4: only additive heartbeat fields and a new capability. Either side can
+be deployed first. An older API ignores the new keys and the capability, and an older
+Agent never sends them.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `workload-metrics` | Advertised by the `docker` driver only. | The API should only expect `workloads.metrics` from a node that advertises it. |
+| `metadata.workloads.metrics` and `metadata.detail_counts.metrics` | Sent in the heartbeat after a fresh sample, bound `SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT`. | Items `{ project_id, deployment_id, replica, sampled_at, cpu_percent, memory_bytes, memory_limit_bytes, restart_count }`, one per running workload container. Sampled at most once per `SAKALA_METRICS_INTERVAL_SECONDS` (default 60) and sent once, so heartbeats in between carry neither key. Both keys are also omitted when a sample fails; a heartbeat without them is "no new reading", never zero usage. `cpu_percent` is percent of one core and may exceed 100. Shape in [Sakala Agent API](AGENT_API.md#metrik-workload). |
+
+New configuration: `SAKALA_METRICS_INTERVAL_SECONDS`, see
+[Configuration](CONFIGURATION.md).
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

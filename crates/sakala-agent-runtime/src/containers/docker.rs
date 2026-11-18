@@ -13,6 +13,7 @@ use sakala_agent_core::ports::{
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
+    WorkloadMetrics,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
@@ -35,6 +36,10 @@ use crate::{
             InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
             parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
         },
+        metrics::{
+            METRICS_INSPECT_FORMAT, STATS_FORMAT, join_sample, parse_inspected_states,
+            parse_metrics_target, parse_stats,
+        },
         network::ProjectNetworks,
         replicas::{REPLICA_LABEL, REPLICAS_LABEL, ReplicaSlot},
     },
@@ -56,6 +61,8 @@ const DEPLOYMENT_ID_LABEL: &str = "dev.sakala.deployment-id";
 /// Marks the container of a release command. It never carries
 /// `MANAGED_LABEL`, so nothing that lists workloads sees it.
 const RELEASE_ROLE_LABEL: &str = "dev.sakala.role=release";
+/// Key of [`RELEASE_ROLE_LABEL`], read back by listings that must skip it.
+const ROLE_LABEL_KEY: &str = "dev.sakala.role";
 /// Prefix of the release container's output in the deployment log, next to
 /// `build` and `runtime`.
 const RELEASE_LOG_PHASE: &str = "release";
@@ -74,6 +81,13 @@ const EXIT_EVENTS_TIMEOUT: Duration = Duration::from_secs(1);
 /// as an app that crashed once and recovered.
 const CRASH_LOOP_MIN_RESTARTS: u32 = 3;
 const ENVIRONMENT_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `docker ps` of a metrics sample.
+const METRICS_LISTING_TIMEOUT: Duration = Duration::from_secs(2);
+/// `docker stats --no-stream` waits for a second reading about a second after
+/// the first to compute CPU usage, so it takes about two seconds on an idle node.
+const METRICS_STATS_TIMEOUT: Duration = Duration::from_secs(8);
+/// `docker inspect` of a metrics sample.
+const METRICS_INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Set by the image or by Sakala itself, and common in ordinary log text.
 const NON_SECRET_ENVIRONMENT_KEYS: [&str; 3] = ["PATH", "HOME", "PORT"];
 const CRASH_STATE_FORMAT: &str = "{{.Id}}\t{{.State.Status}}\t{{.RestartCount}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}";
@@ -605,6 +619,68 @@ impl ContainerEngine for DockerContainerEngine {
                 }
             })
             .collect())
+    }
+
+    async fn workload_metrics(&self) -> Result<Vec<WorkloadMetrics>, RuntimeError> {
+        let listing = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(format!(
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{DEPLOYMENT_ID_LABEL}\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
+            ))
+            .timeout(METRICS_LISTING_TIMEOUT);
+        let targets = self
+            .read_docker(&listing, "docker metrics listing")
+            .await?
+            .lines()
+            .filter_map(parse_metrics_target)
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Every running container, not only the listed ones: given an ID that
+        // is gone, `docker stats` fails as a whole and prints nothing.
+        let stats = CommandSpec::new("docker")
+            .arg("stats")
+            .arg("--no-stream")
+            .arg("--format")
+            .arg(STATS_FORMAT)
+            .timeout(METRICS_STATS_TIMEOUT);
+        let readings = parse_stats(&self.read_docker(&stats, "docker stats").await?)?;
+        // Whole seconds: the control plane aggregates per minute.
+        let sampled_at = OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap_or_else(|_| OffsetDateTime::now_utc());
+
+        let mut inspect = CommandSpec::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg(METRICS_INSPECT_FORMAT)
+            .timeout(METRICS_INSPECT_TIMEOUT);
+        for target in &targets {
+            inspect = inspect.arg(&target.container_id);
+        }
+        let output = self.runner.run(&inspect, &NullOutputSink).await?;
+        // As in the crash inspection: a container removed since the listing
+        // makes `docker inspect` exit non-zero while it still prints the others.
+        if !output.success
+            && output.stdout.trim().is_empty()
+            && !output.stderr.to_ascii_lowercase().contains("no such")
+        {
+            return Err(RuntimeError::Container(format!(
+                "docker metrics inspection failed with {}",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+        join_sample(
+            &targets,
+            &readings,
+            &parse_inspected_states(&output.stdout),
+            sampled_at,
+        )
     }
 
     async fn replica_listing(&self) -> Result<Vec<ListedReplica>, RuntimeError> {
