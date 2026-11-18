@@ -653,7 +653,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "replicas"
   ],
   "metadata": {
-    "version": "0.9.0",
+    "version": "0.9.1",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
