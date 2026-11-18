@@ -146,6 +146,33 @@ Still revision 4, and either side can be deployed first.
 | `SleepProject` payload field `page` | Honoured. | Optional string, `waking` (default) or `unavailable`. `unavailable` installs a static 503 page, "Proyek tidak tersedia", with no script, no wake request, no reload, and no `Retry-After`; the API should send it when a visit must not wake the project, such as on suspension. The Agent never refuses a sleep over this field: an unknown value, `null`, or a non-object payload reads as `waking` and is logged as a warning. Example in `examples/commands/sleep-project-unavailable.json`; semantics in [Sakala Agent API](AGENT_API.md#workload-lifecycle-commands). The API should only send `page` to nodes that advertise `idle-sleep`. Agent v0.7.0 advertises that capability but ignores `page` and shows the waking page, so a suspended project on a v0.7.0 node still shows "Proyek sedang dinyalakan" until the node is upgraded. |
 | Waking page stops reloading | Behaviour change. | The page now asks to wake the project once per visit (counted in the browser's `sessionStorage`), reloads every 3 seconds for at most 2 minutes, then shows "Proyek belum bisa dinyalakan" with a "Coba lagi" button that sends one more wake request and starts another round. Without JavaScript, or when `sessionStorage` is blocked, it reloads every 15 seconds without a cap. Each open tab now calls the public wake endpoint once per visit and once per click on "Coba lagi", instead of every 3 seconds. |
 
+## Revision 4 additions for replicas
+
+Still revision 4: no new command type, only an optional payload field, additive
+heartbeat fields, and a new capability. Either side can be deployed first. An older
+Agent ignores `replicas` and runs one container, so the API must only send a value
+above 1 to a node that advertises `replicas`.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `replicas` | Advertised by the `docker` driver only. | The node's limit is `metadata.workloads.maximum_replicas_per_project` on every heartbeat, from `SAKALA_MAX_REPLICAS_PER_PROJECT` (default 4). `null` on a driver without replicas. |
+| `DeployProject` payload field `replicas` | Honoured. | Optional positive integer, default 1 when absent or `null`. The Agent never refuses a deployment over an unreadable value: `0`, a negative number, a string such as `"3"`, a fraction, or any other type runs one replica and is logged as a warning. A value above the node's limit fails the deployment with `runtime_replicas_exceeded` before checkout; the Agent does not quietly run fewer. Example in `examples/commands/deploy-project-replicas.json`. |
+| `error_code` value `runtime_replicas_exceeded` | Sent on `fail`. | Additive. The API should validate `replicas` against the node limit first, so this is a safety net. |
+| `metadata.workloads.replicas` and `metadata.detail_counts.replicas` | Sent on heartbeat, bound `SAKALA_MAX_ACTIVE_CONTAINERS`. | Items `{ project_id, deployment_id, desired, ready }` for running deployments with more than one replica. Both keys are omitted when there is none. Shape in [Sakala Agent API](AGENT_API.md#replika-workload). |
+| `crashed_details` per deployment | Behaviour change for replicas only. | A deployment is listed only when every running replica is crashed, once, with the replica that ended last. A partly crashed deployment shows as `ready < desired` instead. One-replica deployments are reported as before. |
+| `HealthCheck` result fields `desired_replicas`, `ready_replicas`, `replicas` | Sent for deployments with more than one replica. | Additive. `ready` is `true` while at least one replica answers, and the top-level fields describe the first ready replica, or the first replica when none is. |
+| Events `deployment.container.started` and `deployment.runtime.ready` | Add `replicas` and `containers` for more than one replica. | `container` keeps the first replica's name. |
+
+Capacity: every replica counts against `SAKALA_MAX_ACTIVE_CONTAINERS`, and so does
+`metadata.workloads.active`. A deploy or wake is admitted when the running containers
+of other projects plus the new replicas fit; the project's own running containers are
+not counted, as before, because the new set replaces them. While a rolling deploy
+switches over, the node briefly runs both sets.
+
+A one-replica deployment keeps the container name and the route every earlier Agent
+wrote, so existing and sleeping workloads keep working across the upgrade, and a
+node rolled back to an older Agent still finds them.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

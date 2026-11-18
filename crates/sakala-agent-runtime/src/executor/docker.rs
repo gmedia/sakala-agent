@@ -1,6 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashSet,
+    num::NonZeroU32,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -21,6 +25,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use tokio::{
     sync::{Mutex, Semaphore},
+    task::JoinSet,
     time::Instant,
 };
 use url::Url;
@@ -31,7 +36,7 @@ use crate::{
     builders::{BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
         ContainerEngine, DockerContainerEngine, FailureOutput, ImageCleanup, ImageRetention,
-        ManagedWorkload, RunContainerRequest, container_name, image_name,
+        ManagedWorkload, ReplicaSlot, RunContainerRequest, image_name, replicas::resolve_replicas,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -61,6 +66,7 @@ pub struct DockerRuntimeExecutor {
     build_permits: Arc<Semaphore>,
     container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
+    max_replicas_per_project: u32,
     workspace_gc_max_age: std::time::Duration,
     image_retention: ImageRetention,
     min_workspace_free_bytes: u64,
@@ -122,6 +128,7 @@ impl DockerRuntimeExecutor {
         );
         let agent_id = config.agent_id;
         let max_concurrent_builds = config.max_concurrent_builds;
+        let max_replicas_per_project = config.max_replicas_per_project;
         let workspace_gc_max_age = config.workspace_gc_max_age;
         let image_retention = ImageRetention {
             max_age: config.image_gc_max_age,
@@ -178,6 +185,7 @@ impl DockerRuntimeExecutor {
             config.timeout_safety,
             health_check_window,
             max_concurrent_builds,
+            max_replicas_per_project,
             workspace_gc_max_age,
             image_retention,
             min_workspace_free_bytes,
@@ -198,6 +206,7 @@ impl DockerRuntimeExecutor {
         timeout_safety: crate::TimeoutSafetyConfig,
         health_check_window: std::time::Duration,
         max_concurrent_builds: usize,
+        max_replicas_per_project: u32,
         workspace_gc_max_age: std::time::Duration,
         image_retention: ImageRetention,
         min_workspace_free_bytes: u64,
@@ -228,6 +237,7 @@ impl DockerRuntimeExecutor {
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
+            max_replicas_per_project,
             workspace_gc_max_age,
             image_retention,
             min_workspace_free_bytes,
@@ -308,11 +318,14 @@ impl DockerRuntimeExecutor {
         let deployment_id = request.deployment_id;
         let payload = request.payload;
         validate_payload(&payload, &self.project_domains)?;
+        let replicas = resolve_replicas(payload.replicas, self.max_replicas_per_project)?;
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload, request.repository_credential)?;
         self.ensure_workspace_capacity().await?;
-        self.containers.ensure_capacity(project_id).await?;
+        self.containers
+            .ensure_capacity(project_id, replicas)
+            .await?;
 
         emit_event(
             reporter.as_ref(),
@@ -354,10 +367,17 @@ impl DockerRuntimeExecutor {
             .await?;
         drop(source);
         let image = image_name(project_id, deployment_id, &payload.commit_sha);
-        let container = container_name(project_id, deployment_id);
+        let candidates = ReplicaSlot::all(replicas)
+            .map(|slot| (slot, slot.container_name(project_id, deployment_id)))
+            .collect::<Vec<_>>();
+        let containers = candidates
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
         let route_activated = AtomicBool::new(false);
         let candidate_started = AtomicBool::new(false);
         let cutover_started = AtomicBool::new(false);
+        let failed_replica = OnceLock::new();
 
         let deployment = self.deploy_inner(
             request.command_id,
@@ -366,12 +386,15 @@ impl DockerRuntimeExecutor {
             &payload,
             &workspace,
             &image,
-            &container,
+            &candidates,
             applied_resources,
             applied_timeouts,
-            &route_activated,
-            &candidate_started,
-            &cutover_started,
+            DeploymentProgress {
+                route_activated: &route_activated,
+                candidate_started: &candidate_started,
+                cutover_started: &cutover_started,
+                failed_replica: &failed_replica,
+            },
             Arc::clone(&reporter),
         );
         tokio::pin!(deployment);
@@ -399,16 +422,20 @@ impl DockerRuntimeExecutor {
             && candidate_started.load(Ordering::Acquire)
             && !matches!(result, Err(RuntimeError::Cancelled))
         {
+            // The replica that failed explains the failure; before readiness,
+            // that is the first one.
+            let failed = failed_replica.get().unwrap_or(&containers[0]);
             let output = self
-                .report_candidate_output(&container, payload.log_bounds, reporter.as_ref())
+                .report_candidate_output(failed, payload.log_bounds, reporter.as_ref())
                 .await;
             result = result.map_err(|error| error.refine_crash(output.exec_denied));
         }
         if failed_before_cutover {
-            if let Err(error) = self.containers.cleanup_candidate(&container, &image).await {
+            if let Err(error) = self.containers.cleanup_candidate(&containers, &image).await {
                 let _ = reporter
                     .log(system_log(format!(
-                        "candidate cleanup warning for {container}: {error}"
+                        "candidate cleanup warning for {}: {error}",
+                        containers.join(", ")
                     )))
                     .await;
             }
@@ -506,15 +533,18 @@ impl DockerRuntimeExecutor {
         payload: &DeployProjectPayload,
         workspace: &DeploymentWorkspace,
         image: &str,
-        container: &str,
+        candidates: &[(ReplicaSlot, String)],
         applied_resources: AppliedRuntimeResources,
         applied_timeouts: crate::config::AppliedRuntimeTimeouts,
-        route_activated: &AtomicBool,
-        candidate_started: &AtomicBool,
-        cutover_started: &AtomicBool,
+        progress: DeploymentProgress<'_>,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
         let reporter_ref = reporter.as_ref();
+        let containers = candidates
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect::<Vec<_>>();
+        let replicas = replica_count(candidates.len());
         let context = workspace
             .build_context(payload.root_directory.as_deref())
             .await?;
@@ -553,8 +583,15 @@ impl DockerRuntimeExecutor {
         emit_event(
             reporter_ref,
             "deployment.container.started",
-            "Starting candidate application container.",
-            json!({ "container": container, "image": image }),
+            if containers.len() > 1 {
+                "Starting candidate application containers."
+            } else {
+                "Starting candidate application container."
+            },
+            with_replicas(
+                json!({ "container": containers[0], "image": image }),
+                &containers,
+            ),
         )
         .await?;
         let start_began = Instant::now();
@@ -562,28 +599,33 @@ impl DockerRuntimeExecutor {
             // The early capacity check is only a fast-fail optimization. This
             // serialized re-check is authoritative and closes concurrent admission races.
             let admission = self.container_admission.lock().await;
-            self.containers.ensure_capacity(project_id).await?;
             self.containers
-                .start(
-                    &RunContainerRequest {
-                        command_id,
-                        project_id,
-                        deployment_id,
-                        name: container.to_owned(),
-                        image: image.to_owned(),
-                        workspace: workspace.root().to_owned(),
-                        environment: payload.environment.clone(),
-                        resources: applied_resources,
-                        domain: payload.domain.clone(),
-                        port: payload.container_port,
-                        log_bounds: payload.log_bounds,
-                        // A Railpack image already starts with this command.
-                        start_command: command_field(payload.start_command.as_deref())
-                            .filter(|_| build.builder == DeploymentBuilder::Dockerfile),
-                    },
-                    reporter_ref,
-                )
+                .ensure_capacity(project_id, replicas)
                 .await?;
+            for (replica, name) in candidates {
+                self.containers
+                    .start(
+                        &RunContainerRequest {
+                            command_id,
+                            project_id,
+                            deployment_id,
+                            name: name.clone(),
+                            replica: *replica,
+                            image: image.to_owned(),
+                            workspace: workspace.root().to_owned(),
+                            environment: payload.environment.clone(),
+                            resources: applied_resources,
+                            domain: payload.domain.clone(),
+                            port: payload.container_port,
+                            log_bounds: payload.log_bounds,
+                            // A Railpack image already starts with this command.
+                            start_command: command_field(payload.start_command.as_deref())
+                                .filter(|_| build.builder == DeploymentBuilder::Dockerfile),
+                        },
+                        reporter_ref,
+                    )
+                    .await?;
+            }
             drop(admission);
             Ok::<(), RuntimeError>(())
         })
@@ -592,7 +634,7 @@ impl DockerRuntimeExecutor {
             operation: "deployment-start".to_owned(),
             seconds: applied_timeouts.start.as_secs(),
         })??;
-        candidate_started.store(true, Ordering::Release);
+        progress.candidate_started.store(true, Ordering::Release);
         emit_event(
             reporter_ref,
             "deployment.health.started",
@@ -603,16 +645,25 @@ impl DockerRuntimeExecutor {
             }),
         )
         .await?;
-        self.health
-            .wait_until_ready(&ReadinessRequest {
-                container: container.to_owned(),
-                port: payload.container_port,
-                started_at: start_began,
-                timeout: applied_timeouts.start,
-                expected_restarts: Some(0),
-                operation: "deployment-start",
-            })
-            .await?;
+        // Every replica must answer before the route moves, under one deadline:
+        // the old deployment keeps serving until the whole new set is ready.
+        for name in &containers {
+            if let Err(error) = self
+                .health
+                .wait_until_ready(&ReadinessRequest {
+                    container: name.clone(),
+                    port: payload.container_port,
+                    started_at: start_began,
+                    timeout: applied_timeouts.start,
+                    expected_restarts: Some(0),
+                    operation: "deployment-start",
+                })
+                .await
+            {
+                let _ = progress.failed_replica.set(name.clone());
+                return Err(error);
+            }
+        }
         emit_event(
             reporter_ref,
             "deployment.route.started",
@@ -620,39 +671,49 @@ impl DockerRuntimeExecutor {
             json!({ "domain": payload.domain, "port": payload.container_port }),
         )
         .await?;
-        cutover_started.store(true, Ordering::Release);
+        progress.cutover_started.store(true, Ordering::Release);
         self.routes
             .activate(
                 &RouteSpec {
                     project_id,
                     deployment_id,
                     domain: payload.domain.clone(),
-                    upstream: container.to_owned(),
+                    upstreams: containers.clone(),
                     port: payload.container_port,
                 },
                 reporter_ref,
             )
             .await?;
-        route_activated.store(true, Ordering::Release);
+        progress.route_activated.store(true, Ordering::Release);
         reporter_ref.mark_deployment_committed(CommandOutput::with_result(json!({
             "requested_resources": payload.resources,
             "applied_resources": applied_resources,
         })));
 
-        if let Err(error) = self
-            .containers
-            .report_startup_logs(container, reporter_ref)
-            .await
-        {
-            let _ = reporter
-                .log(system_log(format!(
-                    "startup log collection warning for {container}: {error}"
-                )))
-                .await;
+        for (replica, name) in candidates {
+            if containers.len() > 1 {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "Startup output of replica {}:",
+                        replica.index
+                    )))
+                    .await;
+            }
+            if let Err(error) = self
+                .containers
+                .report_startup_logs(name, reporter_ref)
+                .await
+            {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "startup log collection warning for {name}: {error}"
+                    )))
+                    .await;
+            }
         }
         let finalization_error = match self
             .containers
-            .cleanup_previous(project_id, container, reporter_ref)
+            .cleanup_previous(project_id, &containers, reporter_ref)
             .await
         {
             Ok(()) => None,
@@ -670,13 +731,16 @@ impl DockerRuntimeExecutor {
             reporter_ref,
             "deployment.runtime.ready",
             "Application container and route are ready.",
-            json!({
-                "builder": build.builder,
-                "container": container,
-                "domain": payload.domain,
-                "image": image,
-                "resources": applied_resources,
-            }),
+            with_replicas(
+                json!({
+                    "builder": build.builder,
+                    "container": containers[0],
+                    "domain": payload.domain,
+                    "image": image,
+                    "resources": applied_resources,
+                }),
+                &containers,
+            ),
         )
         .await
         {
@@ -687,21 +751,30 @@ impl DockerRuntimeExecutor {
                 "deployment committed but ready event reporting failed"
             );
         }
-        let _ = self.containers.start_log_follower(container, reporter);
+        for name in &containers {
+            let _ = self
+                .containers
+                .start_log_follower(name, Arc::clone(&reporter));
+        }
         if let Some(error) = finalization_error {
             return Err(error);
         }
         Ok(())
     }
 
-    async fn workload(
+    /// Every replica of the request's deployment, in replica order.
+    async fn workloads(
         &self,
         request: &WorkloadLifecycleRequest,
-    ) -> Result<ManagedWorkload, RuntimeError> {
-        self.containers
-            .workload(request.project_id, request.deployment_id)
-            .await?
-            .ok_or(RuntimeError::WorkloadNotFound)
+    ) -> Result<Vec<ManagedWorkload>, RuntimeError> {
+        let workloads = self
+            .containers
+            .workloads(request.project_id, request.deployment_id)
+            .await?;
+        if workloads.is_empty() {
+            return Err(RuntimeError::WorkloadNotFound);
+        }
+        Ok(workloads)
     }
 
     /// A lifecycle command has no start deadline of its own in its payload.
@@ -711,7 +784,7 @@ impl DockerRuntimeExecutor {
         timeout: std::time::Duration,
     ) -> ReadinessRequest {
         ReadinessRequest {
-            container: container_name(workload.project_id, workload.deployment_id),
+            container: workload.name.clone(),
             port: workload.port,
             started_at: Instant::now(),
             timeout,
@@ -745,30 +818,109 @@ impl DockerRuntimeExecutor {
         }
     }
 
+    /// Waits until one replica answers, then writes the route to all of them.
+    /// The router keeps requests away from a replica it cannot reach, so the
+    /// others may still be starting.
     async fn activate_workload(
         &self,
-        workload: &ManagedWorkload,
+        workloads: &[ManagedWorkload],
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
+        let first = &workloads[0];
         // A recreated router container has lost its project networks.
-        self.containers.attach_router(workload.project_id).await?;
-        self.health
-            .wait_until_ready(
-                &self.workload_readiness(workload, self.timeout_safety.max_start_timeout),
-            )
+        self.containers.attach_router(first.project_id).await?;
+        self.wait_until_any_ready(workloads, self.timeout_safety.max_start_timeout)
             .await?;
         self.routes
             .activate(
                 &RouteSpec {
-                    project_id: workload.project_id,
-                    deployment_id: workload.deployment_id,
-                    domain: workload.domain.clone(),
-                    upstream: container_name(workload.project_id, workload.deployment_id),
-                    port: workload.port,
+                    project_id: first.project_id,
+                    deployment_id: first.deployment_id,
+                    domain: first.domain.clone(),
+                    upstreams: workloads
+                        .iter()
+                        .map(|workload| workload.name.clone())
+                        .collect(),
+                    port: first.port,
                 },
                 reporter,
             )
             .await
+    }
+
+    /// Succeeds as soon as one replica is ready. When none is, the failure of
+    /// the lowest replica is returned, which for one replica is its own.
+    async fn wait_until_any_ready(
+        &self,
+        workloads: &[ManagedWorkload],
+        timeout: std::time::Duration,
+    ) -> Result<(), RuntimeError> {
+        if let [workload] = workloads {
+            return self
+                .health
+                .wait_until_ready(&self.workload_readiness(workload, timeout))
+                .await;
+        }
+        let mut checks = self.spawn_readiness(workloads, timeout);
+        let mut first_failure: Option<(usize, RuntimeError)> = None;
+        while let Some(joined) = checks.join_next().await {
+            let (index, result) = joined.map_err(readiness_task_failed)?;
+            match result {
+                // Dropping the set cancels the checks still waiting.
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if first_failure
+                        .as_ref()
+                        .is_none_or(|(failed, _)| index < *failed)
+                    {
+                        first_failure = Some((index, error));
+                    }
+                }
+            }
+        }
+        Err(first_failure.map_or(RuntimeError::WorkloadNotRunning, |(_, error)| error))
+    }
+
+    /// The readiness of every replica, in replica order.
+    async fn readiness_of_each(
+        &self,
+        workloads: &[ManagedWorkload],
+        timeout: std::time::Duration,
+    ) -> Result<Vec<Result<(), RuntimeError>>, RuntimeError> {
+        let mut checks = self.spawn_readiness(workloads, timeout);
+        let mut results = (0..workloads.len()).map(|_| None).collect::<Vec<_>>();
+        while let Some(joined) = checks.join_next().await {
+            let (index, result) = joined.map_err(readiness_task_failed)?;
+            results[index] = Some(result);
+        }
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or(Err(RuntimeError::WorkloadNotRunning)))
+            .collect())
+    }
+
+    /// Probes the replicas side by side, so a stuck one does not use up the
+    /// deadline of the others. A replica that is not running fails at once.
+    fn spawn_readiness(
+        &self,
+        workloads: &[ManagedWorkload],
+        timeout: std::time::Duration,
+    ) -> JoinSet<(usize, Result<(), RuntimeError>)> {
+        let mut checks = JoinSet::new();
+        for (index, workload) in workloads.iter().enumerate() {
+            let health = Arc::clone(&self.health);
+            let running = workload.is_running();
+            let request = self.workload_readiness(workload, timeout);
+            checks.spawn(async move {
+                let result = if running {
+                    health.wait_until_ready(&request).await
+                } else {
+                    Err(RuntimeError::WorkloadNotRunning)
+                };
+                (index, result)
+            });
+        }
+        checks
     }
 
     async fn run_restart(
@@ -776,12 +928,25 @@ impl DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workload = self.workload(&request).await?;
-        if !workload.status.to_ascii_lowercase().starts_with("up") {
+        let workloads = self.workloads(&request).await?;
+        // A sleeping deployment stays asleep; a running one gets every replica
+        // back, including one that stopped on its own.
+        if !workloads.iter().any(ManagedWorkload::is_running) {
             return Err(RuntimeError::WorkloadNotRunning);
         }
-        self.containers.restart(&workload, 10).await?;
-        self.activate_workload(&workload, reporter.as_ref()).await?;
+        for workload in &workloads {
+            self.containers.restart(workload, 10).await?;
+        }
+        let restarted = workloads
+            .iter()
+            .map(|workload| ManagedWorkload {
+                status: RESTARTED_STATUS.to_owned(),
+                ..workload.clone()
+            })
+            .collect::<Vec<_>>();
+        self.activate_workload(&restarted, reporter.as_ref())
+            .await?;
+        let workload = &workloads[0];
         emit_event(
             reporter.as_ref(),
             "workload.restart.completed",
@@ -798,11 +963,11 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
         remove: bool,
     ) -> Result<CommandOutput, RuntimeError> {
-        let Some(workload) = self
+        let workloads = self
             .containers
-            .workload(request.project_id, request.deployment_id)
-            .await?
-        else {
+            .workloads(request.project_id, request.deployment_id)
+            .await?;
+        let Some(workload) = workloads.first() else {
             if remove {
                 self.routes
                     .deactivate(
@@ -823,13 +988,15 @@ impl DockerRuntimeExecutor {
             }
             return Err(RuntimeError::WorkloadNotFound);
         };
-        self.containers.stop(&workload, 10).await?;
+        self.containers.stop(&workloads, 10).await?;
         if remove {
-            self.deactivate_route(&workload, reporter.as_ref()).await?;
-            self.containers.remove(&workload).await?;
+            self.deactivate_route(workload, reporter.as_ref()).await?;
+            for replica in &workloads {
+                self.containers.remove(replica).await?;
+            }
             self.release_network(workload.project_id).await;
         } else {
-            self.sleep_route(&workload, request.sleeping_page, reporter.as_ref())
+            self.sleep_route(workload, request.sleeping_page, reporter.as_ref())
                 .await?;
         }
         let remove_images = remove && request.remove_images;
@@ -951,23 +1118,33 @@ impl DockerRuntimeExecutor {
         Ok(())
     }
 
-    /// Stops a container this wake started but could not bring online, so it
-    /// does not hold a slot while the sleeping page stays up. The container,
+    /// Stops the containers this wake started but could not bring online, so
+    /// they do not hold slots while the sleeping page stays up. The containers,
     /// image, and network stay for the next wake. A failure here is only logged:
     /// the wake already failed for its own reason, which is what gets reported.
-    async fn stop_failed_wake(&self, workload: &ManagedWorkload) {
-        let started = ManagedWorkload {
-            // The listing said stopped, but this wake has just started it.
-            status: "Up".to_owned(),
-            ..workload.clone()
+    async fn stop_failed_wake(&self, started: &[ManagedWorkload]) {
+        let Some(first) = started.first() else {
+            return;
         };
+        let started = started
+            .iter()
+            .map(|workload| ManagedWorkload {
+                // The listing said stopped, but this wake has just started it.
+                status: RESTARTED_STATUS.to_owned(),
+                ..workload.clone()
+            })
+            .collect::<Vec<_>>();
         if let Err(error) = self.containers.stop(&started, 10).await {
             tracing::warn!(
-                project_id = %workload.project_id,
-                deployment_id = %workload.deployment_id,
-                container = %workload.container_id,
+                project_id = %first.project_id,
+                deployment_id = %first.deployment_id,
+                containers = %started
+                    .iter()
+                    .map(|workload| workload.container_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 %error,
-                "failed wake could not stop the container again; it may still hold a capacity slot"
+                "failed wake could not stop its containers again; they may still hold capacity slots"
             );
         }
     }
@@ -977,20 +1154,38 @@ impl DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workload = self.workload(&request).await?;
+        let workloads = self.workloads(&request).await?;
+        let workload = &workloads[0];
         // Same admission as a deployment: a full node refuses the wake, and the
-        // sleeping page stays until there is room.
+        // sleeping page stays until there is room for every replica.
         let admission = self.container_admission.lock().await;
-        self.containers.ensure_capacity(workload.project_id).await?;
-        self.containers.start_existing(&workload).await?;
+        self.containers
+            .ensure_capacity(workload.project_id, replica_count(workloads.len()))
+            .await?;
+        let mut started = Vec::new();
+        for replica in &workloads {
+            if replica.is_running() {
+                continue;
+            }
+            if let Err(error) = self.containers.start_existing(replica).await {
+                drop(admission);
+                self.stop_failed_wake(&started).await;
+                return Err(error);
+            }
+            started.push(replica.clone());
+        }
         drop(admission);
+        let woken = workloads
+            .iter()
+            .map(|replica| ManagedWorkload {
+                status: RESTARTED_STATUS.to_owned(),
+                ..replica.clone()
+            })
+            .collect::<Vec<_>>();
         // Writes the serving route over the sleeping one in one rename, and puts
         // the sleeping page back when the router refuses the new route.
-        if let Err(error) = self.activate_workload(&workload, reporter.as_ref()).await {
-            let started_here = !workload.status.to_ascii_lowercase().starts_with("up");
-            if started_here {
-                self.stop_failed_wake(&workload).await;
-            }
+        if let Err(error) = self.activate_workload(&woken, reporter.as_ref()).await {
+            self.stop_failed_wake(&started).await;
             return Err(error);
         }
         emit_event(
@@ -1003,28 +1198,41 @@ impl DockerRuntimeExecutor {
         Ok(CommandOutput::with_result(json!({ "status": "ready" })))
     }
 
+    /// One replica reports as before. Several report the first ready replica,
+    /// or the first one when none is, plus every replica under `replicas`: the
+    /// deployment is ready while one of them is, because the router serves it.
     async fn run_health_check(
         &self,
         request: WorkloadLifecycleRequest,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workload = self.workload(&request).await?;
-        let running = workload.status.to_ascii_lowercase().starts_with("up");
-        let readiness = if running {
-            self.health
-                .wait_until_ready(&self.workload_readiness(&workload, self.health_check_window))
-                .await
-        } else {
-            Err(RuntimeError::WorkloadNotRunning)
-        };
-        let failure = readiness.err();
-        Ok(CommandOutput::with_result(json!({
-            "container_id": workload.container_id,
-            "running": running,
-            "ready": failure.is_none(),
-            "docker_status": workload.status,
-            "reason": failure.as_ref().map(ToString::to_string),
-            "error_code": failure.as_ref().map(RuntimeError::code),
-        })))
+        let workloads = self.workloads(&request).await?;
+        let results = self
+            .readiness_of_each(&workloads, self.health_check_window)
+            .await?;
+        let checks = workloads
+            .iter()
+            .zip(&results)
+            .map(|(workload, result)| {
+                let failure = result.as_ref().err();
+                json!({
+                    "container_id": workload.container_id,
+                    "running": workload.is_running(),
+                    "ready": failure.is_none(),
+                    "docker_status": workload.status,
+                    "reason": failure.map(ToString::to_string),
+                    "error_code": failure.map(RuntimeError::code),
+                })
+            })
+            .collect::<Vec<_>>();
+        let reported = results.iter().position(Result::is_ok).unwrap_or(0);
+        let mut result = checks[reported].clone();
+        if checks.len() > 1 {
+            result["desired_replicas"] = json!(checks.len());
+            result["ready_replicas"] =
+                json!(results.iter().filter(|result| result.is_ok()).count());
+            result["replicas"] = json!(checks);
+        }
+        Ok(CommandOutput::with_result(result))
     }
 
     async fn run_refresh_route(
@@ -1032,11 +1240,12 @@ impl DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workload = self.workload(&request).await?;
-        if !workload.status.to_ascii_lowercase().starts_with("up") {
+        let workloads = self.workloads(&request).await?;
+        if !workloads.iter().any(ManagedWorkload::is_running) {
             return Err(RuntimeError::WorkloadNotRunning);
         }
-        self.activate_workload(&workload, reporter.as_ref()).await?;
+        self.activate_workload(&workloads, reporter.as_ref())
+            .await?;
         Ok(CommandOutput::with_result(json!({ "status": "ready" })))
     }
 }
@@ -1343,11 +1552,16 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         for discovered in report.workloads.clone() {
             let workload = match self
                 .containers
-                .workload(discovered.project_id, discovered.deployment_id)
+                .workloads(discovered.project_id, discovered.deployment_id)
                 .await
             {
-                Ok(Some(workload)) => workload,
-                Ok(None) => continue,
+                Ok(workloads) => match workloads
+                    .into_iter()
+                    .find(|workload| workload.container_id == discovered.container_id)
+                {
+                    Some(workload) => workload,
+                    None => continue,
+                },
                 Err(error) => {
                     report.compatibility_issues.push(RuntimeCompatibilityIssue {
                         container_id: discovered.container_id,
@@ -1407,6 +1621,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 .saturating_sub(self.build_permits.available_permits()),
         );
         capacity.maximum_concurrent_builds = Some(self.max_concurrent_builds);
+        capacity.maximum_replicas_per_project = Some(self.max_replicas_per_project);
         Ok(capacity)
     }
 
@@ -1453,9 +1668,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 return None;
             }
         };
+        // Every replica of a deployment is listed; the host is the deployment's.
+        let mut seen = HashSet::new();
         Some(
             workloads
                 .into_iter()
+                .filter(|workload| seen.insert((workload.project_id, workload.deployment_id)))
                 .filter_map(|workload| {
                     Some(WorkloadTraffic {
                         last_request_at: *last_requests.get(&workload.domain)?,
@@ -1479,14 +1697,16 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         if request.cancellation.is_cancelled() {
             return Err(RuntimeError::Cancelled.into());
         }
-        let workload = self
+        let workloads = self
             .containers
-            .workload(request.project_id, request.deployment_id)
+            .workloads(request.project_id, request.deployment_id)
             .await?;
-        let actual_state = match &workload {
-            None => "missing",
-            Some(workload) if workload.status.to_ascii_lowercase().starts_with("up") => "running",
-            Some(_) => "stopped",
+        let actual_state = if workloads.is_empty() {
+            "missing"
+        } else if workloads.iter().any(ManagedWorkload::is_running) {
+            "running"
+        } else {
+            "stopped"
         };
         let desired_state = match request.desired_state {
             sakala_agent_protocol::DesiredWorkloadState::Running => "running",
@@ -1500,8 +1720,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             }
             match action {
                 ReconcileWorkloadAction::RestartLogFollower => {
-                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
-                    if !workload.status.to_ascii_lowercase().starts_with("up") {
+                    let workload = workloads.first().ok_or(RuntimeError::WorkloadNotFound)?;
+                    let running = workloads
+                        .iter()
+                        .filter(|workload| workload.is_running())
+                        .collect::<Vec<_>>();
+                    if running.is_empty() {
                         return Err(RuntimeError::WorkloadNotRunning.into());
                     }
                     // The follower outlives this reconcile command, so it must
@@ -1524,9 +1748,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     let redactor = self.follower_redactor(&workload.container_id).await;
                     let follower_reporter =
                         factory.reporter(command_id, workload.log_bounds, redactor);
-                    let started = self
-                        .containers
-                        .start_log_follower(&workload.container_id, follower_reporter);
+                    let mut started = false;
+                    for replica in running {
+                        started |= self.containers.start_log_follower(
+                            &replica.container_id,
+                            Arc::clone(&follower_reporter),
+                        );
+                    }
                     actions_applied.push(json!({
                         "action": "restart_log_follower",
                         "started": started,
@@ -1534,19 +1762,23 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     }));
                 }
                 ReconcileWorkloadAction::CleanupFailedCandidate => {
-                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
-                    let status = workload.status.to_ascii_lowercase();
-                    if !(status.starts_with("created")
-                        || status.starts_with("exited")
-                        || status.starts_with("dead"))
-                    {
+                    let workload = workloads.first().ok_or(RuntimeError::WorkloadNotFound)?;
+                    let never_serving = workloads.iter().all(|replica| {
+                        let status = replica.status.to_ascii_lowercase();
+                        status.starts_with("created")
+                            || status.starts_with("exited")
+                            || status.starts_with("dead")
+                    });
+                    if !never_serving {
                         return Err(RuntimeError::InvalidCommand(
                             "cleanup_failed_candidate requires a Created, Exited, or Dead workload"
                                 .to_owned(),
                         )
                         .into());
                     }
-                    self.containers.remove(workload).await?;
+                    for replica in &workloads {
+                        self.containers.remove(replica).await?;
+                    }
                     self.release_network(workload.project_id).await;
                     actions_applied.push(json!({
                         "action": "cleanup_failed_candidate",
@@ -1554,11 +1786,14 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     }));
                 }
                 ReconcileWorkloadAction::RestoreRoute => {
-                    let workload = workload.as_ref().ok_or(RuntimeError::WorkloadNotFound)?;
-                    if !workload.status.to_ascii_lowercase().starts_with("up") {
+                    if workloads.is_empty() {
+                        return Err(RuntimeError::WorkloadNotFound.into());
+                    }
+                    if !workloads.iter().any(ManagedWorkload::is_running) {
                         return Err(RuntimeError::WorkloadNotRunning.into());
                     }
-                    self.activate_workload(workload, reporter.as_ref()).await?;
+                    self.activate_workload(&workloads, reporter.as_ref())
+                        .await?;
                     actions_applied.push(json!({ "action": "restore_route" }));
                 }
             }
@@ -1568,7 +1803,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             "actual_state": actual_state,
             "in_sync": desired_state == actual_state,
             "drift_reason": (desired_state != actual_state).then_some("workload_state_mismatch"),
-            "container_id": workload.map(|workload| workload.container_id),
+            "container_id": workloads.first().map(|workload| workload.container_id.clone()),
             "actions_applied": actions_applied,
         })))
     }
@@ -1717,6 +1952,42 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .await
             .map_err(Into::into)
     }
+}
+
+/// The status a container listed as stopped has once a command started it
+/// again; the listing is not read a second time.
+const RESTARTED_STATUS: &str = "Up";
+
+/// What a deployment has done so far, for the cleanup after it ends.
+#[derive(Clone, Copy)]
+struct DeploymentProgress<'a> {
+    route_activated: &'a AtomicBool,
+    candidate_started: &'a AtomicBool,
+    cutover_started: &'a AtomicBool,
+    /// The first replica that failed readiness, whose output explains why.
+    failed_replica: &'a OnceLock<String>,
+}
+
+/// Adds every replica's container to an event of a deployment with several.
+/// One replica keeps the event every earlier Agent sent.
+fn with_replicas(mut details: serde_json::Value, containers: &[String]) -> serde_json::Value {
+    if containers.len() > 1 {
+        details["replicas"] = json!(containers.len());
+        details["containers"] = json!(containers);
+    }
+    details
+}
+
+/// The replica count of a non-empty set of `len` containers.
+fn replica_count(len: usize) -> NonZeroU32 {
+    u32::try_from(len)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .unwrap_or(NonZeroU32::MIN)
+}
+
+fn readiness_task_failed(error: tokio::task::JoinError) -> RuntimeError {
+    RuntimeError::Execution(format!("readiness check did not finish: {error}"))
 }
 
 /// An empty value is left out: nothing is lost, and BuildKit has no use for an

@@ -23,10 +23,11 @@ pub use commands::{
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
-    FinalizationDeferredReason, LogBounds, RuntimeResourceLimits, RuntimeTimeoutLimits,
+    FinalizationDeferredReason, LogBounds, RequestedReplicas, RuntimeResourceLimits,
+    RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
-pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload, WorkloadTraffic};
+pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload, WorkloadReplicas, WorkloadTraffic};
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};

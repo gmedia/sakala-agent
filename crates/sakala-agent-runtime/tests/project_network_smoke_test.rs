@@ -26,8 +26,8 @@ use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
     ProcessRunner, ResourceSafetyConfig, RuntimeError, TokioProcessRunner,
     containers::{
-        ContainerEngine, DockerContainerEngine, RunContainerRequest, WorkloadIsolation,
-        container_name, project_network_name,
+        ContainerEngine, DockerContainerEngine, ReplicaSlot, RunContainerRequest,
+        WorkloadIsolation, container_name, project_network_name,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
 };
@@ -259,6 +259,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
                     project_id: project.id,
                     deployment_id: project.deployment,
                     name: container_name(project.id, project.deployment),
+                    replica: ReplicaSlot::SINGLE,
                     image: IMAGE.to_owned(),
                     workspace,
                     environment: BTreeMap::new(),

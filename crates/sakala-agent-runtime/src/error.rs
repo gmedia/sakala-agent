@@ -74,6 +74,10 @@ pub enum RuntimeError {
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
     Capacity(String),
+    #[error(
+        "the deployment asks for {requested} replicas, but this node runs at most {maximum} replicas per project"
+    )]
+    ReplicasExceeded { requested: u32, maximum: u32 },
     #[error("runtime disk pressure: {0}")]
     DiskPressure(String),
     #[error("managed workload was not found")]
@@ -118,6 +122,7 @@ impl RuntimeError {
             Self::RootDirectoryInvalid { .. } => "runtime_root_directory_invalid",
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
+            Self::ReplicasExceeded { .. } => "runtime_replicas_exceeded",
             Self::DiskPressure(_) => "runtime_disk_pressure",
             Self::WorkloadNotFound => "runtime_workload_not_found",
             Self::WorkloadNotRunning => "runtime_workload_not_running",

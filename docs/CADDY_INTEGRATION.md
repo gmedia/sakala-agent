@@ -39,6 +39,52 @@ http://*.sakala.app {
 
 Dalam pola ini, `sakala-caddy` tetap router dinamis yang dikelola agent dan tetap terhubung ke `sakala-runtime`. Bind port `8080` milik container Caddy ke loopback host. Caddy mempertahankan header `Host` secara default, sehingga router internal tetap dapat memilih file route project. Contoh HTTP di atas tidak menetapkan strategi TLS production; sertifikat dan hardening outer edge harus diputuskan operator secara terpisah.
 
+## Route untuk beberapa replika
+
+Deployment dengan lebih dari satu replika tetap mendapat satu file dan satu blok site,
+dengan semua replika sebagai upstream:
+
+```caddyfile
+# Managed by sakala-agent for project <project-id> deployment <deployment-id>.
+portfolio.sakala.app:80 {
+	reverse_proxy sakala-app-<project8>-<deployment-id>-r0:3000 sakala-app-<project8>-<deployment-id>-r1:3000 sakala-app-<project8>-<deployment-id>-r2:3000 {
+		lb_policy least_conn
+		lb_try_duration 5s
+		lb_try_interval 250ms
+		fail_duration 10s
+	}
+}
+```
+
+Deployment satu replika tetap mendapat `reverse_proxy <container>:<port>` tanpa blok,
+byte demi byte sama dengan Agent sebelumnya. Nilai di atas adalah konstanta di
+`crates/sakala-agent-runtime/src/routing/caddy_file.rs`:
+
+- `least_conn` mengirim request baru ke replika dengan request aktif paling sedikit.
+- `lb_try_duration 5s` dan `lb_try_interval 250ms`: request yang gagal terhubung ke satu
+  replika dicoba ke replika lain selama 5 detik. Request pada koneksi keep-alive ke
+  replika yang mati mendadak baru gagal setelah sekitar 3 detik (terukur 2,8 detik),
+  jadi jendelanya dibuat lebih panjang dari itu. Caddy hanya mengulang request `GET`
+  atau request yang gagal saat dial, sehingga `POST` yang sedang dikirim ke replika
+  yang mati mendadak tetap bisa gagal.
+- `fail_duration 10s` adalah health check pasif: replika yang gagal satu request tidak
+  diberi request selama 10 detik.
+
+Agent tidak memakai health check aktif Caddy (`health_uri`). Di Caddy 2.11,
+`health_status` hanya menerima satu kode atau satu kelas status, dan tanpa itu hanya 2xx
+yang dianggap sehat, sedangkan Sakala menganggap semua jawaban di bawah 500 sehat.
+Aplikasi yang menjawab 404 di `/` akan dikeluarkan dari route-nya sendiri. Agent
+sudah memastikan setiap replika menjawab sebelum route ditulis, dan health check pasif
+menangani replika yang mati sesudahnya.
+
+Caddy tidak kembali ke replika yang ditandai gagal walaupun semua replika ditandai
+gagal. Kegagalan yang mengenai semua replika sekaligus, misalnya DNS Docker yang
+sebentar tidak menjawab, membuat site menjawab 503 paling lama `fail_duration`. Karena
+itu nilainya pendek. Container Caddy harus berjalan di network user-defined
+(`sakala-runtime`) sejak start: di bridge bawaan Docker, resolver-nya memakai name server
+host selama beberapa detik setelah bergabung ke network project, dan request pertama
+gagal me-resolve semua replika.
+
 ## Route tidur dan counter request
 
 Saat `SleepProject`, Agent tidak menghapus file route project, tetapi menggantinya dengan route tidur untuk domain yang sama. Baris pertamanya memakai penanda kepemilikan sendiri:

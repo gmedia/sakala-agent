@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
@@ -160,6 +160,9 @@ pub struct RuntimeHealthSnapshot {
     pub workload: RuntimeWorkload,
     pub ready: bool,
     pub reason: Option<String>,
+    /// How many replicas the workload's deployment was started with. One for a
+    /// deployment without replicas, and for a workload of an older Agent.
+    pub desired_replicas: NonZeroU32,
 }
 
 /// Kapasitas workload yang diketahui runtime lokal saat snapshot diambil.
@@ -173,6 +176,9 @@ pub struct RuntimeCapacity {
     pub maximum_active_workloads: Option<usize>,
     pub active_builds: Option<usize>,
     pub maximum_concurrent_builds: Option<usize>,
+    /// The most replicas one deployment may ask for on this node. `None` when
+    /// the driver cannot run replicas.
+    pub maximum_replicas_per_project: Option<u32>,
 }
 
 /// Host/runtime telemetry gathered by the injected runtime adapter.
@@ -516,6 +522,7 @@ mod tests {
                 maximum_active_workloads: Some(2),
                 active_builds: None,
                 maximum_concurrent_builds: None,
+                maximum_replicas_per_project: None,
             }
             .available_workload_slots(),
             Some(0)

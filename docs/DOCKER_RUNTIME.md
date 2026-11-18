@@ -20,6 +20,13 @@ validate command
 -> hapus container deployment sebelumnya
 ```
 
+Deployment dengan beberapa replika menjalankan langkah `docker run` dan readiness untuk
+setiap replika, menulis satu route berisi semua replika, lalu menghentikan container
+lama dalam satu `docker stop`. Nama replika adalah nama container biasa ditambah
+`-r<indeks>`, dan labelnya menambah `dev.sakala.replica` serta `dev.sakala.replicas`.
+Deployment satu replika tetap memakai nama tanpa akhiran. Lihat [Replika](AGENT_API.md#replika)
+dan [Route untuk beberapa replika](CADDY_INTEGRATION.md#route-untuk-beberapa-replika).
+
 Bila start, readiness, atau routing gagal, Agent lebih dulu mengirim baris terakhir
 output aplikasi, baru menghapus candidate. Tanpa langkah itu output aplikasi hilang
 bersama container, sehingga user tidak punya petunjuk untuk memperbaiki deploy-nya.
