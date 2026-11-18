@@ -1,7 +1,7 @@
 use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
 
 use clap::Parser;
-use sakala_agent_core::{AgentConfig, CoreError};
+use sakala_agent_core::{AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV};
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DockerRuntimeConfig, MAX_REPLICAS_PER_PROJECT_CEILING,
     ProjectDomainSuffixes, ResourceSafetyConfig, TimeoutSafetyConfig,
@@ -84,6 +84,12 @@ struct Cli {
 
     #[arg(long, env = "SAKALA_RUNTIME_NETWORK")]
     runtime_network: Option<String>,
+
+    #[arg(long, env = REGION_ENV)]
+    agent_region: Option<String>,
+
+    #[arg(long, env = EDGE_ADDRESS_ENV)]
+    agent_edge_address: Option<String>,
 
     #[arg(long, env = "SAKALA_RUNTIME_DRIVER")]
     runtime_driver: Option<String>,
@@ -204,6 +210,8 @@ pub fn load() -> Result<AppConfig, CoreError> {
         cli.shutdown_grace_seconds,
     );
     insert(&mut values, "SAKALA_RUNTIME_NETWORK", cli.runtime_network);
+    insert(&mut values, REGION_ENV, cli.agent_region);
+    insert(&mut values, EDGE_ADDRESS_ENV, cli.agent_edge_address);
     insert(&mut values, "SAKALA_RUNTIME_DRIVER", cli.runtime_driver);
     insert(
         &mut values,
@@ -710,6 +718,83 @@ mod tests {
             assert!(
                 error.contains("SAKALA_PROJECT_DOMAIN_SUFFIXES"),
                 "{invalid}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn placement_is_unset_by_default_and_empty_means_unset() {
+        let unset = from_values(&HashMap::new()).expect("config");
+        assert!(unset.agent.placement.is_empty());
+
+        let empty = from_values(&HashMap::from([
+            (REGION_ENV.to_owned(), String::new()),
+            (EDGE_ADDRESS_ENV.to_owned(), String::new()),
+        ]))
+        .expect("config");
+        assert!(empty.agent.placement.is_empty());
+    }
+
+    #[test]
+    fn placement_accepts_values_the_api_accepts() {
+        let config = from_values(&HashMap::from([
+            (REGION_ENV.to_owned(), "id-jog-1".to_owned()),
+            (EDGE_ADDRESS_ENV.to_owned(), "10.0.47.201:8180".to_owned()),
+        ]))
+        .expect("config");
+        let placement = config.agent.placement;
+        assert_eq!(
+            placement.region.as_ref().map(|region| region.as_str()),
+            Some("id-jog-1")
+        );
+        assert_eq!(
+            placement
+                .edge_address
+                .as_ref()
+                .map(|address| address.as_str()),
+            Some("10.0.47.201:8180")
+        );
+
+        for address in ["[fd00::21]:8180", "runtime-01.internal:8180"] {
+            let config = from_values(&HashMap::from([(
+                EDGE_ADDRESS_ENV.to_owned(),
+                address.to_owned(),
+            )]))
+            .expect(address);
+            assert_eq!(
+                config
+                    .agent
+                    .placement
+                    .edge_address
+                    .as_ref()
+                    .map(|value| value.as_str()),
+                Some(address)
+            );
+        }
+    }
+
+    #[test]
+    fn placement_refuses_to_start_with_a_value_the_api_rejects() {
+        let too_long_region = "a".repeat(sakala_agent_protocol::REGION_MAX_LENGTH + 1);
+        for (key, value) in [
+            (REGION_ENV, "JKT"),
+            (REGION_ENV, "id--jog"),
+            (REGION_ENV, " jkt"),
+            (REGION_ENV, too_long_region.as_str()),
+            (EDGE_ADDRESS_ENV, "10.0.47.201"),
+            (EDGE_ADDRESS_ENV, "http://10.0.47.201:8180"),
+            (EDGE_ADDRESS_ENV, "10.0.47.201:0"),
+            (EDGE_ADDRESS_ENV, "10.0.47.201:65536"),
+            (EDGE_ADDRESS_ENV, "fd00::21:8180"),
+            (EDGE_ADDRESS_ENV, "10.0.47.256:8180"),
+        ] {
+            let error = from_values(&HashMap::from([(key.to_owned(), value.to_owned())]))
+                .expect_err(value)
+                .to_string();
+            assert!(error.contains(key), "{key}={value:?}: {error}");
+            assert!(
+                error.contains(&format!("{value:?}")),
+                "{key}={value:?}: {error}"
             );
         }
     }

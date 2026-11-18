@@ -5,7 +5,7 @@ use std::{
 };
 
 use sakala_agent_protocol::{
-    CrashedWorkloadDetail, HeartbeatPayload, NodeInfo, NodeStatus, PROTOCOL_VERSION,
+    CrashedWorkloadDetail, HeartbeatPayload, NodeInfo, NodePlacement, NodeStatus, PROTOCOL_VERSION,
     WorkloadReplicas, WorkloadTraffic,
 };
 use serde_json::{Value, json};
@@ -22,6 +22,13 @@ use crate::{
 };
 
 const MAX_HEARTBEAT_DETAIL_ITEMS: usize = 50;
+
+/// `metadata.runtime`: the node's configured region and edge address.
+const RUNTIME_METADATA_KEY: &str = "runtime";
+
+/// `metadata.workloads.maximum_active_workloads`: the node's
+/// `SAKALA_MAX_ACTIVE_CONTAINERS`, for capacity-aware placement.
+const MAXIMUM_ACTIVE_WORKLOADS_METADATA_KEY: &str = "maximum_active_workloads";
 
 pub struct HeartbeatRuntimeContext {
     pub node_lifecycle: Arc<NodeLifecycle>,
@@ -185,6 +192,8 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         &workloads.replicas,
         context.max_traffic_items,
     );
+    insert_maximum_active_workloads(&mut metadata, workloads.maximum_active_workloads);
+    insert_placement(&mut metadata, &config.placement);
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
@@ -261,6 +270,29 @@ fn insert_replicas(metadata: &mut Value, replicas: &[WorkloadReplicas], bound: u
     metadata["detail_counts"]["replicas"] = json!(replicas.len());
 }
 
+/// Adds the node's container limit when the runtime reports one. An unknown
+/// limit is left out rather than sent as `null`, so the API keeps treating the
+/// node as one without a known capacity.
+fn insert_maximum_active_workloads(metadata: &mut Value, maximum: Option<usize>) {
+    let Some(maximum) = maximum else { return };
+    metadata["workloads"][MAXIMUM_ACTIVE_WORKLOADS_METADATA_KEY] = json!(maximum);
+}
+
+/// Adds `metadata.runtime` with the configured region and edge address. Each
+/// key is left out when unset, and the object is left out when both are, so
+/// the API never receives an empty value. The values were checked against the
+/// API's rules at startup.
+fn insert_placement(metadata: &mut Value, placement: &NodePlacement) {
+    if placement.is_empty() {
+        return;
+    }
+    // Two strings always serialize; on the impossible failure the key stays
+    // out, because the API rejects `runtime: null` with the whole heartbeat.
+    if let Ok(runtime) = serde_json::to_value(placement) {
+        metadata[RUNTIME_METADATA_KEY] = runtime;
+    }
+}
+
 /// Groups the snapshot of running containers by deployment. A deployment of
 /// one replica is left out: its single container already speaks for it.
 fn deployment_replicas(snapshots: &[crate::ports::RuntimeHealthSnapshot]) -> Vec<WorkloadReplicas> {
@@ -309,6 +341,7 @@ struct WorkloadStatistics {
     active_builds: Option<usize>,
     maximum_concurrent_builds: Option<usize>,
     maximum_replicas_per_project: Option<u32>,
+    maximum_active_workloads: Option<usize>,
     unhealthy_details: Vec<crate::ports::RuntimeHealthSnapshot>,
     crashed_details: Option<Vec<CrashedWorkloadDetail>>,
     replicas: Vec<WorkloadReplicas>,
@@ -331,12 +364,16 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
     let maximum_replicas_per_project = capacity
         .as_ref()
         .and_then(|value| value.maximum_replicas_per_project);
+    let maximum_active_workloads = capacity
+        .as_ref()
+        .and_then(|value| value.maximum_active_workloads);
     let health_unavailable = || WorkloadStatistics {
         active,
         stopped,
         active_builds,
         maximum_concurrent_builds,
         maximum_replicas_per_project,
+        maximum_active_workloads,
         capacity_available,
         ..WorkloadStatistics::default()
     };
@@ -377,6 +414,7 @@ async fn workload_statistics(runtime: &dyn RuntimeExecutor) -> WorkloadStatistic
         active_builds,
         maximum_concurrent_builds,
         maximum_replicas_per_project,
+        maximum_active_workloads,
         starting: Some(starting),
         unhealthy: Some(unhealthy_details.len()),
         unhealthy_details,
@@ -1167,6 +1205,125 @@ mod tests {
         assert!(
             unknown.metadata["workloads"]["maximum_replicas_per_project"].is_null(),
             "a driver without replicas reports no limit"
+        );
+    }
+
+    struct CapacityRuntime {
+        maximum_active_workloads: Option<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl RuntimeExecutor for CapacityRuntime {
+        async fn capacity(&self) -> Result<crate::ports::RuntimeCapacity, RuntimeExecutionError> {
+            Ok(crate::ports::RuntimeCapacity {
+                maximum_active_workloads: self.maximum_active_workloads,
+                ..crate::ports::RuntimeCapacity::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_the_node_container_limit_only_when_known() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let known = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(CapacityRuntime {
+                    maximum_active_workloads: Some(20),
+                }),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            known.metadata["workloads"]["maximum_active_workloads"],
+            json!(20)
+        );
+
+        let zero = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(CapacityRuntime {
+                    maximum_active_workloads: Some(0),
+                }),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            zero.metadata["workloads"]["maximum_active_workloads"],
+            json!(0)
+        );
+
+        for runtime in [
+            Arc::new(CapacityRuntime {
+                maximum_active_workloads: None,
+            }) as Arc<dyn RuntimeExecutor>,
+            Arc::new(EmptyRuntime),
+            Arc::new(FailedHealthRuntime),
+        ] {
+            let unknown = payload(
+                &config,
+                &heartbeat_context(runtime, RuntimeReconciliationReport::default()),
+            )
+            .await;
+            assert!(
+                unknown.metadata["workloads"]
+                    .get("maximum_active_workloads")
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_configured_placement_and_omits_the_rest() {
+        let context = || {
+            heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            )
+        };
+        let unset = AgentConfig::from_values(&HashMap::new()).expect("config");
+        assert!(
+            payload(&unset, &context())
+                .await
+                .metadata
+                .get("runtime")
+                .is_none(),
+            "an unconfigured node sends no runtime object at all"
+        );
+
+        let both = AgentConfig::from_values(&HashMap::from([
+            (crate::REGION_ENV.to_owned(), "id-jog-1".to_owned()),
+            (
+                crate::EDGE_ADDRESS_ENV.to_owned(),
+                "10.0.47.201:8180".to_owned(),
+            ),
+        ]))
+        .expect("config");
+        assert_eq!(
+            payload(&both, &context()).await.metadata["runtime"],
+            json!({ "region": "id-jog-1", "edge_address": "10.0.47.201:8180" })
+        );
+
+        let region_only = AgentConfig::from_values(&HashMap::from([(
+            crate::REGION_ENV.to_owned(),
+            "jkt".to_owned(),
+        )]))
+        .expect("config");
+        assert_eq!(
+            payload(&region_only, &context()).await.metadata["runtime"],
+            json!({ "region": "jkt" })
+        );
+
+        let address_only = AgentConfig::from_values(&HashMap::from([(
+            crate::EDGE_ADDRESS_ENV.to_owned(),
+            "[fd00::21]:8180".to_owned(),
+        )]))
+        .expect("config");
+        assert_eq!(
+            payload(&address_only, &context()).await.metadata["runtime"],
+            json!({ "edge_address": "[fd00::21]:8180" })
         );
     }
 

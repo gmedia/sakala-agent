@@ -1,0 +1,26 @@
+{
+  "status": "ready",
+  "hostname": "runtime-01",
+  "runtime_network": "sakala-runtime",
+  "capabilities": ["docker-runtime", "caddy-file-routing", "idle-sleep", "replicas"],
+  "metadata": {
+    "version": "0.8.0",
+    "protocol_version": 4,
+    "runtime_driver": "docker",
+    "runtime": {
+      "region": "id-jog-1",
+      "edge_address": "10.0.47.201:8180"
+    },
+    "workloads": {
+      "active": 4,
+      "starting": 0,
+      "unhealthy": 0,
+      "stopped": 0,
+      "maximum_replicas_per_project": 4,
+      "maximum_active_workloads": 20,
+      "unhealthy_details": [],
+      "crashed_details": []
+    }
+  },
+  "sent_at": "2026-11-18T05:58:20Z"
+}

@@ -13,6 +13,7 @@ pub mod heartbeat;
 pub mod inspections;
 pub mod logs;
 pub mod node;
+pub mod placement;
 pub mod repositories;
 pub mod status;
 
@@ -31,5 +32,9 @@ pub use heartbeat::{CrashedWorkloadDetail, HeartbeatPayload, WorkloadReplicas, W
 pub use inspections::{InspectProjectPayload, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};
+pub use placement::{
+    EDGE_ADDRESS_MAX_LENGTH, EDGE_ADDRESS_MAX_PORT, EdgeAddress, InvalidEdgeAddress, InvalidRegion,
+    NodePlacement, REGION_MAX_LENGTH, REGION_PATTERN, Region,
+};
 pub use repositories::RepositoryAccess;
 pub use status::{CommandStatus, NodeStatus};

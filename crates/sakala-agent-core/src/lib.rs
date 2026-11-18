@@ -16,6 +16,6 @@ pub mod repositories;
 pub mod scheduler;
 pub mod support;
 
-pub use config::{AgentConfig, AgentMode};
+pub use config::{AgentConfig, AgentMode, EDGE_ADDRESS_ENV, REGION_ENV};
 pub use error::CoreError;
 pub use node_state::{NodeLifecycle, NodeLifecycleState};
