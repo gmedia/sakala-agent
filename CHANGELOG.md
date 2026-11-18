@@ -12,6 +12,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 - Project yang tidur kini bisa dibangunkan dari URL-nya pada instalasi yang menghubungi API lewat alamat internal. Halaman route tidur sebelumnya selalu menyuruh browser pengunjung memanggil endpoint wake di bawah `SAKALA_API_URL`; pada self-host nilainya alamat internal seperti `http://127.0.0.1:8100`, sehingga browser tidak bisa menjangkaunya dan project tetap tidur. Konfigurasi opsional baru `SAKALA_PUBLIC_API_URL` (URL absolut `http` atau `https` tanpa kredensial, query, atau fragment) kini dipakai khusus untuk URL yang dibuka browser, dan defaultnya `SAKALA_API_URL`, jadi instalasi hosted tidak berubah. Nilai yang tidak valid membuat Agent berhenti saat start. Lihat [Configuration](docs/CONFIGURATION.md).
 
+### Security
+
+- Setiap route project di router node kini menghapus atribut `Domain` dari setiap header `Set-Cookie` aplikasi (`header_down Set-Cookie "(?i);\s*domain\s*=[^;]*" ""`), baik untuk satu replika maupun beberapa. Selama `sakala.app` belum ada di Public Suffix List, browser menganggap semua `<slug>.sakala.app` satu site, sehingga cookie `Domain=sakala.app` dari satu aplikasi ikut terkirim ke aplikasi lain (cookie tossing dan session fixation antar-aplikasi). Nilai dan atribut cookie lainnya tidak berubah, termasuk nilai yang memuat kata domain seperti `pref=domain%3Dx`. Cookie yang ditulis JavaScript lewat `document.cookie` tidak tertangani; perbaikan sebenarnya tetap pendaftaran ke PSL. Route yang sudah ada di node mendapat baris ini setelah project dideploy, di-restart, dibangunkan, atau menerima `RefreshRoute`/`restore_route`; restart Agent saja tidak menulis ulang route. Uji Docker dengan `caddy:2.11.3-alpine` memastikan sembilan variasi cookie diterima klien tanpa `Domain` dan atribut lain utuh. Lihat [Cookie host-only](docs/RUNTIME_HARDENING.md#cookie-host-only-di-route-project).
+
 ## [0.9.1] - 2026-11-18
 
 ### Fixed

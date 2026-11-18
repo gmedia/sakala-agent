@@ -197,6 +197,67 @@ workspace dengan `df -Pk`. Bila jumlahnya di bawah
 menjalankan `docker image prune -a` atau cleanup host generik; keputusan
 retention dan pembersihan artifact lama tetap harus Sakala-owned.
 
+## Cookie host-only di route project
+
+Setiap route project yang ditulis Agent menghapus atribut `Domain` dari setiap header
+`Set-Cookie` yang dikirim aplikasi, sehingga semua cookie dari server aplikasi menjadi
+host-only, artinya browser hanya mengirimnya kembali ke host yang persis sama.
+
+Alasannya, project dilayani sebagai `<slug>.sakala.app` dan `<slug>.staging.sakala.app`.
+Selama `sakala.app` belum masuk [Public Suffix List](https://publicsuffix.org/) (PSL),
+browser menganggap semua subdomain itu satu site. Aplikasi A bisa mengirim
+`Set-Cookie: session=x; Domain=sakala.app`, lalu browser mengirim cookie itu juga ke
+aplikasi B. Ini disebut cookie tossing: aplikasi milik satu mahasiswa bisa menanam cookie
+sesi di aplikasi mahasiswa lain (session fixation) atau menimpa cookie-nya.
+
+Route project memakai baris ini di dalam blok `reverse_proxy`, baik untuk satu replika
+maupun beberapa:
+
+```caddyfile
+header_down Set-Cookie "(?i);\s*domain\s*=[^;]*" ""
+```
+
+Caddy 2.11.3 menjalankan penggantian regex ini pada setiap nilai header `Set-Cookie`
+secara terpisah (`modules/caddyhttp/headers/headers.go`), dengan regex Go (RE2), jadi
+`(?i)` membuatnya tidak peka huruf besar-kecil. Pola hanya cocok dengan `;` diikuti nama
+atribut `Domain`, spasi opsional, `=`, dan nilainya sampai `;` berikutnya atau akhir
+header. Akibatnya:
+
+- `a=1; Domain=sakala.app; Path=/; HttpOnly` menjadi `a=1; Path=/; HttpOnly`;
+- `b=2; domain=.Sakala.App; Secure` menjadi `b=2; Secure`;
+- nilai atau nama cookie yang memuat kata domain, misalnya `pref=domain%3Dx; Path=/` atau
+  `domain=5; Path=/`, tidak berubah, karena tidak didahului `;`;
+- atribut lain seperti `Expires`, `Max-Age`, `SameSite`, dan `Secure` tetap utuh.
+
+Karena setiap project hanya punya satu host tanpa subdomain di bawahnya, cookie host-only
+berperilaku sama dengan cookie `Domain=<slug>.sakala.app` bagi aplikasi itu sendiri. Pola
+dan header disimpan sebagai konstanta `COOKIE_DOMAIN_ATTRIBUTE_PATTERN` dan
+`SET_COOKIE_HEADER` di `crates/sakala-agent-runtime/src/routing/caddy_file.rs`. Route tidur
+dan halaman project tidak tersedia tidak meneruskan respons aplikasi, jadi tidak memakai
+baris ini. Sakala Edge meneruskan respons router node apa adanya, jadi cookie yang lewat
+Edge sudah diproses di node.
+
+Batasnya:
+
+- Cookie yang ditulis JavaScript di browser lewat `document.cookie` tidak lewat router,
+  jadi tidak tertangani. Script di aplikasi A tetap bisa menulis cookie dengan
+  `domain=sakala.app`.
+- Perbaikan sebenarnya adalah memasukkan `sakala.app` ke PSL. Setelah itu browser
+  menolak cookie `Domain=sakala.app` dari subdomain mana pun. Baris ini tetap aman
+  dipertahankan sesudahnya sebagai lapisan tambahan.
+- Route hanya ditulis ulang saat deploy, `RestartProject`, `WakeProject`, `RefreshRoute`,
+  atau aksi reconcile `restore_route`. Restart Agent tidak menulis ulang route, jadi
+  route yang sudah ada di node mendapat baris ini setelah salah satu command itu
+  dijalankan untuk project tersebut.
+
+Uji Docker nyata dengan `caddy:2.11.3-alpine` dan aplikasi BusyBox yang mengirim sembilan
+header `Set-Cookie` memastikan klien menerima cookie yang sama tanpa atribut `Domain`,
+untuk route satu replika dan route dua replika:
+
+```bash
+cargo test -p sakala-agent-runtime --test cookie_domain_smoke_test -- --ignored --nocapture
+```
+
 ## Isolation Decision
 
 Maintainer memutuskan runtime node memakai Docker rootful dengan `runsc`, dengan alasan dan pembuktian di [gVisor](#gvisor). Untuk workload publik tidak tepercaya, target berikutnya adalah isolated builder yang terpisah dari runtime daemon, karena `runsc` hanya berlaku pada workload. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary.
