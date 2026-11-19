@@ -19,11 +19,9 @@ use std::path::{Component, Path, PathBuf};
 use globset::{GlobBuilder, GlobMatcher};
 use sakala_agent_protocol::{JsPackageManager, JsWorkspace};
 use serde_json::Value;
-use tokio::{fs, io::AsyncReadExt};
 use yaml_rust2::parser::{Event, Parser};
 
-/// Larger than any real manifest or config. They come from the repository.
-const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+use crate::repository_file::{self, MAX_MANIFEST_BYTES, is_file_inside};
 /// A workspace file lists a few patterns; this bounds the glob work it can ask for.
 const MAX_WORKSPACE_PATTERNS: usize = 256;
 const PACKAGE_JSON: &str = "package.json";
@@ -515,30 +513,7 @@ async fn read_json(repository: &Path, path: &Path) -> Option<Value> {
 
 /// A file inside the repository, at most `MAX_MANIFEST_BYTES`.
 async fn read_text(repository: &Path, path: &Path) -> Option<String> {
-    let path = inside_file(repository, path).await?;
-    let mut contents = Vec::new();
-    fs::File::open(&path)
-        .await
-        .ok()?
-        .take(MAX_MANIFEST_BYTES + 1)
-        .read_to_end(&mut contents)
-        .await
-        .ok()?;
-    if contents.len() as u64 > MAX_MANIFEST_BYTES {
-        return None;
-    }
-    String::from_utf8(contents).ok()
-}
-
-async fn is_file_inside(repository: &Path, path: &Path) -> bool {
-    inside_file(repository, path).await.is_some()
-}
-
-/// The repository picks where a symlink points, so one is followed only while it
-/// stays inside the repository.
-async fn inside_file(repository: &Path, path: &Path) -> Option<PathBuf> {
-    let path = fs::canonicalize(path).await.ok()?;
-    (path.starts_with(repository) && fs::metadata(&path).await.ok()?.is_file()).then_some(path)
+    repository_file::read_text(repository, path, MAX_MANIFEST_BYTES).await
 }
 
 #[cfg(test)]
@@ -546,6 +521,7 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
+    use tokio::fs;
 
     fn write(root: &Path, files: &[(&str, &str)]) {
         for (path, contents) in files {

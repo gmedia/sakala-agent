@@ -583,6 +583,49 @@ ke sana. Hanya plugin yang dipakai dari direktori itu.
 Registry publik ikut mengetahui image apa yang dicari node, dan isi config-nya dikendalikan
 pemilik image. Agent hanya mengambil nomor port dari config itu.
 
+## Saran variabel dan database
+
+Wizard Console menyarankan variabel dan database sebelum deployment pertama. Bahannya
+datang dari `InspectProject`: `env_example` berisi variabel dari `.env.example`,
+`.env.sample`, atau `.env.dist`, dan `database_hint` berisi bukti bahwa project memakai
+database beserta release command migrasinya. Bentuk field dan aturan lengkapnya ada di
+[Sakala Agent API](AGENT_API.md#variabel-dari-envexample).
+
+Keduanya hanya membaca root directory project (folder package pada monorepo), tidak
+pernah di atasnya, dengan batas yang sama seperti `Dockerfile`: symlink hanya diikuti
+selama tetap di dalam direktori itu, hanya file biasa, paling besar 1 MiB per file
+(64 KiB untuk file contoh environment), dan listing direktori berhenti di 200 entri.
+`.env` dan nama lain di luar tiga kandidat tidak pernah dibuka. Tidak ada yang
+dijalankan dan isi file tidak ditulis ke log.
+
+Parser file contoh environment ditulis sendiri. `dotenvy` 0.15.7 mengisi `${VAR}` dan
+`$VAR` dari environment process lebih dulu (`std::env::var` di `apply_substitution`)
+tanpa opsi untuk mematikannya, sehingga baris seperti `X=${SAKALA_AGENT_TOKEN}` di
+repository akan menyalin environment Agent ke hasil inspection. Parser Sakala tidak
+melakukan interpolasi apa pun.
+
+Nama package yang dihitung sebagai sinyal `package_dependency`:
+
+| File | Package | Engine |
+| --- | --- | --- |
+| `package.json` (`dependencies`, `devDependencies`) | `pg`, `postgres`, `@neondatabase/serverless` | postgresql |
+| | `mysql`, `mysql2` | mysql |
+| | `better-sqlite3`, `sqlite3` | sqlite |
+| | `@prisma/client`, `prisma`, `drizzle-orm`, `sequelize`, `typeorm`, `knex` | tidak menentukan |
+| `composer.json` (`require`, `require-dev`) | `doctrine/orm`, `doctrine/dbal` | tidak menentukan |
+| `requirements.txt`, `pyproject.toml` | `psycopg`, `psycopg2`, `psycopg2-binary`, `asyncpg` | postgresql |
+| | `mysqlclient`, `pymysql` | mysql |
+| | `dj-database-url`, `sqlalchemy` | tidak menentukan |
+| `Gemfile` | `pg` | postgresql |
+| | `mysql2`, `trilogy` | mysql |
+| | `sqlite3` | sqlite |
+
+File Python dibaca per baris: nama sebelum versi, extra, atau marker, dinormalisasi
+seperti PEP 503 (huruf kecil, `_` dan `.` menjadi `-`). Pada `pyproject.toml` string
+dalam array satu baris seperti `dependencies = ["django>=5", "psycopg"]` ikut dibaca.
+`config/database.yml` dibaca per baris, bukan sebagai YAML, karena file Rails biasanya
+memuat ERB; `adapter:` berisi ERB dilaporkan sebagai `null`.
+
 ## Batas Keamanan MVP
 
 - Repository memakai URL canonical `https://github.com` tanpa credential pada URL. Repository private memakai credential lease sementara melalui `GIT_ASKPASS` dan tidak menaruh token di arguments, remote URL, atau log.
