@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-19
+
 ### Added
 
 - Root directory yang merupakan package workspace JavaScript kini bisa dideploy tanpa perintah khusus (gmedia/sakala-agent#74). Pada uji production 2026-11-19, `root_directory: apps/web` di monorepo pnpm gagal dengan `sh: 1: pnpm: not found`, karena lockfile, `pnpm-workspace.yaml`, dan `packageManager` hanya ada di root repository. Bila root directory adalah package workspace pnpm, npm, Yarn, atau Bun yang root-nya ada di atasnya (`packages` di `pnpm-workspace.yaml` atau `workspaces` di `package.json`, workspace terdekat yang memutuskan), build Railpack kini berjalan dari root workspace dan perintahnya diarahkan ke package: `pnpm --filter '<name>...' run build` pada pnpm sehingga package workspace yang dipakainya ikut dibangun, `cd '<package>' && <pm> run build` pada manager lain, `cd '<package>' && <pm> run start` bila ada script `start`, dan SPA Vite tanpa script `start` disajikan dengan Caddy milik Railpack lewat `RAILPACK_SPA_OUTPUT_DIR`. `build_command`, `start_command`, dan `release_command` project dijalankan dengan `cd '<package>' && ...`, jadi `pnpm run build` di root directory `apps/web` berjalan di `apps/web` dengan pnpm tersedia. Variabel project `RAILPACK_BUILD_CMD`, `RAILPACK_START_CMD`, dan `RAILPACK_SPA_OUTPUT_DIR` tetap menang atas perintah turunan. Build Dockerfile dan repository tanpa workspace tidak berubah. Deployment seperti ini mengirim event baru `deployment.workspace.detected`, dan hasil `InspectProject` selalu membawa field baru `workspace` (`null` tanpa workspace). Uji Docker nyata dengan fixture monorepo pnpm di `tests/fixtures/pnpm-workspace` membuktikan `apps/web` dibangun dan disajikan serta `apps/api` berjalan. Aditif di protocol revision 4; lihat [Monorepo JavaScript](docs/DOCKER_RUNTIME.md#monorepo-javascript) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-javascript-monorepos).
@@ -277,7 +279,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gmedia/sakala-agent/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/gmedia/sakala-agent/compare/v0.9.1...v0.10.0
