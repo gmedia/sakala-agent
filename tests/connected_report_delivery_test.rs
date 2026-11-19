@@ -2,7 +2,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -570,6 +570,18 @@ async fn acknowledged_batches(server: &MockServer, failed: usize) -> Vec<(String
         .collect()
 }
 
+/// Waits until the fake server has answered `count` log requests. Bounded so a
+/// broken reporter fails the test instead of hanging it.
+async fn wait_for_log_requests(server: &MockServer, count: usize) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log_requests(server).await.len() < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the reporter sends its first batch");
+}
+
 fn numbered(count: usize) -> Vec<String> {
     (0..count).map(|index| format!("line {index:03}")).collect()
 }
@@ -717,6 +729,9 @@ async fn a_full_buffer_drops_the_oldest_queued_lines_and_marks_the_gap() {
         batch_of(2),
         LogDeliveryPolicy {
             max_buffered_lines: 5,
+            // Only a full batch or a flush sends, so a slow runner cannot
+            // split the first batch.
+            flush_interval: Duration::from_secs(60),
             ..fast_policy()
         },
     );
@@ -725,9 +740,7 @@ async fn a_full_buffer_drops_the_oldest_queued_lines_and_marks_the_gap() {
     reporter.log(log(&lines[0])).await.expect("line queues");
     reporter.log(log(&lines[1])).await.expect("line queues");
     // The first batch is now in flight and outside the buffer.
-    while log_requests(&server).await.is_empty() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    wait_for_log_requests(&server, 1).await;
     for line in &lines[2..] {
         reporter
             .log(log(line))
@@ -809,34 +822,34 @@ async fn a_rejection_other_than_conflict_or_budget_stops_without_retry() {
 async fn flush_gives_up_after_its_grace_and_delivery_resumes_for_later_lines() {
     let server = MockServer::start().await;
     let down = Arc::new(AtomicBool::new(true));
-    let attempts = Arc::new(AtomicUsize::new(0));
-    struct Counting {
-        inner: Outage,
-        attempts: Arc<AtomicUsize>,
-    }
-    impl Respond for Counting {
-        fn respond(&self, request: &Request) -> ResponseTemplate {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
-            self.inner.respond(request)
-        }
-    }
     Mock::given(method("POST"))
         .and(path(logs_path()))
-        .respond_with(Counting {
-            inner: Outage {
-                down: Arc::clone(&down),
-            },
-            attempts: Arc::clone(&attempts),
+        .respond_with(Outage {
+            down: Arc::clone(&down),
         })
         .mount(&server)
         .await;
-    let reporter = reporter_with(&server.uri(), batch_of(2), fast_policy());
+    // After its first failure the worker waits at least a minute before it
+    // tries again, so once that failure has reached the server nothing is in
+    // flight and no retry can happen during the test. That makes "not retried
+    // after the grace" a fact about the requests, not about a sleep.
+    let reporter = reporter_with(
+        &server.uri(),
+        batch_of(2),
+        LogDeliveryPolicy {
+            flush_interval: Duration::from_secs(60),
+            retry_min_delay: Duration::from_secs(60),
+            retry_max_delay: Duration::from_secs(60),
+            ..fast_policy()
+        },
+    );
 
     for line in ["a", "b", "c"] {
         reporter.log(log(line)).await.expect("line queues");
     }
+    wait_for_log_requests(&server, 1).await;
     let error = reporter
-        .flush_within(Duration::from_millis(300))
+        .flush_within(Duration::from_millis(200))
         .await
         .expect_err("the API never answered within the grace");
     assert!(
@@ -845,13 +858,6 @@ async fn flush_gives_up_after_its_grace_and_delivery_resumes_for_later_lines() {
     );
 
     // Container output keeps flowing under the same command after cutover.
-    let attempts_at_grace = attempts.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        attempts_at_grace,
-        "the abandoned batch is not retried any more"
-    );
     down.store(false, Ordering::SeqCst);
     reporter
         .log(log("later"))
@@ -862,6 +868,14 @@ async fn flush_gives_up_after_its_grace_and_delivery_resumes_for_later_lines() {
         .await
         .expect_err("the earlier loss is still reported");
     assert!(error.to_string().contains("3 log lines"), "{error}");
-    let last = log_requests(&server).await.pop().expect("a request");
-    assert_eq!(log_messages(&last), ["later"]);
+
+    let requests = log_requests(&server).await;
+    assert_eq!(
+        requests.iter().map(log_messages).collect::<Vec<_>>(),
+        [
+            vec!["a".to_owned(), "b".to_owned()],
+            vec!["later".to_owned()]
+        ],
+        "the abandoned batch is not retried any more"
+    );
 }
