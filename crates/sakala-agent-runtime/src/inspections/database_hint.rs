@@ -18,7 +18,10 @@ use sakala_agent_protocol::{
 use serde_json::Value;
 use tokio::fs;
 
-use super::env_example::EnvExampleScan;
+use super::{
+    env_example::EnvExampleScan,
+    json_manifest::{self, PACKAGE_JSON, PACKAGE_JSON_SECTIONS, has_package},
+};
 use crate::repository_file::{self, EntryKind, MAX_MANIFEST_BYTES};
 
 const MAX_SIGNALS: usize = 16;
@@ -46,8 +49,6 @@ const DB_CONNECTION_KEY: &str = "DB_CONNECTION";
 /// Connection URLs whose scheme names the engine, in priority order.
 const DATABASE_URL_KEYS: [&str; 2] = ["DATABASE_URL", "DB_URL"];
 
-const PACKAGE_JSON: &str = "package.json";
-const PACKAGE_JSON_SECTIONS: [&str; 2] = ["dependencies", "devDependencies"];
 const NODE_DATABASE_PACKAGES: [&str; 13] = [
     "pg",
     "postgres",
@@ -224,7 +225,7 @@ impl ProjectFiles<'_> {
     }
 
     async fn read_json(&self, relative: &str) -> Option<Value> {
-        serde_json::from_str(&self.read_text(relative).await?).ok()
+        json_manifest::read(self.root, relative).await
     }
 
     async fn is_file(&self, relative: &str) -> bool {
@@ -585,25 +586,16 @@ fn json_packages(
     };
     packages
         .iter()
-        .filter(|package| has_json_package(manifest, sections, package))
+        .filter(|package| has_package(manifest, sections, package))
         .map(|package| package_signal(file, package))
         .collect()
-}
-
-fn has_json_package(manifest: &Value, sections: &[&str], package: &str) -> bool {
-    sections.iter().any(|section| {
-        manifest
-            .get(section)
-            .and_then(Value::as_object)
-            .is_some_and(|dependencies| dependencies.contains_key(package))
-    })
 }
 
 fn has_any_package(package_json: Option<&Value>, packages: &[&str]) -> bool {
     package_json.is_some_and(|manifest| {
         packages
             .iter()
-            .any(|package| has_json_package(manifest, &PACKAGE_JSON_SECTIONS, package))
+            .any(|package| has_package(manifest, &PACKAGE_JSON_SECTIONS, package))
     })
 }
 

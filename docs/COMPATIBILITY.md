@@ -330,6 +330,15 @@ result fields. Either side can be deployed first.
 | `InspectProject` result field `env_example` | Sent, always. | `null` when the inspected directory has no `.env.example`, `.env.sample`, or `.env.dist`, or the first one that exists cannot be read safely (symlink leaving the directory, not a regular file, over 64 KiB). Otherwise `{ file, entries: [{ key, example_value }], truncated }`, at most 200 entries; `example_value` is `null` when empty, multi-line, or credential-like. `.env` is never opened and nothing is interpolated. A result without the field comes from an older Agent. An older API copies known keys only, so it ignores the field. Rules in [Sakala Agent API](AGENT_API.md#variabel-dari-envexample). |
 | `InspectProject` result field `database_hint` | Sent, always, as an object. | `{ likely, engine, signals: [{ kind, file, name }], suggested_release_command }`. `engine` is one of `postgresql`, `mysql`, `sqlite`, `unknown`; `kind` is one of `env_variable`, `laravel_migrations`, `prisma_schema`, `django_settings`, `rails_database_config`, `package_dependency`, and new kinds may be added, so consumers must ignore unknown ones. `suggested_release_command` is `null` or exactly one of `php artisan migrate --force`, `python manage.py migrate`, `npx prisma migrate deploy`, `bin/rails db:migrate`. At most 16 signals. A result without the field comes from an older Agent. Rules in [Sakala Agent API](AGENT_API.md#petunjuk-database). |
 
+## Revision 4 additions for framework hints
+
+Still revision 4: no new command type or payload field, only one additive inspection
+result field. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `InspectProject` result field `frameworks` | Sent, always, as an array. | Sorted, unique strings from the closed set `astro`, `docusaurus`, `eleventy`, `gatsby`, `next`, `nuxt`, `react-router`, `remix`, `sveltekit`, `tanstack-start`, `vitepress`: build-time-rendering frameworks named by exact package names in `dependencies` or `devDependencies` of the inspected directory's `package.json` (the package directory in a JavaScript workspace). `[]` when none match or there is no readable `package.json`; an invalid or oversized file never fails the inspection. A result without the field comes from an older Agent, and the API then falls back to Railpack signals. An older API copies known keys only, so it ignores the field. Rules and the package table in [Sakala Agent API](AGENT_API.md#framework-yang-merender-saat-build). |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

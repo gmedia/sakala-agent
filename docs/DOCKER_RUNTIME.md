@@ -661,7 +661,11 @@ datang dari `InspectProject`: `env_example` berisi variabel dari `.env.example`,
 database beserta release command migrasinya. Bentuk field dan aturan lengkapnya ada di
 [Sakala Agent API](AGENT_API.md#variabel-dari-envexample).
 
-Keduanya hanya membaca root directory project (folder package pada monorepo), tidak
+`frameworks` menyebut framework yang merender halaman saat build, seperti Gatsby atau Astro,
+dari nama dependency di `package.json`. API memakainya untuk memutuskan apakah perubahan
+variabel butuh build ulang, karena Railpack melaporkan framework seperti itu sebagai Node biasa.
+
+Ketiganya hanya membaca root directory project (folder package pada monorepo), tidak
 pernah di atasnya, dengan batas yang sama seperti `Dockerfile`: symlink hanya diikuti
 selama tetap di dalam direktori itu, hanya file biasa, paling besar 1 MiB per file
 (64 KiB untuk file contoh environment), dan listing direktori berhenti di 200 entri.

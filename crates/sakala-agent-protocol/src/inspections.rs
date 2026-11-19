@@ -44,7 +44,66 @@ pub struct ProjectInspection {
     /// that knows it; a missing field (read as `None`) means an Agent before this field.
     #[serde(default)]
     pub database_hint: Option<DatabaseHint>,
+    /// Frameworks that can render pages at build time, named by the dependencies of
+    /// the inspected directory's `package.json`, sorted by wire name and unique.
+    /// Always sent, `[]` without any or without a readable `package.json`; a missing
+    /// field (read as `[]`) means an Agent before this field.
+    #[serde(default)]
+    pub frameworks: Vec<JsFramework>,
     pub railpack: Value,
+}
+
+/// A JavaScript framework that can render pages at build time, so a variable it reads
+/// then is baked into the image. A closed set: an Agent reports nothing else.
+/// Variants are declared in wire-name order, so `Ord` sorts like the strings.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JsFramework {
+    Astro,
+    Docusaurus,
+    Eleventy,
+    Gatsby,
+    Next,
+    Nuxt,
+    ReactRouter,
+    Remix,
+    Sveltekit,
+    TanstackStart,
+    Vitepress,
+}
+
+impl JsFramework {
+    /// Every value, in wire-name order.
+    pub const ALL: [Self; 11] = [
+        Self::Astro,
+        Self::Docusaurus,
+        Self::Eleventy,
+        Self::Gatsby,
+        Self::Next,
+        Self::Nuxt,
+        Self::ReactRouter,
+        Self::Remix,
+        Self::Sveltekit,
+        Self::TanstackStart,
+        Self::Vitepress,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Astro => "astro",
+            Self::Docusaurus => "docusaurus",
+            Self::Eleventy => "eleventy",
+            Self::Gatsby => "gatsby",
+            Self::Next => "next",
+            Self::Nuxt => "nuxt",
+            Self::ReactRouter => "react-router",
+            Self::Remix => "remix",
+            Self::Sveltekit => "sveltekit",
+            Self::TanstackStart => "tanstack-start",
+            Self::Vitepress => "vitepress",
+        }
+    }
 }
 
 /// The environment example file names an Agent reads, in the order it looks for
@@ -219,8 +278,8 @@ mod tests {
 
     use super::{
         DatabaseEngine, DatabaseHint, DatabaseSignal, DatabaseSignalKind, EnvExample,
-        EnvExampleEntry, EnvExampleFile, JsPackageManager, JsWorkspace, ProjectInspection,
-        SuggestedReleaseCommand,
+        EnvExampleEntry, EnvExampleFile, JsFramework, JsPackageManager, JsWorkspace,
+        ProjectInspection, SuggestedReleaseCommand,
     };
 
     fn result_without_ports() -> serde_json::Value {
@@ -367,6 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn frameworks_is_always_sent_and_absent_only_from_an_older_agent() {
+        let mut inspection: ProjectInspection =
+            serde_json::from_value(result_without_ports()).expect("older result");
+        assert!(inspection.frameworks.is_empty());
+        assert_eq!(
+            serde_json::to_value(&inspection).expect("json")["frameworks"],
+            json!([])
+        );
+        inspection.frameworks = vec![JsFramework::Gatsby, JsFramework::TanstackStart];
+        let json = serde_json::to_value(&inspection).expect("json");
+        assert_eq!(json["frameworks"], json!(["gatsby", "tanstack-start"]));
+        let read_back: ProjectInspection = serde_json::from_value(json).expect("round trip");
+        assert_eq!(read_back, inspection);
+    }
+
+    #[test]
+    fn a_framework_outside_the_closed_set_is_rejected() {
+        let mut json = result_without_ports();
+        json["frameworks"] = json!(["vite"]);
+        assert!(serde_json::from_value::<ProjectInspection>(json).is_err());
+    }
+
+    #[test]
+    fn framework_order_is_wire_name_order() {
+        let names: Vec<&str> = JsFramework::ALL.iter().map(|f| f.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        let mut by_ord = JsFramework::ALL;
+        by_ord.sort_unstable();
+        assert_eq!(by_ord, JsFramework::ALL);
+    }
+
+    #[test]
     fn a_hint_without_evidence_is_an_explicit_object() {
         assert_eq!(
             serde_json::to_value(DatabaseHint::none()).expect("json"),
@@ -383,6 +476,12 @@ mod tests {
     fn wire_names_match_the_string_helpers() {
         for file in EnvExampleFile::CANDIDATES {
             assert_eq!(serde_json::to_value(file).expect("json"), file.as_str());
+        }
+        for framework in JsFramework::ALL {
+            assert_eq!(
+                serde_json::to_value(framework).expect("json"),
+                framework.as_str()
+            );
         }
         for command in [
             SuggestedReleaseCommand::LaravelMigrate,

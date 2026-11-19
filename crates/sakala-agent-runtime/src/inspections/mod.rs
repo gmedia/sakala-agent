@@ -2,6 +2,8 @@ mod base_image;
 mod database_hint;
 mod dockerfile;
 mod env_example;
+mod frameworks;
+mod json_manifest;
 
 use std::{path::Path, sync::Arc};
 
@@ -105,9 +107,10 @@ impl ProjectInspector for RailpackProjectInspector {
             Some(contents) => exposed_ports(&contents, &self.registry).await,
             None => Vec::new(),
         };
-        // Both read the root directory only, also inside a workspace package.
+        // These read the root directory only, also inside a workspace package.
         let env_example = env_example::read(context).await;
         let database_hint = database_hint::detect(context, env_example.as_ref()).await;
+        let frameworks = frameworks::detect(context).await;
 
         Ok(ProjectInspection {
             repository_url: source.repository_url.clone(),
@@ -129,6 +132,7 @@ impl ProjectInspector for RailpackProjectInspector {
             exposed_ports,
             env_example: env_example.map(|scan| scan.example),
             database_hint: Some(database_hint),
+            frameworks,
             railpack,
         })
     }
