@@ -16,7 +16,11 @@
 //! loopback port, with `log_statement=all` so the server log can be checked for
 //! the plaintext password, and removes it at the end.
 
-use std::{process::Command, sync::Arc, time::Duration};
+use std::{
+    process::Command,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sakala_agent_core::{
@@ -39,17 +43,26 @@ use uuid::Uuid;
 const CONTAINER: &str = "sakala-smdb-postgres";
 const DEFAULT_IMAGE: &str = "postgres:18-alpine";
 const IMAGE_ENV: &str = "SAKALA_SMOKE_POSTGRES_IMAGE";
-const ADMIN_PASSWORD: &str = "smoke-admin-password-0f3c9a";
 const READY_ATTEMPTS: usize = 60;
 
 const DATABASE_A: &str = "p_smokeaaaaaaaaaaaa";
 const ROLE_A: &str = "p_smokeroleaaaaaaaa";
-const PASSWORD_A: &str = "Aa1-smoke-tenant-password-first";
-const PASSWORD_A_ROTATED: &str = "Aa2-smoke-tenant-password-rotated";
 const DATABASE_B: &str = "p_smokebbbbbbbbbbbb";
 const ROLE_B: &str = "p_smokerolebbbbbbbb";
-const PASSWORD_B: &str = "Bb1-smoke-tenant-password-second";
 const OUTSIDER: &str = "smoke_outsider";
+
+// Passwords are random per run, so nothing secret-looking is committed and a
+// leftover container from an earlier run cannot be reused by accident.
+static ADMIN_PASSWORD: LazyLock<String> = LazyLock::new(random_password);
+static PASSWORD_A: LazyLock<String> = LazyLock::new(random_password);
+static PASSWORD_A_ROTATED: LazyLock<String> = LazyLock::new(random_password);
+static PASSWORD_B: LazyLock<String> = LazyLock::new(random_password);
+static OUTSIDER_PASSWORD: LazyLock<String> = LazyLock::new(random_password);
+
+/// 32 hexadecimal characters, inside the agent's accepted password length.
+fn random_password() -> String {
+    Uuid::new_v4().simple().to_string()
+}
 
 struct SilentReporter;
 
@@ -79,7 +92,8 @@ fn docker(arguments: &[&str]) -> String {
         .expect("docker runs");
     assert!(
         output.status.success(),
-        "docker {arguments:?}: {}",
+        "docker {}: {}",
+        arguments.first().copied().unwrap_or_default(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
@@ -89,7 +103,7 @@ fn start_postgres() -> (Container, u16) {
     let _ = Command::new("docker")
         .args(["rm", "-f", CONTAINER])
         .output();
-    let password = format!("POSTGRES_PASSWORD={ADMIN_PASSWORD}");
+    let password = format!("POSTGRES_PASSWORD={}", ADMIN_PASSWORD.as_str());
     let image = std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_owned());
     docker(&[
         "run",
@@ -137,7 +151,7 @@ async fn connect(
 
 async fn wait_until_ready(port: u16) {
     for _ in 0..READY_ATTEMPTS {
-        if connect(port, "postgres", "postgres", ADMIN_PASSWORD)
+        if connect(port, "postgres", "postgres", ADMIN_PASSWORD.as_str())
             .await
             .is_ok()
         {
@@ -190,7 +204,7 @@ async fn show(client: &Client, parameter: &str) -> String {
 async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     let (_container, port) = start_postgres();
     wait_until_ready(port).await;
-    let version: String = connect(port, "postgres", "postgres", ADMIN_PASSWORD)
+    let version: String = connect(port, "postgres", "postgres", ADMIN_PASSWORD.as_str())
         .await
         .expect("admin")
         .query_one("SHOW server_version", &[])
@@ -200,7 +214,8 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     println!("PostgreSQL {version} on 127.0.0.1:{port}");
 
     let admin_config = PostgresAdminConfig::parse(&SecretString::new(format!(
-        "postgresql://postgres:{ADMIN_PASSWORD}@127.0.0.1:{port}/postgres"
+        "postgresql://postgres:{}@127.0.0.1:{port}/postgres",
+        ADMIN_PASSWORD.as_str()
     )))
     .expect("admin config");
     let admin = Arc::new(PostgresDatabaseAdmin::new(admin_config));
@@ -209,7 +224,8 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         .with_database_admin(Arc::clone(&admin) as Arc<dyn DatabaseAdmin>);
 
     // Create, then create again: the second run changes nothing.
-    let create_a = json!({ "database": DATABASE_A, "role": ROLE_A, "password": PASSWORD_A });
+    let create_a =
+        json!({ "database": DATABASE_A, "role": ROLE_A, "password": PASSWORD_A.as_str() });
     let first = dispatch(&dispatcher, CommandType::CreateDatabase, create_a.clone())
         .await
         .expect("create A");
@@ -224,18 +240,18 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         again,
         json!({ "database": DATABASE_A, "role": ROLE_A, "created": false })
     );
-    assert!(!first.to_string().contains(PASSWORD_A));
+    assert!(!first.to_string().contains(PASSWORD_A.as_str()));
     dispatch(
         &dispatcher,
         CommandType::CreateDatabase,
-        json!({ "database": DATABASE_B, "role": ROLE_B, "password": PASSWORD_B }),
+        json!({ "database": DATABASE_B, "role": ROLE_B, "password": PASSWORD_B.as_str() }),
     )
     .await
     .expect("create B");
     println!("create: first {first}, repeated {again}");
 
     // The tenant connects and works in its own database.
-    let tenant = connect(port, DATABASE_A, ROLE_A, PASSWORD_A)
+    let tenant = connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
         .await
         .expect("tenant A connects");
     tenant
@@ -289,7 +305,7 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
 
     // Isolation: no other tenant database, no maintenance database.
     for database in [DATABASE_B, "postgres", "template1"] {
-        let error = connect(port, database, ROLE_A, PASSWORD_A)
+        let error = connect(port, database, ROLE_A, PASSWORD_A.as_str())
             .await
             .expect_err("tenant A cannot connect elsewhere");
         assert_eq!(
@@ -302,17 +318,18 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
 
     // No CREATE on schema public for anyone but the owner, even a role that
     // was given CONNECT by hand.
-    let superuser = connect(port, DATABASE_A, "postgres", ADMIN_PASSWORD)
+    let superuser = connect(port, DATABASE_A, "postgres", ADMIN_PASSWORD.as_str())
         .await
         .expect("admin in A");
     superuser
         .batch_execute(&format!(
-            "CREATE ROLE {OUTSIDER} LOGIN PASSWORD 'outsider-password-123'; \
-             GRANT CONNECT ON DATABASE {DATABASE_A} TO {OUTSIDER};"
+            "CREATE ROLE {OUTSIDER} LOGIN PASSWORD '{}'; \
+             GRANT CONNECT ON DATABASE {DATABASE_A} TO {OUTSIDER};",
+            OUTSIDER_PASSWORD.as_str()
         ))
         .await
         .expect("outsider");
-    let outsider = connect(port, DATABASE_A, OUTSIDER, "outsider-password-123")
+    let outsider = connect(port, DATABASE_A, OUTSIDER, &OUTSIDER_PASSWORD)
         .await
         .expect("outsider connects");
     let create = outsider
@@ -343,12 +360,12 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     let mut sessions = Vec::new();
     for _ in 0..4 {
         sessions.push(
-            connect(port, DATABASE_A, ROLE_A, PASSWORD_A)
+            connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
                 .await
                 .expect("session"),
         );
     }
-    let sixth = connect(port, DATABASE_A, ROLE_A, PASSWORD_A)
+    let sixth = connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
         .await
         .expect_err("sixth session");
     assert_eq!(sql_state(&sixth), SqlState::TOO_MANY_CONNECTIONS.code());
@@ -385,14 +402,14 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         tenant.batch_execute("SELECT 1").await.is_err(),
         "the open session ended"
     );
-    let refused = connect(port, DATABASE_A, ROLE_A, PASSWORD_A)
+    let refused = connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
         .await
         .expect_err("locked");
     assert_eq!(
         sql_state(&refused),
         SqlState::INVALID_AUTHORIZATION_SPECIFICATION.code()
     );
-    connect(port, DATABASE_A, "postgres", ADMIN_PASSWORD)
+    connect(port, DATABASE_A, "postgres", ADMIN_PASSWORD.as_str())
         .await
         .expect("admin connects to a locked database for backups");
     assert_eq!(admin.database_sizes().await.expect("sizes").len(), 2);
@@ -406,13 +423,15 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     let repeat = dispatch(
         &dispatcher,
         CommandType::CreateDatabase,
-        json!({ "database": DATABASE_A, "role": ROLE_A, "password": PASSWORD_A }),
+        json!({ "database": DATABASE_A, "role": ROLE_A, "password": PASSWORD_A.as_str() }),
     )
     .await
     .expect("create on a locked database");
     assert_eq!(repeat["created"], false);
     assert!(
-        connect(port, DATABASE_A, ROLE_A, PASSWORD_A).await.is_err(),
+        connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
+            .await
+            .is_err(),
         "a repeated create does not unlock"
     );
     println!(
@@ -427,7 +446,7 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     .await
     .expect("unlock");
     assert_eq!(unlock["locked"], false);
-    connect(port, DATABASE_A, ROLE_A, PASSWORD_A)
+    connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
         .await
         .expect("tenant connects after unlock");
     println!("unlock: {unlock}; tenant connects again");
@@ -436,13 +455,17 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
     let rotate = dispatch(
         &dispatcher,
         CommandType::RotateDatabasePassword,
-        json!({ "role": ROLE_A, "password": PASSWORD_A_ROTATED }),
+        json!({ "role": ROLE_A, "password": PASSWORD_A_ROTATED.as_str() }),
     )
     .await
     .expect("rotate");
     assert_eq!(rotate, json!({ "role": ROLE_A }));
-    assert!(connect(port, DATABASE_A, ROLE_A, PASSWORD_A).await.is_err());
-    let tenant = connect(port, DATABASE_A, ROLE_A, PASSWORD_A_ROTATED)
+    assert!(
+        connect(port, DATABASE_A, ROLE_A, PASSWORD_A.as_str())
+            .await
+            .is_err()
+    );
+    let tenant = connect(port, DATABASE_A, ROLE_A, PASSWORD_A_ROTATED.as_str())
         .await
         .expect("new password");
     println!("rotate: old password refused, new password accepted");
@@ -538,7 +561,7 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         .expect("drop A again");
     assert_eq!(dropped["dropped"], true);
     assert_eq!(dropped_again["dropped"], false);
-    let leftovers: i64 = connect(port, "postgres", "postgres", ADMIN_PASSWORD)
+    let leftovers: i64 = connect(port, "postgres", "postgres", ADMIN_PASSWORD.as_str())
         .await
         .expect("admin")
         .query_one(
@@ -551,7 +574,7 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         .get(0);
     assert_eq!(leftovers, 0);
     assert!(
-        connect(port, DATABASE_A, ROLE_A, PASSWORD_A_ROTATED)
+        connect(port, DATABASE_A, ROLE_A, PASSWORD_A_ROTATED.as_str())
             .await
             .is_err()
     );
@@ -570,7 +593,11 @@ async fn the_database_role_isolates_tenants_on_a_real_postgres() {
         String::from_utf8_lossy(&log.stdout),
         String::from_utf8_lossy(&log.stderr)
     );
-    for password in [PASSWORD_A, PASSWORD_A_ROTATED, PASSWORD_B] {
+    for password in [
+        PASSWORD_A.as_str(),
+        PASSWORD_A_ROTATED.as_str(),
+        PASSWORD_B.as_str(),
+    ] {
         assert!(
             !log.contains(password),
             "a tenant password reached the server log"
