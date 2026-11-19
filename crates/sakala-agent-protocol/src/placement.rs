@@ -180,7 +180,7 @@ fn is_valid_host(host: &str) -> bool {
 
 /// Dot-separated labels of letters, digits, and inner hyphens, each 1 to 63
 /// characters, at most 253 characters in total and without a trailing dot.
-fn is_valid_hostname(host: &str) -> bool {
+pub(crate) fn is_valid_hostname(host: &str) -> bool {
     (1..=HOSTNAME_MAX_LENGTH).contains(&host.len())
         && host.split(DNS_LABEL_SEPARATOR).all(|label| {
             let edges_are_alphanumeric = label

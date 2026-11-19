@@ -14,7 +14,10 @@ use tokio::{sync::watch, time::sleep};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::metrics::{WorkloadMetricsSampler, insert_metrics};
+use super::{
+    databases::DatabaseHeartbeat,
+    metrics::{WorkloadMetricsSampler, insert_metrics},
+};
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
     api::ApiClient,
@@ -47,6 +50,9 @@ pub struct HeartbeatRuntimeContext {
     /// `None` on a runtime without the `workload-metrics` capability, whose
     /// heartbeats never carry the list.
     pub metrics: Option<WorkloadMetricsSampler>,
+    /// `metadata.database` and `metadata.databases` on a database host, `None`
+    /// on a node without `SAKALA_DATABASE_DRIVER`.
+    pub database: Option<DatabaseHeartbeat>,
 }
 
 pub async fn run(
@@ -213,10 +219,15 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
     }
     insert_maximum_active_workloads(&mut metadata, workloads.maximum_active_workloads);
     insert_placement(&mut metadata, &config.placement);
+    let database_available = match &context.database {
+        Some(database) => database.insert(&mut metadata).await,
+        None => true,
+    };
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
                 if !telemetry_available
+                    || !database_available
                     || resources.runtime_operational == Some(false)
                     || !workloads.capacity_available
                     || !workloads.health_available
@@ -601,6 +612,7 @@ mod tests {
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
+            database: None,
         }
     }
 
@@ -626,6 +638,7 @@ mod tests {
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
+            database: None,
         };
         let heartbeat = payload(&config, &context).await;
 
@@ -1448,6 +1461,93 @@ mod tests {
         assert!(between.metadata["detail_counts"].get("metrics").is_none());
     }
 
+    struct DatabaseSizes {
+        result: Result<Vec<sakala_agent_protocol::ManagedDatabaseSize>, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::DatabaseAdmin for DatabaseSizes {
+        async fn database_sizes(
+            &self,
+        ) -> Result<Vec<sakala_agent_protocol::ManagedDatabaseSize>, RuntimeExecutionError>
+        {
+            self.result
+                .clone()
+                .map_err(|()| RuntimeExecutionError::new("database_admin_unavailable", "refused"))
+        }
+    }
+
+    fn database_context(
+        result: Result<Vec<sakala_agent_protocol::ManagedDatabaseSize>, ()>,
+    ) -> HeartbeatRuntimeContext {
+        let mut context = heartbeat_context(
+            Arc::new(EmptyRuntime),
+            RuntimeReconciliationReport::default(),
+        );
+        context.database = Some(super::DatabaseHeartbeat::new(
+            Arc::new(DatabaseSizes { result }),
+            sakala_agent_protocol::DatabaseEndpoint::new("10.0.47.10", 5432).expect("endpoint"),
+        ));
+        context
+    }
+
+    #[tokio::test]
+    async fn a_database_host_reports_its_endpoint_and_database_sizes() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let context = database_context(Ok(vec![sakala_agent_protocol::ManagedDatabaseSize {
+            name: "p_0123456789abcdef".to_owned(),
+            size_bytes: 7_952_063,
+        }]));
+
+        let heartbeat = payload(&config, &context).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Ready);
+        assert_eq!(
+            heartbeat.metadata["database"],
+            json!({ "endpoint": { "host": "10.0.47.10", "port": 5432 }, "available": true })
+        );
+        assert_eq!(
+            heartbeat.metadata["databases"],
+            json!([{ "name": "p_0123456789abcdef", "size_bytes": 7_952_063 }])
+        );
+        assert_eq!(heartbeat.metadata["detail_counts"]["databases"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_database_host_that_cannot_read_its_instance_is_degraded() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+
+        let heartbeat = payload(&config, &database_context(Err(()))).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Degraded);
+        assert_eq!(heartbeat.metadata["database"]["available"], false);
+        assert!(heartbeat.metadata.get("databases").is_none());
+        assert!(
+            heartbeat.metadata["detail_counts"]
+                .get("databases")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_node_sends_no_database_keys() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert!(heartbeat.metadata.get("database").is_none());
+        assert!(heartbeat.metadata.get("databases").is_none());
+    }
+
     #[tokio::test]
     async fn a_runtime_without_the_capability_never_samples_metrics() {
         let config = AgentConfig::from_values(&HashMap::new())
@@ -1527,6 +1627,7 @@ mod tests {
             minimum_workspace_free_bytes: 0,
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
+            database: None,
         };
 
         assert_eq!(

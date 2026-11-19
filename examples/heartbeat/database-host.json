@@ -1,0 +1,29 @@
+{
+  "status": "ready",
+  "hostname": "database-01",
+  "runtime_network": "sakala-runtime",
+  "capabilities": ["noop-runtime", "managed-postgres"],
+  "metadata": {
+    "version": "0.11.0",
+    "protocol_version": 4,
+    "runtime_driver": "noop",
+    "runtime": {
+      "region": "id-jog-1"
+    },
+    "database": {
+      "endpoint": {
+        "host": "10.0.47.10",
+        "port": 5432
+      },
+      "available": true
+    },
+    "databases": [
+      { "name": "p_8k2m4q7x9z1c3v5b6n0d", "size_bytes": 7952063 },
+      { "name": "p_q1w2e3r4t5y6u7i8o9p0", "size_bytes": 412090368 }
+    ],
+    "detail_counts": {
+      "databases": 2
+    }
+  },
+  "sent_at": "2026-11-19T03:20:00Z"
+}

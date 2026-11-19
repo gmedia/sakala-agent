@@ -1,0 +1,69 @@
+{
+  "data": [
+    {
+      "id": "6f0c2d4e-1a3b-4c5d-8e9f-0a1b2c3d4e5f",
+      "type": "CreateDatabase",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "database": "p_8k2m4q7x9z1c3v5b6n0d",
+        "role": "p_r4t7y2u9i1o3p5a8s6d0",
+        "password": "example-only-Xq9vR2mT7kL4wN8cZ1bH5jF3"
+      }
+    },
+    {
+      "id": "7a1d3e5f-2b4c-4d6e-9f0a-1b2c3d4e5f60",
+      "type": "RotateDatabasePassword",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "role": "p_r4t7y2u9i1o3p5a8s6d0",
+        "password": "example-only-Pw7sD3fG9hJ2kL5zX8cV1bN4"
+      }
+    },
+    {
+      "id": "8b2e4f60-3c5d-4e7f-a01b-2c3d4e5f6071",
+      "type": "LockDatabase",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "database": "p_8k2m4q7x9z1c3v5b6n0d"
+      }
+    },
+    {
+      "id": "9c3f5061-4d6e-4f80-b12c-3d4e5f607182",
+      "type": "UnlockDatabase",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "database": "p_8k2m4q7x9z1c3v5b6n0d"
+      }
+    },
+    {
+      "id": "ad406172-5e7f-4091-c23d-4e5f60718293",
+      "type": "InstallDatabaseExtension",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "database": "p_8k2m4q7x9z1c3v5b6n0d",
+        "extension": "vector"
+      }
+    },
+    {
+      "id": "be517283-6f80-41a2-d34e-5f60718293a4",
+      "type": "DropDatabase",
+      "status": "Pending",
+      "project_id": null,
+      "deployment_id": null,
+      "payload": {
+        "database": "p_8k2m4q7x9z1c3v5b6n0d",
+        "role": "p_r4t7y2u9i1o3p5a8s6d0"
+      }
+    }
+  ]
+}

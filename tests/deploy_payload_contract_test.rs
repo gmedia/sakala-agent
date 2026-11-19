@@ -1,7 +1,8 @@
 use sakala_agent_protocol::{
-    AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DeployProjectResult,
-    FinalizationDeferredReason, HeartbeatPayload, NodePlacement, RequestedReplicas, SleepingPage,
-    WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
+    AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
+    DatabaseExtension, DeployProjectResult, FinalizationDeferredReason, HeartbeatPayload,
+    MANAGED_POSTGRES_CAPABILITY, ManagedDatabaseSize, ManagedName, NodePlacement,
+    RequestedReplicas, SleepingPage, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
 
 #[test]
@@ -398,4 +399,84 @@ fn workload_metrics_fixture_matches_the_heartbeat_contract() {
         serde_json::to_value(&metrics).expect("metrics serialize"),
         heartbeat.metadata["workloads"]["metrics"]
     );
+}
+
+#[test]
+fn api_database_command_fixtures_carry_valid_payloads_without_workload_identity() {
+    let poll: CommandPoll =
+        serde_json::from_str(include_str!("../examples/commands/database-commands.json"))
+            .expect("database command fixture must deserialize");
+
+    let types: Vec<_> = poll
+        .data
+        .iter()
+        .map(|command| command.command_type)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            CommandType::CreateDatabase,
+            CommandType::RotateDatabasePassword,
+            CommandType::LockDatabase,
+            CommandType::UnlockDatabase,
+            CommandType::InstallDatabaseExtension,
+            CommandType::DropDatabase,
+        ]
+    );
+    for command in &poll.data {
+        assert!(command.project_id.is_none());
+        assert!(command.deployment_id.is_none());
+    }
+    let create = poll.data[0]
+        .create_database_payload()
+        .expect("CreateDatabase payload must be valid");
+    assert_eq!(create.database.as_str(), "p_8k2m4q7x9z1c3v5b6n0d");
+    assert_eq!(create.role.as_str(), "p_r4t7y2u9i1o3p5a8s6d0");
+    poll.data[1]
+        .rotate_database_password_payload()
+        .expect("RotateDatabasePassword payload must be valid");
+    poll.data[2]
+        .database_target_payload()
+        .expect("LockDatabase payload must be valid");
+    poll.data[3]
+        .database_target_payload()
+        .expect("UnlockDatabase payload must be valid");
+    assert_eq!(
+        poll.data[4]
+            .install_database_extension_payload()
+            .expect("InstallDatabaseExtension payload must be valid")
+            .extension,
+        DatabaseExtension::Vector
+    );
+    poll.data[5]
+        .drop_database_payload()
+        .expect("DropDatabase payload must be valid");
+}
+
+#[test]
+fn database_host_heartbeat_fixture_matches_the_protocol_types() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/database-host.json"))
+            .expect("database host heartbeat fixture must deserialize");
+
+    assert!(
+        heartbeat
+            .node
+            .capabilities
+            .contains(&MANAGED_POSTGRES_CAPABILITY.to_owned())
+    );
+    let endpoint: DatabaseEndpoint =
+        serde_json::from_value(heartbeat.metadata["database"]["endpoint"].clone())
+            .expect("endpoint");
+    assert_eq!(
+        endpoint,
+        DatabaseEndpoint::new("10.0.47.10", 5432).expect("valid endpoint")
+    );
+    let databases: Vec<ManagedDatabaseSize> =
+        serde_json::from_value(heartbeat.metadata["databases"].clone()).expect("databases");
+    assert_eq!(databases.len(), 2);
+    assert_eq!(heartbeat.metadata["detail_counts"]["databases"], 2);
+    for database in databases {
+        ManagedName::parse(&database.name).expect("managed name");
+    }
 }

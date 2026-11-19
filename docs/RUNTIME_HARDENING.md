@@ -325,6 +325,12 @@ semula.
 Yang tidak dibatasi: laju koneksi baru per workload, dan penyalahgunaan tujuan publik
 di port yang diizinkan, seperti scanning, flood, atau spam HTTP.
 
+## Host database
+
+Hardening instance PostgreSQL terkelola (runc, `pg_hba` hanya `hostssl` dengan SCRAM
+dari IP runtime node, batas memori, `max_connections`) dan yang ditegakkan Agent per
+database tenant ada di [Database Host](DATABASE_HOST.md).
+
 ## Isolation Decision
 
 Maintainer memutuskan runtime node memakai Docker rootful dengan `runsc`, dengan alasan dan pembuktian di [gVisor](#gvisor). Untuk workload publik tidak tepercaya, target berikutnya adalah isolated builder yang terpisah dari runtime daemon, karena `runsc` hanya berlaku pada workload. Rootless mode sendiri mengurangi privilege, tetapi tidak menggantikan tenant isolation, network policy, cache isolation, dan secret boundary. Pembatasan lalu lintas keluar workload dijelaskan di [Egress workload](#egress-workload).

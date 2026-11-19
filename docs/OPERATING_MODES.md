@@ -77,6 +77,13 @@ Noop bukan runtime aplikasi. Completion dari noop hanya membuktikan lifecycle co
 
 Aktifkan hanya pada node yang memenuhi requirement di [DOCKER_RUNTIME.md](DOCKER_RUNTIME.md) dan [RUNTIME_HARDENING.md](RUNTIME_HARDENING.md).
 
+### Peran database
+
+`SAKALA_DATABASE_DRIVER=postgres` menambahkan peran host database di samping driver
+runtime mana pun: Agent mengelola satu instance PostgreSQL lokal untuk database
+terkelola dan mengiklankan capability `managed-postgres`. Host database khusus
+memakai driver runtime `noop`. Lihat [Database Host](DATABASE_HOST.md).
+
 ## Topologi Caddy MVP
 
 Implementasi runtime saat ini memakai topologi referensi `sakala-infra`:

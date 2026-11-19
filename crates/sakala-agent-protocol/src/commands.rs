@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{CommandStatus, DeployProjectPayload, InspectProjectPayload};
+use crate::{
+    CommandStatus, CreateDatabasePayload, DatabasePayloadError, DatabaseTargetPayload,
+    DeployProjectPayload, DropDatabasePayload, InspectProjectPayload,
+    InstallDatabaseExtensionPayload, RotateDatabasePasswordPayload,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +91,13 @@ pub enum CommandType {
     CleanupRuntime,
     DrainNode,
     ResumeNode,
+    /// Managed PostgreSQL, only on nodes that advertise `managed-postgres`.
+    CreateDatabase,
+    DropDatabase,
+    RotateDatabasePassword,
+    LockDatabase,
+    UnlockDatabase,
+    InstallDatabaseExtension,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -127,6 +138,31 @@ impl AgentCommand {
             return Ok(StopProjectPayload::default());
         }
         serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn create_database_payload(&self) -> Result<CreateDatabasePayload, DatabasePayloadError> {
+        CreateDatabasePayload::from_value(&self.payload)
+    }
+
+    pub fn drop_database_payload(&self) -> Result<DropDatabasePayload, DatabasePayloadError> {
+        DropDatabasePayload::from_value(&self.payload)
+    }
+
+    pub fn rotate_database_password_payload(
+        &self,
+    ) -> Result<RotateDatabasePasswordPayload, DatabasePayloadError> {
+        RotateDatabasePasswordPayload::from_value(&self.payload)
+    }
+
+    /// The payload of `LockDatabase` and `UnlockDatabase`.
+    pub fn database_target_payload(&self) -> Result<DatabaseTargetPayload, DatabasePayloadError> {
+        DatabaseTargetPayload::from_value(&self.payload)
+    }
+
+    pub fn install_database_extension_payload(
+        &self,
+    ) -> Result<InstallDatabaseExtensionPayload, DatabasePayloadError> {
+        InstallDatabaseExtensionPayload::from_value(&self.payload)
     }
 
     /// A missing or `null` payload reads as an empty object. An unknown `page`

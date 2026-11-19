@@ -3,6 +3,7 @@
 pub mod builders;
 pub mod config;
 pub mod containers;
+pub mod database;
 pub mod domains;
 pub mod error;
 pub mod executor;

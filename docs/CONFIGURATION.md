@@ -46,6 +46,10 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_MAX_CONTAINER_CPU_MILLIS` | `1000` | Hard ceiling CPU; `1000` berarti `1` vCPU. |
 | `SAKALA_DEFAULT_CONTAINER_PIDS_LIMIT` | `128` | Fallback jumlah process container. |
 | `SAKALA_MAX_CONTAINER_PIDS_LIMIT` | `256` | Hard ceiling jumlah process pada node. |
+| `SAKALA_DATABASE_DRIVER` | `none` | `none` atau `postgres`. `postgres` menjadikan node host database untuk PostgreSQL terkelola, mengiklankan capability `managed-postgres`, dan bisa dipakai bersama driver runtime mana pun. Lihat [Database Host](DATABASE_HOST.md). |
+| `SAKALA_DATABASE_ADMIN_DSN` | tidak ada | Wajib dengan `SAKALA_DATABASE_DRIVER=postgres`. DSN libpq (URL atau `key=value`) ke instance lokal sebagai superuser, misalnya `host=/var/run/postgresql user=postgres dbname=postgres`. Semua host harus socket Unix atau alamat loopback; host lain membuat Agent berhenti saat start. Hanya dibaca dari environment (tidak ada CLI flag, supaya password superuser tidak muncul di argumen process) dan tidak pernah dicetak. Simpan di env file berizin terbatas. |
+| `SAKALA_DATABASE_PUBLIC_HOST` | tidak ada | Wajib dengan `SAKALA_DATABASE_DRIVER=postgres`. Alamat instance seperti yang dijangkau runtime node lewat jaringan privat: IPv4, IPv6 tanpa kurung siku, atau nama DNS. Dikirim di heartbeat sebagai `database.endpoint.host`. |
+| `SAKALA_DATABASE_PUBLIC_PORT` | `5432` | Port 1 sampai 65535 untuk `SAKALA_DATABASE_PUBLIC_HOST`. |
 | `SAKALA_LOG_LEVEL` | `info` | Filter `tracing-subscriber`, misalnya `debug` atau `sakala_agent=debug`. |
 
 `SAKALA_AGENT_MODE` dan `SAKALA_RUNTIME_DRIVER` tidak mewakili hal yang sama. Mode menentukan koneksi control plane, sedangkan driver menentukan efek command pada runtime node. Lihat [Operating Modes](OPERATING_MODES.md) untuk matriks lengkap.

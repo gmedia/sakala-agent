@@ -1,6 +1,8 @@
+mod database;
 mod repository;
 mod runtime;
 
+pub use database::DatabaseAdmin;
 pub use repository::{
     RepositoryCredential, RepositoryCredentialProvider, SecretString,
     UnavailableRepositoryCredentialProvider,

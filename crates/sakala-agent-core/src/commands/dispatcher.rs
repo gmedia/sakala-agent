@@ -9,9 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NodeLifecycle, NodeLifecycleState,
-    commands::handlers::{deploy_project, inspect_project},
+    commands::handlers::{database, deploy_project, inspect_project},
     ports::{
-        CleanupRuntimeRequest, CommandOutput, ReconcileWorkloadRequest,
+        CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ReconcileWorkloadRequest,
         RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
         RuntimeReporterFactory, UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
     },
@@ -22,6 +22,7 @@ pub struct CommandDispatcher {
     repository_credentials: Arc<dyn RepositoryCredentialProvider>,
     node_lifecycle: Arc<NodeLifecycle>,
     reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
+    database_admin: Option<Arc<dyn DatabaseAdmin>>,
 }
 
 impl CommandDispatcher {
@@ -32,6 +33,7 @@ impl CommandDispatcher {
             repository_credentials: Arc::new(UnavailableRepositoryCredentialProvider),
             node_lifecycle: Arc::new(NodeLifecycle::new()),
             reporter_factory: None,
+            database_admin: None,
         }
     }
 
@@ -45,6 +47,7 @@ impl CommandDispatcher {
             repository_credentials,
             node_lifecycle: Arc::new(NodeLifecycle::new()),
             reporter_factory: None,
+            database_admin: None,
         }
     }
 
@@ -59,6 +62,7 @@ impl CommandDispatcher {
             repository_credentials,
             node_lifecycle,
             reporter_factory: None,
+            database_admin: None,
         }
     }
 
@@ -71,6 +75,14 @@ impl CommandDispatcher {
         reporter_factory: Arc<dyn RuntimeReporterFactory>,
     ) -> Self {
         self.reporter_factory = Some(reporter_factory);
+        self
+    }
+
+    /// Handles the managed PostgreSQL commands on a database host. Without it
+    /// every database command fails with `unsupported_runtime_command`.
+    #[must_use]
+    pub fn with_database_admin(mut self, database_admin: Arc<dyn DatabaseAdmin>) -> Self {
+        self.database_admin = Some(database_admin);
         self
     }
 
@@ -231,6 +243,14 @@ impl CommandDispatcher {
                         "available_workload_slots": available_workload_slots,
                     },
                 })))
+            }
+            CommandType::CreateDatabase
+            | CommandType::DropDatabase
+            | CommandType::RotateDatabasePassword
+            | CommandType::LockDatabase
+            | CommandType::UnlockDatabase
+            | CommandType::InstallDatabaseExtension => {
+                database::handle(command, self.database_admin.as_deref()).await
             }
         }
     }
