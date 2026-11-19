@@ -42,5 +42,17 @@
   {
     "error_code": "release_command_timeout",
     "error_message": "the release command did not finish within 600 seconds and was stopped, so this deployment was not started"
+  },
+  {
+    "error_code": "runtime_app_host_blocked",
+    "error_message": "Vite's preview server refuses requests for portfolio.sakala.app, so every visitor would get HTTP 403; add it to preview.allowedHosts in vite.config (for example preview: { allowedHosts: ['portfolio.sakala.app'] }), or clear the start command so Sakala serves the build output as a static site"
+  },
+  {
+    "error_code": "runtime_app_host_blocked",
+    "error_message": "the start command runs Vite's development server, which refuses requests for portfolio.sakala.app, so every visitor would get HTTP 403; clear the start command so Sakala serves the build output as a static site, or add the host to server.allowedHosts in vite.config"
+  },
+  {
+    "error_code": "runtime_app_host_blocked",
+    "error_message": "Django refuses requests for portfolio.sakala.app (DisallowedHost), so every visitor would get HTTP 400; add it to ALLOWED_HOSTS in settings.py, and turn DEBUG off for production"
   }
 ]

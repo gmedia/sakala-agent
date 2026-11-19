@@ -50,6 +50,13 @@ pub enum RuntimeError {
         status: u16,
         waited_seconds: u64,
     },
+    /// The app answers, but a framework setting refuses the project's domain, so
+    /// every visitor would get the refusal.
+    #[error("{}", .check.describe(.host))]
+    AppHostBlocked {
+        host: String,
+        check: crate::health::HostCheck,
+    },
     #[error("the app exited during start with {}", describe_exit_code(*.exit_code))]
     AppCrashed { exit_code: Option<i32> },
     /// The kernel refused to execute a program in the image with EPERM. In a
@@ -128,6 +135,7 @@ impl RuntimeError {
             Self::Health(_) => "runtime_health_check_failed",
             Self::AppNotListening { .. } => "runtime_app_not_listening",
             Self::AppUnhealthy { .. } => "runtime_app_unhealthy",
+            Self::AppHostBlocked { .. } => "runtime_app_host_blocked",
             Self::AppCrashed { .. } => "runtime_app_crashed",
             Self::AppExecDenied { .. } => "runtime_app_exec_denied",
             Self::AppOutOfMemory { .. } => "runtime_app_out_of_memory",

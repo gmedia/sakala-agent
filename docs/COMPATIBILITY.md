@@ -279,6 +279,18 @@ package (gmedia/sakala-agent#74). Either side can be deployed first.
 | `InspectProject` result field `workspace` | Sent, always. | `null` without a workspace. Otherwise `{ manager, root_directory, package_directory, package_name, build_command, start_command, static_output_directory }`; `manager` is one of `npm`, `pnpm`, `yarn`, `bun`, and `package_manager` then holds the same value. A result without the field comes from an older Agent. An older API copies known keys only, so it ignores the field. Shape in [Sakala Agent API](AGENT_API.md#project-inspection-command). |
 | Event `deployment.workspace.detected` | Sent only for such a build, after `deployment.analysis.started`. | Additive. Metadata has the shape of `workspace` above with the commands actually used. An API that does not map it stores it on the timeline without changing status; it maps to no status. |
 
+## Revision 4 additions for host checks
+
+Still revision 4: one additive failure code and no wire change otherwise. Either side
+can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `error_code` value `runtime_app_host_blocked` | Sent on `fail` of `DeployProject`. | Additive and user-fixable. The app answered, but Vite's preview or dev server (403) or Django's debug page (400) refuses the project's domain, so every visitor would get that refusal. Such a deployment used to succeed, because any status below 500 passes readiness. The message names the domain, the framework, and the fix. The previous deployment keeps serving. Suggested mapping: category start, hint to add the domain to `allowedHosts`/`ALLOWED_HOSTS` or to clear a `vite preview` start command. Rules in [Docker Runtime](DOCKER_RUNTIME.md#host-yang-ditolak-framework). |
+
+Host requirement: the runtime router image needs BusyBox `nc`, which `caddy:*-alpine`
+has. Without it the check is skipped and readiness behaves as before.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

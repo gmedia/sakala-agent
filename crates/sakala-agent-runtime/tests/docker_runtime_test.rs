@@ -26,7 +26,7 @@ use sakala_agent_protocol::{
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
-    ProcessRunner, ProcessStream, ProjectDomainSuffixes, RuntimeError,
+    ProcessRunner, ProcessStream, ProjectDomainSuffixes, RuntimeError, health::HostCheck,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -3067,6 +3067,90 @@ async fn root_returning_404_passes_because_the_app_answers() {
 }
 
 #[tokio::test]
+async fn a_vite_host_block_fails_the_deployment_instead_of_serving_403() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_probe_results(&[(1, FORBIDDEN_PROBE_STDERR)])
+            .with_host_check_reply(VITE_PREVIEW_HOST_BLOCK),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let route = route_file(&config);
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+    let deploy = deploy_with_start_timeout(1);
+    let domain = deploy.payload["domain"]
+        .as_str()
+        .expect("domain")
+        .to_owned();
+
+    let error = dispatch(executor, &deploy, reporter)
+        .await
+        .expect_err("visitors would only get 403");
+
+    assert_eq!(error.code(), "runtime_app_host_blocked");
+    let message = error.to_string();
+    assert!(message.contains(&domain), "{message}");
+    assert!(message.contains("preview.allowedHosts"), "{message}");
+    assert!(!route.exists());
+    let check = string_arguments(&find_command(&runner, is_host_check));
+    assert!(check.contains(&domain), "{check:?}");
+    assert_eq!(runner.count_commands(is_host_check), 1);
+}
+
+#[tokio::test]
+async fn a_403_that_is_not_a_host_block_still_counts_as_an_answer() {
+    for reply in [
+        "HTTP/1.1 403 Forbidden\r\n\r\nPlease sign in",
+        "sh: nc: not found\n",
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(
+            FakeRunner::new(true)
+                .with_probe_results(&[(1, FORBIDDEN_PROBE_STDERR)])
+                .with_host_check_reply(reply),
+        );
+        let config = runtime_config(&temp);
+        let route = route_file(&config);
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+        dispatch(
+            executor,
+            &deploy_with_start_timeout(1),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect("a login wall is a working app");
+
+        assert!(route.exists(), "{reply:?}");
+        assert_eq!(runner.count_commands(is_host_check), 1, "{reply:?}");
+    }
+}
+
+#[tokio::test]
+async fn statuses_no_host_check_uses_skip_the_second_request() {
+    for stderr in [OK_PROBE_STDERR, NOT_FOUND_PROBE_STDERR] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(
+            FakeRunner::new(true)
+                .with_probe_results(&[(1, stderr)])
+                .with_host_check_reply(VITE_PREVIEW_HOST_BLOCK),
+        );
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+        dispatch(
+            executor,
+            &deploy_with_start_timeout(1),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect("deployment completes");
+
+        assert_eq!(runner.count_commands(is_host_check), 0, "{stderr}");
+    }
+}
+
+#[tokio::test]
 async fn root_returning_500_fails_as_unhealthy_with_the_last_status() {
     let temp = TempDir::new().expect("temp directory should be available");
     let runner =
@@ -5749,6 +5833,18 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
             out_of_memory_limit_mb: Some(256),
         },
         RuntimeError::ReleaseCommandTimeout { seconds: 600 },
+        RuntimeError::AppHostBlocked {
+            host: "portfolio.sakala.app".to_owned(),
+            check: HostCheck::VitePreview,
+        },
+        RuntimeError::AppHostBlocked {
+            host: "portfolio.sakala.app".to_owned(),
+            check: HostCheck::ViteDevServer,
+        },
+        RuntimeError::AppHostBlocked {
+            host: "portfolio.sakala.app".to_owned(),
+            check: HostCheck::Django,
+        },
     ];
     let expected = fixture.as_array().expect("fixture is a list");
     assert_eq!(expected.len(), errors.len());
@@ -6308,6 +6404,8 @@ const RUNNING_STATE: &str = "running\t0\t0\tfalse\tnone\t268435456\n";
 const OK_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.3:3000)\n  HTTP/1.1 200 OK\n  Content-Length: 4\n  \nremote file exists\n";
 const NOT_FOUND_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.4:3000)\n  HTTP/1.1 404 Not Found\nwget: server returned error: HTTP/1.1 404 Not Found\n";
 const SERVER_ERROR_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.5:3000)\n  HTTP/1.1 500 Internal Server Error\nwget: server returned error: HTTP/1.1 500 Internal Server Error\n";
+const FORBIDDEN_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.4:3000)\n  HTTP/1.1 403 Forbidden\nwget: server returned error: HTTP/1.1 403 Forbidden\n";
+const VITE_PREVIEW_HOST_BLOCK: &str = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nBlocked request. This host (\"portfolio.sakala.app\") is not allowed.\nTo allow this host, add \"portfolio.sakala.app\" to `preview.allowedHosts` in vite.config.js.";
 const REFUSED_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.3:3000)\nwget: can't connect to remote host (172.25.0.3): Connection refused\n";
 const REDIRECT_PROBE_STDERR: &str = "Connecting to app:3000 (172.25.0.9:3000)\n  HTTP/1.1 302 Found\n  Location: http://outside.invalid/x\n  HTTP/1.1 302 Found\n  Location: http://outside.invalid/x\nwget: too many redirections\n";
 const BAD_ADDRESS_PROBE_STDERR: &str = "wget: bad address 'app:3000'\n";
@@ -6370,6 +6468,15 @@ fn is_probe(spec: &CommandSpec) -> bool {
         && !spec.args.iter().any(|argument| argument == "--help")
 }
 
+fn is_host_check(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "exec")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument.to_string_lossy().contains("| nc -w"))
+}
+
 fn is_app_logs(spec: &CommandSpec) -> bool {
     spec.program == "docker"
         && spec.args.first().is_some_and(|argument| argument == "logs")
@@ -6410,6 +6517,8 @@ fn reported_messages(reporter: &RecordingReporter) -> Vec<String> {
 
 struct FakeRunner {
     dockerfile: bool,
+    /// What the router's second request with the visitors' `Host` prints.
+    host_check_reply: Option<String>,
     /// Makes the checkout a pnpm workspace with `apps/web` as a Vite package.
     js_workspace: bool,
     commands: Mutex<Vec<CommandSpec>>,
@@ -6682,6 +6791,7 @@ impl FakeRunner {
     fn new(dockerfile: bool) -> Self {
         Self {
             dockerfile,
+            host_check_reply: None,
             js_workspace: false,
             commands: Mutex::new(Vec::new()),
             docker_ps_stdout: String::new(),
@@ -6808,6 +6918,11 @@ impl FakeRunner {
     }
 
     /// `wget` results, in order, as exit code and stderr. The last one repeats.
+    fn with_host_check_reply(mut self, reply: &str) -> Self {
+        self.host_check_reply = Some(reply.to_owned());
+        self
+    }
+
     fn with_probe_results(self, results: &[(i32, &str)]) -> Self {
         *self.probe_results.lock().expect("probe lock") = results
             .iter()
@@ -7183,6 +7298,14 @@ impl ProcessRunner for FakeRunner {
                 code: Some(125),
                 stdout: String::new(),
                 stderr: "docker: unknown or invalid runtime name: runsc".to_owned(),
+            });
+        }
+        if is_host_check(spec) {
+            return Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout: self.host_check_reply.clone().unwrap_or_default(),
+                stderr: String::new(),
             });
         }
         if is_probe(spec) {

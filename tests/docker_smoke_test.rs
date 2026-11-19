@@ -82,6 +82,58 @@ fn serve(status: u16) -> String {
     )
 }
 
+/// A Node app that refuses every `Host` except `allowed` the way Vite 8's
+/// `vite preview` does: 403 and the same text (`hostCheck.ts`). The backticks are
+/// `\x60`, because the script runs inside `sh -c "…"`.
+fn vite_like_host_check(allowed: &str) -> String {
+    node_app(
+        &format!(
+            "const h=(q.headers.host||'').split(':')[0];if(h==='{allowed}'){{s.end('ok')}}else{{s.statusCode=403;s.setHeader('Content-Type','text/plain');s.end('Blocked request. This host ('+JSON.stringify(h)+') is not allowed.\\nTo allow this host, add '+JSON.stringify(h)+' to \\x60preview.allowedHosts\\x60 in vite.config.js.')}}"
+        ),
+        "process.env.PORT,'0.0.0.0'",
+        "",
+    )
+}
+
+/// The probe cannot tell a host refusal from a login page by status, so on 403 the
+/// Agent asks once more through the real router with the visitors' `Host`. An app
+/// that refuses that host fails; one that refuses only the probe's container name,
+/// as Vite with `allowedHosts` set correctly does, still deploys.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, caddy:2.11.3-alpine, and node:24-alpine"]
+async fn a_framework_that_refuses_the_domain_fails_readiness() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start(&temp).await;
+
+    let run = harness
+        .deploy("hostblocked", &vite_like_host_check("nobody.invalid"), &[])
+        .await;
+    run.print("Vite-like host check refuses the domain");
+    run.assert_failed(
+        "runtime_app_host_blocked",
+        &["hostblocked.run.sakala.localhost", "preview.allowedHosts"],
+    );
+
+    let run = harness
+        .deploy(
+            "hostallowed",
+            &vite_like_host_check("hostallowed.run.sakala.localhost"),
+            &[],
+        )
+        .await;
+    run.print("Vite-like host check allows the domain only");
+    run.assert_completed();
+
+    let run = harness.deploy("loginwall", &serve(403), &[]).await;
+    run.print("root returns a plain 403");
+    run.assert_completed();
+    harness.executor.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 #[ignore = "needs a local Docker daemon, caddy:2.11.3-alpine, and node:24-alpine"]
 async fn real_docker_deployments_report_what_actually_happened() {

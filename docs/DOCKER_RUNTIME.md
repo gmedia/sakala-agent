@@ -204,6 +204,54 @@ Perilaku BusyBox `wget` v1.37.0 yang menentukan desain ini, diverifikasi pada
   terbukti menerimanya. Aplikasi yang merutekan dari `req.url` mentah bisa membalas
   404, yang tetap dihitung sehat.
 
+### Host yang ditolak framework
+
+Status di bawah 500 dihitung sehat, jadi aplikasi yang menolak domain project dulu
+lolos readiness lalu menjawab 403 ke setiap pengunjung. Itu terjadi di production
+2026-11-19 dengan `vite preview`: Vite 6 ke atas menolak `Host` di luar
+`preview.allowedHosts`. Probe `wget` mengirim nama container sebagai `Host`, yang juga
+ditolak Vite, sehingga status 403 saja tidak membedakan host yang ditolak dari halaman
+login.
+
+Karena itu, saat deploy dan hanya bila probe mendapat 400 atau 403, Agent mengirim satu
+request lagi lewat container Caddy dengan `Host` yang sama dengan pengunjung, yaitu
+`domain` deployment:
+
+```txt
+docker exec sakala-caddy sh -c '<printf request> | nc -w <detik> "$2" "$3" | head -c "$5"' \
+  sh <domain> <container> <port> <detik> 4096
+```
+
+BusyBox `wget` tidak mencetak body untuk 4xx, jadi request ini memakai BusyBox `nc` dari
+image yang sama. Nilainya masuk sebagai parameter posisi, bukan bagian script, dan
+koneksinya langsung ke aplikasi tanpa mengikuti redirect. Hanya 4096 byte pertama yang
+dibaca. Deployment gagal dengan `runtime_app_host_blocked` hanya bila jawabannya persis
+salah satu ini:
+
+| Framework | Status | Isi yang dicocokkan |
+| --- | --- | --- |
+| Vite preview (`vite preview`) | 403 | `Blocked request. This host (`, `is not allowed`, dan `preview.allowedHosts` |
+| Vite dev server (`vite`) | 403 | Teks yang sama dengan `server.allowedHosts` |
+| Django dengan `DEBUG = True` | 400 | `Invalid HTTP_HOST header` dan `ALLOWED_HOSTS` |
+
+Teks Vite diambil dari Vite 8.3.5 (`hostCheck.ts`) dan dicocokkan dengan jawaban asli
+yang direkam lewat `nc`. Vite selalu mengizinkan `localhost` dan subdomain `.localhost`,
+jadi di instalasi lokal dengan domain `*.run.sakala.localhost` masalah ini tidak muncul
+dan cek ini tidak pernah gagal; ia baru terlihat dengan domain sungguhan seperti
+`*.sakala.app`. Django dengan `DEBUG = False` menjawab `Bad Request (400)` tanpa
+menyebut penyebabnya, jadi tidak dikenali dan tetap lolos seperti sebelumnya. Next.js
+tidak dimasukkan karena tidak memeriksa `Host` pada request biasa (`allowedDevOrigins`
+hanya untuk resource dev lintas origin), dan webpack-dev-server (`Invalid Host header`)
+belum dimasukkan karena teksnya belum diverifikasi pada versi yang dipakai.
+
+Jawaban lain, termasuk 403 dari halaman login, 403 untuk nama container saja (Vite dengan
+`allowedHosts` yang benar), atau request yang tidak bisa dijalankan karena image router
+tidak punya `nc`, tidak mengubah hasil readiness. Gagal dipilih, bukan berhasil dengan
+peringatan, karena setiap pengunjung akan mendapat penolakan itu, dan dengan gagal
+deployment sebelumnya tetap melayani. `RestartProject`, `WakeProject`, `RefreshRoute`,
+`restore_route`, dan `HealthCheck` tidak menjalankan cek ini, karena image-nya sudah lolos
+saat deploy.
+
 Probe tidak menilai aplikasi saat ia tidak bisa berjalan. Kegagalan seperti `wget`
 hilang, Caddy mati, atau nama container tidak ter-resolve dilaporkan sebagai
 `runtime_dependency_failed`.
