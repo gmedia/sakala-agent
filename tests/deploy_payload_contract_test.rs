@@ -2,7 +2,8 @@ use sakala_agent_protocol::{
     AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
     DatabaseExtension, DeployProjectResult, FinalizationDeferredReason, HeartbeatPayload,
     MANAGED_POSTGRES_CAPABILITY, ManagedDatabaseSize, ManagedName, NodePlacement,
-    RequestedReplicas, SleepingPage, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
+    RequestedImageReuse, RequestedReplicas, SleepingPage, WorkloadMetrics, WorkloadReplicas,
+    WorkloadTraffic,
 };
 
 #[test]
@@ -248,6 +249,41 @@ fn deploy_payload_release_command_fixture_matches_the_contract() {
         serde_json::to_value(&plain)
             .expect("payload serializes")
             .get("release_command")
+            .is_none(),
+        "absent stays absent"
+    );
+}
+
+#[test]
+fn deploy_payload_image_reuse_fixture_matches_the_contract() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-image-reuse.json"
+    ))
+    .expect("fixture must deserialize");
+    let payload = command.deploy_payload().expect("payload must be valid");
+
+    let source = uuid::Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("UUID");
+    assert_eq!(
+        payload.reuse_image_from_deployment_id,
+        RequestedImageReuse::Deployment(source)
+    );
+    assert_eq!(
+        serde_json::to_value(&payload).expect("payload serializes")["reuse_image_from_deployment_id"],
+        "4f1f21ef-730d-42d5-a46d-d965353cb993"
+    );
+
+    let plain: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("fixture must deserialize");
+    let plain = plain.deploy_payload().expect("payload must be valid");
+    assert_eq!(
+        plain.reuse_image_from_deployment_id,
+        RequestedImageReuse::Absent
+    );
+    assert!(
+        serde_json::to_value(&plain)
+            .expect("payload serializes")
+            .get("reuse_image_from_deployment_id")
             .is_none(),
         "absent stays absent"
     );
