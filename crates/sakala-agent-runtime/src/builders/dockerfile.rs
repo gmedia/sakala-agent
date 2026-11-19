@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::{CommandSpec, RuntimeError, builders::with_tenant_isolation};
+use crate::{
+    CommandSpec, RuntimeError,
+    builders::{with_image_labels, with_tenant_isolation},
+};
 
 const MAX_DOCKERFILE_BYTES: u64 = 1024 * 1024;
 const FRONTEND_LOCK: &str =
@@ -63,7 +66,7 @@ pub fn build_command(
     dockerfile: &Path,
     image: &str,
     project_id: Uuid,
-    deployment_id: Uuid,
+    labels: &[String],
 ) -> CommandSpec {
     let command = CommandSpec::new("docker")
         .arg("buildx")
@@ -71,20 +74,14 @@ pub fn build_command(
         .arg("--load")
         .arg("--progress")
         .arg("plain");
-    with_tenant_isolation(command)
+    let command = with_tenant_isolation(command)
         .arg("--build-arg")
         .arg(format!("BUILDKIT_CACHE_MOUNT_NS={project_id}"))
         .arg("--file")
         .arg(dockerfile.as_os_str())
         .arg("--tag")
-        .arg(image)
-        .arg("--label")
-        .arg("dev.sakala.managed=true")
-        .arg("--label")
-        .arg(format!("dev.sakala.project-id={project_id}"))
-        .arg("--label")
-        .arg(format!("dev.sakala.deployment-id={deployment_id}"))
-        .arg(source.as_os_str())
+        .arg(image);
+    with_image_labels(command, labels).arg(source.as_os_str())
 }
 
 #[cfg(test)]

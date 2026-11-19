@@ -2,7 +2,10 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::{CommandSpec, builders::with_tenant_isolation};
+use crate::{
+    CommandSpec,
+    builders::{with_image_labels, with_tenant_isolation},
+};
 
 pub fn build_command(
     source: &Path,
@@ -10,7 +13,7 @@ pub fn build_command(
     image: &str,
     frontend: &str,
     project_id: Uuid,
-    deployment_id: Uuid,
+    labels: &[String],
     secrets_fingerprint: Option<&str>,
 ) -> CommandSpec {
     let command = CommandSpec::new("docker")
@@ -32,16 +35,10 @@ pub fn build_command(
             .arg("--build-arg")
             .arg(format!("secrets-hash={fingerprint}"));
     }
-    command
+    let command = command
         .arg("--file")
         .arg(plan.as_os_str())
         .arg("--tag")
-        .arg(image)
-        .arg("--label")
-        .arg("dev.sakala.managed=true")
-        .arg("--label")
-        .arg(format!("dev.sakala.project-id={project_id}"))
-        .arg("--label")
-        .arg(format!("dev.sakala.deployment-id={deployment_id}"))
-        .arg(source.as_os_str())
+        .arg(image);
+    with_image_labels(command, labels).arg(source.as_os_str())
 }

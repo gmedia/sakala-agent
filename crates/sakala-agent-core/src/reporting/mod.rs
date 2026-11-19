@@ -1,3 +1,3 @@
 mod runtime;
 
-pub use runtime::{ApiRuntimeReporter, ApiRuntimeReporterFactory};
+pub use runtime::{ApiRuntimeReporter, ApiRuntimeReporterFactory, LogDeliveryPolicy};

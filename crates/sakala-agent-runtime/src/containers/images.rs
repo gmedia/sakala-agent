@@ -24,6 +24,12 @@ pub(crate) const IMAGE_LIST_FORMAT: &str = "{{.ID}}\t{{.Repository}}\t{{.Tag}}";
 /// `docker image ls` has no field for labels, so they come from inspect. A
 /// missing label prints `<no value>`.
 pub(crate) const IMAGE_INSPECT_FORMAT: &str = "{{.Id}}\t{{index .Config.Labels \"dev.sakala.project-id\"}}\t{{index .Config.Labels \"dev.sakala.deployment-id\"}}\t{{.Created}}\t{{.Size}}";
+/// Every label of one image as a JSON object, or `null` when it has none. JSON,
+/// because a label value may hold a tab or a newline.
+pub(crate) const IMAGE_LABELS_FORMAT: &str = "{{json .Config.Labels}}";
+/// What `docker image inspect` reports, in any letter case, for a reference the
+/// node has no image under.
+pub(crate) const NO_SUCH_IMAGE: &str = "no such image";
 /// The image ID a container runs, whatever tag it was started with, and the
 /// project the container belongs to. A missing label prints `<no value>`.
 pub(crate) const CONTAINER_IMAGE_FORMAT: &str =
@@ -100,6 +106,17 @@ pub(crate) fn parse_image_list(stdout: &str) -> Vec<ListedImage> {
         }
     }
     images
+}
+
+/// Reads what [`IMAGE_LABELS_FORMAT`] prints for one image.
+pub(crate) fn parse_image_labels(stdout: &str) -> Result<BTreeMap<String, String>, RuntimeError> {
+    serde_json::from_str::<Option<BTreeMap<String, String>>>(stdout.trim())
+        .map(Option::unwrap_or_default)
+        .map_err(|error| {
+            RuntimeError::Container(format!(
+                "docker image inspect returned unreadable labels: {error}"
+            ))
+        })
 }
 
 pub(crate) fn parse_image_inspect(stdout: &str) -> Result<Vec<InspectedImage>, RuntimeError> {
@@ -249,6 +266,18 @@ mod tests {
 
     fn at(timestamp: &str) -> OffsetDateTime {
         OffsetDateTime::parse(timestamp, &Rfc3339).expect("timestamp")
+    }
+
+    #[test]
+    fn reads_image_labels_including_none_at_all() {
+        let labels = parse_image_labels(
+            "{\"dev.sakala.builder\":\"railpack\",\"dev.sakala.package-directory\":\"apps/web\"}\n",
+        )
+        .expect("labels");
+        assert_eq!(labels["dev.sakala.builder"], "railpack");
+        assert_eq!(labels["dev.sakala.package-directory"], "apps/web");
+        assert!(parse_image_labels("null\n").expect("no labels").is_empty());
+        assert!(parse_image_labels("<no value>").is_err());
     }
 
     /// Captured from Docker 29.9.3 (containerd image store) with the formats above.

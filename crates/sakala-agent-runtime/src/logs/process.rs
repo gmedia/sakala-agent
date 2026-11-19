@@ -13,10 +13,27 @@ pub(crate) async fn emit_event(
     message: &str,
     metadata: serde_json::Value,
 ) -> Result<(), RuntimeError> {
+    emit_event_at(
+        reporter,
+        DeploymentEventLevel::Info,
+        event_type,
+        message,
+        metadata,
+    )
+    .await
+}
+
+pub(crate) async fn emit_event_at(
+    reporter: &dyn RuntimeReporter,
+    level: DeploymentEventLevel,
+    event_type: &str,
+    message: &str,
+    metadata: serde_json::Value,
+) -> Result<(), RuntimeError> {
     reporter
         .event(DeploymentEvent {
             event_type: event_type.to_owned(),
-            level: DeploymentEventLevel::Info,
+            level,
             message: message.to_owned(),
             metadata,
             occurred_at: OffsetDateTime::now_utc(),

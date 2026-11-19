@@ -24,6 +24,9 @@ use crate::{
 };
 
 mod dockerfile;
+pub(crate) mod image_labels;
+
+pub(crate) use image_labels::reusable_build;
 
 /// All projects on a node share one BuildKit, so nothing a build reuses may come
 /// from another project. `--no-cache` stops a step from reusing a layer built with
@@ -34,6 +37,14 @@ mod dockerfile;
 /// repository picks need not honour either. See `write_locked_dockerfile`.
 pub(crate) fn with_tenant_isolation(command: CommandSpec) -> CommandSpec {
     command.arg("--no-cache").arg("--pull")
+}
+
+/// Adds one `--label` per value of [`image_labels::image_labels`].
+pub(crate) fn with_image_labels(mut command: CommandSpec, labels: &[String]) -> CommandSpec {
+    for label in labels {
+        command = command.arg("--label").arg(label);
+    }
+    command
 }
 
 /// Hands every variable to BuildKit as a secret, which never enters image layers
@@ -224,8 +235,7 @@ impl ImageBuilder for ImageBuildService {
             )
         };
 
-        let mut package_directory = None;
-        match builder {
+        let output = match builder {
             DeploymentBuilder::Dockerfile => {
                 ensure_dockerfile_in_workspace(request).await?;
                 started_build().await?;
@@ -244,17 +254,26 @@ impl ImageBuilder for ImageBuildService {
                     &request.workspace,
                 )
                 .await?;
+                let output = BuildOutput {
+                    builder,
+                    package_directory: None,
+                };
                 let command = with_build_secrets(
                     dockerfile::build_command(
                         &request.source,
                         &dockerfile,
                         &request.image,
                         request.project_id,
-                        request.deployment_id,
+                        &image_labels::image_labels(
+                            request.project_id,
+                            request.deployment_id,
+                            &output,
+                        ),
                     ),
                     &request.environment,
                 );
                 run_checked(self.runner.as_ref(), &command, "docker-build", reporter).await?;
+                output
             }
             DeploymentBuilder::Railpack => {
                 emit_event(
@@ -290,6 +309,12 @@ impl ImageBuilder for ImageBuildService {
                     .prepare(context, &request.workspace, &environment, reporter)
                     .await?;
                 started_build().await?;
+                let output = BuildOutput {
+                    builder,
+                    package_directory: workspace
+                        .as_ref()
+                        .map(|workspace| workspace.package_directory().to_owned()),
+                };
                 let build = with_build_secrets(
                     crate::railpack::build_command(
                         context,
@@ -297,23 +322,22 @@ impl ImageBuilder for ImageBuildService {
                         &request.image,
                         &self.railpack_frontend,
                         request.project_id,
-                        request.deployment_id,
+                        &image_labels::image_labels(
+                            request.project_id,
+                            request.deployment_id,
+                            &output,
+                        ),
                         self.secrets_fingerprint(&environment).as_deref(),
                     ),
                     &environment,
                 );
                 run_checked(self.runner.as_ref(), &build, "railpack-build", reporter).await?;
-                package_directory = workspace
-                    .as_ref()
-                    .map(|workspace| workspace.package_directory().to_owned());
+                output
             }
             DeploymentBuilder::Auto => unreachable!("auto builder must be resolved before build"),
-        }
+        };
 
-        Ok(BuildOutput {
-            builder,
-            package_directory,
-        })
+        Ok(output)
     }
 }
 

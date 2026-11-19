@@ -21,6 +21,9 @@ validate command
 -> hapus container deployment sebelumnya
 ```
 
+Deployment yang [memakai ulang image](#memakai-ulang-image) melewati tiga langkah
+pertama setelah validasi: init repository, pemilihan builder, dan build. Sisanya sama.
+
 Deployment dengan beberapa replika menjalankan langkah `docker run` dan readiness untuk
 setiap replika, menulis satu route berisi semua replika, lalu menghentikan container
 lama dalam satu `docker stop`. Nama replika adalah nama container biasa ditambah
@@ -419,6 +422,73 @@ lama selama deploy bergulir: tidak dihitung untuk project-nya sendiri, tetapi di
 satu slot oleh project lain. Lock admission dilepas begitu container release berjalan,
 jadi deploy dan wake project lain tidak menunggu migrasi selesai.
 
+## Memakai ulang image
+
+Redeploy yang hanya mengubah konfigurasi, misalnya variabel, rotasi password database,
+atau attach database, memakai commit yang sama dengan deployment aktif. Image-nya pun
+sama, jadi build ulang hanya membuang waktu: di staging, rotasi password database
+membuat aplikasi 503 selama 6 menit 56 detik, 6 menit 17 detik di antaranya build. Bila
+payload membawa `reuse_image_from_deployment_id`, Agent memakai image deployment itu.
+Kontraknya ada di [Memakai ulang image](AGENT_API.md#memakai-ulang-image-tanpa-build).
+
+Setiap image yang dibangun Agent kini membawa label berikut, untuk Dockerfile maupun
+Railpack:
+
+| Label | Isi |
+| --- | --- |
+| `dev.sakala.managed` | `true`, seperti sebelumnya. |
+| `dev.sakala.project-id` | Project yang membangunnya, seperti sebelumnya. |
+| `dev.sakala.deployment-id` | Deployment yang membangunnya, seperti sebelumnya. |
+| `dev.sakala.builder` | `dockerfile` atau `railpack`. Baru. |
+| `dev.sakala.package-directory` | Direktori package bila image dibangun dari root workspace JavaScript, misalnya `apps/web`. Baru, dan tidak ada untuk image lain. |
+
+Sebelum checkout, Agent menghitung referensi image dari project yang meminta,
+`sakala/project-<project_id>:<commit12>-<source8>`, lalu membaca labelnya dengan
+`docker image inspect --format '{{json .Config.Labels}}' <referensi>`. Image dipakai
+ulang hanya bila `dev.sakala.project-id` dan `dev.sakala.deployment-id` menyebut project
+dan deployment sumber itu, dan `dev.sakala.builder` dikenal. Nama image saja tidak
+membuktikan apa pun, karena pemegang Docker socket bisa men-tag image project lain di
+bawah nama itu; smoke test `an_image_tagged_into_another_projects_repository_is_never_run`
+membuktikan image seperti itu ditolak dan project-nya build image sendiri.
+
+Jalur reuse:
+
+- tidak ada checkout, tidak ada pemeriksaan ruang disk workspace
+  (`SAKALA_MIN_WORKSPACE_FREE_MB`), dan tidak mengantre di
+  `SAKALA_MAX_CONCURRENT_BUILDS`, karena tidak ada yang dibangun;
+- Agent tetap membuat direktori workspace kosong per command, hanya untuk env file
+  `runtime.env` milik container release dan replika, dan menghapusnya seperti checkout;
+- label builder dan package directory mengembalikan hasil build aslinya, jadi image
+  Dockerfile menerima `start_command` saat dijalankan, image Railpack tidak (start
+  command-nya sudah ada di image), dan release command image workspace berjalan dengan
+  `cd '<package>' && ...`;
+- release command, pemeriksaan kapasitas, readiness, replika, perpindahan route,
+  penghapusan container lama, dan log follower berjalan persis seperti setelah build.
+
+Bila image tidak ada, labelnya tidak cocok, atau label builder-nya belum ada (image dari
+Agent sebelum fitur ini), Agent mengirim `deployment.image.reuse_skipped` dengan alasannya
+lalu build seperti biasa. Image yang gagal di-inspect Docker, misalnya karena daemon
+lambat menjawab dalam 10 detik, juga dianggap tidak ada (`image_missing`): build selalu
+jawaban yang benar, hanya lebih lambat.
+
+Deployment reuse yang gagal atau dibatalkan sebelum route pindah menghapus container
+kandidatnya, tetapi tidak pernah menghapus image-nya. Image itu milik deployment yang
+masih melayani; deployment yang build sendiri tetap menghapus image kandidatnya seperti
+sebelumnya.
+
+Tidak ada retensi image tambahan. Image GC tidak berubah: image yang dipakai ulang
+dipakai container deployment baru, jadi otomatis dipertahankan seperti image aktif
+lainnya. Bila image sudah dibersihkan, misalnya karena project lama tidak punya
+container, redeploy berikutnya build ulang dengan `image_missing`. Retensi untuk rollback
+adalah topik terpisah.
+
+Smoke test `image_reuse_smoke_test` membuktikan ketiga jalur di Docker, BuildKit, dan
+Caddy asli. Pada laptop dengan Docker 29.9.3 dan fixture Dockerfile `busybox` yang
+sangat kecil, deploy dengan build butuh 4,0 sampai 5,3 detik dan deploy reuse 3,6 sampai
+3,8 detik (route pindah setelah 2,0 sampai 2,4 detik) pada tiga run. Selisihnya kecil karena build fixture ini
+hanya beberapa detik; pada aplikasi nyata yang build-nya beberapa menit, seluruh waktu
+build itu hilang dari redeploy konfigurasi.
+
 ## Isolasi antar-project saat build
 
 Semua project pada satu node memakai BuildKit yang sama, jadi tanpa pembatasan satu project bisa memakai hasil project lain. Ketiga jalur ini terbukti nyata pada BuildKit asli:
@@ -453,7 +523,7 @@ Langkah dengan konteks, plan, dan sidik jari secret yang identik tetap berbagi l
 Saat API meminta batal, Agent membatalkan token command itu. Melepas future process
 mematikan process group-nya, termasuk klien `docker buildx`, dan BuildKit menghentikan
 langkah build yang sedang berjalan saat kliennya hilang. Candidate, image, dan workspace
-lalu dihapus. Setelah aktivasi route dimulai, pembatalan tidak lagi menghentikan
+lalu dihapus, kecuali image yang [dipakai ulang](#memakai-ulang-image). Setelah aktivasi route dimulai, pembatalan tidak lagi menghentikan
 deployment, karena route lama sudah mulai digantikan.
 
 ## Variabel saat build

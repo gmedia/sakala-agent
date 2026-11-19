@@ -101,6 +101,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1664,7 +1673,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sakala-agent"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1685,10 +1694,12 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "backon",
+ "httpdate",
  "reqwest",
  "sakala-agent-protocol",
  "serde",
@@ -1703,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-protocol"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1713,7 +1724,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-runtime"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1739,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-edge"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "async-trait",

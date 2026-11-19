@@ -1,6 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url, header::ACCEPT};
+use reqwest::{
+    Client, Method, RequestBuilder, Response, StatusCode, Url,
+    header::{ACCEPT, HeaderMap, RETRY_AFTER},
+};
 use sakala_agent_protocol::{
     CommandPoll, CommandStatus, CompleteCommandPayload, DeploymentEvent, DeploymentLog,
     HeartbeatPayload, NodeLifecyclePayload,
@@ -46,6 +49,41 @@ pub struct ReportAcknowledgement {
     pub duplicate_count: u64,
     pub first_sequence: u64,
     pub last_sequence: u64,
+}
+
+/// Outcome of one report request that did not deliver the batch.
+#[derive(Debug)]
+pub enum ReportAttemptError {
+    /// The batch may succeed when resent unchanged under the same key: a
+    /// connection or timeout failure, an unreadable body, `408`, `429`, or
+    /// `5xx`. `retry_after` carries the server's `Retry-After`, when present
+    /// and readable.
+    Transient {
+        detail: String,
+        retry_after: Option<Duration>,
+    },
+    /// Resending cannot succeed: `409`, `413`, `422`, another `4xx`, or a
+    /// `200` without a valid acknowledgement. See
+    /// [`CoreError::stops_report_delivery`].
+    Rejected(CoreError),
+}
+
+impl ReportAttemptError {
+    fn transient(error: &reqwest::Error) -> Self {
+        Self::Transient {
+            detail: error.to_string(),
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ReportAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient { detail, .. } => formatter.write_str(detail),
+            Self::Rejected(error) => error.fmt(formatter),
+        }
+    }
 }
 
 impl ApiClient {
@@ -265,7 +303,30 @@ impl ApiClient {
             .header(ACCEPT, "application/json")
     }
 
-    /// Sends one report batch under one `Idempotency-Key`.
+    /// Sends one batch of redacted log lines once, under the caller's
+    /// `Idempotency-Key`.
+    ///
+    /// The caller owns the retry: it must resend the identical batch under the
+    /// same key after a [`ReportAttemptError::Transient`] outcome, so the
+    /// control plane returns the original sequence range instead of storing the
+    /// lines twice.
+    pub async fn logs_attempt(
+        &self,
+        command_id: Uuid,
+        idempotency_key: &str,
+        logs: &[DeploymentLog],
+    ) -> Result<ReportAcknowledgement, ReportAttemptError> {
+        self.report_attempt(
+            &endpoints::command_action(command_id, "logs"),
+            idempotency_key,
+            &json!({ "logs": logs }),
+            logs.len(),
+        )
+        .await
+    }
+
+    /// Sends one report batch under one `Idempotency-Key`, retrying transient
+    /// outcomes with the bounded [`RetryPolicy`].
     ///
     /// A `204` from an older control plane is accepted as delivered. A `200`
     /// must carry a valid acknowledgement envelope: a body that cannot be read
@@ -285,25 +346,13 @@ impl ApiClient {
         let attempts = self.retry.max_attempts.max(1);
         let mut attempt = 0;
         loop {
-            let outcome = self
-                .request(Method::POST, endpoint)
-                .header("Idempotency-Key", &idempotency_key)
-                .json(payload)
-                .send()
-                .await;
-            let transient = match outcome {
-                Ok(response) if is_retryable_status(response.status()) => {
-                    format!("HTTP {}", response.status().as_u16())
-                }
-                Ok(response) => match Self::report_outcome(response, item_count).await {
-                    Ok(acknowledgement) => return Ok(acknowledgement),
-                    Err(CoreError::Api(error)) if is_retryable_transport_error(&error) => {
-                        error.to_string()
-                    }
-                    Err(error) => return Err(error),
-                },
-                Err(error) if is_retryable_transport_error(&error) => error.to_string(),
-                Err(error) => return Err(CoreError::Api(error)),
+            let transient = match self
+                .report_attempt(endpoint, &idempotency_key, payload, item_count)
+                .await
+            {
+                Ok(acknowledgement) => return Ok(acknowledgement),
+                Err(ReportAttemptError::Rejected(error)) => return Err(error),
+                Err(ReportAttemptError::Transient { detail, .. }) => detail,
             };
             if attempt + 1 >= attempts {
                 return Err(CoreError::InvalidReportAcknowledgement(format!(
@@ -319,6 +368,41 @@ impl ApiClient {
             );
             tokio::time::sleep(delay).await;
             attempt += 1;
+        }
+    }
+
+    /// Sends one report request and classifies the outcome.
+    async fn report_attempt<T: Serialize + ?Sized>(
+        &self,
+        endpoint: &str,
+        idempotency_key: &str,
+        payload: &T,
+        item_count: usize,
+    ) -> Result<ReportAcknowledgement, ReportAttemptError> {
+        let outcome = self
+            .request(Method::POST, endpoint)
+            .header("Idempotency-Key", idempotency_key)
+            .json(payload)
+            .send()
+            .await;
+        match outcome {
+            Ok(response) if is_retryable_status(response.status()) => {
+                Err(ReportAttemptError::Transient {
+                    detail: format!("HTTP {}", response.status().as_u16()),
+                    retry_after: retry_after(response.headers()),
+                })
+            }
+            Ok(response) => match Self::report_outcome(response, item_count).await {
+                Ok(acknowledgement) => Ok(acknowledgement),
+                Err(CoreError::Api(error)) if is_retryable_transport_error(&error) => {
+                    Err(ReportAttemptError::transient(&error))
+                }
+                Err(error) => Err(ReportAttemptError::Rejected(error)),
+            },
+            Err(error) if is_retryable_transport_error(&error) => {
+                Err(ReportAttemptError::transient(&error))
+            }
+            Err(error) => Err(ReportAttemptError::Rejected(CoreError::Api(error))),
         }
     }
 
@@ -463,6 +547,20 @@ fn is_retryable_transport_error(error: &reqwest::Error) -> bool {
     error.is_connect() || error.is_timeout() || error.is_request() || error.is_body()
 }
 
+/// Reads `Retry-After` as delay-seconds or an HTTP-date (RFC 9110 §10.2.3).
+/// A date in the past means "now"; anything unreadable is ignored.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(
+        at.duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 async fn conflict_detail(response: Response) -> String {
     match response.json::<ConflictPayload>().await {
         Ok(ConflictPayload {
@@ -582,7 +680,36 @@ struct RepositoryCredentialLeasePayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_error_code, sanitize_error_message};
+    use std::time::{Duration, SystemTime};
+
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    use super::{retry_after, sanitize_error_code, sanitize_error_message};
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        assert_eq!(retry_after(&headers("7")), Some(Duration::from_secs(7)));
+        assert_eq!(retry_after(&headers(" 0 ")), Some(Duration::ZERO));
+        let later = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(120));
+        let delay = retry_after(&headers(&later)).expect("an HTTP-date is a delay");
+        assert!(delay > Duration::from_secs(100) && delay <= Duration::from_secs(120));
+        assert_eq!(
+            retry_after(&headers("Wed, 21 Oct 2015 07:28:00 GMT")),
+            Some(Duration::ZERO),
+            "a date in the past means retry now"
+        );
+        assert_eq!(retry_after(&headers("soon")), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn error_code_is_restricted_to_the_control_plane_alphabet() {
