@@ -235,7 +235,10 @@ salah satu ini:
 | Django dengan `DEBUG = True` | 400 | `Invalid HTTP_HOST header` dan `ALLOWED_HOSTS` |
 
 Teks Vite diambil dari Vite 8.3.5 (`hostCheck.ts`) dan dicocokkan dengan jawaban asli
-yang direkam lewat `nc`. Django dengan `DEBUG = False` menjawab `Bad Request (400)` tanpa
+yang direkam lewat `nc`. Vite selalu mengizinkan `localhost` dan subdomain `.localhost`,
+jadi di instalasi lokal dengan domain `*.run.sakala.localhost` masalah ini tidak muncul
+dan cek ini tidak pernah gagal; ia baru terlihat dengan domain sungguhan seperti
+`*.sakala.app`. Django dengan `DEBUG = False` menjawab `Bad Request (400)` tanpa
 menyebut penyebabnya, jadi tidak dikenali dan tetap lolos seperti sebelumnya. Next.js
 tidak dimasukkan karena tidak memeriksa `Host` pada request biasa (`allowedDevOrigins`
 hanya untuk resource dev lintas origin), dan webpack-dev-server (`Invalid Host header`)
