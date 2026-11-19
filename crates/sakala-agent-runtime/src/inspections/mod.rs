@@ -10,14 +10,19 @@ use tokio::{fs, io::AsyncReadExt};
 
 use self::base_image::{PublicImage, RegistryLookup};
 use crate::{
-    ProcessRunner, RuntimeError, RuntimeReporter, railpack::RailpackSandbox,
+    ProcessRunner, RuntimeError, RuntimeReporter, js_workspace,
+    railpack::{self, RailpackSandbox},
     workspace::RepositorySource,
 };
+use sakala_agent_core::ports::SecretString;
 
 #[async_trait]
 pub trait ProjectInspector: Send + Sync {
+    /// `repository` is the checkout and `context` the root directory, both
+    /// canonical.
     async fn inspect(
         &self,
+        repository: &Path,
         context: &Path,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
@@ -43,13 +48,47 @@ impl RailpackProjectInspector {
 impl ProjectInspector for RailpackProjectInspector {
     async fn inspect(
         &self,
+        repository: &Path,
         context: &Path,
         source: &RepositorySource,
         reporter: &dyn RuntimeReporter,
     ) -> Result<ProjectInspection, RuntimeError> {
         let manifests = detected_manifests(context).await?;
         let dockerfile_found = manifests.iter().any(|name| name == "Dockerfile");
-        let railpack: Value = match self.sandbox.info(context, reporter).await {
+        // A package of a JavaScript workspace is analysed from the workspace root
+        // with the commands a deployment would get, so the report matches the build.
+        // A Dockerfile build never uses them, but the preview cannot know which
+        // builder the project will pick.
+        let workspace = js_workspace::detect(repository, context).await;
+        let (railpack_context, environment, workspace) = match &workspace {
+            Some(detected) => {
+                let commands = detected.commands(None, None);
+                let environment = [
+                    (railpack::BUILD_COMMAND_SETTING, &commands.build),
+                    (railpack::START_COMMAND_SETTING, &commands.start),
+                    (
+                        railpack::SPA_OUTPUT_DIRECTORY_SETTING,
+                        &commands.static_output_directory,
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(name, value)| {
+                    Some((name.to_owned(), SecretString::new(value.clone()?)))
+                })
+                .collect::<Vec<_>>();
+                (
+                    detected.root(),
+                    environment,
+                    Some(detected.summary(&commands)),
+                )
+            }
+            None => (context, Vec::new(), None),
+        };
+        let railpack: Value = match self
+            .sandbox
+            .info(railpack_context, &environment, reporter)
+            .await
+        {
             // The parse error is not reported: the report is attacker-controlled.
             Ok(info) => serde_json::from_slice(&info).map_err(|_| {
                 RuntimeError::Execution("Railpack produced an unreadable report".to_owned())
@@ -75,7 +114,11 @@ impl ProjectInspector for RailpackProjectInspector {
                     "compose.yml" | "compose.yaml" | "docker-compose.yml" | "docker-compose.yaml"
                 )
             }),
-            package_manager: detect_package_manager(&manifests).map(str::to_owned),
+            package_manager: match &workspace {
+                Some(workspace) => Some(workspace.manager.as_str().to_owned()),
+                None => detect_package_manager(&manifests).map(str::to_owned),
+            },
+            workspace,
             manifests,
             exposed_ports,
             railpack,

@@ -231,6 +231,12 @@ Bagian ini boleh dipakai untuk dokumentasi user.
 path relatif di dalam repository. Pada project dengan Dockerfile, `Dockerfile` dicari di
 folder itu.
 
+**Monorepo JavaScript.** Bila folder itu adalah salah satu package workspace pnpm, npm,
+Yarn, atau Bun yang root-nya ada di atasnya, build Railpack berjalan dari root workspace,
+karena lockfile, `pnpm-workspace.yaml`, dan `packageManager` ada di sana. Contohnya
+root directory `apps/web` di repository yang punya `pnpm-workspace.yaml` dengan
+`packages: [apps/*]` di root-nya. Detailnya di [Monorepo JavaScript](#monorepo-javascript).
+
 **Build command.** Hanya berlaku untuk project tanpa Dockerfile. Pada project dengan
 Dockerfile, langkah build ditentukan oleh Dockerfile itu sendiri, jadi perintah ini
 diabaikan dan log build menyebutkannya.
@@ -241,6 +247,75 @@ container, jadi image-nya harus punya `sh`. Image `scratch` dan distroless gagal
 
 Semua perintah ini hanya berjalan di dalam build atau container, tidak pernah di shell
 host. Agent tidak memakai `sh -c` di host; argumen dikirim terstruktur ke Docker.
+
+## Monorepo JavaScript
+
+Di workspace pnpm, npm, Yarn, atau Bun, lockfile dan package manager hanya ada di root
+workspace. Railpack yang dijalankan di folder package saja memilih npm dan tidak punya
+lockfile, sehingga build gagal dengan `pnpm: not found` (gmedia/sakala-agent#74).
+Railpack sendiri mendukung workspace, tetapi hanya bila build berjalan dari root
+workspace, dan di sana ia membangun serta menjalankan package root
+([dokumentasi Railpack](https://railpack.com/languages/node#monorepos-and-workspaces)).
+Karena itu Agent membangun dari root workspace dan mengarahkan perintahnya ke package.
+
+**Deteksi.** Hanya pada build Railpack (termasuk `auto` tanpa Dockerfile di root
+directory) dan hanya bila `root_directory` diisi. Agent mencari direktori terdekat di
+atas root directory, sampai root repository, yang punya `package.json` dan daftar
+workspace: `packages` di `pnpm-workspace.yaml`, atau `workspaces` di `package.json`
+(array atau `{ "packages": [...] }`), dengan urutan yang sama seperti Railpack. Root
+directory dianggap package workspace bila ia punya `package.json` dan cocok dengan salah
+satu pola (glob seperti pnpm dan npm: `*` satu level, `**` berapa pun level, pola
+berawalan `!` mengecualikan). Workspace terdekat yang memutuskan; bila ia tidak memuat
+root directory, build berjalan seperti sebelumnya. Lockfile tidak dibaca untuk
+keanggotaan, karena pnpm dan npm hanya menulis package workspace ke lockfile bila daftar
+workspace di atas ada, dan Yarn 1 tidak menulisnya sama sekali.
+
+Package manager dipilih dengan urutan Railpack, supaya perintahnya memakai tool yang
+dipasang Railpack: `packageManager` di `package.json` root, lalu `pnpm-lock.yaml`,
+`bun.lockb` atau `bun.lock`, `.yarnrc.yml` atau `.yarnrc.yaml`, `yarn.lock`, lalu
+`engines`, dan npm bila tidak ada.
+
+**Perintah.** Konteks build dan direktori `railpack prepare` menjadi root workspace.
+Railpack memasang dependency seluruh workspace dengan lockfile-nya, lalu:
+
+| Situasi | Build | Start |
+| --- | --- | --- |
+| Project mengisi `build_command` / `start_command` | `cd '<package>' && <perintah>` | `cd '<package>' && <perintah>` |
+| pnpm, package punya script `build` | `pnpm --filter '<name>...' run build`, jadi package workspace yang dipakainya ikut dibangun lebih dulu | |
+| npm, Yarn, Bun, atau package tanpa `name` | `cd '<package>' && <pm> run build` | |
+| Package punya script `start` | | `cd '<package>' && <pm> run start` |
+| Tanpa script `start`, package adalah SPA Vite | | Railpack menyajikan `<package>/<outDir>` dengan Caddy-nya sendiri lewat `RAILPACK_SPA_OUTPUT_DIR` |
+
+Aturan SPA Vite sama dengan Railpack: `vite` ada di `dependencies` atau
+`devDependencies`, ada script `build`, dan script itu memuat `vite build` atau ada
+`vite.config.js`/`vite.config.ts`; SvelteKit tidak termasuk. `outDir` dibaca dari config
+seperti Railpack membacanya, dengan default `dist`, dan nilai yang keluar dari package
+diabaikan. Framework SPA lain yang dikenali Railpack (Astro statis, CRA, Angular, React
+Router) belum diturunkan; package seperti itu butuh script `start` atau `start_command`.
+
+Perintah dari project tetap menang atas variabel project bernama sama. Perintah yang
+diturunkan Agent hanya dipakai bila project tidak punya variabel `RAILPACK_BUILD_CMD`,
+`RAILPACK_START_CMD`, atau `RAILPACK_SPA_OUTPUT_DIR`, jadi variabel itu tetap cara
+menggantinya, dan nilainya berjalan di root workspace apa adanya. `release_command` juga
+dijalankan dengan `cd '<package>' && ...`, karena working directory image adalah root
+workspace. Nama package dan path di-quote untuk shell, karena Railpack menjalankan
+perintah dengan `bash -c`.
+
+Deployment seperti ini mengirim event `deployment.workspace.detected` setelah
+`deployment.analysis.started`, dengan metadata yang sama bentuknya dengan field
+`workspace` di hasil `InspectProject`. `InspectProject` dengan `root_directory` di
+package workspace menjalankan `railpack info` di root workspace dengan perintah turunan
+yang sama, sehingga preview menunjukkan rencana build yang sebenarnya.
+
+Build Dockerfile tidak berubah: `Dockerfile` di root directory tetap dibangun dengan
+root directory sebagai konteksnya. Repository tanpa workspace juga tidak berubah sama
+sekali.
+
+**Batas keamanan deteksi.** Deteksi membaca file repository di host, jadi symlink hanya
+diikuti selama tetap di dalam checkout, setiap file dibatasi 1 MiB, dan
+`pnpm-workspace.yaml` dibaca dari event parser YAML dengan alias ditolak, supaya file
+kecil tidak bisa meminta memori besar lewat ekspansi alias. File yang tidak terbaca
+berarti "bukan workspace", jadi deteksi hanya mengubah build bila buktinya jelas.
 
 ## Release command
 

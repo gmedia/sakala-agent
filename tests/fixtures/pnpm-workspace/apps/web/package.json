@@ -1,0 +1,11 @@
+{
+  "name": "@fixture/web",
+  "private": true,
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "@fixture/greeting": "workspace:*",
+    "vite": "workspace:*"
+  }
+}

@@ -137,9 +137,9 @@ seperti sebelumnya, dan nilai kosong berarti tidak diisi.
 
 | Field | Dockerfile | Railpack |
 | --- | --- | --- |
-| `root_directory` | Menjadi konteks build, dan `Dockerfile` dicari di sana. | Menjadi direktori `railpack prepare` dan konteks build. |
-| `build_command` | Tidak bisa dipakai, karena langkah build ditentukan Dockerfile. Agent mencatatnya di log. | Diteruskan sebagai `RAILPACK_BUILD_CMD`, dan berjalan di dalam build. |
-| `start_command` | Menggantikan entrypoint dan command image: `docker run --entrypoint sh <image> -c <command>`. Image tanpa `sh` gagal dengan `runtime_app_crashed`. | Diteruskan sebagai `RAILPACK_START_CMD`, dan menjadi command image. |
+| `root_directory` | Menjadi konteks build, dan `Dockerfile` dicari di sana. | Menjadi direktori `railpack prepare` dan konteks build, kecuali bila ia package workspace JavaScript: build lalu berjalan dari root workspace ([Monorepo JavaScript](DOCKER_RUNTIME.md#monorepo-javascript)). |
+| `build_command` | Tidak bisa dipakai, karena langkah build ditentukan Dockerfile. Agent mencatatnya di log. | Diteruskan sebagai `RAILPACK_BUILD_CMD`, dan berjalan di dalam build. Di package workspace menjadi `cd '<package>' && <command>`. |
+| `start_command` | Menggantikan entrypoint dan command image: `docker run --entrypoint sh <image> -c <command>`. Image tanpa `sh` gagal dengan `runtime_app_crashed`. | Diteruskan sebagai `RAILPACK_START_CMD`, dan menjadi command image. Di package workspace menjadi `cd '<package>' && <command>`. |
 
 `container_port` adalah port efektif pilihan API. Agent mengekspornya sebagai `PORT`,
 memprobe-nya, dan membuat route ke sana.
@@ -165,7 +165,9 @@ gagal dengan `runtime_build_failed`.
 `InspectProject` juga menerima `root_directory` opsional dengan aturan yang sama. Bila
 API mengirimnya, `railpack info` dan scanner manifest bekerja di direktori itu,
 termasuk `dockerfile_found`. Tanpa field ini, inspection tetap memeriksa root
-repository.
+repository. Bila direktori itu package workspace JavaScript, `railpack info` berjalan di
+root workspace dan result membawa `workspace`; lihat
+[Project inspection](#project-inspection-command).
 
 `sakala-api` menentukan `resources`, `timeouts`, dan `log_bounds` berdasarkan policy project/workspace/plan. `cpu_millis=500` berarti `0.5` vCPU. Agent menjalankan build, start/health, dan seluruh command menggunakan deadline payload, tetapi menolak timeout yang nol atau melebihi hard maximum node. Agent juga merahasiakan secret, membatasi panjang baris dan total byte log sebelum report; API tetap memvalidasi ulang log sebagai trust boundary terakhir. Network Docker tidak boleh berasal dari payload karena merupakan konfigurasi lokal runtime node.
 
@@ -620,10 +622,44 @@ Setelah `railpack info` dan scanner selesai, agent menyelesaikan command dengan 
     "manifests": [".env.example", "package.json", "pnpm-lock.yaml"],
     "package_manager": "pnpm",
     "exposed_ports": [],
+    "workspace": null,
     "railpack": {}
   }
 }
 ```
+
+`workspace` selalu dikirim. Nilainya `null`, kecuali `root_directory` adalah package
+workspace pnpm, npm, Yarn, atau Bun yang root-nya ada di atasnya. Field yang tidak ada
+berarti Agent sebelum field ini. Contoh untuk `root_directory: "apps/web"`:
+
+```json
+{
+  "package_manager": "pnpm",
+  "workspace": {
+    "manager": "pnpm",
+    "root_directory": ".",
+    "package_directory": "apps/web",
+    "package_name": "@facility-reporting/web",
+    "build_command": "pnpm --filter '@facility-reporting/web...' run build",
+    "start_command": null,
+    "static_output_directory": "apps/web/dist"
+  }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `manager` | `"npm"` \| `"pnpm"` \| `"yarn"` \| `"bun"` | Package manager yang dipasang Railpack, dipilih dengan urutan Railpack. Pada inspection seperti ini `package_manager` juga bernilai sama. |
+| `root_directory` | string | Root workspace relatif terhadap root repository, `.` untuk root repository. Inilah konteks build. |
+| `package_directory` | string | Root directory project, relatif terhadap root workspace. |
+| `package_name` | string \| `null` | `name` di `package.json` package, `null` bila tidak ada. |
+| `build_command` | string \| `null` | Perintah build yang berjalan di root workspace. Pada inspection, ini perintah turunan dari script `build` package, karena payload inspection tidak membawa `build_command` project. `null` bila package tidak punya script `build`. |
+| `start_command` | string \| `null` | Perintah start image. `null` bila image menyajikan `static_output_directory`, atau bila tidak ada script `start` maupun perintah. |
+| `static_output_directory` | string \| `null` | Hasil build SPA Vite, relatif terhadap root workspace, yang disajikan Railpack dengan Caddy-nya sendiri. |
+
+Aturan deteksi dan perintahnya ada di [Docker Runtime](DOCKER_RUNTIME.md#monorepo-javascript).
+Console bisa memakai field ini untuk menjelaskan bahwa build berjalan dari root workspace
+dan perintah apa yang akan dipakai.
 
 `exposed_ports` berisi port TCP yang dideklarasikan `EXPOSE` di stage terakhir
 `Dockerfile` pada direktori yang diinspeksi, terurut dan tanpa duplikat, paling banyak
@@ -1292,6 +1328,7 @@ dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
 | --- | --- | --- |
 | `deployment.checkout.started` | Clone repository dimulai. | `cloning` |
 | `deployment.analysis.started` | `railpack prepare` dimulai. Hanya pada build Railpack, karena memilih Dockerfile hanyalah memeriksa satu file. | `analyzing` |
+| `deployment.workspace.detected` | Hanya pada build Railpack yang root directory-nya package workspace JavaScript, setelah analisis dimulai. Metadata-nya berbentuk sama dengan `workspace` di hasil `InspectProject`, dengan perintah yang benar-benar dipakai. | tidak ada; tetap `analyzing` |
 | `deployment.build.started` | Build image dimulai. Pada Railpack, event ini kini datang setelah analisis. | `building` |
 | `deployment.container.started` | `docker run` candidate akan dijalankan. | `deploying` |
 | `deployment.health.started` | Container sudah jalan, probe readiness dimulai. | `health_checking` |

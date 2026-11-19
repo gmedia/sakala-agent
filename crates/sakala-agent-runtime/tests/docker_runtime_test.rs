@@ -4531,6 +4531,127 @@ async fn railpack_build_uses_the_root_directory_for_both_steps() {
     );
 }
 
+fn workspace_event(reporter: &RecordingReporter) -> Option<serde_json::Value> {
+    reporter
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .find(|event| event.event_type == "deployment.workspace.detected")
+        .map(|event| event.metadata.clone())
+}
+
+#[tokio::test]
+async fn a_package_of_a_pnpm_workspace_builds_from_the_workspace_root() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_js_workspace());
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/web" }));
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let prepare = find_command(&runner, is_sandbox);
+    assert!(
+        sandbox_mount(&prepare, "/app").ends_with("/source"),
+        "the lockfile and pnpm-workspace.yaml must be in the build"
+    );
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(build_context(&build).ends_with("/source"), "{build:?}");
+    let settings = prepare.secret_environment_names().collect::<Vec<_>>();
+    assert_eq!(
+        settings,
+        ["RAILPACK_BUILD_CMD", "RAILPACK_SPA_OUTPUT_DIR"],
+        "the package's own build, served as a static site"
+    );
+    assert_eq!(
+        workspace_event(&reporter).expect("workspace event"),
+        json!({
+            "manager": "pnpm",
+            "root_directory": ".",
+            "package_directory": "apps/web",
+            "package_name": "@demo/web",
+            "build_command": "pnpm --filter '@demo/web...' run build",
+            "start_command": null,
+            "static_output_directory": "apps/web/dist"
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_package_runs_the_projects_commands_in_its_directory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_js_workspace());
+    let reporter = Arc::new(RecordingReporter::default());
+    let mut command = deploy_with_config(
+        "auto",
+        json!({
+            "root_directory": "apps/web",
+            "build_command": "pnpm run build",
+            "start_command": "pnpm run preview",
+        }),
+    );
+    command.payload["release_command"] = json!("pnpm run migrate");
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let event = workspace_event(&reporter).expect("workspace event");
+    assert_eq!(event["build_command"], "cd 'apps/web' && pnpm run build");
+    assert_eq!(event["start_command"], "cd 'apps/web' && pnpm run preview");
+    assert_eq!(event["static_output_directory"], serde_json::Value::Null);
+    let release = string_arguments(&find_command(&runner, is_release_run));
+    assert_eq!(
+        release.last().map(String::as_str),
+        Some("cd 'apps/web' && pnpm run migrate"),
+        "{release:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dockerfile_in_a_workspace_package_keeps_the_package_as_its_context() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_js_workspace());
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/web" }));
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        build_context(&build).ends_with("/source/apps/web"),
+        "{build:?}"
+    );
+    assert_eq!(workspace_event(&reporter), None);
+}
+
+#[tokio::test]
+async fn a_repository_without_a_workspace_builds_exactly_as_before() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config(
+        "auto",
+        json!({ "root_directory": "apps/web", "start_command": "node server.js" }),
+    );
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let prepare = find_command(&runner, is_sandbox);
+    assert!(sandbox_mount(&prepare, "/app").ends_with("/source/apps/web"));
+    assert_eq!(
+        prepare.secret_environment_names().collect::<Vec<_>>(),
+        ["RAILPACK_START_CMD"]
+    );
+    assert_eq!(workspace_event(&reporter), None);
+}
+
 #[tokio::test]
 async fn a_symlink_that_stays_in_the_repository_is_a_valid_root_directory() {
     let temp = TempDir::new().expect("temp directory should be available");
@@ -4828,6 +4949,54 @@ async fn inspection_looks_at_the_requested_root_directory() {
         "the lockfile is at the repository root: {manifests:?}"
     );
     assert_eq!(output.result["dockerfile_found"], true);
+}
+
+#[tokio::test]
+async fn inspection_of_a_workspace_package_analyses_the_workspace_root() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_js_workspace());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = inspect_command();
+    command.payload["root_directory"] = json!("apps/web");
+
+    let output = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("inspection completes");
+
+    let info = find_command(&runner, is_sandbox);
+    assert!(sandbox_mount(&info, "/app").ends_with("/source"));
+    assert_eq!(
+        info.secret_environment_names().collect::<Vec<_>>(),
+        ["RAILPACK_BUILD_CMD", "RAILPACK_SPA_OUTPUT_DIR"]
+    );
+    assert_eq!(output.result["package_manager"], "pnpm");
+    assert_eq!(output.result["workspace"]["manager"], "pnpm");
+    assert_eq!(output.result["workspace"]["package_name"], "@demo/web");
+    assert_eq!(
+        output.result["workspace"]["static_output_directory"],
+        "apps/web/dist"
+    );
+}
+
+#[tokio::test]
+async fn inspection_without_a_workspace_sends_null() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut command = inspect_command();
+    command.payload["root_directory"] = json!("apps/web");
+
+    let output = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("inspection completes");
+
+    assert_eq!(output.result["workspace"], serde_json::Value::Null);
+    assert_eq!(
+        find_command(&runner, is_sandbox)
+            .secret_environment_names()
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -6241,6 +6410,8 @@ fn reported_messages(reporter: &RecordingReporter) -> Vec<String> {
 
 struct FakeRunner {
     dockerfile: bool,
+    /// Makes the checkout a pnpm workspace with `apps/web` as a Vite package.
+    js_workspace: bool,
     commands: Mutex<Vec<CommandSpec>>,
     docker_ps_stdout: String,
     workload_lookup_stdout: Option<String>,
@@ -6511,6 +6682,7 @@ impl FakeRunner {
     fn new(dockerfile: bool) -> Self {
         Self {
             dockerfile,
+            js_workspace: false,
             commands: Mutex::new(Vec::new()),
             docker_ps_stdout: String::new(),
             workload_lookup_stdout: None,
@@ -6555,6 +6727,11 @@ impl FakeRunner {
             release_oom_killed: false,
             release_run_failure: None,
         }
+    }
+
+    fn with_js_workspace(mut self) -> Self {
+        self.js_workspace = true;
+        self
     }
 
     fn with_release_exit(mut self, exit_code: i32, oom_killed: bool) -> Self {
@@ -6936,6 +7113,23 @@ impl ProcessRunner for FakeRunner {
                     "# syntax=evil/frontend\nFROM scratch\n# apps-web\nEXPOSE 80/tcp\n",
                 )
                 .expect("fake app Dockerfile");
+            }
+            if self.js_workspace {
+                fs::write(
+                    source.join("package.json"),
+                    r#"{"name":"demo","packageManager":"pnpm@10.0.0"}"#,
+                )
+                .expect("fake workspace manifest");
+                fs::write(
+                    source.join("pnpm-workspace.yaml"),
+                    "packages:\n  - apps/*\n",
+                )
+                .expect("fake workspace file");
+                fs::write(
+                    app.join("package.json"),
+                    r#"{"name":"@demo/web","scripts":{"build":"vite build"},"devDependencies":{"vite":"^8.0.0"}}"#,
+                )
+                .expect("fake workspace package");
             }
             fs::write(source.join("a-file"), "not a directory\n").expect("fake file");
             std::os::unix::fs::symlink("/etc", source.join("link-out")).expect("escaping symlink");

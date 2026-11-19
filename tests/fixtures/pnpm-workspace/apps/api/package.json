@@ -1,0 +1,10 @@
+{
+  "name": "@fixture/api",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@fixture/greeting": "workspace:*"
+  }
+}
