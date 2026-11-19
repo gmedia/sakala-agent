@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-19
+
 ### Added
 
 - Redeploy tanpa build ulang. Payload `DeployProject` boleh membawa `reuse_image_from_deployment_id` (string UUID deployment yang membangun image-nya), dan Agent lalu menyalakan deployment dari image itu dengan environment baru, tanpa checkout dan tanpa build. Gunanya untuk redeploy yang hanya mengubah konfigurasi pada commit yang sama: di staging, rotasi password database membuat aplikasi 503 selama 6 menit 56 detik, 6 menit 17 detik di antaranya build. Agent menghitung referensi image sendiri dari project yang meminta, `sakala/project-<project_id>:<commit12>-<source8>`, tidak pernah menerima referensi dari payload, dan memakainya hanya bila label `dev.sakala.project-id` dan `dev.sakala.deployment-id` image itu cocok dan `dev.sakala.builder` bernilai `dockerfile` atau `railpack`. Setiap image yang dibangun kini membawa label baru `dev.sakala.builder` dan, bila dibangun dari root workspace JavaScript, `dev.sakala.package-directory`, sehingga `start_command` dan `release_command` berperilaku persis seperti pada build aslinya. Release command tetap dijalankan; pemeriksaan kapasitas, readiness, replika, dan perpindahan route tidak berubah; pemeriksaan disk workspace dan antrean build dilewati. Event baru `deployment.image.reused` (level `info`, metadata `image`, `source_deployment_id`, `builder`) menggantikan event checkout, analisis, dan build. Bila image tidak bisa dipakai, Agent mengirim `deployment.image.reuse_skipped` (level `warning`, metadata `source_deployment_id` dan `reason`: `image_missing`, `image_not_owned`, `image_metadata_missing`, atau `invalid_reference`) lalu build seperti biasa; ini bukan kegagalan. Field yang bukan UUID tidak pernah menolak payload. Deployment reuse yang gagal tidak pernah menghapus image yang dipakainya, karena image itu milik deployment yang sedang melayani. Image GC tidak berubah. Image dari Agent sebelumnya belum punya label builder, jadi redeploy konfigurasi pertama setelah upgrade build satu kali. Uji Docker nyata (`image_reuse_smoke_test`) membuktikan redeploy reuse menyajikan nilai variabel baru tanpa build, image yang tidak ada jatuh ke build dengan `image_missing`, dan image project lain yang di-tag ke repository sebuah project ditolak dengan `image_not_owned` dan tidak pernah dijalankan. Aditif di protocol revision 4; lihat [Memakai ulang image](docs/DOCKER_RUNTIME.md#memakai-ulang-image) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-image-reuse).
@@ -291,7 +293,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gmedia/sakala-agent/compare/v0.10.0...v0.11.0
