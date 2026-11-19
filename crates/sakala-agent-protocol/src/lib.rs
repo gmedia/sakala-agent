@@ -41,8 +41,8 @@ pub use heartbeat::{
 };
 pub use inspections::{
     DatabaseEngine, DatabaseHint, DatabaseSignal, DatabaseSignalKind, EnvExample, EnvExampleEntry,
-    EnvExampleFile, InspectProjectPayload, JsPackageManager, JsWorkspace, ProjectInspection,
-    SuggestedReleaseCommand,
+    EnvExampleFile, InspectProjectPayload, JsFramework, JsPackageManager, JsWorkspace,
+    ProjectInspection, SuggestedReleaseCommand,
 };
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};

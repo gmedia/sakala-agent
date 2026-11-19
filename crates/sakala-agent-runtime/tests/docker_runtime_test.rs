@@ -807,6 +807,7 @@ async fn project_preview_uses_railpack_info_without_preparing_or_building() {
             "suggested_release_command": null
         })
     );
+    assert_eq!(output.result["frameworks"], json!([]));
     assert_eq!(output.result["railpack"]["provider"], "node");
 
     let commands = runner.commands.lock().expect("command lock");
@@ -5077,6 +5078,8 @@ async fn inspection_of_a_workspace_package_analyses_the_workspace_root() {
         output.result["workspace"]["static_output_directory"],
         "apps/web/dist"
     );
+    // The package's own `package.json`, not the workspace root's `gatsby`.
+    assert_eq!(output.result["frameworks"], json!(["astro"]));
 }
 
 #[tokio::test]
@@ -7734,7 +7737,7 @@ impl ProcessRunner for FakeRunner {
             if self.js_workspace {
                 fs::write(
                     source.join("package.json"),
-                    r#"{"name":"demo","packageManager":"pnpm@10.0.0"}"#,
+                    r#"{"name":"demo","packageManager":"pnpm@10.0.0","devDependencies":{"gatsby":"^5.0.0"}}"#,
                 )
                 .expect("fake workspace manifest");
                 fs::write(
@@ -7744,7 +7747,7 @@ impl ProcessRunner for FakeRunner {
                 .expect("fake workspace file");
                 fs::write(
                     app.join("package.json"),
-                    r#"{"name":"@demo/web","scripts":{"build":"vite build"},"devDependencies":{"vite":"^8.0.0"}}"#,
+                    r#"{"name":"@demo/web","scripts":{"build":"vite build"},"devDependencies":{"astro":"^5.0.0","vite":"^8.0.0"}}"#,
                 )
                 .expect("fake workspace package");
             }

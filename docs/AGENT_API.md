@@ -733,6 +733,7 @@ Setelah `railpack info` dan scanner selesai, agent menyelesaikan command dengan 
       ],
       "suggested_release_command": "npx prisma migrate deploy"
     },
+    "frameworks": ["next"],
     "railpack": {}
   }
 }
@@ -889,6 +890,52 @@ direktori yang diinspeksi setelah symlink diikuti, harus file biasa, paling besa
 (64 KiB untuk file contoh environment), dan listing direktori berhenti setelah 200 entri.
 Tidak ada yang dijalankan, file yang tidak terbaca dilewati, dan isi repository tidak
 ditulis ke log.
+
+### Framework yang merender saat build
+
+`frameworks` selalu dikirim oleh Agent yang mengenal field ini. Isinya framework
+JavaScript yang bisa merender halaman saat build, sehingga variabel yang dibacanya saat
+itu ikut tertanam di image. API memakainya untuk memutuskan bahwa perubahan variabel
+butuh build baru, karena Railpack melaporkan beberapa di antaranya (Gatsby, Astro mode
+server, Eleventy, Docusaurus, VitePress, SvelteKit tanpa config Vite) sebagai `node`
+biasa. Field yang tidak ada berarti Agent sebelum field ini, dan API lalu kembali ke
+sinyal Railpack.
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `frameworks` | array of string | Nilai dari tabel berikut, terurut menurut string-nya dan tanpa duplikat. `[]` bila tidak ada yang cocok atau tidak ada `package.json` yang bisa dibaca. Tidak pernah `null`. |
+
+Nilainya himpunan tertutup. Sebuah nilai dilaporkan bila salah satu nama package-nya
+persis menjadi key di `dependencies` atau `devDependencies`:
+
+| Nilai | Nama package |
+| --- | --- |
+| `astro` | `astro` |
+| `docusaurus` | `@docusaurus/core` |
+| `eleventy` | `@11ty/eleventy` |
+| `gatsby` | `gatsby` |
+| `next` | `next` |
+| `nuxt` | `nuxt`, `nuxt3` |
+| `react-router` | `@react-router/dev` (framework mode) |
+| `remix` | `@remix-run/dev` |
+| `sveltekit` | `@sveltejs/kit` |
+| `tanstack-start` | `@tanstack/react-start`, `@tanstack/solid-start`, `@tanstack/start` |
+| `vitepress` | `vitepress` |
+
+Aturan membaca:
+
+- Hanya `package.json` di direktori yang diinspeksi, yaitu direktori yang sama dengan
+  yang dibaca `database_hint`: root directory project, atau folder package pada
+  monorepo. `package.json` root workspace di atasnya tidak dibaca.
+- Hanya keberadaan nama package. Versi tidak dibaca, section lain seperti
+  `peerDependencies` dan `scripts` tidak dihitung, dan tidak ada yang dijalankan.
+  Library yang juga dipakai tanpa build framework-nya tidak dihitung: `react-router`
+  saja tidak menghasilkan `react-router`, dan `@remix-run/react` saja tidak
+  menghasilkan `remix`.
+- File dibaca dengan aturan yang sama dengan `database_hint`: symlink hanya diikuti
+  selama tetap di dalam direktori yang diinspeksi, harus file biasa, dan paling besar
+  1 MiB. File yang tidak ada, tidak bisa dibaca, terlalu besar, atau bukan JSON yang
+  valid menghasilkan `[]`, tidak pernah menggagalkan inspection.
 
 Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan raw JSON untuk audit dan evolusi adapter; console tidak boleh bergantung langsung pada struktur raw tersebut tanpa schema/normalization.
 
