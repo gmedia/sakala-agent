@@ -1,7 +1,17 @@
-use std::time::Duration;
+use std::{
+    net::{SocketAddr, TcpListener},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use sakala_agent_core::{
-    CoreError, api::ApiClient, ports::RuntimeReporter, reporting::ApiRuntimeReporter,
+    CoreError,
+    api::ApiClient,
+    ports::RuntimeReporter,
+    reporting::{ApiRuntimeReporter, LogDeliveryPolicy},
     support::retry::RetryPolicy,
 };
 use sakala_agent_protocol::{
@@ -296,10 +306,11 @@ async fn reporter_does_not_drop_a_partially_acknowledged_batch() {
         },
     );
     reporter.log(log("one")).await.expect("first line queues");
+    reporter.log(log("two")).await.expect("second line queues");
     let error = reporter
-        .log(log("two"))
+        .flush()
         .await
-        .expect_err("the full batch flush must fail on a partial acknowledgement");
+        .expect_err("the full batch must fail on a partial acknowledgement");
     assert!(error.to_string().contains("accepted 1 of 2"), "{error}");
     reporter
         .log(log("three"))
@@ -340,8 +351,9 @@ async fn reporter_does_not_drop_a_batch_on_malformed_acknowledgement() {
             ..LogBounds::default()
         },
     );
+    reporter.log(log("first")).await.expect("line queues");
     let error = reporter
-        .log(log("first"))
+        .flush()
         .await
         .expect_err("undelivered batch must surface as a delivery failure");
     assert!(error.to_string().contains("acknowledgement"), "{error}");
@@ -371,8 +383,9 @@ async fn exhausted_log_budget_stops_delivery_without_retry() {
             ..LogBounds::default()
         },
     );
+    reporter.log(log("over budget")).await.expect("line queues");
     let error = reporter
-        .log(log("over budget"))
+        .flush()
         .await
         .expect_err("422 must surface as a delivery stop");
     assert!(error.to_string().contains("422"), "{error}");
@@ -500,4 +513,355 @@ async fn fail_body_is_sanitized_to_control_plane_limits() {
     assert!(message.starts_with("boomxxx"));
     assert_eq!(message.chars().count(), 1_000);
     assert!(!message.contains('\u{202E}'));
+}
+
+/// Fast retries so an outage of a few hundred milliseconds behaves like the
+/// 80-second one seen on staging on 2026-11-19.
+fn fast_policy() -> LogDeliveryPolicy {
+    LogDeliveryPolicy {
+        flush_interval: Duration::from_millis(20),
+        retry_min_delay: Duration::from_millis(10),
+        retry_max_delay: Duration::from_millis(40),
+        flush_grace: Duration::from_secs(10),
+        ..LogDeliveryPolicy::default()
+    }
+}
+
+fn reporter_with(
+    base_url: &str,
+    bounds: LogBounds,
+    policy: LogDeliveryPolicy,
+) -> ApiRuntimeReporter {
+    let client = ApiClient::new(base_url, "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    ApiRuntimeReporter::with_policy(client, command_id(), bounds, policy)
+}
+
+fn batch_of(lines: u64) -> LogBounds {
+    LogBounds {
+        max_batch_lines: Some(lines),
+        ..LogBounds::default()
+    }
+}
+
+/// Answers `503` while `down` is set, then acknowledges whole batches.
+struct Outage {
+    down: Arc<AtomicBool>,
+}
+
+impl Respond for Outage {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self.down.load(Ordering::SeqCst) {
+            ResponseTemplate::new(503)
+        } else {
+            AcceptWholeBatch.respond(request)
+        }
+    }
+}
+
+/// Batches the control plane acknowledged, in arrival order, keyed by their
+/// `Idempotency-Key` so a resent batch can be checked against the original.
+async fn acknowledged_batches(server: &MockServer, failed: usize) -> Vec<(String, Vec<String>)> {
+    log_requests(server)
+        .await
+        .iter()
+        .skip(failed)
+        .map(|request| (idempotency_key(request), log_messages(request)))
+        .collect()
+}
+
+fn numbered(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("line {index:03}")).collect()
+}
+
+#[tokio::test]
+async fn lines_logged_during_an_unreachable_api_arrive_in_order_once_it_returns() {
+    // Staging, 2026-11-19 17.53 WIB: `error sending request` for 80 seconds,
+    // three attempts per batch, and the deployment lost every later line.
+    let reserved = TcpListener::bind("127.0.0.1:0").expect("reserve a port");
+    let address: SocketAddr = reserved.local_addr().expect("reserved address");
+    drop(reserved);
+    let reporter = reporter_with(&format!("http://{address}"), batch_of(10), fast_policy());
+
+    let lines = numbered(35);
+    for line in &lines {
+        reporter
+            .log(log(line))
+            .await
+            .expect("logging never waits for the API");
+    }
+    // Several retries hit a closed port before the API comes back.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let listener = TcpListener::bind(address).expect("the API returns on the same address");
+    let server = MockServer::builder().listener(listener).start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(AcceptWholeBatch)
+        .mount(&server)
+        .await;
+
+    reporter
+        .flush()
+        .await
+        .expect("everything is delivered after the outage");
+
+    let delivered = acknowledged_batches(&server, 0)
+        .await
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, lines, "every line, once, in the order logged");
+}
+
+#[tokio::test]
+async fn a_batch_resent_after_server_errors_keeps_its_key_content_and_order() {
+    let server = MockServer::start().await;
+    let down = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(Outage {
+            down: Arc::clone(&down),
+        })
+        .mount(&server)
+        .await;
+    let reporter = reporter_with(&server.uri(), batch_of(4), fast_policy());
+
+    let lines = numbered(10);
+    for line in &lines {
+        reporter.log(log(line)).await.expect("line queues");
+    }
+    while log_requests(&server).await.len() < 3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    down.store(false, Ordering::SeqCst);
+    reporter
+        .flush()
+        .await
+        .expect("delivery resumes when the API recovers");
+
+    let requests = log_requests(&server).await;
+    let failed = requests
+        .iter()
+        .take_while(|request| idempotency_key(request) == idempotency_key(&requests[0]))
+        .count();
+    assert!(
+        failed >= 3,
+        "the first batch was retried while the API failed"
+    );
+    // Every retry of the first batch is byte-for-byte the same request, so
+    // the control plane can answer it from its idempotency record.
+    for request in &requests[..failed] {
+        assert_eq!(request.body, requests[0].body);
+    }
+    let batches = acknowledged_batches(&server, failed - 1).await;
+    assert_eq!(batches[0].0, idempotency_key(&requests[0]));
+    let keys = batches
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    let mut distinct = keys.clone();
+    distinct.dedup();
+    assert_eq!(keys, distinct, "each later batch has its own key");
+    let delivered = batches
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .collect::<Vec<_>>();
+    assert_eq!(delivered, lines);
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(AcceptWholeBatch)
+        .mount(&server)
+        .await;
+    let reporter = reporter_with(&server.uri(), LogBounds::default(), fast_policy());
+
+    let started = Instant::now();
+    reporter.log(log("throttled")).await.expect("line queues");
+    reporter
+        .flush()
+        .await
+        .expect("delivered after the requested wait");
+
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the retry waited {:?}, less than Retry-After",
+        started.elapsed()
+    );
+    assert_eq!(log_requests(&server).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_full_buffer_drops_the_oldest_queued_lines_and_marks_the_gap() {
+    let server = MockServer::start().await;
+    let down = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(Outage {
+            down: Arc::clone(&down),
+        })
+        .mount(&server)
+        .await;
+    let reporter = reporter_with(
+        &server.uri(),
+        batch_of(2),
+        LogDeliveryPolicy {
+            max_buffered_lines: 5,
+            ..fast_policy()
+        },
+    );
+
+    let lines = numbered(12);
+    reporter.log(log(&lines[0])).await.expect("line queues");
+    reporter.log(log(&lines[1])).await.expect("line queues");
+    // The first batch is now in flight and outside the buffer.
+    while log_requests(&server).await.is_empty() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    for line in &lines[2..] {
+        reporter
+            .log(log(line))
+            .await
+            .expect("a full buffer still accepts the newest line");
+    }
+    down.store(false, Ordering::SeqCst);
+
+    let error = reporter
+        .flush()
+        .await
+        .expect_err("dropped lines are reported as not delivered");
+    assert!(
+        error.to_string().contains("5 log lines were not delivered"),
+        "{error}"
+    );
+
+    let requests = log_requests(&server).await;
+    let failed = requests
+        .iter()
+        .filter(|request| log_messages(request) == lines[..2])
+        .count()
+        - 1;
+    let delivered = acknowledged_batches(&server, failed)
+        .await
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .collect::<Vec<_>>();
+    assert_eq!(delivered[..2], lines[..2]);
+    assert_eq!(
+        delivered[2],
+        "5 log lines are missing here: the Sakala Agent could not reach the control plane in time and dropped them."
+    );
+    assert_eq!(delivered[3..], lines[7..], "the newest lines are kept");
+    let notice = requests
+        .iter()
+        .flat_map(|request| {
+            request.body_json::<serde_json::Value>().expect("json")["logs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .find(|line| {
+            line["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("missing here"))
+        })
+        .expect("the gap notice is sent");
+    assert_eq!(notice["stream"], "system");
+}
+
+#[tokio::test]
+async fn a_rejection_other_than_conflict_or_budget_stops_without_retry() {
+    for status in [400, 403, 404] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(logs_path()))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reporter = reporter_with(&server.uri(), LogBounds::default(), fast_policy());
+
+        reporter.log(log("refused")).await.expect("line queues");
+        reporter.log(log("refused too")).await.expect("line queues");
+        let error = reporter.flush().await.expect_err("a 4xx stops delivery");
+        assert!(
+            error.to_string().contains(&status.to_string()),
+            "{status}: {error}"
+        );
+        reporter
+            .log(log("after"))
+            .await
+            .expect_err("delivery stays stopped");
+    }
+}
+
+#[tokio::test]
+async fn flush_gives_up_after_its_grace_and_delivery_resumes_for_later_lines() {
+    let server = MockServer::start().await;
+    let down = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    struct Counting {
+        inner: Outage,
+        attempts: Arc<AtomicUsize>,
+    }
+    impl Respond for Counting {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            self.inner.respond(request)
+        }
+    }
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(Counting {
+            inner: Outage {
+                down: Arc::clone(&down),
+            },
+            attempts: Arc::clone(&attempts),
+        })
+        .mount(&server)
+        .await;
+    let reporter = reporter_with(&server.uri(), batch_of(2), fast_policy());
+
+    for line in ["a", "b", "c"] {
+        reporter.log(log(line)).await.expect("line queues");
+    }
+    let error = reporter
+        .flush_within(Duration::from_millis(300))
+        .await
+        .expect_err("the API never answered within the grace");
+    assert!(
+        error.to_string().contains("3 log lines were not delivered"),
+        "{error}"
+    );
+
+    // Container output keeps flowing under the same command after cutover.
+    let attempts_at_grace = attempts.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        attempts_at_grace,
+        "the abandoned batch is not retried any more"
+    );
+    down.store(false, Ordering::SeqCst);
+    reporter
+        .log(log("later"))
+        .await
+        .expect("new lines are still accepted");
+    let error = reporter
+        .flush()
+        .await
+        .expect_err("the earlier loss is still reported");
+    assert!(error.to_string().contains("3 log lines"), "{error}");
+    let last = log_requests(&server).await.pop().expect("a request");
+    assert_eq!(log_messages(&last), ["later"]);
 }

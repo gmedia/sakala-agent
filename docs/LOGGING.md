@@ -67,19 +67,48 @@ Docker runtime mengambil maksimal 100 baris startup setelah health check, lalu m
 Baris log tidak dikirim satu per satu. Reporter mem-buffer baris yang sudah
 diredaksi dan mengirim batch `{ "logs": [...] }` saat mencapai
 `min(log_bounds.max_batch_lines, 100)` baris atau 512 KiB message, atau paling
-lambat 200 ms setelah baris pertama masuk buffer. Urutan baris dipertahankan.
-Setiap request membawa `Idempotency-Key` unik; kegagalan transport dan respons
-`408`/`429`/`5xx` di-retry dengan key yang sama (backoff 500 ms–5 s, maksimum
-tiga percobaan) sehingga API mendeduplikasi item yang terkirim ganda. Sebelum
-`complete`/`fail`, core mem-flush sisa buffer; kegagalan flush hanya menjadi
-warning karena hasil command ditentukan runtime, bukan transport log.
+lambat 200 ms setelah baris pertama masuk buffer. Memasukkan baris ke buffer
+tidak pernah menunggu jaringan, jadi API yang lambat atau mati tidak menahan
+output build atau container. Satu worker per command mengirim batch satu per
+satu sehingga urutan baris dipertahankan.
+
+Setiap batch membawa `Idempotency-Key` unik dan isinya tidak berubah sampai
+di-ack. Kegagalan transport (koneksi, timeout, body tidak terbaca) dan respons
+`408`/`429`/`5xx` di-retry dengan key dan isi yang sama, jadi bila response
+pertama hilang setelah API menyimpan batch, API menjawab sequence yang sama
+dan tidak menyimpan baris dua kali. Jeda retry dimulai 1 detik, berlipat dua
+sampai 15 detik, ditambah jitter acak sampai sebesar jeda itu (jadi paling lama
+30 detik), dan tidak kurang dari `Retry-After` dari server (dibatasi 5 menit).
+Retry berjalan tanpa batas jumlah selama command berjalan. Pada staging
+2026-11-19 API tidak terjangkau sekitar 80 detik; reporter lama berhenti
+setelah tiga percobaan dan deployment kehilangan semua baris berikutnya,
+termasuk baris `[release]`.
+
+Buffer per command menampung paling banyak 10.000 baris dan 2 MiB message di
+luar satu batch yang sedang dikirim (paling besar 512 KiB). Bila penuh, baris
+**tertua** di buffer yang dibuang, karena bagian akhir output (langkah yang
+gagal, release command) paling menjelaskan sebuah deployment. Di titik itu
+timeline mendapat satu baris `system`: `<n> log lines are missing here: the
+Sakala Agent could not reach the control plane in time and dropped them.`
+Byte baris yang dibuang dikembalikan ke budget `max_total_bytes`.
+
+Sebelum `complete`/`fail`, core menunggu buffer kosong paling lama 120 detik,
+tetapi tidak melewati batas waktu command itu sendiri (minimal 10 detik), supaya
+lease API (`command_timeout_seconds` + `SAKALA_AGENT_LEASE_GRACE_SECONDS`) tidak
+habis selama menunggu. Command `Failed` tidak menerima baris baru setelah
+`fail`, jadi flush ini satu-satunya kesempatan mengirim log kegagalan. Baris
+yang masih tertahan saat waktu tunggu habis dianggap hilang. Bila ada baris
+command itu yang hilang, karena buffer penuh, ditolak, atau waktu tunggu habis,
+Agent mencatat warning `deployment logs could not be fully delivered` dengan
+jumlahnya (`<n> log lines were not delivered`). Hasil command tetap ditentukan
+runtime, bukan transport log. Setelah itu reporter tetap menerima baris baru,
+karena output container deployment yang sukses terus diikuti di bawah command
+yang sama.
 
 Follower bukan storage. Respons `409` (command terminal atau bukan node
-pemilik) dan `422` (budget `max_total_bytes` habis) menghentikan delivery log
-command tersebut tanpa retry: reporter menolak baris berikutnya sehingga
-follower berhenti dan menulis warning pada log operator. Kegagalan transient
-yang tetap gagal setelah retry berakhir dengan cara yang sama agar kegagalan
-reporting tidak tumbuh menjadi retry loop tanpa batas. Batch yang masih berada
-di buffer saat follower dibatalkan pada shutdown Agent (paling banyak 200 ms
-output) tidak dikirim. Resume cursor dan reconnect terkontrol menjadi pekerjaan
-lanjutan setelah endpoint log menyediakan kontrak sequence/cursor.
+pemilik), `413`, `422` (budget `max_total_bytes` habis), `4xx` lain, dan `200`
+tanpa acknowledgement yang valid menghentikan delivery log command tersebut
+tanpa retry: baris di buffer dibuang (warning `deployment log delivery
+stopped` dengan `dropped_lines`) dan reporter menolak baris berikutnya. Baris
+yang masih di buffer saat Agent shutdown tidak dikirim. Resume cursor setelah
+restart Agent tetap menjadi pekerjaan lanjutan.

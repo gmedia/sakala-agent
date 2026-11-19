@@ -308,6 +308,18 @@ advertises `image-reuse`.
 | Image labels `dev.sakala.builder` and `dev.sakala.package-directory` | Written on every image built from this release on. | `dev.sakala.builder` is `dockerfile` or `railpack`. `dev.sakala.package-directory` is written only for an image built from a JavaScript workspace root. Images built by an older Agent lack them, so the first configuration redeploy after the upgrade builds once with `image_metadata_missing`. |
 | Failure cleanup | Behaviour change for reuse only. | A reused deployment that fails before its route switches removes its candidate containers but never the image, which the serving deployment still uses. Image GC is unchanged. |
 
+## Revision 4 behaviour change: log delivery retries
+
+Still revision 4, with no wire change: the same endpoint, body, `Idempotency-Key`
+semantics, and acknowledgement. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Transient failures on `POST /commands/{id}/logs` | Retried until acknowledged. | Connection and timeout failures, an unreadable body, `408`, `429`, and `5xx` are retried with the same key and the same batch, 1 to 15 s exponential backoff plus jitter, never sooner than `Retry-After` (capped at 5 minutes), for as long as the command runs, and up to 120 s before `complete`/`fail` (never past `command_timeout_seconds`, at least 10 s). Agent v0.13.0 and older gave up after 3 attempts and dropped every later line of the command. The API must keep answering a replayed key with the original sequence range, which it does for as long as the log rows exist. |
+| Order of log lines | Unchanged. | One batch per command is in flight at a time, so sequence order is the order the lines were produced. |
+| Lines dropped by the Agent | Marked in the timeline. | The Agent queues at most 10,000 lines and 2 MiB per command besides the batch in flight; past that the oldest queued lines are dropped and a `system` line `<n> log lines are missing here: ...` is sent where they were. It is an ordinary log line and counts toward `max_total_bytes`. |
+| Other `4xx` on log reports | Stop delivery, as `409`/`413`/`422` do. | No change in practice: these were never retried. |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

@@ -11,6 +11,8 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+backon = { version = "1.6.0", default-features = false, features = ["std"] }
+httpdate = "1.0.3"
 reqwest.workspace = true
 sakala-agent-protocol.workspace = true
 serde.workspace = true
