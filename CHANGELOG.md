@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-20
+
 ### Added
 
 - Hasil `InspectProject` kini selalu membawa dua field baru untuk saran variabel dan database di wizard Console. `env_example` berisi variabel dari `.env.example`, `.env.sample`, atau `.env.dist` pertama yang ada di root directory project (folder package pada monorepo): paling banyak 200 entri `{ key, example_value }` dan `truncated`, atau `null` bila tidak ada file, file itu symlink yang keluar dari direktori, bukan file biasa, atau lebih dari 64 KiB. `.env` tidak pernah dibuka. Nilai kosong, multi-baris, atau mirip credential (blok PEM, URL dengan password di userinfo) dilaporkan `null`, dan nilai dipotong di 200 karakter. Parsernya ditulis sendiri tanpa interpolasi, karena `dotenvy` 0.15.7 mengisi `${VAR}` dari environment process Agent tanpa opsi untuk mematikannya. `database_hint` berisi `likely`, `engine` (`postgresql`, `mysql`, `sqlite`, `unknown`), paling banyak 16 `signals` (variabel database di file contoh, migrasi Laravel, schema Prisma, settings Django, `config/database.yml` Rails, dan nama package database di `package.json`, `composer.json`, `requirements.txt`, `pyproject.toml`, `Gemfile`), serta `suggested_release_command` yang hanya bisa bernilai `php artisan migrate --force`, `python manage.py migrate`, `npx prisma migrate deploy`, atau `bin/rails db:migrate`. Semua file dibaca dengan batas yang sama seperti `Dockerfile` dan tidak ada yang dijalankan. Uji dengan `.env.example` dan layout asli contoh Laravel gmedia/sakala-examples menghasilkan 11 variabel tanpa baris `DB_*` yang dikomentari, sinyal `laravel_migrations`, dan `php artisan migrate --force`. Pembacaan file aman yang sebelumnya terpisah di `js_workspace` dan inspection kini memakai satu modul `repository_file`. Aditif di protocol revision 4; lihat [Sakala Agent API](docs/AGENT_API.md#variabel-dari-envexample) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-env-and-database-suggestions).
@@ -298,7 +300,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...v0.12.0
