@@ -1277,9 +1277,11 @@ menetapkan sequence secara atomik.
 
 Agent mengirim report dalam bentuk batch. Event dikirim segera, satu request
 per event; log di-buffer dan dikirim per batch (maksimum 100 baris atau 512 KiB
-message per request, atau setelah 200 ms) dalam urutan produksi. Setiap request
-membawa header `Idempotency-Key` (UUID v4 unik per request) sehingga retry
-transport aman: API mendeduplikasi per item berdasarkan key dan index batch.
+message per request, atau setelah 200 ms) dalam urutan produksi, satu batch
+per command pada satu waktu. Setiap batch membawa header `Idempotency-Key`
+(UUID v4 unik per batch) dan dikirim ulang dengan key dan isi yang sama sampai
+di-ack, sehingga retry transport aman: API mendeduplikasi per item berdasarkan
+key dan index batch, dan sequence yang diberikan API mengikuti urutan baris.
 
 ```http
 POST /api/agent/v1/commands/{command}/events
@@ -1373,7 +1375,8 @@ Respons yang diperlakukan Agent:
 | --- | --- | --- |
 | `200` dengan acknowledgement valid, atau `204` | Diterima (duplikat tetap di-ack). | Lanjut. |
 | `200` dengan body tidak sesuai kontrak | Tidak diketahui apakah tersimpan. | Hentikan delivery log command ini; batch tidak dianggap terkirim. |
-| `408`, `429`, `5xx`, kegagalan transport | Transien. | Retry dengan key yang sama, backoff eksponensial 500 ms–5 s, maksimum 3 percobaan. |
+| `408`, `429`, `5xx`, kegagalan transport | Transien. | Log: retry dengan key dan isi yang sama, backoff eksponensial 1–15 s plus jitter, tidak kurang dari `Retry-After` (dibatasi 5 menit), tanpa batas jumlah selama command berjalan; baris berikutnya menunggu di buffer berbatas (lihat [Logging](LOGGING.md)). Event: maksimum 3 percobaan, backoff 500 ms–5 s. |
+| `4xx` lain | Tidak akan berhasil bila diulang. | Hentikan delivery log command ini tanpa retry. |
 | `409` | Command terminal, bukan node pemilik, atau `Idempotency-Key` dipakai untuk payload berbeda. | Hentikan delivery log command ini tanpa retry. |
 | `422` | Budget `max_total_bytes` habis atau field tidak valid. | Hentikan delivery log command ini tanpa retry. |
 | `413` | Body melebihi `SAKALA_LOG_MAX_REQUEST_BYTES` (1 MiB). | Hentikan delivery; batas lokal Agent sengaja jauh di bawah nilai ini. |
@@ -1386,8 +1389,13 @@ kumulatif `max_total_bytes` tetap berlaku; `422` atau `409` menghentikan
 follower tanpa retry. Event setelah command terminal selalu ditolak `409`.
 Command `Failed`, `Cancelled`, atau `Expired` tidak menerima log lagi.
 
-Sebelum `complete`/`fail`, Agent mem-flush batch log yang tersisa. Kegagalan
-flush dicatat sebagai warning dan tidak mengubah hasil command.
+Sebelum `complete`/`fail`, Agent mem-flush batch log yang tersisa, menunggu
+API pulih paling lama 120 detik tetapi tidak melewati `command_timeout_seconds`
+(minimal 10 detik), agar lease tidak habis. Baris yang tidak terkirim dicatat
+sebagai warning beserta jumlahnya dan tidak mengubah hasil command. Bila buffer
+Agent penuh selama API tidak terjangkau, baris tertua dibuang dan timeline
+menerima satu baris `system` biasa yang menyebut jumlah baris yang hilang di
+titik itu; tidak ada field baru.
 
 Failure memakai field stabil yang sama dengan persistence model API:
 
@@ -1542,8 +1550,10 @@ Client memakai timeout 10 detik per request dan memperlakukan HTTP status
 failure sebagai request error. Polling dan heartbeat tidak di-retry; keduanya
 melanjutkan worker loop pada tick berikutnya. Claim tidak di-retry (lihat
 [Polling and Claim Semantics](#polling-and-claim-semantics)). Report event/log
-serta `complete`/`fail` di-retry dengan backoff terbatas hanya untuk kegagalan
-transient dan memakai `Idempotency-Key` yang sama pada setiap percobaan. Lease
+serta `complete`/`fail` di-retry hanya untuk kegagalan transient dan memakai
+`Idempotency-Key` yang sama pada setiap percobaan: event dan `complete`/`fail`
+dengan backoff terbatas (3 percobaan), log sampai di-ack, ditolak, atau batas
+flush akhir habis (lihat tabel respons di atas). Lease
 expiry, offline detection, dan recovery command yang terputus dimiliki
 `sakala-api` dan dijelaskan pada
 [Semantik control plane yang diandalkan Agent](#semantik-control-plane-yang-diandalkan-agent).

@@ -246,6 +246,81 @@ async fn connected_agent_polls_and_reports_a_complete_noop_lifecycle() {
         .expect("noop command lifecycle should complete");
 }
 
+/// A log batch that meets an unavailable API is delivered once it recovers,
+/// and before the command is completed, instead of being dropped.
+#[tokio::test]
+async fn logs_survive_a_brief_api_outage_and_land_before_completion() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    mount_event_mock(&server, "command.claimed", "Agent claimed command.").await;
+    mount_event_mock(
+        &server,
+        "runtime.noop.completed",
+        "Noop runtime completed command without host changes.",
+    )
+    .await;
+    let logs = format!("/api/agent/v1/commands/{COMMAND_ID}/logs");
+    Mock::given(method("POST"))
+        .and(path(logs.clone()))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(logs.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 1,
+                "last_sequence": 1
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let command: AgentCommand =
+        serde_json::from_value(command_fixture()).expect("command fixture should deserialize");
+
+    let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
+    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
+        .process(&command, CancellationToken::new())
+        .await
+        .expect("the command completes");
+
+    let paths = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded")
+        .into_iter()
+        .map(|request| request.url.path().to_owned())
+        .collect::<Vec<_>>();
+    let last_log = paths
+        .iter()
+        .rposition(|path| *path == logs)
+        .expect("logs were sent");
+    let complete = paths
+        .iter()
+        .position(|path| path.ends_with("/complete"))
+        .expect("the command was completed");
+    assert_eq!(paths.iter().filter(|path| **path == logs).count(), 2);
+    assert!(
+        last_log < complete,
+        "logs must be delivered before completion: {paths:?}"
+    );
+}
+
 #[tokio::test]
 async fn connected_agent_reports_runtime_failures_with_stable_error_fields() {
     let server = MockServer::start().await;

@@ -21,6 +21,14 @@ use crate::{
 };
 
 const POST_COMMIT_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
+/// Longest wait for buffered log lines before `complete`/`fail`, when the
+/// control plane is unreachable at the end of a command.
+const FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(120);
+/// Shortest such wait, even for a command that used its whole timeout. The
+/// control-plane lease outlives the command timeout by
+/// `SAKALA_AGENT_LEASE_GRACE_SECONDS` (default 60), so this still leaves room
+/// for the terminal report.
+const MIN_FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(10);
 
 /// Payload field of `CreateDatabase` and `RotateDatabasePassword`.
 const DATABASE_PASSWORD_FIELD: &str = "password";
@@ -30,6 +38,7 @@ pub struct CommandProcessor {
     dispatcher: CommandDispatcher,
     command_timeout: Duration,
     post_commit_finalization_grace: Duration,
+    final_log_flush_grace: Duration,
 }
 
 impl CommandProcessor {
@@ -66,6 +75,7 @@ impl CommandProcessor {
             .with_reporter_factory(reporter_factory),
             command_timeout,
             post_commit_finalization_grace: POST_COMMIT_FINALIZATION_GRACE,
+            final_log_flush_grace: FINAL_LOG_FLUSH_GRACE,
         }
     }
 
@@ -74,6 +84,14 @@ impl CommandProcessor {
     #[must_use]
     pub fn with_post_commit_finalization_grace(mut self, grace: Duration) -> Self {
         self.post_commit_finalization_grace = grace;
+        self
+    }
+
+    /// Overrides the longest wait for buffered log lines before the terminal
+    /// report. Primarily useful for deterministic integration tests.
+    #[must_use]
+    pub fn with_final_log_flush_grace(mut self, grace: Duration) -> Self {
+        self.final_log_flush_grace = grace;
         self
     }
 
@@ -209,10 +227,17 @@ impl CommandProcessor {
         };
 
         // Buffered log batches are delivered before the terminal transition so
-        // the control-plane timeline is complete. Undeliverable logs are a
-        // warning: the command outcome is decided by the runtime, not by log
+        // the control-plane timeline is complete; a failed command no longer
+        // accepts new lines afterwards. The wait ends inside the command's own
+        // timeout so the lease cannot expire under it. Undeliverable logs are
+        // a warning: the command outcome is decided by the runtime, not by log
         // transport.
-        if let Err(error) = reporter.flush().await {
+        let flush_grace = self.final_log_flush_grace.min(
+            execution_timeout
+                .saturating_sub(started.elapsed())
+                .max(MIN_FINAL_LOG_FLUSH_GRACE),
+        );
+        if let Err(error) = reporter.flush_within(flush_grace).await {
             warn!(command_id = %command.id, %error, "deployment logs could not be fully delivered");
         }
 
