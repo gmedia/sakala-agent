@@ -45,6 +45,13 @@ const GITHUB_TOKEN: &str = "ghs_ephemeraltokenvalue";
 const DATABASE_PASSWORD: &str = "hunter2-database";
 const PLAIN_VALUE: &str = "kL9-unusual-value-under-a-plain-name";
 const COMMAND_ID_NOT_RUNNING: &str = "0198a2f0-6a51-7c3e-9d6e-1b2c3d4e5f60";
+/// The values above that must never leave the node, by the name a failure message may show.
+const SECRET_VALUES: [(&str, &str); 4] = [
+    ("API_KEY", API_KEY),
+    ("GITHUB_TOKEN", GITHUB_TOKEN),
+    ("DATABASE_PASSWORD", DATABASE_PASSWORD),
+    ("PLAIN_VALUE", PLAIN_VALUE),
+];
 
 #[tokio::test]
 async fn crash_during_start_delivers_redacted_logs_before_the_failure_report() {
@@ -63,7 +70,12 @@ async fn crash_during_start_delivers_redacted_logs_before_the_failure_report() {
         requests
             .iter()
             .position(|(path, _)| path.ends_with(suffix))
-            .unwrap_or_else(|| panic!("{suffix} should be requested: {requests:?}"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{suffix} should be requested: {}",
+                    masked(&format!("{requests:?}"))
+                )
+            })
     };
     assert!(
         index_of("/logs") < index_of("/fail"),
@@ -92,13 +104,15 @@ async fn crash_during_start_delivers_redacted_logs_before_the_failure_report() {
         messages
             .iter()
             .any(|message| message == "[runtime] listening failed"),
-        "{messages:?}"
+        "{}",
+        masked(&format!("{messages:?}"))
     );
     assert!(
         messages
             .iter()
             .any(|message| message.contains("API_KEY=[REDACTED]")),
-        "{messages:?}"
+        "{}",
+        masked(&format!("{messages:?}"))
     );
     assert!(
         delivered
@@ -108,10 +122,10 @@ async fn crash_during_start_delivers_redacted_logs_before_the_failure_report() {
     );
 
     let everything_sent = serde_json::to_string(&requests).expect("requests serialize");
-    for secret in [API_KEY, GITHUB_TOKEN, DATABASE_PASSWORD] {
+    for (name, value) in &SECRET_VALUES[..3] {
         assert!(
-            !everything_sent.contains(secret),
-            "{secret} must not reach the control plane"
+            !everything_sent.contains(value),
+            "{name} must not reach the control plane"
         );
     }
     assert!(
@@ -179,11 +193,16 @@ async fn a_command_environment_value_never_reaches_the_control_plane() {
 
     let requests = requests.lock().expect("request lock").clone();
     let everything_sent = serde_json::to_string(&requests).expect("requests serialize");
-    assert!(!everything_sent.contains(PLAIN_VALUE), "{everything_sent}");
+    assert!(
+        !everything_sent.contains(PLAIN_VALUE),
+        "{}",
+        masked(&everything_sent)
+    );
     assert!(everything_sent.contains("connecting to [REDACTED]"));
     assert!(
         everything_sent.contains("still alive at 3000 in production"),
-        "short and ordinary values must not mangle logs: {everything_sent}"
+        "short and ordinary values must not mangle logs: {}",
+        masked(&everything_sent)
     );
 }
 
@@ -302,7 +321,8 @@ async fn cancel_requested_after_cutover_completes_the_deployment() {
     let requests = requests.lock().expect("request lock").clone();
     assert!(
         requests.iter().any(|(path, _)| path.ends_with("/complete")),
-        "{requests:?}"
+        "{}",
+        masked(&format!("{requests:?}"))
     );
     assert!(!requests.iter().any(|(path, _)| path.ends_with("/fail")));
     let (_, completion) = requests
@@ -499,6 +519,16 @@ async fn a_build_timeout_keeps_earlier_output_and_names_the_stage_and_limit() {
     let message = failure["error_message"].as_str().expect("message");
     assert!(message.contains("deployment-build"), "{message}");
     assert!(message.contains("1s"), "{message}");
+}
+
+/// Output for a failed assertion with every value in `SECRET_VALUES` replaced by its
+/// name, so a test that catches a leak does not print the value it caught.
+fn masked(text: &str) -> String {
+    SECRET_VALUES
+        .iter()
+        .fold(text.to_owned(), |text, (name, value)| {
+            text.replace(value, &format!("<{name}>"))
+        })
 }
 
 fn build_report(requests: &[(String, Value)]) -> (Vec<String>, Value) {

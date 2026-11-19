@@ -197,7 +197,11 @@ async fn real_docker_deployments_report_what_actually_happened() {
         !run.sent.contains(SECRET),
         "the secret must not reach the control plane"
     );
-    assert!(run.sent.contains("API_KEY=[REDACTED]"), "{}", run.sent);
+    assert!(
+        run.sent.contains("API_KEY=[REDACTED]"),
+        "{}",
+        masked(&run.sent, SECRET)
+    );
     assert_no_containers_named(&run.project_prefix());
 
     let run = harness
@@ -525,7 +529,11 @@ async fn dockerfile_build_uses_project_variables_without_keeping_them_in_the_ima
         !sent.contains(VALUE),
         "the value must not reach the control plane"
     );
-    assert!(sent.contains("seen as env: [REDACTED]"), "{sent}");
+    assert!(
+        sent.contains("seen as env: [REDACTED]"),
+        "{}",
+        masked(&sent, VALUE)
+    );
 
     // The step really had the value, under both documented forms.
     let length = VALUE.len().to_string();
@@ -537,9 +545,17 @@ async fn dockerfile_build_uses_project_variables_without_keeping_them_in_the_ima
 
     // And the image keeps none of it, in history, config, or any layer.
     let history = docker(&["history", "--no-trunc", IMAGE]);
-    assert!(!history.contains(VALUE), "history: {history}");
+    assert!(
+        !history.contains(VALUE),
+        "history: {}",
+        masked(&history, VALUE)
+    );
     let inspect = docker(&["image", "inspect", IMAGE]);
-    assert!(!inspect.contains(VALUE), "config: {inspect}");
+    assert!(
+        !inspect.contains(VALUE),
+        "config: {}",
+        masked(&inspect, VALUE)
+    );
     // The marker proves this search would find a value a step had written.
     let search = |needle: &str| {
         docker(&[
@@ -1146,6 +1162,12 @@ fn write_repository(root: &std::path::Path, files: &[(&str, &str)]) {
     }
 }
 
+/// Output for a failed assertion with the secret replaced, so a test that catches a
+/// leak does not print the value it caught.
+fn masked(text: &str, secret: &str) -> String {
+    text.replace(secret, "<secret>")
+}
+
 /// Lets a test read what a repository's code saw inside the sandbox. The sandbox has
 /// no writable host path of its own, so this adds one mount to it and changes nothing
 /// else about the command the Agent runs.
@@ -1492,17 +1514,26 @@ async fn projects_share_nothing_through_the_build_cache() {
         }
     };
 
-    let (first_secret, first_seen) = build("one", "secret-of-project-one").await;
-    let (second_secret, second_seen) = build("two", "secret-of-project-two").await;
-    println!("project one holds {first_secret}, its cache mount held {first_seen}");
-    println!("project two holds {second_secret}, its cache mount held {second_seen}");
-    assert_eq!(first_secret, "secret-of-project-one");
-    assert_eq!(second_secret, "secret-of-project-two");
-    assert_eq!(first_seen, "NOTHING");
-    assert_eq!(
-        second_seen, "NOTHING",
-        "a cache mount must not cross projects"
-    );
+    // Both files can hold a build secret, so only what they prove is printed, never the value.
+    for (name, value) in [
+        ("one", "secret-of-project-one"),
+        ("two", "secret-of-project-two"),
+    ] {
+        let (baked, seen) = build(name, value).await;
+        let holds_its_own = baked == value;
+        let cache_was_empty = seen == "NOTHING";
+        println!(
+            "project {name}: image holds its own value: {holds_its_own}, cache mount was empty: {cache_was_empty}"
+        );
+        assert!(
+            holds_its_own,
+            "project {name}'s image must hold the value it was built with"
+        );
+        assert!(
+            cache_was_empty,
+            "a cache mount must not cross projects: project {name} found an earlier build's file"
+        );
+    }
 
     // `--no-cache` hides a cache mount for that build, so the namespace is checked on
     // its own here: a build with the same namespace sees it, another one does not.
@@ -1719,7 +1750,6 @@ async fn railpack_projects_keep_their_own_secrets() {
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
             .expect("source permissions");
     }
-    let mut seen = Vec::new();
     for (name, secret) in [
         ("one", "railpack-secret-one"),
         ("two", "railpack-secret-two"),
@@ -1754,10 +1784,14 @@ async fn railpack_projects_keep_their_own_secrets() {
         ])
         .trim()
         .to_owned();
-        println!("project {name} holds {baked}");
-        seen.push(baked);
+        // The file holds a build secret, so only whether it matches is printed.
+        let holds_its_own = baked == secret;
+        println!("project {name}: image holds its own value: {holds_its_own}");
+        assert!(
+            holds_its_own,
+            "project {name}'s image must hold the value it was built with"
+        );
     }
-    assert_eq!(seen, ["railpack-secret-one", "railpack-secret-two"]);
 }
 
 /// Runs a real workload under `SAKALA_SMOKE_CONTAINER_RUNTIME`, on whichever daemon
