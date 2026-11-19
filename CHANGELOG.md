@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-19
+
 ### Added
 
 - Peran host database untuk PostgreSQL terkelola tahap pertama (ADR-020, gmedia/sakala-api#125). Dengan `SAKALA_DATABASE_DRIVER=postgres` (baru, default `none`), binary yang sama mengelola satu instance PostgreSQL lokal sebagai superuser lewat `SAKALA_DATABASE_ADMIN_DSN` (baru, hanya socket Unix atau loopback, tidak pernah dicetak), mengiklankan capability baru `managed-postgres`, dan bisa berjalan di samping driver runtime mana pun. Enam command baru: `CreateDatabase`, `DropDatabase`, `RotateDatabasePassword`, `LockDatabase`, `UnlockDatabase`, dan `InstallDatabaseExtension`. Nama database dan role wajib cocok dengan `^p_[a-z0-9]{16,40}$`, dan semua command idempotent. Setiap database tenant mendapat role `LOGIN` tanpa `CREATEDB`/`CREATEROLE` dengan `CONNECTION LIMIT 5`, default `statement_timeout` dan `idle_in_transaction_session_timeout` 60 detik serta `idle_session_timeout` 30 menit, `temp_file_limit` 1 GB yang tidak bisa dinaikkan tenant, database milik role itu dengan `CONNECTION LIMIT 5`, `REVOKE ALL ... FROM PUBLIC`, dan tanpa `CREATE` di schema `public` untuk `PUBLIC`. `postgres` dan `template1` ditutup untuk `PUBLIC`. Password disimpan sebagai verifier SCRAM-SHA-256 yang dihitung Agent, sehingga plaintext tidak pernah sampai ke server atau log statement-nya. Lock mematikan `LOGIN` role owner dan mengakhiri sesinya, bukan `ALLOW_CONNECTIONS false`, supaya backup tetap jalan dan tenant tidak bisa membukanya sendiri. Extension hanya dari allow-list `pgcrypto`, `citext`, `pg_trgm`, `unaccent`, `hstore`, `vector`. Delapan kode kegagalan baru berawalan `database_`. Heartbeat node database membawa `metadata.database` (`endpoint` dari `SAKALA_DATABASE_PUBLIC_HOST` dan `SAKALA_DATABASE_PUBLIC_PORT`, keduanya baru, serta `available`) dan, paling sering sekali per 60 detik, `metadata.databases` berisi `{ name, size_bytes }` untuk paling banyak 1000 database terkelola; instance yang tidak terbaca membuat node `degraded`. Uji dengan `postgres:18-alpine` sungguhan membuktikan isolasi antar-tenant, default role, batas koneksi, lock, rotasi, allow-list extension, drop, dan log server tanpa password. Aditif di protocol revision 4, tetapi API hanya boleh mengirim command baru ke node `managed-postgres`; lihat [Database Host](docs/DATABASE_HOST.md), [Sakala Agent API](docs/AGENT_API.md#database-host), dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-managed-postgresql).
@@ -269,7 +271,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/gmedia/sakala-agent/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gmedia/sakala-agent/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/gmedia/sakala-agent/compare/v0.9.1...v0.10.0
 [0.9.1]: https://github.com/gmedia/sakala-agent/compare/v0.9.0...v0.9.1
