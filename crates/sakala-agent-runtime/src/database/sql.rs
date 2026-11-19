@@ -252,8 +252,10 @@ pub fn login(role: &ManagedName, allowed: bool) -> String {
     format!("ALTER ROLE {} WITH {attribute}", identifier(role))
 }
 
+/// Rotation: the role's password becomes a SCRAM-SHA-256 verifier computed by
+/// the agent, never the plaintext.
 #[must_use]
-pub fn set_password(role: &ManagedName, password_verifier: &str) -> String {
+pub fn set_scram_verifier(role: &ManagedName, password_verifier: &str) -> String {
     format!(
         "ALTER ROLE {} WITH PASSWORD {}",
         identifier(role),
@@ -462,7 +464,7 @@ mod tests {
             "ALTER ROLE \"p_fedcba9876543210\" WITH LOGIN"
         );
         assert_eq!(
-            set_password(&role(), VERIFIER),
+            set_scram_verifier(&role(), VERIFIER),
             format!("ALTER ROLE \"p_fedcba9876543210\" WITH PASSWORD '{VERIFIER}'")
         );
         assert_eq!(

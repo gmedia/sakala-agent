@@ -326,7 +326,7 @@ impl DatabaseAdmin for PostgresDatabaseAdmin {
             .ok_or_else(|| not_found(format!("role {} does not exist", payload.role)))?;
         let verifier = scram_sha_256(payload.password.expose().as_bytes());
         client
-            .batch_execute(&sql::set_password(&payload.role, &verifier))
+            .batch_execute(&sql::set_scram_verifier(&payload.role, &verifier))
             .await
             .map_err(postgres_error)?;
         Ok(RotateDatabasePasswordResult {

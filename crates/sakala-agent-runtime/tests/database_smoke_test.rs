@@ -43,6 +43,9 @@ use uuid::Uuid;
 const CONTAINER: &str = "sakala-smdb-postgres";
 const DEFAULT_IMAGE: &str = "postgres:18-alpine";
 const IMAGE_ENV: &str = "SAKALA_SMOKE_POSTGRES_IMAGE";
+/// Read by the image from the container environment, which `docker run -e`
+/// copies from the docker CLI's own environment.
+const POSTGRES_PASSWORD_ENV: &str = "POSTGRES_PASSWORD";
 const READY_ATTEMPTS: usize = 60;
 
 const DATABASE_A: &str = "p_smokeaaaaaaaaaaaa";
@@ -85,11 +88,15 @@ impl Drop for Container {
     }
 }
 
-fn docker(arguments: &[&str]) -> String {
-    let output = Command::new("docker")
-        .args(arguments)
-        .output()
-        .expect("docker runs");
+/// Runs docker. The admin password, when given, goes into the docker CLI's
+/// environment, never into its arguments.
+fn docker_with(arguments: &[&str], admin_password: Option<&str>) -> String {
+    let mut command = Command::new("docker");
+    command.args(arguments);
+    if let Some(password) = admin_password {
+        command.env(POSTGRES_PASSWORD_ENV, password);
+    }
+    let output = command.output().expect("docker runs");
     assert!(
         output.status.success(),
         "docker {}: {}",
@@ -99,25 +106,31 @@ fn docker(arguments: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+fn docker(arguments: &[&str]) -> String {
+    docker_with(arguments, None)
+}
+
 fn start_postgres() -> (Container, u16) {
     let _ = Command::new("docker")
         .args(["rm", "-f", CONTAINER])
         .output();
-    let password = format!("POSTGRES_PASSWORD={}", ADMIN_PASSWORD.as_str());
     let image = std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_owned());
-    docker(&[
-        "run",
-        "-d",
-        "--name",
-        CONTAINER,
-        "-e",
-        &password,
-        "-p",
-        "127.0.0.1::5432",
-        &image,
-        "-c",
-        "log_statement=all",
-    ]);
+    docker_with(
+        &[
+            "run",
+            "-d",
+            "--name",
+            CONTAINER,
+            "-e",
+            POSTGRES_PASSWORD_ENV,
+            "-p",
+            "127.0.0.1::5432",
+            &image,
+            "-c",
+            "log_statement=all",
+        ],
+        Some(ADMIN_PASSWORD.as_str()),
+    );
     let published = docker(&["port", CONTAINER, "5432/tcp"]);
     let port = published
         .lines()
