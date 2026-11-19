@@ -1,17 +1,20 @@
 mod base_image;
+mod database_hint;
 mod dockerfile;
+mod env_example;
 
 use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::ProjectInspection;
 use serde_json::Value;
-use tokio::{fs, io::AsyncReadExt};
+use tokio::fs;
 
 use self::base_image::{PublicImage, RegistryLookup};
 use crate::{
     ProcessRunner, RuntimeError, RuntimeReporter, js_workspace,
     railpack::{self, RailpackSandbox},
+    repository_file,
     workspace::RepositorySource,
 };
 use sakala_agent_core::ports::SecretString;
@@ -102,6 +105,9 @@ impl ProjectInspector for RailpackProjectInspector {
             Some(contents) => exposed_ports(&contents, &self.registry).await,
             None => Vec::new(),
         };
+        // Both read the root directory only, also inside a workspace package.
+        let env_example = env_example::read(context).await;
+        let database_hint = database_hint::detect(context, env_example.as_ref()).await;
 
         Ok(ProjectInspection {
             repository_url: source.repository_url.clone(),
@@ -121,6 +127,8 @@ impl ProjectInspector for RailpackProjectInspector {
             workspace,
             manifests,
             exposed_ports,
+            env_example: env_example.map(|scan| scan.example),
+            database_hint: Some(database_hint),
             railpack,
         })
     }
@@ -156,21 +164,9 @@ const MAX_DOCKERFILE_BYTES: u64 = 1024 * 1024;
 /// repository chooses where it points.
 async fn read_dockerfile(context: &Path) -> Option<String> {
     let root = fs::canonicalize(context).await.ok()?;
-    let path = fs::canonicalize(context.join("Dockerfile")).await.ok()?;
-    if !path.starts_with(&root) || !fs::metadata(&path).await.ok()?.is_file() {
-        return None;
-    }
-    let mut contents = Vec::new();
-    fs::File::open(&path)
-        .await
-        .ok()?
-        .take(MAX_DOCKERFILE_BYTES + 1)
-        .read_to_end(&mut contents)
-        .await
-        .ok()?;
-    if contents.len() as u64 > MAX_DOCKERFILE_BYTES {
-        return None;
-    }
+    let contents =
+        repository_file::read_bytes(&root, &context.join("Dockerfile"), MAX_DOCKERFILE_BYTES)
+            .await?;
     Some(String::from_utf8_lossy(&contents).into_owned())
 }
 

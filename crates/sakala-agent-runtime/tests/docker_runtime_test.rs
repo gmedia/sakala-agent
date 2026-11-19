@@ -790,6 +790,23 @@ async fn project_preview_uses_railpack_info_without_preparing_or_building() {
 
     assert_eq!(output.result["package_manager"], "pnpm");
     assert_eq!(output.result["env_example_found"], true);
+    assert_eq!(
+        output.result["env_example"],
+        json!({
+            "file": ".env.example",
+            "entries": [{ "key": "APP_URL", "example_value": null }],
+            "truncated": false
+        })
+    );
+    assert_eq!(
+        output.result["database_hint"],
+        json!({
+            "likely": false,
+            "engine": "unknown",
+            "signals": [],
+            "suggested_release_command": null
+        })
+    );
     assert_eq!(output.result["railpack"]["provider"], "node");
 
     let commands = runner.commands.lock().expect("command lock");

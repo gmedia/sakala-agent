@@ -39,7 +39,11 @@ pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::{
     CrashedWorkloadDetail, HeartbeatPayload, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
-pub use inspections::{InspectProjectPayload, JsPackageManager, JsWorkspace, ProjectInspection};
+pub use inspections::{
+    DatabaseEngine, DatabaseHint, DatabaseSignal, DatabaseSignalKind, EnvExample, EnvExampleEntry,
+    EnvExampleFile, InspectProjectPayload, JsPackageManager, JsWorkspace, ProjectInspection,
+    SuggestedReleaseCommand,
+};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};
 pub use placement::{

@@ -320,6 +320,16 @@ semantics, and acknowledgement. Either side can be deployed first.
 | Lines dropped by the Agent | Marked in the timeline. | The Agent queues at most 10,000 lines and 2 MiB per command besides the batch in flight; past that the oldest queued lines are dropped and a `system` line `<n> log lines are missing here: ...` is sent where they were. It is an ordinary log line and counts toward `max_total_bytes`. |
 | Other `4xx` on log reports | Stop delivery, as `409`/`413`/`422` do. | No change in practice: these were never retried. |
 
+## Revision 4 additions for env and database suggestions
+
+Still revision 4: no new command type or payload field, only two additive inspection
+result fields. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `InspectProject` result field `env_example` | Sent, always. | `null` when the inspected directory has no `.env.example`, `.env.sample`, or `.env.dist`, or the first one that exists cannot be read safely (symlink leaving the directory, not a regular file, over 64 KiB). Otherwise `{ file, entries: [{ key, example_value }], truncated }`, at most 200 entries; `example_value` is `null` when empty, multi-line, or credential-like. `.env` is never opened and nothing is interpolated. A result without the field comes from an older Agent. An older API copies known keys only, so it ignores the field. Rules in [Sakala Agent API](AGENT_API.md#variabel-dari-envexample). |
+| `InspectProject` result field `database_hint` | Sent, always, as an object. | `{ likely, engine, signals: [{ kind, file, name }], suggested_release_command }`. `engine` is one of `postgresql`, `mysql`, `sqlite`, `unknown`; `kind` is one of `env_variable`, `laravel_migrations`, `prisma_schema`, `django_settings`, `rails_database_config`, `package_dependency`, and new kinds may be added, so consumers must ignore unknown ones. `suggested_release_command` is `null` or exactly one of `php artisan migrate --force`, `python manage.py migrate`, `npx prisma migrate deploy`, `bin/rails db:migrate`. At most 16 signals. A result without the field comes from an older Agent. Rules in [Sakala Agent API](AGENT_API.md#petunjuk-database). |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

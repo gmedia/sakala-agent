@@ -715,6 +715,24 @@ Setelah `railpack info` dan scanner selesai, agent menyelesaikan command dengan 
     "package_manager": "pnpm",
     "exposed_ports": [],
     "workspace": null,
+    "env_example": {
+      "file": ".env.example",
+      "entries": [
+        { "key": "APP_NAME", "example_value": "Buku tamu Sakala" },
+        { "key": "APP_KEY", "example_value": null }
+      ],
+      "truncated": false
+    },
+    "database_hint": {
+      "likely": true,
+      "engine": "postgresql",
+      "signals": [
+        { "kind": "env_variable", "file": ".env.example", "name": "DATABASE_URL" },
+        { "kind": "prisma_schema", "file": "prisma/schema.prisma", "name": "postgresql" },
+        { "kind": "package_dependency", "file": "package.json", "name": "@prisma/client" }
+      ],
+      "suggested_release_command": "npx prisma migrate deploy"
+    },
     "railpack": {}
   }
 }
@@ -788,6 +806,89 @@ inspection, karena build Dockerfile tidak memakai Railpack. Railpack gagal, misa
 pada repository yang hanya berisi Dockerfile. `railpack` lalu bernilai `null`, dan
 output Railpack tetap ada di log command. Tanpa Dockerfile, kegagalan itu tetap
 menjadi `fail` dengan `runtime_build_failed`.
+
+### Variabel dari `.env.example`
+
+`env_example` selalu dikirim. Isinya daftar variabel yang dicantumkan file contoh
+environment di direktori yang diinspeksi, supaya Console bisa menyarankannya sebelum
+deployment pertama. Field yang tidak ada berarti Agent sebelum field ini.
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `env_example` | object \| `null` | `null` bila tidak ada file kandidat, atau file itu tidak bisa dibaca dengan aman (lihat di bawah). |
+| `env_example.file` | `".env.example"` \| `".env.sample"` \| `".env.dist"` | File yang dibaca. Kandidat dicari dengan urutan ini dan yang pertama ada yang dipakai. |
+| `env_example.entries` | array | Paling banyak 200 entri, urut seperti di file. |
+| `env_example.entries[].key` | string | Nama variabel, cocok dengan `^[A-Za-z_][A-Za-z0-9_]{0,127}$`. Nama lain dibuang dan tidak dihitung. |
+| `env_example.entries[].example_value` | string \| `null` | Nilai contoh tanpa tanda kutip, paling banyak 200 karakter Unicode (dipotong di batas karakter). `null` bila kosong, bila nilainya berlanjut ke baris berikutnya atau kutipnya tidak ditutup, atau bila nilainya mirip credential: memuat `-----BEGIN`, atau URL yang userinfo-nya berisi password seperti `postgres://u:p@h/db`. |
+| `env_example.truncated` | boolean | `true` bila file memuat lebih dari 200 key yang valid. |
+
+Aturan membaca file:
+
+- Kandidat hanya dicari di direktori yang diinspeksi (`root_directory`, jadi folder
+  package pada monorepo), tidak pernah di atasnya. `.env`, `.env.local`,
+  `.env.production`, dan nama lain tidak pernah dibuka.
+- Kandidat pertama yang ada menang. Bila file itu symlink yang keluar dari direktori
+  yang diinspeksi, bukan file biasa, atau lebih dari 64 KiB (65536 byte), hasilnya
+  `null`; kandidat berikutnya tidak dibaca sebagai gantinya.
+- Baris berbentuk `KEY=VALUE`, boleh berawalan `export `. Spasi di sekitar key dan `=`
+  diabaikan. Baris kosong, baris komentar `#`, dan baris tanpa `=` dilewati. Pada nilai
+  tanpa kutip, `#` yang didahului spasi memulai komentar.
+- Kutip tunggal, ganda, dan backtick dibuang. Di dalam kutip ganda hanya `\"` yang
+  diartikan (sebagai `"`); `\n` dan escape lain tetap teks apa adanya. Teks setelah
+  kutip penutup diabaikan.
+- Tidak ada interpolasi: `${VAR}` dan `$VAR` tetap teks apa adanya, tidak ada perintah
+  yang dijalankan, dan environment Agent sendiri tidak pernah dibaca.
+- Kutip yang tidak ditutup di baris yang sama: entrinya tetap ada dengan
+  `example_value: null`, dan baris berikutnya sampai kutip penutup dilewati.
+- Key yang muncul dua kali memakai nilai terakhir di posisi kemunculan pertama.
+
+### Petunjuk database
+
+`database_hint` selalu dikirim oleh Agent yang mengenal field ini, berupa object; field
+yang tidak ada berarti Agent sebelum field ini. Tanpa bukti apa pun nilainya
+`{ "likely": false, "engine": "unknown", "signals": [], "suggested_release_command": null }`.
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `likely` | boolean | `true` tepat ketika `signals` tidak kosong. |
+| `engine` | `"postgresql"` \| `"mysql"` \| `"sqlite"` \| `"unknown"` | Engine yang paling mungkin, dari sumber pertama yang tegas (urutan di bawah). |
+| `signals` | array | Bukti yang ditemukan, paling banyak 16, tanpa duplikat. Bukti dari variabel dan framework datang lebih dulu daripada nama package, jadi batas 16 memotong nama package dulu. |
+| `signals[].kind` | string | Salah satu nilai di tabel berikut. Nilai baru bisa ditambahkan; consumer mengabaikan nilai yang tidak dikenalnya. |
+| `signals[].file` | string | File atau direktori bukti, relatif terhadap direktori yang diinspeksi. |
+| `signals[].name` | string \| `null` | Lihat tabel berikut. |
+| `suggested_release_command` | string \| `null` | Salah satu dari empat perintah di bawah, hanya bila terdeteksi dengan yakin. |
+
+| `kind` | Kapan | `name` |
+| --- | --- | --- |
+| `env_variable` | Key tanpa komentar di `env_example` salah satu dari `DATABASE_URL`, `DB_URL`, `DB_CONNECTION`, `DB_HOST`, `POSTGRES_URL`, `POSTGRES_HOST`, `MYSQL_URL`, `MYSQL_HOST`, `PGHOST`. | Key itu. |
+| `laravel_migrations` | `require` di `composer.json` memuat `laravel/framework` dan `database/migrations/` berisi setidaknya satu file `*.php`. `file` bernilai `database/migrations`. | `null` |
+| `prisma_schema` | `prisma/schema.prisma` (atau `schema.prisma` di root) punya blok `datasource` dengan `provider = "..."`. | Nilai provider, atau `null` bila bukan identifier pendek. |
+| `django_settings` | Ada `manage.py`, dan `settings.py` atau `settings/*.py` satu level di bawahnya menyebut `dj_database_url` atau `DATABASES`. | `"dj_database_url"` bila disebut, selain itu `"DATABASES"`. |
+| `rails_database_config` | `config/database.yml` ada. | Nilai `adapter:` pertama, `null` bila berupa ERB atau tidak ada. |
+| `package_dependency` | Nama package database di `package.json` (`dependencies`, `devDependencies`), `composer.json` (`require`, `require-dev`), `requirements.txt` atau `pyproject.toml`, dan `Gemfile`. Daftarnya ada di [Docker Runtime](DOCKER_RUNTIME.md#saran-variabel-dan-database). | Nama package. |
+
+Urutan sumber `engine`: nilai `DB_CONNECTION` (`pgsql`, `postgres`, `postgresql`,
+`mysql`, `mariadb`, `sqlite`), scheme `DATABASE_URL` lalu `DB_URL` (`postgres`,
+`postgresql`, `mysql`, `mariadb`, `sqlite`, `file`; akhiran driver seperti
+`postgresql+asyncpg` ikut dikenali), provider Prisma, adapter Rails (`postgresql`,
+`mysql2`, `trilogy`, `sqlite3`), string `django.db.backends.*` di settings Django, lalu
+nama package. Scheme dibaca juga ketika `example_value`-nya disembunyikan sebagai
+credential, karena scheme sendiri bukan rahasia.
+
+`suggested_release_command` diambil dari baris pertama yang cocok:
+
+| Perintah | Syarat |
+| --- | --- |
+| `php artisan migrate --force` | File `artisan` dan sinyal `laravel_migrations`. |
+| `python manage.py migrate` | File `manage.py` dan `django` di `requirements.txt` atau `pyproject.toml`. |
+| `npx prisma migrate deploy` | Sinyal `prisma_schema`, direktori `prisma/migrations/`, dan `prisma` atau `@prisma/client` di `package.json`. |
+| `bin/rails db:migrate` | File `bin/rails`, `config/database.yml`, dan direktori `db/migrate/`. |
+
+Semua file dibaca dengan aturan yang sama dengan `Dockerfile`: harus tetap di dalam
+direktori yang diinspeksi setelah symlink diikuti, harus file biasa, paling besar 1 MiB
+(64 KiB untuk file contoh environment), dan listing direktori berhenti setelah 200 entri.
+Tidak ada yang dijalankan, file yang tidak terbaca dilewati, dan isi repository tidak
+ditulis ke log.
 
 Field stabil Sakala berada di tingkat atas `result`. Field `railpack` menyimpan raw JSON untuk audit dan evolusi adapter; console tidak boleh bergantung langsung pada struktur raw tersebut tanpa schema/normalization.
 
