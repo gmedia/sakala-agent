@@ -78,6 +78,11 @@ impl DeploymentWorkspace {
         &self.source
     }
 
+    /// The checkout with every symlink resolved, the form `build_context` returns.
+    pub async fn canonical_source(&self) -> Result<PathBuf, RuntimeError> {
+        Ok(tokio::fs::canonicalize(&self.source).await?)
+    }
+
     /// Resolves the directory a build works in. Only the checkout can show where
     /// a symlink leads, so this runs after it, and the resolved path is what gets
     /// used: nothing follows the link again later.

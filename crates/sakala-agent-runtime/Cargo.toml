@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64 = "0.23"
+globset = "0.4.21"
 nix = { version = "0.31.3", features = ["signal", "process"] }
 oci-spec = { version = "0.10.0", default-features = false, features = ["distribution"] }
 postgres-protocol = "0.6.12"
@@ -26,6 +27,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 url = "2.5.8"
 uuid.workspace = true
+yaml-rust2 = { version = "0.13.0", default-features = false }
 
 [lints]
 workspace = true

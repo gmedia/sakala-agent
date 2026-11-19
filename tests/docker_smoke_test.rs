@@ -495,6 +495,7 @@ async fn dockerfile_build_uses_project_variables_without_keeping_them_in_the_ima
                 project_id: Uuid::new_v4(),
                 deployment_id: Uuid::new_v4(),
                 workspace: temp.path().to_path_buf(),
+                repository: source.clone(),
                 source,
                 image: IMAGE.to_owned(),
                 requested: DeploymentBuilder::Dockerfile,
@@ -1255,7 +1256,7 @@ async fn a_malicious_repository_stays_inside_the_railpack_sandbox() {
         ],
     );
     sandbox
-        .info(&exec_repo, &reporter)
+        .info(&exec_repo, &[], &reporter)
         .await
         .expect("analysis of the repository finishes");
     let id = evidence.read("id");
@@ -1333,7 +1334,7 @@ async fn a_malicious_repository_stays_inside_the_railpack_sandbox() {
         .await
         .ok();
     let info = sandbox
-        .info(&link_repo, &reporter)
+        .info(&link_repo, &[], &reporter)
         .await
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default();
@@ -1438,7 +1439,7 @@ async fn the_sandbox_cannot_reach_other_containers_but_can_reach_out() {
             ),
         ],
     );
-    sandbox.info(&repo, &reporter).await.expect("analysis");
+    sandbox.info(&repo, &[], &reporter).await.expect("analysis");
 
     let answer = |name: &str| evidence.read(name).trim().to_owned();
     for name in ["workload", "peer", "host", "metadata", "internet"] {
@@ -1494,6 +1495,7 @@ async fn projects_share_nothing_through_the_build_cache() {
                         project_id: Uuid::new_v4(),
                         deployment_id: Uuid::new_v4(),
                         workspace,
+                        repository: source.clone(),
                         source,
                         image: image.clone(),
                         requested: DeploymentBuilder::Dockerfile,
@@ -1589,6 +1591,7 @@ async fn projects_share_nothing_through_the_build_cache() {
                     project_id: Uuid::new_v4(),
                     deployment_id: Uuid::new_v4(),
                     workspace: temp.path().to_path_buf(),
+                    repository: shared.clone(),
                     source: shared.clone(),
                     image: image.clone(),
                     requested: DeploymentBuilder::Dockerfile,
@@ -1624,6 +1627,7 @@ async fn projects_share_nothing_through_the_build_cache() {
                 project_id: Uuid::new_v4(),
                 deployment_id: Uuid::new_v4(),
                 workspace: temp.path().to_path_buf(),
+                repository: stolen.clone(),
                 source: stolen,
                 image: "sakala-agent-sm/cache-stolen:latest".to_owned(),
                 requested: DeploymentBuilder::Dockerfile,
@@ -1650,6 +1654,7 @@ async fn projects_share_nothing_through_the_build_cache() {
                 project_id: Uuid::new_v4(),
                 deployment_id: Uuid::new_v4(),
                 workspace: temp.path().to_path_buf(),
+                repository: stolen.clone(),
                 source: stolen,
                 image: "sakala-agent-sm/cache-stolen:latest".to_owned(),
                 requested: DeploymentBuilder::Dockerfile,
@@ -1682,6 +1687,7 @@ async fn projects_share_nothing_through_the_build_cache() {
                     project_id: Uuid::new_v4(),
                     deployment_id: Uuid::new_v4(),
                     workspace: temp.path().to_path_buf(),
+                    repository: chosen.clone(),
                     source: chosen,
                     image: "sakala-agent-sm/cache-chosen:latest".to_owned(),
                     requested: DeploymentBuilder::Dockerfile,
@@ -1761,6 +1767,7 @@ async fn railpack_projects_keep_their_own_secrets() {
                     project_id: Uuid::new_v4(),
                     deployment_id: Uuid::new_v4(),
                     workspace: temp.path().to_path_buf(),
+                    repository: source.clone(),
                     source: source.clone(),
                     image: tag.clone(),
                     requested: DeploymentBuilder::Railpack,
@@ -2240,6 +2247,139 @@ async fn a_static_site_deploys_with_railpack() {
     ]);
     assert!(page.contains("static site served"), "{page}");
     assert_no_platform_details(&run, &temp);
+    harness.executor.shutdown().await.expect("shutdown");
+}
+
+/// Every file of a fixture repository under `tests/fixtures`, by relative path.
+fn fixture_files(name: &str) -> Vec<(String, String)> {
+    fn walk(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        files: &mut Vec<(String, String)>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("fixture directory") {
+            let path = entry.expect("fixture entry").path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else {
+                let relative = path.strip_prefix(root).expect("relative path");
+                files.push((
+                    relative.to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&path).expect("fixture file"),
+                ));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name);
+    let mut files = Vec::new();
+    walk(&root, &root, &mut files);
+    files.sort();
+    files
+}
+
+/// A pnpm monorepo whose lockfile, `pnpm-workspace.yaml`, and `packageManager` are
+/// only at its root, as in gmedia/sakala-agent#74. Built from `apps/web` alone,
+/// Railpack picked npm and the build failed with `pnpm: not found`. `apps/web` is a
+/// single-page app built with `vite build` (the fixture's `packages/vite` stands in
+/// for Vite, so nothing comes from the npm registry) that needs the workspace
+/// package `@fixture/greeting` built first; `apps/api` is a Node server that
+/// imports it.
+#[tokio::test]
+#[ignore = "needs a local Docker daemon, network access, and moby/buildkit:buildx-stable-1"]
+async fn pnpm_workspace_packages_build_from_the_workspace_root() {
+    let _serial = SERIAL.lock().await;
+    let _cleanup = Cleanup;
+    Cleanup::remove_everything();
+    start_router();
+    let image = build_sandbox_image();
+    start_host_network_builder();
+
+    let temp = TempDir::new().expect("temp directory");
+    let harness = Harness::start_with(&temp, &image, Some(HOST_NETWORK_BUILDER)).await;
+    harness
+        .runner
+        .use_real_build(fixture_files("pnpm-workspace"));
+    let timeouts = json!({
+        "build_timeout_seconds": 590,
+        "start_timeout_seconds": 60,
+        "command_timeout_seconds": 800
+    });
+
+    let inspection = harness
+        .inspect_with(
+            "https://github.com/sakala-demo/pnpm-workspace.git",
+            "0123456789abcdef0123456789abcdef01234567",
+            json!({ "root_directory": "apps/web" }),
+        )
+        .await;
+    println!("inspection workspace: {}", inspection["workspace"]);
+    println!(
+        "inspection railpack deploy: {}",
+        inspection["railpack"]["plan"]["deploy"]["startCommand"]
+    );
+    assert_eq!(inspection["package_manager"], "pnpm");
+    assert_eq!(
+        inspection["workspace"]["build_command"],
+        "pnpm --filter '@fixture/web...' run build"
+    );
+    assert_eq!(
+        inspection["workspace"]["static_output_directory"],
+        "apps/web/dist"
+    );
+
+    for (name, root_directory, expected) in [
+        ("pnpmweb", "apps/web", "<h1>hello from the workspace</h1>"),
+        ("pnpmapi", "apps/api", "api: hello from the workspace"),
+    ] {
+        let run = harness
+            .run_custom(
+                name,
+                json!({
+                    "builder": "railpack",
+                    "root_directory": root_directory,
+                    "timeouts": timeouts,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        println!(
+            "{root_directory}: {:.1} s, stages {:?}",
+            run.elapsed.as_secs_f64(),
+            run.stages
+        );
+        if let Some(failure) = &run.failure {
+            for line in run.logs.iter().rev().take(60).rev() {
+                println!("log: {line}");
+            }
+            panic!("{root_directory} failed: {failure}");
+        }
+        assert!(
+            run.sent.contains("deployment.workspace.detected"),
+            "the deployment must report the workspace it found"
+        );
+        let container = docker(&[
+            "ps",
+            "--filter",
+            &format!("label=dev.sakala.project-id={}", run.project_id),
+            "--format",
+            "{{.Names}}",
+        ])
+        .trim()
+        .to_owned();
+        let page = docker(&[
+            "exec",
+            ROUTER,
+            "wget",
+            "-q",
+            "-O-",
+            &format!("http://{container}:3000/"),
+        ]);
+        println!("{root_directory} answers: {}", page.trim());
+        assert!(page.contains(expected), "{page}");
+        assert_no_platform_details(&run, &temp);
+    }
     harness.executor.shutdown().await.expect("shutdown");
 }
 
@@ -2902,13 +3042,21 @@ impl Harness {
     }
 
     async fn inspect(&self, repository_url: &str, commit: &str) -> Value {
+        self.inspect_with(repository_url, commit, json!({})).await
+    }
+
+    async fn inspect_with(&self, repository_url: &str, commit: &str, extra: Value) -> Value {
+        let mut payload = json!({ "repository_url": repository_url, "commit_sha": commit });
+        for (key, value) in extra.as_object().expect("extra payload") {
+            payload[key] = value.clone();
+        }
         let command: AgentCommand = serde_json::from_value(json!({
             "id": Uuid::new_v4(),
             "type": "InspectProject",
             "status": "Pending",
             "project_id": Uuid::new_v4(),
             "deployment_id": null,
-            "payload": { "repository_url": repository_url, "commit_sha": commit },
+            "payload": payload,
         }))
         .expect("command");
         self.requests.lock().expect("request lock").clear();

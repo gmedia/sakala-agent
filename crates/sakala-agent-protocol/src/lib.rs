@@ -38,7 +38,7 @@ pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::{
     CrashedWorkloadDetail, HeartbeatPayload, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
-pub use inspections::{InspectProjectPayload, ProjectInspection};
+pub use inspections::{InspectProjectPayload, JsPackageManager, JsWorkspace, ProjectInspection};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};
 pub use placement::{
