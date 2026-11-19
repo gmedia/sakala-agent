@@ -267,6 +267,18 @@ New configuration: `SAKALA_DATABASE_DRIVER`, `SAKALA_DATABASE_ADMIN_DSN`,
 `SAKALA_DATABASE_PUBLIC_HOST`, `SAKALA_DATABASE_PUBLIC_PORT`, see
 [Configuration](CONFIGURATION.md) and [Database Host](DATABASE_HOST.md).
 
+## Revision 4 additions for JavaScript monorepos
+
+Still revision 4: no new command type or payload field, only an additive inspection
+result field, a new event, and a behaviour change for Railpack builds of a workspace
+package (gmedia/sakala-agent#74). Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Railpack build context for a workspace package | Behaviour change. | When `root_directory` names a package of a pnpm, npm, Yarn, or Bun workspace whose root is above it, `railpack prepare` and the build context move to the workspace root, and the build and start commands target the package. A project's own `build_command`, `start_command`, and `release_command` run as `cd '<package>' && <command>`. A Vite single-page app without a `start` script is served as static files. Dockerfile builds and repositories without a workspace are unchanged. Rules in [Docker Runtime](DOCKER_RUNTIME.md#monorepo-javascript). |
+| `InspectProject` result field `workspace` | Sent, always. | `null` without a workspace. Otherwise `{ manager, root_directory, package_directory, package_name, build_command, start_command, static_output_directory }`; `manager` is one of `npm`, `pnpm`, `yarn`, `bun`, and `package_manager` then holds the same value. A result without the field comes from an older Agent. An older API copies known keys only, so it ignores the field. Shape in [Sakala Agent API](AGENT_API.md#project-inspection-command). |
+| Event `deployment.workspace.detected` | Sent only for such a build, after `deployment.analysis.started`. | Additive. Metadata has the shape of `workspace` above with the commands actually used. An API that does not map it stores it on the timeline without changing status; it maps to no status. |
+
 ## Revision 4 additions for host checks
 
 Still revision 4: one additive failure code and no wire change otherwise. Either side

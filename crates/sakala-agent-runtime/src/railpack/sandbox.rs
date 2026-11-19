@@ -116,17 +116,7 @@ impl RailpackSandbox {
             "--plan-out".into(),
             RESULT_FILE.into(),
         ];
-        let mut secrets = Vec::new();
-        for (name, value) in environment {
-            arguments.push("--env".into());
-            if name.starts_with(RAILPACK_CONFIG_PREFIX) {
-                // `--env NAME` makes Railpack read the value from its environment.
-                arguments.push(name.into());
-                secrets.push((name.clone(), value.clone()));
-            } else {
-                arguments.push(format!("{name}={VALUE_PLACEHOLDER}").into());
-            }
-        }
+        let secrets = push_environment(&mut arguments, environment);
         let content = self
             .run("railpack-prepare", context, arguments, secrets, reporter)
             .await?;
@@ -148,20 +138,24 @@ impl RailpackSandbox {
     }
 
     /// Analyses a repository and returns the bytes of the `railpack info` report.
+    /// `environment` takes the same values as for `prepare`, so the report shows the
+    /// plan a deployment would get.
     pub async fn info(
         &self,
         context: &Path,
+        environment: &[(String, SecretString)],
         reporter: &dyn RuntimeReporter,
     ) -> Result<Vec<u8>, RuntimeError> {
-        let arguments = vec![
+        let mut arguments = vec![
             "info".into(),
             "--format".into(),
             "json".into(),
             "--out".into(),
             RESULT_FILE.into(),
-            APP_DIR.into(),
         ];
-        self.run("railpack-info", context, arguments, Vec::new(), reporter)
+        let secrets = push_environment(&mut arguments, environment);
+        arguments.push(APP_DIR.into());
+        self.run("railpack-info", context, arguments, secrets, reporter)
             .await
     }
 
@@ -253,6 +247,26 @@ impl RailpackSandbox {
         }
         command
     }
+}
+
+/// Adds `--env` for every variable and returns the ones whose value the sandbox
+/// must receive.
+fn push_environment(
+    arguments: &mut Vec<OsString>,
+    environment: &[(String, SecretString)],
+) -> Vec<(String, SecretString)> {
+    let mut secrets = Vec::new();
+    for (name, value) in environment {
+        arguments.push("--env".into());
+        if name.starts_with(RAILPACK_CONFIG_PREFIX) {
+            // `--env NAME` makes Railpack read the value from its environment.
+            arguments.push(name.into());
+            secrets.push((name.clone(), value.clone()));
+        } else {
+            arguments.push(format!("{name}={VALUE_PLACEHOLDER}").into());
+        }
+    }
+    secrets
 }
 
 fn read_only_mount(source: &Path, target: &str) -> OsString {

@@ -296,12 +296,19 @@ impl DockerRuntimeExecutor {
             .await?;
         let inspection_source = source.without_credential();
         drop(source);
-        let result = match workspace
+        let target = match workspace
             .build_context(request.payload.root_directory.as_deref())
             .await
         {
-            Ok(context) => tokio::select! {
-                result = self.inspector.inspect(&context, &inspection_source, reporter) => result,
+            Ok(context) => workspace
+                .canonical_source()
+                .await
+                .map(|repository| (repository, context)),
+            Err(error) => Err(error),
+        };
+        let result = match target {
+            Ok((repository, context)) => tokio::select! {
+                result = self.inspector.inspect(&repository, &context, &inspection_source, reporter) => result,
                 () = request.cancellation.cancelled() => Err(RuntimeError::Cancelled),
             },
             Err(error) => Err(error),
@@ -596,6 +603,7 @@ impl DockerRuntimeExecutor {
                     project_id,
                     deployment_id,
                     workspace: workspace.root().to_owned(),
+                    repository: workspace.canonical_source().await?,
                     source: context,
                     image: image.to_owned(),
                     requested: payload.builder,
@@ -629,7 +637,7 @@ impl DockerRuntimeExecutor {
                     environment: payload.environment.clone(),
                     resources: applied_resources,
                     port: payload.container_port,
-                    command,
+                    command: build.in_package(command),
                 },
                 replicas,
                 progress.release,

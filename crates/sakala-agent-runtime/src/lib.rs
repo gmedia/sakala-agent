@@ -9,6 +9,7 @@ pub mod error;
 pub mod executor;
 pub mod health;
 mod inspections;
+pub mod js_workspace;
 pub mod logs;
 pub mod process;
 pub mod railpack;
