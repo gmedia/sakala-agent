@@ -295,12 +295,21 @@ pub trait ContainerEngine: Send + Sync {
     /// Attempts every candidate cleanup action, for all replicas of the
     /// candidate. A failure is returned only after all owned artifacts have
     /// been attempted, so callers can report partial cleanup without replacing
-    /// the primary deployment error.
+    /// the primary deployment error. `image` is the image the candidate built;
+    /// `None` for a candidate that reused another deployment's image, which
+    /// must stay.
     async fn cleanup_candidate(
         &self,
         containers: &[String],
-        image: &str,
+        image: Option<&str>,
     ) -> Result<(), RuntimeError>;
+
+    /// The labels of the image under `image`, or `None` when the node has no
+    /// image under that reference.
+    async fn image_labels(
+        &self,
+        image: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, RuntimeError>;
 
     /// Lists the Sakala images that [`Self::cleanup_stale_images`] would remove,
     /// without removing anything.

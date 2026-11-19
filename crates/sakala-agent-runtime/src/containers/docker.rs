@@ -32,9 +32,10 @@ use crate::{
         ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ResourceSafetyConfig,
         RoutedWorkload, RunContainerRequest,
         images::{
-            CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LIST_FORMAT,
-            InspectedImage, ListedImage, Retention, StaleImage, parse_container_usage,
-            parse_image_inspect, parse_image_list, select_project_images, select_stale_images,
+            CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LABELS_FORMAT,
+            IMAGE_LIST_FORMAT, InspectedImage, ListedImage, NO_SUCH_IMAGE, Retention, StaleImage,
+            parse_container_usage, parse_image_inspect, parse_image_labels, parse_image_list,
+            select_project_images, select_stale_images,
         },
         metrics::{
             METRICS_INSPECT_FORMAT, STATS_FORMAT, join_sample, parse_inspected_states,
@@ -81,6 +82,9 @@ const EXIT_EVENTS_TIMEOUT: Duration = Duration::from_secs(1);
 /// as an app that crashed once and recovered.
 const CRASH_LOOP_MIN_RESTARTS: u32 = 3;
 const ENVIRONMENT_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// `docker image inspect` of the image a deployment asks to reuse. Past it the
+/// deployment builds instead.
+const IMAGE_LABELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// `docker ps` of a metrics sample.
 const METRICS_LISTING_TIMEOUT: Duration = Duration::from_secs(2);
 /// `docker stats --no-stream` waits for a second reading about a second after
@@ -1298,15 +1302,14 @@ impl ContainerEngine for DockerContainerEngine {
     async fn cleanup_candidate(
         &self,
         containers: &[String],
-        image: &str,
+        image: Option<&str>,
     ) -> Result<(), RuntimeError> {
         let mut failures = Vec::new();
         let mut remove_containers = CommandSpec::new("docker").arg("rm").arg("--force");
         for container in containers {
             remove_containers = remove_containers.arg(container);
         }
-        for (artifact, command) in [
-            ("candidate container", remove_containers),
+        let remove_image = image.map(|image| {
             (
                 "candidate image",
                 CommandSpec::new("docker")
@@ -1314,8 +1317,11 @@ impl ContainerEngine for DockerContainerEngine {
                     .arg("rm")
                     .arg("--force")
                     .arg(image),
-            ),
-        ] {
+            )
+        });
+        for (artifact, command) in
+            std::iter::once(("candidate container", remove_containers)).chain(remove_image)
+        {
             match self.runner.run(&command, &NullOutputSink).await {
                 Ok(output) if output.success => {}
                 Ok(output) => failures.push(format!(
@@ -1333,6 +1339,30 @@ impl ContainerEngine for DockerContainerEngine {
                 failures.join("; ")
             )))
         }
+    }
+
+    async fn image_labels(
+        &self,
+        image: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("image")
+            .arg("inspect")
+            .arg("--format")
+            .arg(IMAGE_LABELS_FORMAT)
+            .arg(image)
+            .timeout(IMAGE_LABELS_TIMEOUT);
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if output.success {
+            return parse_image_labels(&output.stdout).map(Some);
+        }
+        if output.stderr.to_ascii_lowercase().contains(NO_SUCH_IMAGE) {
+            return Ok(None);
+        }
+        Err(RuntimeError::Container(format!(
+            "image inspection failed with {}",
+            crate::error::describe_exit(output.code)
+        )))
     }
 
     async fn detect_stale_images(
