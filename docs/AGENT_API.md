@@ -736,7 +736,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "workload-metrics"
   ],
   "metadata": {
-    "version": "0.12.0",
+    "version": "0.13.0",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "lifecycle_state": "active",
