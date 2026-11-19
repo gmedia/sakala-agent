@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Aplikasi kini menerima alamat pengunjung yang sebenarnya. Setiap route project memuat `header_up X-Forwarded-For {client_ip}` dan `header_up X-Real-IP {client_ip}`, jadi kedua header berisi tepat satu alamat: pengunjung untuk request dari Caddy host atau Sakala Edge, atau peer itu sendiri untuk koneksi lain seperti workload yang memanggil router langsung. Pada staging 2026-11-19, aplikasi di balik HTTPS menerima `X-Forwarded-Proto: http` dan `X-Forwarded-For` berisi gateway network project, sehingga Laravel dengan `trustProxies(at: '*')` membuat URL `http://`; `X-Real-IP` kiriman pengunjung juga sampai ke aplikasi apa adanya. Perbaikan ini bergantung pada `servers { trusted_proxies ... }` di Caddyfile runtime node (sakala-deployment), yang hanya mempercayai alamat asal Edge; tanpa blok itu `{client_ip}` adalah alamat Edge. Uji Docker nyata dengan `caddy:2.11.3-alpine` (`client_ip_smoke_test`) membuktikan alamat dari Edge dipakai, rantai yang ditulis pengunjung dilewati, dan header palsu dari workload tidak dipercaya. Lihat [Alamat klien dan header forwarded](docs/CADDY_INTEGRATION.md#alamat-klien-dan-header-forwarded).
+
 ## [0.13.0] - 2026-11-19
 
 ### Added
