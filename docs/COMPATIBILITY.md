@@ -246,6 +246,27 @@ Agent never sends them.
 New configuration: `SAKALA_METRICS_INTERVAL_SECONDS`, see
 [Configuration](CONFIGURATION.md).
 
+## Revision 4 additions for managed PostgreSQL
+
+Still revision 4, but this release adds six command types. An older Agent fails to
+deserialize a poll response that holds one of them, so the API must only assign them
+to a node that advertises `managed-postgres`, and must not raise
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS` for it. Deploy `sakala-api` first: an older
+API ignores the new capability and heartbeat keys.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `managed-postgres` | Advertised when `SAKALA_DATABASE_DRIVER=postgres`, next to the runtime driver's capabilities. | A dedicated database host runs `SAKALA_RUNTIME_DRIVER=noop`; a single-node installation may run `docker` with the database role. See [Database Host](DATABASE_HOST.md). |
+| Command types `CreateDatabase`, `DropDatabase`, `RotateDatabasePassword`, `LockDatabase`, `UnlockDatabase`, `InstallDatabaseExtension` | Handled by the database role. | `project_id` and `deployment_id` are `null`. Names match `^p_[a-z0-9]{16,40}$`; passwords are 24 to 128 printable ASCII characters; extensions come from an allow-list, with `pgvector` accepted for `vector`. Every command is idempotent. Payloads, results, and semantics in [Sakala Agent API](AGENT_API.md#database-host); example in `examples/commands/database-commands.json`. |
+| `error_code` values `database_name_invalid`, `database_password_invalid`, `database_extension_not_allowed`, `database_extension_unavailable`, `database_not_found`, `database_conflict`, `database_admin_unavailable`, `database_operation_failed` | Sent on `fail` of database commands. | Additive. Meaning and suggested API handling in [Sakala Agent API](AGENT_API.md#kode-kegagalan-database). |
+| `metadata.database` | Sent on every heartbeat of a database host. | `{ endpoint: { host, port }, available }`. `available: false` also makes the node `degraded`. |
+| `metadata.databases` and `metadata.detail_counts.databases` | Sent after a fresh size read, at most once per 60 s, bound 1000. | Items `{ name, size_bytes }` from `pg_database_size()`, managed databases only. A heartbeat without them carries no new reading. Example in `examples/heartbeat/database-host.json`. |
+| Lock semantics | `NOLOGIN` on the owner role, not `ALLOW_CONNECTIONS false`. | The wire contract is unchanged. A locked database stays reachable for the admin user, so backups and size reads continue, and the tenant cannot undo the lock as database owner. |
+
+New configuration: `SAKALA_DATABASE_DRIVER`, `SAKALA_DATABASE_ADMIN_DSN`,
+`SAKALA_DATABASE_PUBLIC_HOST`, `SAKALA_DATABASE_PUBLIC_PORT`, see
+[Configuration](CONFIGURATION.md) and [Database Host](DATABASE_HOST.md).
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

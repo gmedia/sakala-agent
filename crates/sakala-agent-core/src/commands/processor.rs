@@ -15,12 +15,15 @@ use crate::{
     api::ApiClient,
     commands::CommandDispatcher,
     logs::redactor::ValueRedactor,
-    ports::{CommandOutput, RuntimeExecutor, RuntimeReporter},
+    ports::{CommandOutput, DatabaseAdmin, RuntimeExecutor, RuntimeReporter},
     reporting::{ApiRuntimeReporter, ApiRuntimeReporterFactory},
     repositories::ApiRepositoryCredentialProvider,
 };
 
 const POST_COMMIT_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
+
+/// Payload field of `CreateDatabase` and `RotateDatabasePassword`.
+const DATABASE_PASSWORD_FIELD: &str = "password";
 
 pub struct CommandProcessor {
     client: ApiClient,
@@ -71,6 +74,13 @@ impl CommandProcessor {
     #[must_use]
     pub fn with_post_commit_finalization_grace(mut self, grace: Duration) -> Self {
         self.post_commit_finalization_grace = grace;
+        self
+    }
+
+    /// Lets the processor run managed PostgreSQL commands on a database host.
+    #[must_use]
+    pub fn with_database_admin(mut self, database_admin: Arc<dyn DatabaseAdmin>) -> Self {
+        self.dispatcher = self.dispatcher.with_database_admin(database_admin);
         self
     }
 
@@ -256,7 +266,7 @@ impl CommandProcessor {
             return Ok((
                 self.command_timeout,
                 LogBounds::default(),
-                ValueRedactor::default(),
+                ValueRedactor::new(command_password(command)),
             ));
         }
         let payload = command.deploy_payload().map_err(|error| {
@@ -284,6 +294,23 @@ impl CommandProcessor {
     }
 }
 
+/// The tenant password a database command carries, hidden from its failure
+/// message like a deployment's environment values.
+fn command_password(command: &AgentCommand) -> Option<String> {
+    matches!(
+        command.command_type,
+        CommandType::CreateDatabase | CommandType::RotateDatabasePassword
+    )
+    .then(|| {
+        command
+            .payload
+            .get(DATABASE_PASSWORD_FIELD)?
+            .as_str()
+            .map(str::to_owned)
+    })
+    .flatten()
+}
+
 fn deferred_committed_output(
     reporter: &dyn RuntimeReporter,
     reason: FinalizationDeferredReason,
@@ -302,4 +329,49 @@ fn deferred_committed_output(
         "finalization_deferred_reason": reason,
     });
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use sakala_agent_protocol::CommandStatus;
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    use super::*;
+
+    const PASSWORD: &str = "c2VjcmV0LXBhc3N3b3JkLXZhbHVlLTEyMzQ1";
+
+    fn command(command_type: CommandType, payload: Value) -> AgentCommand {
+        AgentCommand {
+            id: Uuid::new_v4(),
+            command_type,
+            status: CommandStatus::Claimed,
+            project_id: None,
+            deployment_id: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_database_password_is_redacted_from_the_failure_message() {
+        for command_type in [
+            CommandType::CreateDatabase,
+            CommandType::RotateDatabasePassword,
+        ] {
+            let password = command_password(&command(
+                command_type,
+                json!({ "role": "p_0123456789abcdef", "password": PASSWORD }),
+            ));
+            let redacted = ValueRedactor::new(password)
+                .redact(&format!("PostgreSQL refused near '{PASSWORD}'"));
+            assert!(!redacted.contains(PASSWORD), "{command_type:?}: {redacted}");
+        }
+        for command in [
+            command(CommandType::LockDatabase, json!({ "password": PASSWORD })),
+            command(CommandType::CreateDatabase, json!({ "password": 7 })),
+            command(CommandType::CreateDatabase, Value::Null),
+        ] {
+            assert_eq!(command_password(&command), None);
+        }
+    }
 }

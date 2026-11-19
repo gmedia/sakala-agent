@@ -5,11 +5,13 @@ use sakala_agent_core::{
     AgentMode, NodeLifecycle,
     api::ApiClient,
     heartbeat,
-    ports::{RuntimeExecutor, RuntimePreflightReport, RuntimeReconciliationReport},
+    ports::{DatabaseAdmin, RuntimeExecutor, RuntimePreflightReport, RuntimeReconciliationReport},
     reporting::ApiRuntimeReporterFactory,
     scheduler,
 };
-use sakala_agent_runtime::{DockerRuntimeExecutor, NoopRuntimeExecutor};
+use sakala_agent_runtime::{
+    DockerRuntimeExecutor, NoopRuntimeExecutor, database::PostgresDatabaseAdmin,
+};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -52,6 +54,26 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     log_preflight(&preflight);
     if preflight.has_fatal_failure() {
         anyhow::bail!("runtime preflight found one or more fatal dependency failures");
+    }
+    let database = config.database.map(|database| {
+        let admin: Arc<dyn DatabaseAdmin> = Arc::new(PostgresDatabaseAdmin::new(database.admin));
+        (admin, database.endpoint)
+    });
+    if let Some((admin, endpoint)) = &database {
+        // Not fatal: the instance may still be starting. The node reports
+        // `degraded` and database commands fail until it answers.
+        match admin.check().await {
+            Ok(()) => info!(
+                endpoint_host = %endpoint.host,
+                endpoint_port = endpoint.port,
+                "managed PostgreSQL instance is reachable as superuser"
+            ),
+            Err(error) => warn!(
+                error_code = error.code(),
+                %error,
+                "managed PostgreSQL instance is not ready; database commands fail until it is"
+            ),
+        }
     }
     let reporter_factory = client.clone().map(|client| {
         Arc::new(ApiRuntimeReporterFactory::new(client))
@@ -154,6 +176,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                     max_metric_items,
                 )
             }),
+            database: database.as_ref().map(|(admin, endpoint)| {
+                heartbeat::databases::DatabaseHeartbeat::new(Arc::clone(admin), endpoint.clone())
+            }),
         },
         shutdown_rx.clone(),
     ));
@@ -163,6 +188,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::clone(&runtime),
         node_lifecycle,
         scheduler_metrics,
+        database.map(|(admin, _)| admin),
         shutdown_rx,
     ));
 

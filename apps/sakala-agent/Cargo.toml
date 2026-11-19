@@ -18,6 +18,7 @@ tokio-util.workspace = true
 time.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+sakala-agent-protocol.workspace = true
 
 [lints]
 workspace = true
@@ -61,7 +62,6 @@ path = "../../tests/docker_smoke_test.rs"
 [dev-dependencies]
 async-trait.workspace = true
 sakala-agent-core.workspace = true
-sakala-agent-protocol.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 uuid.workspace = true

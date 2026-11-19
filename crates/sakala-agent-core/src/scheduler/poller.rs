@@ -11,8 +11,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    AgentConfig, NodeLifecycle, NodeLifecycleState, api::ApiClient, commands::CommandProcessor,
-    ports::RuntimeExecutor, scheduler::metrics::SchedulerMetrics,
+    AgentConfig, NodeLifecycle, NodeLifecycleState,
+    api::ApiClient,
+    commands::CommandProcessor,
+    ports::{DatabaseAdmin, RuntimeExecutor},
+    scheduler::metrics::SchedulerMetrics,
 };
 
 pub async fn run(
@@ -21,15 +24,20 @@ pub async fn run(
     runtime: Arc<dyn RuntimeExecutor>,
     node_lifecycle: Arc<NodeLifecycle>,
     metrics: Arc<SchedulerMetrics>,
+    database_admin: Option<Arc<dyn DatabaseAdmin>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let handler = client.as_ref().map(|client| {
-        Arc::new(CommandProcessor::with_node_lifecycle(
+        let processor = CommandProcessor::with_node_lifecycle(
             client.clone(),
             runtime,
             config.command_timeout(),
             Arc::clone(&node_lifecycle),
-        ))
+        );
+        Arc::new(match database_admin {
+            Some(database_admin) => processor.with_database_admin(database_admin),
+            None => processor,
+        })
     });
     let mut executions =
         CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));

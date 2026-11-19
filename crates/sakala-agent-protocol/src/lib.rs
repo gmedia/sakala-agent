@@ -7,6 +7,7 @@
 pub const PROTOCOL_VERSION: u32 = 4;
 
 pub mod commands;
+pub mod databases;
 pub mod deployments;
 pub mod events;
 pub mod heartbeat;
@@ -21,6 +22,12 @@ pub use commands::{
     AgentCommand, CleanupRuntimePayload, CommandPoll, CommandType, CompleteCommandPayload,
     DesiredWorkloadState, ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
     SleepProjectPayload, SleepingPage, StopProjectPayload,
+};
+pub use databases::{
+    CreateDatabasePayload, DatabaseEndpoint, DatabaseExtension, DatabasePassword,
+    DatabasePayloadError, DatabaseTargetPayload, DropDatabasePayload,
+    InstallDatabaseExtensionPayload, MANAGED_NAME_PATTERN, MANAGED_POSTGRES_CAPABILITY,
+    ManagedDatabaseSize, ManagedName, RotateDatabasePasswordPayload,
 };
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,

@@ -1135,6 +1135,104 @@ Batas ukuran serialized heartbeat 256 KiB tetap merupakan enforcement terakhir d
 API. Agent membatasi collection sumber seperti di atas dan tidak menggagalkan
 heartbeat hanya karena perkiraan ukuran JSON.
 
+## Database host
+
+Node dengan `SAKALA_DATABASE_DRIVER=postgres` mengelola PostgreSQL terkelola
+(ADR-020) dan mengiklankan capability `managed-postgres`. API hanya boleh mengirim
+command di bagian ini ke node dengan capability itu: Agent yang lebih lama tidak
+mengenal tipe command ini, dan nilai `type` yang tidak dikenal menggagalkan
+deserialisasi seluruh respons polling. Node tanpa peran database yang menerimanya
+gagal dengan `unsupported_runtime_command`. Hardening dan konfigurasi host ada di
+[Database Host](DATABASE_HOST.md).
+
+### Command database
+
+Command database tidak membawa identitas workload: `project_id` dan
+`deployment_id` bernilai `null`. Contoh lengkapnya ada di
+`examples/commands/database-commands.json`.
+
+| `type` | Payload | Result saat `complete` |
+| --- | --- | --- |
+| `CreateDatabase` | `{ database, role, password }` | `{ database, role, created }` |
+| `DropDatabase` | `{ database, role }` | `{ database, role, dropped }` |
+| `RotateDatabasePassword` | `{ role, password }` | `{ role }` |
+| `LockDatabase` | `{ database }` | `{ database, role, locked: true, terminated_connections }` |
+| `UnlockDatabase` | `{ database }` | `{ database, role, locked: false, terminated_connections: 0 }` |
+| `InstallDatabaseExtension` | `{ database, extension }` | `{ database, extension, created }` |
+
+Aturan field payload, semuanya string dan wajib ada:
+
+| Field | Aturan |
+| --- | --- |
+| `database`, `role` | Cocok persis dengan `^p_[a-z0-9]{16,40}$`: awalan `p_` lalu 16 sampai 40 huruf kecil atau angka, misalnya `p_8k2m4q7x9z1c3v5b6n0d`. Nama lain, termasuk `postgres` dan template, ditolak sebelum SQL apa pun dibuat. API sebaiknya memakai nilai acak yang berbeda untuk `database` dan `role`. |
+| `password` | 24 sampai 128 karakter ASCII yang bisa dicetak, tanpa spasi (byte `0x21` sampai `0x7E`). API tetap harus meng-encode-nya saat menyusun `DATABASE_URL`. |
+| `extension` | Salah satu dari `pgcrypto`, `citext`, `pg_trgm`, `unaccent`, `hstore`, `vector`. `pgvector` diterima sebagai alias `vector`, dan result selalu menulis `vector`. |
+
+Field lain di payload diabaikan, jadi API boleh menambah field sebelum Agent
+membacanya. Result tidak pernah memuat password, dan password di payload diredaksi
+dari pesan `fail`.
+
+Semua command idempotent. Mengulang command yang sudah selesai berhasil tanpa
+perubahan yang terlihat tenant:
+
+- `CreateDatabase` membuat yang belum ada dan menyamakan lagi yang sudah ada: atribut role, batas koneksi, default role, privilege, dan password diset ulang ke nilai payload. `created` bernilai `false` bila database sudah ada. Role yang sudah ada tidak diubah atribut `LOGIN`-nya, jadi mengulang create tidak membuka database yang di-lock.
+- `DropDatabase` mematikan login role, menghapus database beserta sesinya (`DROP DATABASE ... WITH (FORCE)`), lalu menghapus role. `dropped` bernilai `false` bila keduanya sudah tidak ada.
+- `LockDatabase` dan `UnlockDatabase` mengubah `LOGIN` role owner database. Lock juga mengakhiri semua sesi role itu dan melaporkan jumlahnya di `terminated_connections`. Sesi superuser, misalnya backup, tidak diakhiri, dan superuser tetap bisa terhubung ke database yang di-lock. Alasan tidak memakai `ALLOW_CONNECTIONS` ada di [Database Host](DATABASE_HOST.md#lock).
+- `RotateDatabasePassword` mengganti password role. Sesi yang sudah terbuka tetap berjalan sampai ditutup; container project memakai password baru setelah redeploy.
+- `InstallDatabaseExtension` memasang extension ke schema `public` database itu sebagai superuser. `created` bernilai `false` bila extension sudah terpasang.
+
+Agent menjalankan command database satu per satu per node, termasuk pembacaan ukuran
+untuk heartbeat.
+
+### Kode kegagalan database
+
+| `error_code` | Arti | Tindakan API |
+| --- | --- | --- |
+| `invalid_runtime_command` | Payload bukan object, atau field wajib tidak ada atau bukan string. | Bug di API. |
+| `database_name_invalid` | `database` atau `role` tidak cocok dengan pola nama. | Bug di API. |
+| `database_password_invalid` | Password terlalu pendek, terlalu panjang, atau memuat karakter di luar ASCII yang bisa dicetak. | Bug di API. |
+| `database_extension_not_allowed` | Extension di luar allow-list. | Tolak permintaan user lebih awal. |
+| `database_extension_unavailable` | Extension diizinkan tetapi file-nya tidak ada di host database, misalnya `vector` di `postgres:18-alpine`. | Tampilkan sebagai belum tersedia; urusan operator. |
+| `database_not_found` | `RotateDatabasePassword` untuk role yang tidak ada, atau lock, unlock, atau extension untuk database yang tidak ada. | Rekonsiliasi status resource. |
+| `database_conflict` | Database ada tetapi dimiliki role lain, role sudah memiliki database lain, owner database bukan role terkelola, atau role masih memiliki objek di luar database-nya saat drop. Tidak ada yang diubah. | Periksa manual; jangan di-retry otomatis. |
+| `database_admin_unavailable` | Agent tidak bisa terhubung ke instance, user DSN bukan superuser, versi PostgreSQL di bawah 15, atau instance sedang start, shutdown, atau kehabisan koneksi. | Retry nanti; node juga melaporkan `degraded`. |
+| `database_operation_failed` | PostgreSQL menolak statement karena alasan lain. Pesan berisi pesan server dan SQLSTATE-nya. | Periksa manual. |
+| `unsupported_runtime_command` | Node tidak punya peran database. | Bug penempatan di API. |
+
+### Heartbeat database host
+
+Node dengan peran database menambahkan dua key di `metadata`. Contoh lengkapnya ada
+di `examples/heartbeat/database-host.json`:
+
+```json
+{
+  "database": {
+    "endpoint": { "host": "10.0.47.10", "port": 5432 },
+    "available": true
+  },
+  "databases": [
+    { "name": "p_8k2m4q7x9z1c3v5b6n0d", "size_bytes": 7952063 }
+  ],
+  "detail_counts": {
+    "databases": 1
+  }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `database` | object | Dikirim di setiap heartbeat node database, tidak pernah oleh node lain. |
+| `database.endpoint.host` | string | `SAKALA_DATABASE_PUBLIC_HOST`: IPv4, IPv6 tanpa kurung siku, atau nama DNS tempat runtime node menjangkau instance lewat jaringan privat. Bahan `DB_HOST` dan `DATABASE_URL`; IPv6 perlu kurung siku di URL. |
+| `database.endpoint.port` | integer 1 sampai 65535 | `SAKALA_DATABASE_PUBLIC_PORT`, default 5432. |
+| `database.available` | boolean | Apakah pembacaan ukuran terakhir berhasil. Saat `false`, `status` node menjadi `degraded` dan API sebaiknya tidak membuat database baru di node ini. |
+| `databases` | array, opsional | Setiap database terkelola, urut nama, paling banyak 1000 item. Hanya dikirim di heartbeat pertama setelah pembacaan baru yang berhasil, paling sering sekali per 60 detik. Heartbeat tanpa key ini tidak membawa bacaan baru, dan tidak boleh dibaca sebagai "database hilang" atau ukuran nol. List kosong berarti instance tidak punya database terkelola. |
+| `databases[].name` | string | Nama database, selalu cocok dengan `^p_[a-z0-9]{16,40}$`. Database lain tidak pernah dilaporkan. |
+| `databases[].size_bytes` | integer ≥ 0 | `pg_database_size()`: semua file database di disk, dalam byte. Termasuk katalog sistem, jadi database kosong sekitar 7,5 MiB. |
+| `detail_counts.databases` | integer ≥ 0 | Jumlah database terkelola sebelum dibatasi; dikirim bersama `databases`. |
+
+Region database host memakai `metadata.runtime.region` yang sudah ada
+(`SAKALA_AGENT_REGION`).
+
 ## Event and Log Payloads
 
 Command identifier berada di URL endpoint dan tidak diulang pada body.

@@ -6,11 +6,15 @@ use sakala_agent_core::{
     heartbeat::metrics::{
         DEFAULT_METRICS_INTERVAL, MAX_METRICS_INTERVAL, METRICS_INTERVAL_ENV, MIN_METRICS_INTERVAL,
     },
+    ports::SecretString,
 };
+use sakala_agent_protocol::{DatabaseEndpoint, MANAGED_POSTGRES_CAPABILITY};
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
-    TimeoutSafetyConfig, routing::check_public_api_url,
+    TimeoutSafetyConfig,
+    database::{DATABASE_ADMIN_DSN_ENV, PostgresAdminConfig},
+    routing::check_public_api_url,
 };
 
 /// The control plane as visitors' browsers reach it, for browser-facing URLs
@@ -18,6 +22,49 @@ use sakala_agent_runtime::{
 pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
 
 const RELEASE_COMMAND_TIMEOUT_ENV: &str = "SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS";
+
+/// Turns on the database host role: `none` (default) or `postgres`.
+const DATABASE_DRIVER_ENV: &str = "SAKALA_DATABASE_DRIVER";
+
+/// Where runtime nodes reach the managed instance over the private network,
+/// reported as `metadata.database.endpoint`.
+const DATABASE_PUBLIC_HOST_ENV: &str = "SAKALA_DATABASE_PUBLIC_HOST";
+const DATABASE_PUBLIC_PORT_ENV: &str = "SAKALA_DATABASE_PUBLIC_PORT";
+
+/// PostgreSQL's own default port.
+const DEFAULT_DATABASE_PUBLIC_PORT: u16 = 5432;
+
+/// Which database engine the agent administers, independent of the runtime
+/// driver: a dedicated database host runs `noop` with `postgres`, and a
+/// single-node installation can run `docker` with `postgres` (ADR-020).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DatabaseDriver {
+    #[default]
+    None,
+    Postgres,
+}
+
+impl FromStr for DatabaseDriver {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "postgres" => Ok(Self::Postgres),
+            _ => Err(CoreError::InvalidConfiguration(format!(
+                "{DATABASE_DRIVER_ENV} must be none or postgres, received {value}"
+            ))),
+        }
+    }
+}
+
+/// The database host role's settings, present only with
+/// `SAKALA_DATABASE_DRIVER=postgres`.
+#[derive(Clone, Debug)]
+pub struct DatabaseHostConfig {
+    pub admin: PostgresAdminConfig,
+    pub endpoint: DatabaseEndpoint,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
@@ -59,6 +106,8 @@ pub struct AppConfig {
     pub image_gc_interval: Duration,
     /// How often heartbeats sample `workloads.metrics`.
     pub metrics_interval: Duration,
+    /// `None` unless the node is a database host.
+    pub database: Option<DatabaseHostConfig>,
     pub log_level: String,
 }
 
@@ -195,6 +244,17 @@ struct Cli {
     #[arg(long, env = "SAKALA_MAX_CONTAINER_PIDS_LIMIT")]
     max_container_pids_limit: Option<String>,
 
+    #[arg(long, env = DATABASE_DRIVER_ENV)]
+    database_driver: Option<String>,
+
+    #[arg(long, env = DATABASE_PUBLIC_HOST_ENV)]
+    database_public_host: Option<String>,
+
+    #[arg(long, env = DATABASE_PUBLIC_PORT_ENV)]
+    database_public_port: Option<String>,
+
+    // SAKALA_DATABASE_ADMIN_DSN has no flag on purpose: it holds the superuser
+    // password, which must not appear in the process arguments.
     #[arg(long, env = "SAKALA_LOG_LEVEL")]
     log_level: Option<String>,
 }
@@ -357,6 +417,17 @@ pub fn load() -> Result<AppConfig, CoreError> {
         "SAKALA_MAX_CONTAINER_PIDS_LIMIT",
         cli.max_container_pids_limit,
     );
+    insert(&mut values, DATABASE_DRIVER_ENV, cli.database_driver);
+    insert(
+        &mut values,
+        DATABASE_PUBLIC_HOST_ENV,
+        cli.database_public_host,
+    );
+    insert(
+        &mut values,
+        DATABASE_PUBLIC_PORT_ENV,
+        cli.database_public_port,
+    );
     insert(&mut values, "SAKALA_LOG_LEVEL", cli.log_level);
 
     from_values(&values)
@@ -366,6 +437,12 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     let runtime_driver = get(values, "SAKALA_RUNTIME_DRIVER", "noop").parse()?;
     let mut agent = AgentConfig::from_values(values)?;
     agent.capabilities = capabilities(runtime_driver);
+    let database = database_host(values)?;
+    if database.is_some() {
+        agent
+            .capabilities
+            .push(MANAGED_POSTGRES_CAPABILITY.to_owned());
+    }
     let resource_safety = resource_safety(values)?;
     let min_workspace_free_bytes = positive_u64(values, "SAKALA_MIN_WORKSPACE_FREE_MB", 1_024)?
         .checked_mul(1_024 * 1_024)
@@ -457,6 +534,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             3_600,
         )?),
         metrics_interval: metrics_interval(values)?,
+        database,
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -561,6 +639,56 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
         .map(str::to_owned)
         .collect(),
     }
+}
+
+/// Reads the database host role. With `postgres`, the admin DSN and the public
+/// host are required and checked now, so a typo stops the agent instead of
+/// failing every database command later.
+fn database_host(
+    values: &HashMap<String, String>,
+) -> Result<Option<DatabaseHostConfig>, CoreError> {
+    let driver: DatabaseDriver = get(values, DATABASE_DRIVER_ENV, "none").trim().parse()?;
+    if driver == DatabaseDriver::None {
+        return Ok(None);
+    }
+    let required = |key: &str| {
+        values
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CoreError::InvalidConfiguration(format!(
+                    "{key} is required when {DATABASE_DRIVER_ENV}=postgres"
+                ))
+            })
+    };
+    let admin = PostgresAdminConfig::parse(&SecretString::new(required(DATABASE_ADMIN_DSN_ENV)?))
+        .map_err(CoreError::InvalidConfiguration)?;
+    let host = required(DATABASE_PUBLIC_HOST_ENV)?;
+    let port = match values
+        .get(DATABASE_PUBLIC_PORT_ENV)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        None => DEFAULT_DATABASE_PUBLIC_PORT,
+        Some(port) => port.parse::<u16>().map_err(|_| {
+            CoreError::InvalidConfiguration(format!(
+                "{DATABASE_PUBLIC_PORT_ENV} must be a port from 1 to 65535, received {port:?}"
+            ))
+        })?,
+    };
+    let endpoint = DatabaseEndpoint::new(host, port).map_err(|reason| {
+        let key = match reason {
+            sakala_agent_protocol::databases::InvalidDatabaseEndpoint::Host => {
+                DATABASE_PUBLIC_HOST_ENV
+            }
+            sakala_agent_protocol::databases::InvalidDatabaseEndpoint::Port => {
+                DATABASE_PUBLIC_PORT_ENV
+            }
+        };
+        CoreError::InvalidConfiguration(format!("{key} {reason}"))
+    })?;
+    Ok(Some(DatabaseHostConfig { admin, endpoint }))
 }
 
 /// An empty value means unset, which leaves the choice to Docker. Other values become
@@ -1233,5 +1361,105 @@ mod tests {
             config.docker_runtime.min_workspace_free_bytes,
             256 * 1_024 * 1_024
         );
+    }
+
+    fn database_values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut values = HashMap::from([
+            (DATABASE_DRIVER_ENV.to_owned(), "postgres".to_owned()),
+            (
+                DATABASE_ADMIN_DSN_ENV.to_owned(),
+                "host=/var/run/postgresql user=postgres password=admin-secret-value".to_owned(),
+            ),
+            (DATABASE_PUBLIC_HOST_ENV.to_owned(), "10.0.47.10".to_owned()),
+        ]);
+        for (key, value) in pairs {
+            values.insert((*key).to_owned(), (*value).to_owned());
+        }
+        values
+    }
+
+    #[test]
+    fn the_database_role_is_off_by_default_and_none_means_off() {
+        for values in [
+            HashMap::new(),
+            HashMap::from([(DATABASE_DRIVER_ENV.to_owned(), "none".to_owned())]),
+            HashMap::from([(DATABASE_DRIVER_ENV.to_owned(), String::new())]),
+        ] {
+            let config = from_values(&values).expect("config");
+            assert!(config.database.is_none());
+            assert!(
+                !config
+                    .agent
+                    .capabilities
+                    .contains(&MANAGED_POSTGRES_CAPABILITY.to_owned())
+            );
+        }
+        assert!(
+            from_values(&HashMap::from([(
+                DATABASE_DRIVER_ENV.to_owned(),
+                "mysql".to_owned()
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_database_host_advertises_managed_postgres_next_to_its_runtime() {
+        let noop = from_values(&database_values(&[])).expect("config");
+        assert_eq!(
+            noop.agent.capabilities,
+            ["noop-runtime", MANAGED_POSTGRES_CAPABILITY]
+        );
+        let database = noop.database.expect("database role");
+        assert_eq!(
+            database.endpoint,
+            DatabaseEndpoint::new("10.0.47.10", 5432).expect("endpoint")
+        );
+
+        let docker =
+            from_values(&database_values(&[("SAKALA_RUNTIME_DRIVER", "docker")])).expect("config");
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&"docker-runtime".to_owned())
+        );
+        assert_eq!(
+            docker.agent.capabilities.last().map(String::as_str),
+            Some(MANAGED_POSTGRES_CAPABILITY)
+        );
+
+        let port =
+            from_values(&database_values(&[(DATABASE_PUBLIC_PORT_ENV, "6432")])).expect("config");
+        assert_eq!(port.database.expect("database").endpoint.port, 6432);
+    }
+
+    #[test]
+    fn a_database_host_refuses_to_start_on_missing_or_invalid_values() {
+        for (key, value) in [
+            (DATABASE_ADMIN_DSN_ENV, ""),
+            (DATABASE_PUBLIC_HOST_ENV, " "),
+            (DATABASE_PUBLIC_HOST_ENV, "db 01"),
+            (DATABASE_PUBLIC_PORT_ENV, "0"),
+            (DATABASE_PUBLIC_PORT_ENV, "65536"),
+            (DATABASE_PUBLIC_PORT_ENV, "postgres"),
+            (
+                DATABASE_ADMIN_DSN_ENV,
+                "postgresql://postgres:admin-secret-value@10.0.47.10/postgres",
+            ),
+        ] {
+            let error = from_values(&database_values(&[(key, value)]))
+                .expect_err("invalid database host config")
+                .to_string();
+            assert!(error.contains(key), "{key}={value:?}: {error}");
+            assert!(!error.contains("admin-secret-value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_admin_dsn_never_reaches_debug_output() {
+        let config = from_values(&database_values(&[])).expect("config");
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("admin-secret-value"), "{printed}");
     }
 }

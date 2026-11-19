@@ -49,6 +49,7 @@ async fn failed_api_polling_respects_interval_without_retry_storm() {
         Arc::new(NoopRuntimeExecutor),
         Arc::new(NodeLifecycle::new()),
         Arc::new(scheduler::metrics::SchedulerMetrics::default()),
+        None,
         shutdown_rx,
     ));
 
@@ -117,6 +118,7 @@ async fn a_command_whose_task_panics_is_failed_instead_of_hanging() {
         Arc::new(PanickingRuntimeExecutor),
         Arc::new(NodeLifecycle::new()),
         Arc::new(scheduler::metrics::SchedulerMetrics::default()),
+        None,
         shutdown_rx,
     ));
 
