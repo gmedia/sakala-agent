@@ -308,11 +308,14 @@ Hubungannya dengan Agent:
 - gVisor mengirim paket workload lewat veth dan bridge yang sama dengan `runc`, jadi
   aturan host berlaku untuk keduanya. Hal ini terlihat di log kernel, dengan
   `PHYSIN=veth...` pada paket yang ditolak dari container `runsc`.
-- Router (`sakala-caddy`) dikecualikan lewat `sakala-runtime`, tetapi default route-nya
-  saat ini lewat salah satu network project. Lalu lintas keluar router ikut tunduk pada
-  kebijakan ini. Hari ini router tidak membutuhkannya, karena ia hanya mem-proxy ke
-  container di network project. Kalau kelak router perlu menghubungi alamat privat,
-  sambungkan `sakala-runtime` dengan `gw_priority` lebih tinggi.
+- Router (`sakala-caddy`) dikecualikan lewat `sakala-runtime`. Tanpa prioritas gateway,
+  Docker memilih salah satu network project sebagai default route router dan memasang
+  port publish router di network itu, sehingga koneksi loopback dari Caddy host datang
+  dari gateway network project yang berganti-ganti. Karena itu sakala-deployment
+  menyambungkan `sakala-runtime` dengan `gw_priority: 100` (Docker Engine 28 ke atas):
+  port publish dan default route router tetap di `sakala-runtime`, dan alamat asal Edge
+  stabil untuk `trusted_proxies`. Lihat
+  [Alamat klien dan header forwarded](CADDY_INTEGRATION.md#alamat-klien-dan-header-forwarded).
 
 Yang diuji di staging pada 2026-11-19 (Docker 29.5.2, `runsc` systrap): HTTPS dan DNS
 publik berjalan; SSH node, alamat privat, `169.254.169.254`, container project lain,

@@ -41,6 +41,20 @@ const LB_TRY_INTERVAL: Duration = Duration::from_millis(250);
 /// at once, such as a DNS hiccup, makes the site answer 503 for this long.
 const FAIL_DURATION: Duration = Duration::from_secs(10);
 
+/// Request headers that carry exactly one address to the app: the visitor's.
+/// The router resolves that address itself as `{client_ip}`: from the
+/// `X-Forwarded-For` of host Caddy or Sakala Edge when the connection comes
+/// from an address in the router's `trusted_proxies`, read right to left so a
+/// value the visitor wrote is skipped, and the connection's own address
+/// otherwise, such as a workload calling the router directly. Without this the
+/// router appends the edge's address to `X-Forwarded-For`, so an app that trusts
+/// only its immediate peer (Laravel `trustProxies(at: '*')`, Express
+/// `trust proxy 1`) reports the edge as the client, and a client-supplied
+/// `X-Real-IP` reaches the app untouched.
+const CLIENT_IP_HEADERS: [&str; 2] = ["X-Forwarded-For", "X-Real-IP"];
+/// Caddy's placeholder for the client address it resolved for the request.
+const CLIENT_IP_PLACEHOLDER: &str = "{client_ip}";
+
 /// The response header whose values lose their `Domain` attribute.
 const SET_COOKIE_HEADER: &str = "Set-Cookie";
 /// One `Domain` attribute of a `Set-Cookie` value, in any case, with the `;`
@@ -155,6 +169,9 @@ fn serving_route(route: &RouteSpec) -> String {
             caddy_duration(LB_TRY_INTERVAL),
             caddy_duration(FAIL_DURATION),
         );
+    }
+    for header in CLIENT_IP_HEADERS {
+        let _ = writeln!(content, "\t\theader_up {header} {CLIENT_IP_PLACEHOLDER}");
     }
     // Every upstream cookie becomes host-only; the empty replacement deletes
     // the attribute.
@@ -400,12 +417,14 @@ mod tests {
     }
 
     #[test]
-    fn one_replica_proxies_and_makes_cookies_host_only() {
+    fn one_replica_proxies_with_the_client_address_and_makes_cookies_host_only() {
         assert_eq!(
             serving_route(&route(&["app"])),
             "# Managed by sakala-agent for project ff66ed4a-6303-4be6-8ef4-63c28b112680 deployment 4f1f21ef-730d-42d5-a46d-d965353cb993.\n\
              portfolio.sakala.app:80 {\n\
              \treverse_proxy app:3000 {\n\
+             \t\theader_up X-Forwarded-For {client_ip}\n\
+             \t\theader_up X-Real-IP {client_ip}\n\
              \t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n\
              \t}\n\
              }\n"
@@ -431,6 +450,8 @@ mod tests {
              \t\tlb_try_duration 5s\n\
              \t\tlb_try_interval 250ms\n\
              \t\tfail_duration 10s\n\
+             \t\theader_up X-Forwarded-For {client_ip}\n\
+             \t\theader_up X-Real-IP {client_ip}\n\
              \t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n\
              \t}\n\
              }\n"

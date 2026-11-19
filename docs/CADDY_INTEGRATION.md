@@ -39,6 +39,52 @@ http://*.sakala.app {
 
 Dalam pola ini, `sakala-caddy` tetap router dinamis yang dikelola agent dan tetap terhubung ke `sakala-runtime`. Bind port `8080` milik container Caddy ke loopback host. Caddy mempertahankan header `Host` secara default, sehingga router internal tetap dapat memilih file route project. Contoh HTTP di atas tidak menetapkan strategi TLS production; sertifikat dan hardening outer edge harus diputuskan operator secara terpisah.
 
+## Alamat klien dan header forwarded
+
+Pengunjung tidak pernah terhubung langsung ke router. Caddy host atau Sakala Edge
+memutus TLS, lalu meneruskan request ke router node dengan `X-Forwarded-Proto: https`,
+`X-Forwarded-Host`, dan `X-Forwarded-For` berisi alamat pengunjung yang ia lihat. Hop
+pertama itu tidak boleh punya `trusted_proxies` untuk site project, supaya header
+`X-Forwarded-*` buatan pengunjung selalu ditimpa.
+
+Router hanya mempercayai header itu dari alamat yang terdaftar di blok global
+Caddyfile runtime (sakala-deployment, `runtime/caddy/Caddyfile`):
+
+```caddyfile
+{
+	servers {
+		trusted_proxies static {$SAKALA_RUNTIME_TRUSTED_PROXIES}
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For
+	}
+}
+```
+
+Isinya alamat persis asal koneksi Caddy host atau Edge seperti yang terlihat dari dalam
+container router, bukan `private_ranges` atau satu network penuh. Agent menyambungkan
+router ke setiap network project, jadi workload juga peer router. Kalau network
+workload dipercaya, satu tenant bisa mengirim `X-Forwarded-For` palsu ke aplikasi tenant
+lain, misalnya untuk menghindari rate limit per IP.
+
+Dengan blok itu, `{client_ip}` di route adalah alamat pengunjung untuk request dari
+Edge, dibaca dari kanan sehingga bagian kiri yang ditulis pengunjung dilewati, dan
+alamat peer sendiri untuk koneksi lain. Route menulis nilai itu sebagai satu-satunya isi
+`X-Forwarded-For` dan `X-Real-IP`. Tanpa baris ini router menambahkan alamat Edge di
+belakang `X-Forwarded-For`, sehingga aplikasi yang hanya mempercayai peer langsungnya,
+seperti Laravel `trustProxies(at: '*')` atau Express `trust proxy 1`, melaporkan Edge
+sebagai klien, dan `X-Real-IP` kiriman pengunjung sampai ke aplikasi apa adanya.
+
+Yang diterima aplikasi:
+
+| Asal request ke router | `X-Forwarded-For` dan `X-Real-IP` | `X-Forwarded-Proto` | `X-Forwarded-Host` |
+| --- | --- | --- | --- |
+| Alamat di `trusted_proxies` (Edge) | alamat pengunjung | dari Edge (`https`) | dari Edge |
+| Peer lain, misalnya workload | alamat peer itu | `http` | `Host` request |
+
+`Host` diteruskan apa adanya ke aplikasi. `X-Forwarded-Port` dan `Forwarded` tidak
+diatur router; aplikasi sebaiknya tidak mempercayainya. Uji Docker nyata ada di
+`crates/sakala-agent-runtime/tests/client_ip_smoke_test.rs`.
+
 ## Route untuk beberapa replika
 
 Deployment dengan lebih dari satu replika tetap mendapat satu file dan satu blok site,
@@ -52,14 +98,18 @@ portfolio.sakala.app:80 {
 		lb_try_duration 5s
 		lb_try_interval 250ms
 		fail_duration 10s
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Real-IP {client_ip}
 		header_down Set-Cookie "(?i);\s*domain\s*=[^;]*" ""
 	}
 }
 ```
 
 Deployment satu replika mendapat `reverse_proxy <container>:<port>` dengan blok yang
-hanya berisi baris `header_down`. Baris itu ada di setiap route project dan membuat
-cookie dari aplikasi menjadi host-only; alasannya ada di
+hanya berisi dua baris `header_up` dan satu baris `header_down`. Ketiganya ada di setiap
+route project. Baris `header_up` memberi aplikasi tepat satu alamat klien; lihat
+[Alamat klien dan header forwarded](#alamat-klien-dan-header-forwarded). Baris
+`header_down` membuat cookie dari aplikasi menjadi host-only; alasannya ada di
 [Cookie host-only](RUNTIME_HARDENING.md#cookie-host-only-di-route-project). Opsi load
 balancing di atas adalah konstanta di
 `crates/sakala-agent-runtime/src/routing/caddy_file.rs`:

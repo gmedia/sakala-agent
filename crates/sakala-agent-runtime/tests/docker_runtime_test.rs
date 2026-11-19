@@ -7693,8 +7693,9 @@ fn replica_rows(count: u32, status: &str) -> String {
         .collect()
 }
 
-/// The line every serving route carries to make upstream cookies host-only.
-const COOKIE_DOMAIN_STRIP: &str = "\t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n";
+/// The lines every serving route carries: the client address the router
+/// resolved, as the only forwarded address, and host-only upstream cookies.
+const ROUTE_HEADERS: &str = "\t\theader_up X-Forwarded-For {client_ip}\n\t\theader_up X-Real-IP {client_ip}\n\t\theader_down Set-Cookie \"(?i);\\s*domain\\s*=[^;]*\" \"\"\n";
 
 fn balanced_route(upstreams: &[String]) -> String {
     let upstreams = upstreams
@@ -7702,7 +7703,7 @@ fn balanced_route(upstreams: &[String]) -> String {
         .map(|name| format!(" {name}:3000"))
         .collect::<String>();
     format!(
-        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy{upstreams} {{\n\t\tlb_policy least_conn\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t\tfail_duration 10s\n{COOKIE_DOMAIN_STRIP}\t}}\n}}\n"
+        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy{upstreams} {{\n\t\tlb_policy least_conn\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t\tfail_duration 10s\n{ROUTE_HEADERS}\t}}\n}}\n"
     )
 }
 
@@ -7812,7 +7813,7 @@ async fn one_replica_keeps_the_container_name_of_earlier_agents() {
         assert_eq!(
             fs::read_to_string(route_file(&config)).expect("route"),
             format!(
-                "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy {BASE_NAME}:3000 {{\n{COOKIE_DOMAIN_STRIP}\t}}\n}}\n"
+                "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80 {{\n\treverse_proxy {BASE_NAME}:3000 {{\n{ROUTE_HEADERS}\t}}\n}}\n"
             )
         );
     }
