@@ -6,8 +6,10 @@ use tokio::time::Instant;
 use crate::RuntimeError;
 
 mod docker;
+mod host_check;
 
 pub use docker::DockerHealthChecker;
+pub use host_check::HostCheck;
 
 /// What must hold for a workload to count as ready, and until when to wait.
 #[derive(Clone, Debug)]
@@ -23,6 +25,9 @@ pub struct ReadinessRequest {
     pub expected_restarts: Option<u32>,
     /// Names the operation when Docker itself never answers before the deadline.
     pub operation: &'static str,
+    /// The domain visitors use. When set, an answer of 400 or 403 is checked once
+    /// more with this `Host`, so a framework that refuses it fails readiness.
+    pub host: Option<String>,
 }
 
 #[async_trait]

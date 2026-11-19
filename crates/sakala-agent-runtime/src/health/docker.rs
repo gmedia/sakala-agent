@@ -9,7 +9,10 @@ use tracing::debug;
 
 use crate::{
     CommandSpec, NullOutputSink, ProcessOutput, ProcessRunner, RuntimeError,
-    health::{HealthChecker, ReadinessRequest},
+    health::{
+        HealthChecker, ReadinessRequest,
+        host_check::{self, HOST_CHECK_STATUSES},
+    },
 };
 
 const STATE_FORMAT: &str = "{{.State.Status}}\t{{.RestartCount}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}\t{{.HostConfig.Memory}}";
@@ -78,10 +81,7 @@ impl DockerHealthChecker {
     }
 
     async fn probe(&self, request: &ReadinessRequest, remaining: Duration) -> ProbeOutcome {
-        let read_seconds = remaining
-            .as_secs_f64()
-            .ceil()
-            .clamp(1.0, MAX_PROBE_READ_SECONDS as f64) as u64;
+        let read_seconds = probe_read_seconds(remaining);
         let bound = Duration::from_secs(read_seconds) + PROBE_PROCESS_GRACE;
         let command = probe_command(
             &self.router_container,
@@ -95,6 +95,42 @@ impl DockerHealthChecker {
             Err(error) => {
                 debug!(%error, "readiness probe process did not finish");
                 ProbeOutcome::Inconclusive
+            }
+        }
+    }
+
+    /// Asks once more with the visitors' `Host` and fails only when the reply is a
+    /// framework's host refusal. A request that cannot be made, for example on a
+    /// router image without `nc`, leaves readiness as the probe decided it.
+    async fn check_host(
+        &self,
+        request: &ReadinessRequest,
+        remaining: Duration,
+    ) -> Result<(), RuntimeError> {
+        let Some(host) = &request.host else {
+            return Ok(());
+        };
+        let read_seconds = probe_read_seconds(remaining);
+        let bound = Duration::from_secs(read_seconds) + PROBE_PROCESS_GRACE;
+        let command = host_check::request_command(
+            &self.router_container,
+            &request.container,
+            request.port,
+            host,
+            read_seconds,
+        )
+        .timeout(bound);
+        match self.run_within(&command, bound).await {
+            Ok(output) => match host_check::refused_by(&output.stdout) {
+                Some(check) => Err(RuntimeError::AppHostBlocked {
+                    host: host.clone(),
+                    check,
+                }),
+                None => Ok(()),
+            },
+            Err(error) => {
+                debug!(%error, "host check request did not finish");
+                Ok(())
             }
         }
     }
@@ -206,6 +242,13 @@ impl HealthChecker for DockerHealthChecker {
                                 {
                                     progress.last_server_error = Some(status);
                                 }
+                                ProbeOutcome::Answered(Some(status))
+                                    if HOST_CHECK_STATUSES.contains(&status) =>
+                                {
+                                    let remaining =
+                                        deadline.saturating_duration_since(Instant::now());
+                                    return self.check_host(request, remaining).await;
+                                }
                                 ProbeOutcome::Answered(_) => return Ok(()),
                                 ProbeOutcome::NoAnswer => progress.no_answer = true,
                                 ProbeOutcome::Unresolved => progress.unresolved = true,
@@ -231,6 +274,13 @@ impl HealthChecker for DockerHealthChecker {
             sleep(self.interval.max(MIN_POLL_INTERVAL).min(remaining)).await;
         }
     }
+}
+
+fn probe_read_seconds(remaining: Duration) -> u64 {
+    remaining
+        .as_secs_f64()
+        .ceil()
+        .clamp(1.0, MAX_PROBE_READ_SECONDS as f64) as u64
 }
 
 /// `wget` always follows a redirect and BusyBox has no flag to stop it. In proxy

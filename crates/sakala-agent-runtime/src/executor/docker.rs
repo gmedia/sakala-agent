@@ -715,6 +715,7 @@ impl DockerRuntimeExecutor {
                     timeout: applied_timeouts.start,
                     expected_restarts: Some(0),
                     operation: "deployment-start",
+                    host: Some(payload.domain.clone()),
                 })
                 .await
             {
@@ -928,6 +929,9 @@ impl DockerRuntimeExecutor {
             timeout,
             expected_restarts: None,
             operation: "workload-readiness",
+            // The deployment already passed this check, and the image has not
+            // changed since.
+            host: None,
         }
     }
 

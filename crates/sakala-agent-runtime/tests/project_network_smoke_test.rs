@@ -286,6 +286,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
                 timeout: Duration::from_secs(30),
                 expected_restarts: Some(0),
                 operation: "smoke",
+                host: None,
             })
             .await
             .expect("the router reaches the workload by name");

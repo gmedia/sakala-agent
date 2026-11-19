@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Added
+
+- Deployment yang framework-nya menolak domain project kini gagal dengan kode baru `runtime_app_host_blocked`, bukan berhasil sambil menjawab 403 ke setiap pengunjung. Pada uji production 2026-11-19, `vite preview` lolos health check karena status di bawah 500 dihitung sehat, padahal Vite menolak `Host` di luar `preview.allowedHosts`. Saat deploy, bila probe readiness mendapat 400 atau 403, Agent kini mengirim satu request lagi lewat container Caddy dengan `Host` pengunjung (BusyBox `nc`, paling banyak 4096 byte dibaca) dan menggagalkan deployment hanya bila jawabannya penolakan host Vite preview, Vite dev server, atau halaman debug Django (`DisallowedHost`). Pesannya menyebut domain dan perbaikannya, misalnya `preview: { allowedHosts: ['<domain>'] }` atau mengosongkan start command supaya hasil build disajikan sebagai situs statis. Deployment sebelumnya tetap melayani. 403 lain, misalnya halaman login, dan aplikasi yang hanya menolak nama container tetap lolos. Uji Docker nyata dengan `caddy:2.11.3-alpine` membuktikan ketiganya, dan teks Vite dicocokkan dengan jawaban asli Vite 8.3.5. Aditif di protocol revision 4; lihat [Host yang ditolak framework](docs/DOCKER_RUNTIME.md#host-yang-ditolak-framework) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-host-checks).
+
 ## [0.12.0] - 2026-11-19
 
 ### Added

@@ -267,6 +267,18 @@ New configuration: `SAKALA_DATABASE_DRIVER`, `SAKALA_DATABASE_ADMIN_DSN`,
 `SAKALA_DATABASE_PUBLIC_HOST`, `SAKALA_DATABASE_PUBLIC_PORT`, see
 [Configuration](CONFIGURATION.md) and [Database Host](DATABASE_HOST.md).
 
+## Revision 4 additions for host checks
+
+Still revision 4: one additive failure code and no wire change otherwise. Either side
+can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `error_code` value `runtime_app_host_blocked` | Sent on `fail` of `DeployProject`. | Additive and user-fixable. The app answered, but Vite's preview or dev server (403) or Django's debug page (400) refuses the project's domain, so every visitor would get that refusal. Such a deployment used to succeed, because any status below 500 passes readiness. The message names the domain, the framework, and the fix. The previous deployment keeps serving. Suggested mapping: category start, hint to add the domain to `allowedHosts`/`ALLOWED_HOSTS` or to clear a `vite preview` start command. Rules in [Docker Runtime](DOCKER_RUNTIME.md#host-yang-ditolak-framework). |
+
+Host requirement: the runtime router image needs BusyBox `nc`, which `caddy:*-alpine`
+has. Without it the check is skipped and readiness behaves as before.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

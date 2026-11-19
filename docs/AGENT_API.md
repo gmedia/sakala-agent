@@ -1378,6 +1378,7 @@ di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh te
 | --- | --- | --- |
 | `runtime_app_not_listening` | Sampai deadline start tidak ada yang menjawab pada port. Termasuk aplikasi yang hanya listen di `127.0.0.1`. | Port, lama menunggu, dan kewajiban listen di `0.0.0.0:$PORT`. |
 | `runtime_app_unhealthy` | Aplikasi hanya menjawab 5xx sampai deadline. | Port dan status terakhir. |
+| `runtime_app_host_blocked` | Aplikasi menjawab, tetapi setting framework menolak domain project, jadi setiap pengunjung akan mendapat penolakan itu: server preview atau dev Vite (403 `Blocked request. This host (…) is not allowed`, setting `preview.allowedHosts` atau `server.allowedHosts`) atau halaman debug Django (400 `DisallowedHost`, `ALLOWED_HOSTS`). Hanya dicek saat deploy. | Domain project, framework, dan perbaikannya: menambah domain ke setting itu, atau mengosongkan start command supaya hasil build disajikan sebagai situs statis. |
 | `runtime_app_crashed` | Process keluar selama start. Satu restart saja sudah dihitung crash. | Exit code, atau keterangan bahwa Docker tidak lagi melaporkannya. |
 | `runtime_app_exec_denied` | Kernel menolak menjalankan program di image dengan `Operation not permitted`: exit code 126 dari shell, atau 255 dari runc, disertai baris itu di output terakhir aplikasi. Di container Sakala penyebabnya file capability di luar [allowlist workload](DOCKER_RUNTIME.md#capability-workload), misalnya `cap_net_raw`. | Exit code, contoh `NET_RAW`, dan saran `setcap -r` atau image lain. Tidak menyebut environment variable. |
 | `runtime_app_out_of_memory` | Container keluar dengan `State.OOMKilled` atau event `oom`, atau masih hidup dengan flag itu tetapi tidak pernah menjawab. | Batas memory yang diterapkan. |
@@ -1389,6 +1390,13 @@ di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh te
 Kedua code release bisa diperbaiki user: perintahnya, migrasinya, atau batas waktunya.
 Saran pemetaan di API: kategori tersendiri sebelum start, dengan hint untuk membaca log
 `[release]`. Pesannya tidak menyebut perintah atau output-nya.
+
+`runtime_app_host_blocked` bisa diperbaiki user. Saran pemetaan di API: kategori start,
+dengan hint menambahkan domain project ke `allowedHosts` atau `ALLOWED_HOSTS`, atau
+mengosongkan start command (misalnya `vite preview`) supaya Sakala menyajikan hasil build
+sebagai situs statis. Deployment gagal, bukan berhasil dengan peringatan, karena setiap
+pengunjung akan mendapat 403 atau 400, dan dengan gagal versi sebelumnya tetap melayani.
+Aturannya ada di [Docker Runtime](DOCKER_RUNTIME.md#host-yang-ditolak-framework).
 
 `runtime_app_exec_denied` dideteksi dari output aplikasi sendiri, jadi aplikasi bisa
 memicunya dengan mencetak baris yang sama. Akibatnya hanya pesan untuk deployment itu
