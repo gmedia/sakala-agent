@@ -8,7 +8,9 @@ use sakala_agent_core::{
     },
     ports::SecretString,
 };
-use sakala_agent_protocol::{DatabaseEndpoint, MANAGED_POSTGRES_CAPABILITY};
+use sakala_agent_protocol::{
+    DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, MANAGED_POSTGRES_CAPABILITY,
+};
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
@@ -634,6 +636,9 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             "release-command",
             // `workloads.metrics`: CPU, memory, and restarts per workload container.
             "workload-metrics",
+            // `DeployProject.reuse_image_from_deployment_id`: start from an image
+            // built earlier instead of building.
+            IMAGE_REUSE_CAPABILITY,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1092,6 +1097,25 @@ mod tests {
                 .agent
                 .capabilities
                 .contains(&"release-command".to_owned())
+        );
+    }
+
+    #[test]
+    fn image_reuse_is_advertised_only_by_the_docker_runtime() {
+        let docker = HashMap::from([("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned())]);
+        let docker = from_values(&docker).expect("Docker app config should load");
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&IMAGE_REUSE_CAPABILITY.to_owned())
+        );
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(
+            !noop
+                .agent
+                .capabilities
+                .contains(&IMAGE_REUSE_CAPABILITY.to_owned())
         );
     }
 

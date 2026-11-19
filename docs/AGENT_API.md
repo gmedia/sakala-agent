@@ -256,6 +256,98 @@ Release command hanya dijalankan oleh `DeployProject`. `WakeProject`, `RestartPr
 `RefreshRoute`, `ReconcileWorkload`, dan pemulihan replika tidak pernah menjalankannya,
 karena semuanya memakai container deployment yang sudah ada.
 
+### Memakai ulang image (tanpa build)
+
+Payload `DeployProject` boleh membawa `reuse_image_from_deployment_id`, yaitu deployment
+yang membangun image yang ingin dipakai ulang. Gunanya untuk redeploy yang hanya
+mengubah konfigurasi, misalnya variabel, rotasi password database, atau attach database:
+commit-nya sama dengan deployment aktif, jadi image-nya pun sama, dan build 3 sampai 6
+menit tidak perlu diulang. Contohnya ada di
+`examples/commands/deploy-project-image-reuse.json`.
+
+| Nilai | Perilaku Agent |
+| --- | --- |
+| Tidak ada atau `null` | Build seperti biasa, sama seperti sebelum field ini ada. |
+| String UUID | Agent mencari image deployment itu di node. Bila ketemu dan terbukti milik project ini, deployment memakai image itu tanpa checkout dan tanpa build. Bila tidak, Agent build seperti biasa dan melaporkan alasannya. |
+| Nilai lain: string yang bukan UUID, angka, array, atau tipe lain | Build seperti biasa dengan alasan `invalid_reference`. Payload tidak pernah ditolak karena field ini. |
+
+UUID itu harus deployment yang benar-benar membangun image-nya, bukan deployment yang
+sendirinya memakai ulang image. API yang menelusuri rantai itu. API hanya boleh mengirim
+field ini ke node yang mengiklankan capability `image-reuse`; Agent lama mengabaikannya
+dan build.
+
+Agent tidak pernah menerima referensi image dari payload. Referensinya dihitung sendiri
+dari project yang meminta, yaitu `sakala/project-<project_id>:<commit12>-<source8>`
+(`project_id` dari command, commit dari `commit_sha` payload, dan 8 karakter pertama UUID
+deployment sumber). Siapa pun yang memegang Docker socket bisa men-tag image apa saja di
+bawah nama itu, jadi Agent hanya memakainya bila label image-nya sendiri cocok:
+
+- `dev.sakala.project-id` sama dengan `project_id` command;
+- `dev.sakala.deployment-id` sama dengan `reuse_image_from_deployment_id` (UUID lengkap);
+- `dev.sakala.builder` bernilai `dockerfile` atau `railpack`.
+
+Label `dev.sakala.builder` dan `dev.sakala.package-directory` mengembalikan hasil build
+aslinya, jadi `start_command` dan `release_command` berperilaku persis seperti pada
+deployment yang membangunnya. Image Dockerfile menerima `start_command` saat container
+dijalankan. Image Railpack sudah membawa start command-nya sejak build, jadi
+`start_command` tidak diteruskan. Release command image dari root workspace JavaScript
+dijalankan dengan `cd '<package>' && ...`.
+
+Pada deployment yang memakai ulang image, Agent mengirim `deployment.resources.resolved`
+dan `deployment.timeouts.resolved` seperti biasa, lalu `deployment.image.reused`
+(level `info`) sebagai ganti `deployment.checkout.started`, `deployment.analysis.started`,
+`deployment.workspace.detected`, dan `deployment.build.started`:
+
+```json
+{
+  "type": "deployment.image.reused",
+  "level": "info",
+  "metadata": {
+    "image": "sakala/project-ff66ed4a-6303-4be6-8ef4-63c28b112680:0123456789ab-4f1f21ef",
+    "source_deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+    "builder": "dockerfile"
+  }
+}
+```
+
+Setelah itu urutannya sama seperti deployment yang build: release command bila ada,
+`deployment.container.started`, `deployment.health.started`, `deployment.route.started`,
+dan `deployment.runtime.ready` dengan `image` berisi referensi yang dipakai ulang dan
+`builder` dari label. Checkout, pemeriksaan ruang disk workspace, dan antrean build
+(`SAKALA_MAX_CONCURRENT_BUILDS`) dilewati. Pemeriksaan kapasitas container, readiness,
+replika, dan perpindahan route tanpa downtime tidak berubah.
+
+Bila image tidak bisa dipakai ulang, Agent mengirim `deployment.image.reuse_skipped`
+(level `warning`) sebelum `deployment.checkout.started`, lalu build seperti biasa.
+Ini bukan kegagalan, dan tidak ada kode error atau result completion baru.
+
+```json
+{
+  "type": "deployment.image.reuse_skipped",
+  "level": "warning",
+  "metadata": {
+    "source_deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+    "reason": "image_missing"
+  }
+}
+```
+
+| `reason` | Arti |
+| --- | --- |
+| `image_missing` | Node tidak punya image di bawah referensi itu: sudah dibersihkan image GC, deployment sumbernya di node lain, atau tidak pernah ada. Image yang gagal di-inspect Docker juga dihitung begini. |
+| `image_not_owned` | Label image menyebut project atau deployment lain, atau label kepemilikannya tidak ada. |
+| `image_metadata_missing` | Label `dev.sakala.builder` tidak ada atau nilainya tidak dikenal. Image ini dibangun Agent sebelum fitur ini ada, jadi redeploy konfigurasi pertama setelah upgrade build satu kali. |
+| `invalid_reference` | `reuse_image_from_deployment_id` bukan string UUID. `source_deployment_id` bernilai `null`. |
+
+Release command tetap dijalankan pada deployment yang memakai ulang image. Database
+yang baru di-attach butuh migrasinya dijalankan ke database itu, dan perubahan
+environment bisa mengubah apa yang dilakukan migrasi.
+
+Deployment yang memakai ulang image dan gagal sebelum route pindah tidak pernah
+menghapus image itu, karena image tersebut masih dipakai deployment yang sedang
+melayani. Container kandidatnya tetap dihapus seperti biasa. Detail runtime ada di
+[Memakai ulang image](DOCKER_RUNTIME.md#memakai-ulang-image).
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -733,7 +825,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "idle-sleep",
     "replicas",
     "release-command",
-    "workload-metrics"
+    "workload-metrics",
+    "image-reuse"
   ],
   "metadata": {
     "version": "0.13.0",
@@ -1328,6 +1421,8 @@ dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
 
 | `type` | Kapan | Status deployment yang cocok |
 | --- | --- | --- |
+| `deployment.image.reused` | Hanya bila payload membawa `reuse_image_from_deployment_id` dan image-nya bisa dipakai ulang. Level `info`, metadata `image`, `source_deployment_id`, `builder`. Menggantikan empat event berikutnya. Lihat [Memakai ulang image](#memakai-ulang-image-tanpa-build). | tidak ada |
+| `deployment.image.reuse_skipped` | Hanya bila payload membawa `reuse_image_from_deployment_id` tetapi image-nya tidak bisa dipakai ulang, sebelum checkout. Level `warning`, metadata `source_deployment_id` (atau `null`) dan `reason`. Build lalu berjalan seperti biasa. | tidak ada |
 | `deployment.checkout.started` | Clone repository dimulai. | `cloning` |
 | `deployment.analysis.started` | `railpack prepare` dimulai. Hanya pada build Railpack, karena memilih Dockerfile hanyalah memeriksa satu file. | `analyzing` |
 | `deployment.workspace.detected` | Hanya pada build Railpack yang root directory-nya package workspace JavaScript, setelah analisis dimulai. Metadata-nya berbentuk sama dengan `workspace` di hasil `InspectProject`, dengan perintah yang benar-benar dipakai. | tidak ada; tetap `analyzing` |

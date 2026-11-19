@@ -291,6 +291,23 @@ can be deployed first.
 Host requirement: the runtime router image needs BusyBox `nc`, which `caddy:*-alpine`
 has. Without it the check is skipped and readiness behaves as before.
 
+## Revision 4 additions for image reuse
+
+Still revision 4: no new command type, error code, or completion field, only an
+optional payload field, two events, image labels, and a new capability. Either side can
+be deployed first. An older Agent ignores `reuse_image_from_deployment_id` and builds,
+which is correct but slow, so the API must only send the field to a node that
+advertises `image-reuse`.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `image-reuse` | Advertised by the `docker` driver only. | Not sent on the heartbeat otherwise. |
+| `DeployProject` payload field `reuse_image_from_deployment_id` | Honoured. | Optional string, the UUID of the deployment that built the image to start from. Absent or `null` builds as before. The Agent never refuses a deployment over this field: any value that is not a UUID string builds and reports `invalid_reference`. The Agent looks the image up as `sakala/project-<project_id>:<commit12>-<source8>`, computed from the command's `project_id`, the payload's `commit_sha`, and the field, never from an image reference in the payload, and reuses it only when its labels `dev.sakala.project-id` and `dev.sakala.deployment-id` name that project and deployment and `dev.sakala.builder` is `dockerfile` or `railpack`. A reuse skips checkout, the workspace disk check, and the build queue; the release command, capacity checks, readiness, replicas, and the zero-downtime switch run as for a build. Example in `examples/commands/deploy-project-image-reuse.json`; semantics in [Sakala Agent API](AGENT_API.md#memakai-ulang-image-tanpa-build). |
+| Event `deployment.image.reused` | Sent on reuse, after `deployment.timeouts.resolved`. | Level `info`, metadata `{ image, source_deployment_id, builder }`. Replaces `deployment.checkout.started`, `deployment.analysis.started`, `deployment.workspace.detected`, and `deployment.build.started`. `deployment.runtime.ready` reports the reused `image` and the labelled `builder`. Maps to no status. |
+| Event `deployment.image.reuse_skipped` | Sent when reuse was asked for but the Agent builds, before `deployment.checkout.started`. | Level `warning`, metadata `{ source_deployment_id, reason }`; `source_deployment_id` is `null` for `invalid_reference`. `reason` is one of `image_missing`, `image_not_owned`, `image_metadata_missing`, `invalid_reference`. Not a failure; the build path follows unchanged. Maps to no status. |
+| Image labels `dev.sakala.builder` and `dev.sakala.package-directory` | Written on every image built from this release on. | `dev.sakala.builder` is `dockerfile` or `railpack`. `dev.sakala.package-directory` is written only for an image built from a JavaScript workspace root. Images built by an older Agent lack them, so the first configuration redeploy after the upgrade builds once with `image_metadata_missing`. |
+| Failure cleanup | Behaviour change for reuse only. | A reused deployment that fails before its route switches removes its candidate containers but never the image, which the serving deployment still uses. Image GC is unchanged. |
+
 ## Revision 4 behaviour change: log delivery retries
 
 Still revision 4, with no wire change: the same endpoint, body, `Idempotency-Key`

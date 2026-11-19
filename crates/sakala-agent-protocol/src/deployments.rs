@@ -2,8 +2,21 @@ use std::{collections::BTreeMap, num::NonZeroU32};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::RepositoryAccess;
+
+/// Capability of a node that reads `DeployProject.reuse_image_from_deployment_id`.
+/// The control plane sends the field only to a node that advertises it.
+pub const IMAGE_REUSE_CAPABILITY: &str = "image-reuse";
+
+/// Event of a deployment that starts from the image of an earlier deployment
+/// instead of building one.
+pub const IMAGE_REUSED_EVENT: &str = "deployment.image.reused";
+
+/// Event of a deployment that was asked to reuse an image but builds instead.
+/// Its metadata names one [`ImageReuseFallbackReason`].
+pub const IMAGE_REUSE_SKIPPED_EVENT: &str = "deployment.image.reuse_skipped";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -12,6 +25,21 @@ pub enum DeploymentBuilder {
     Auto,
     Dockerfile,
     Railpack,
+}
+
+impl DeploymentBuilder {
+    /// The builders that actually build an image. `Auto` only picks one.
+    pub const CONCRETE: [Self; 2] = [Self::Dockerfile, Self::Railpack];
+
+    /// The wire name, the same one serde writes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Dockerfile => "dockerfile",
+            Self::Railpack => "railpack",
+        }
+    }
 }
 
 /// Product-level resource request resolved by the control plane.
@@ -100,6 +128,68 @@ pub struct DeployProjectPayload {
     /// How many containers serve the deployment behind the node's router.
     #[serde(default, skip_serializing_if = "RequestedReplicas::is_absent")]
     pub replicas: RequestedReplicas,
+    /// The deployment whose image this one starts from instead of building.
+    #[serde(default, skip_serializing_if = "RequestedImageReuse::is_absent")]
+    pub reuse_image_from_deployment_id: RequestedImageReuse,
+}
+
+/// The `reuse_image_from_deployment_id` field of a `DeployProject` payload: the
+/// deployment that built the image to start from.
+///
+/// Read leniently, like [`RequestedReplicas`]: a value that is not a UUID string
+/// never fails the payload. The deployment then builds, and reports why.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestedImageReuse {
+    /// The field is missing or `null`: build, as before image reuse existed.
+    #[default]
+    Absent,
+    /// The deployment that built the image to reuse.
+    Deployment(Uuid),
+    /// Present, but not a UUID string.
+    Invalid,
+}
+
+impl RequestedImageReuse {
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestedImageReuse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Null => Self::Absent,
+            Value::String(value) => Uuid::parse_str(&value).map_or(Self::Invalid, Self::Deployment),
+            _ => Self::Invalid,
+        })
+    }
+}
+
+impl Serialize for RequestedImageReuse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Deployment(id) => id.serialize(serializer),
+            Self::Absent | Self::Invalid => serializer.serialize_none(),
+        }
+    }
+}
+
+/// Why a deployment asked to reuse an image builds one instead. Reported in
+/// the metadata of [`IMAGE_REUSE_SKIPPED_EVENT`]; none of them fails the
+/// deployment.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageReuseFallbackReason {
+    /// This node has no image under the reference of that deployment.
+    ImageMissing,
+    /// The image's labels name another project or another deployment.
+    ImageNotOwned,
+    /// The image has no known builder label: an Agent built it before image
+    /// reuse existed.
+    ImageMetadataMissing,
+    /// `reuse_image_from_deployment_id` is not a UUID string.
+    InvalidReference,
 }
 
 /// The `replicas` field of a `DeployProject` payload.
@@ -276,6 +366,111 @@ mod tests {
             serde_json::to_value(&payload).expect("serialize")["release_command"],
             json!("npm run migrate")
         );
+    }
+
+    fn image_reuse(value: Option<Value>) -> RequestedImageReuse {
+        let mut payload = json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.sakala.app",
+        });
+        if let Some(value) = value {
+            payload["reuse_image_from_deployment_id"] = value;
+        }
+        serde_json::from_value::<DeployProjectPayload>(payload)
+            .expect("an image reuse value never fails the payload")
+            .reuse_image_from_deployment_id
+    }
+
+    #[test]
+    fn image_reuse_is_absent_when_missing_or_null() {
+        assert_eq!(image_reuse(None), RequestedImageReuse::Absent);
+        assert_eq!(image_reuse(Some(Value::Null)), RequestedImageReuse::Absent);
+    }
+
+    #[test]
+    fn a_uuid_string_names_the_deployment_whose_image_is_reused() {
+        let id = Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("UUID");
+        assert_eq!(
+            image_reuse(Some(json!("4f1f21ef-730d-42d5-a46d-d965353cb993"))),
+            RequestedImageReuse::Deployment(id)
+        );
+    }
+
+    #[test]
+    fn anything_else_builds_instead_of_refusing_the_deployment() {
+        for value in [
+            json!(""),
+            json!("not-a-uuid"),
+            json!("4f1f21ef-730d-42d5-a46d"),
+            json!(42),
+            json!(true),
+            json!(["4f1f21ef-730d-42d5-a46d-d965353cb993"]),
+            json!({ "id": "4f1f21ef-730d-42d5-a46d-d965353cb993" }),
+        ] {
+            assert_eq!(
+                image_reuse(Some(value.clone())),
+                RequestedImageReuse::Invalid,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_deployment_id_is_written_back() {
+        let mut payload: DeployProjectPayload = serde_json::from_value(json!({
+            "repository_url": "https://github.com/gmedia/example-app.git",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+            "domain": "portfolio.sakala.app",
+        }))
+        .expect("payload");
+        assert!(
+            serde_json::to_value(&payload)
+                .expect("serialize")
+                .get("reuse_image_from_deployment_id")
+                .is_none()
+        );
+        let id = Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993").expect("UUID");
+        payload.reuse_image_from_deployment_id = RequestedImageReuse::Deployment(id);
+        assert_eq!(
+            serde_json::to_value(&payload).expect("serialize")["reuse_image_from_deployment_id"],
+            json!("4f1f21ef-730d-42d5-a46d-d965353cb993")
+        );
+    }
+
+    #[test]
+    fn fallback_reasons_use_their_wire_names() {
+        for (reason, name) in [
+            (ImageReuseFallbackReason::ImageMissing, "image_missing"),
+            (ImageReuseFallbackReason::ImageNotOwned, "image_not_owned"),
+            (
+                ImageReuseFallbackReason::ImageMetadataMissing,
+                "image_metadata_missing",
+            ),
+            (
+                ImageReuseFallbackReason::InvalidReference,
+                "invalid_reference",
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).expect("serialize"),
+                json!(name)
+            );
+        }
+    }
+
+    #[test]
+    fn builder_names_match_what_serde_writes() {
+        for builder in [
+            DeploymentBuilder::Auto,
+            DeploymentBuilder::Dockerfile,
+            DeploymentBuilder::Railpack,
+        ] {
+            assert_eq!(
+                serde_json::to_value(builder).expect("serialize"),
+                json!(builder.as_str())
+            );
+        }
     }
 
     #[test]

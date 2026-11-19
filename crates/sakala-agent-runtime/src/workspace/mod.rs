@@ -130,6 +130,12 @@ pub trait WorkspaceManager: Send + Sync {
         cancellation: CancellationToken,
     ) -> Result<DeploymentWorkspace, RuntimeError>;
 
+    /// The command's workspace without a checkout, for a deployment that
+    /// reuses an image and needs a directory only for its containers' env
+    /// file. [`Self::cleanup`] and [`Self::cleanup_stale`] remove it like a
+    /// checkout.
+    async fn empty(&self, command_id: Uuid) -> Result<DeploymentWorkspace, RuntimeError>;
+
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError>;
 
     async fn cleanup_stale(&self, minimum_age: Duration) -> Result<usize, RuntimeError>;

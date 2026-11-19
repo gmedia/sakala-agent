@@ -33,16 +33,17 @@ use url::Url;
 use uuid::Uuid;
 
 use super::{
+    image_reuse::ImagePlan,
     project_locks::ProjectLocks,
     replica_restore::{ReplicaRestorer, RestorePolicy, RestoreTarget},
 };
 use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
-    builders::{BuildRequest, ImageBuildService, ImageBuilder},
+    builders::{BuildOutput, BuildRequest, ImageBuildService, ImageBuilder},
     containers::{
         ContainerEngine, DockerContainerEngine, FailureOutput, ImageCleanup, ImageRetention,
         ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ReplicaSlot, RunContainerRequest,
-        image_name, release_container_name, replicas::resolve_replicas,
+        release_container_name, replicas::resolve_replicas,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -348,7 +349,17 @@ impl DockerRuntimeExecutor {
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload, request.repository_credential)?;
-        self.ensure_workspace_capacity().await?;
+        let plan = ImagePlan::resolve(
+            self.containers.as_ref(),
+            project_id,
+            deployment_id,
+            &payload,
+        )
+        .await;
+        // A reused image needs no checkout and no build space.
+        if !plan.reuses() {
+            self.ensure_workspace_capacity().await?;
+        }
         self.containers
             .ensure_capacity(project_id, replicas)
             .await?;
@@ -375,24 +386,31 @@ impl DockerRuntimeExecutor {
         )
         .await?;
 
-        emit_event(
-            reporter.as_ref(),
-            "deployment.checkout.started",
-            "Cloning repository at the requested commit.",
-            json!({ "commit_sha": payload.commit_sha }),
-        )
-        .await?;
-        let workspace = self
-            .workspace
-            .checkout(
-                request.command_id,
-                &source,
+        plan.report(reporter.as_ref()).await?;
+        let workspace = if plan.reuses() {
+            drop(source);
+            // Only for the env file of the release container and the replicas.
+            self.workspace.empty(request.command_id).await?
+        } else {
+            emit_event(
                 reporter.as_ref(),
-                request.cancellation.clone(),
+                "deployment.checkout.started",
+                "Cloning repository at the requested commit.",
+                json!({ "commit_sha": payload.commit_sha }),
             )
             .await?;
-        drop(source);
-        let image = image_name(project_id, deployment_id, &payload.commit_sha);
+            let workspace = self
+                .workspace
+                .checkout(
+                    request.command_id,
+                    &source,
+                    reporter.as_ref(),
+                    request.cancellation.clone(),
+                )
+                .await?;
+            drop(source);
+            workspace
+        };
         let candidates = ReplicaSlot::all(replicas)
             .map(|slot| (slot, slot.container_name(project_id, deployment_id)))
             .collect::<Vec<_>>();
@@ -415,7 +433,7 @@ impl DockerRuntimeExecutor {
             deployment_id,
             &payload,
             &workspace,
-            &image,
+            &plan,
             &candidates,
             applied_resources,
             applied_timeouts,
@@ -473,7 +491,11 @@ impl DockerRuntimeExecutor {
             result = result.map_err(|error| error.refine_crash(output.exec_denied));
         }
         if failed_before_cutover {
-            if let Err(error) = self.containers.cleanup_candidate(&containers, &image).await {
+            if let Err(error) = self
+                .containers
+                .cleanup_candidate(&containers, plan.candidate_image())
+                .await
+            {
                 let _ = reporter
                     .log(system_log(format!(
                         "candidate cleanup warning for {}: {error}",
@@ -574,7 +596,7 @@ impl DockerRuntimeExecutor {
         deployment_id: Uuid,
         payload: &DeployProjectPayload,
         workspace: &DeploymentWorkspace,
-        image: &str,
+        plan: &ImagePlan,
         candidates: &[(ReplicaSlot, String)],
         applied_resources: AppliedRuntimeResources,
         applied_timeouts: crate::config::AppliedRuntimeTimeouts,
@@ -587,41 +609,24 @@ impl DockerRuntimeExecutor {
             .map(|(_, name)| name.clone())
             .collect::<Vec<_>>();
         let replicas = replica_count(candidates.len());
-        let context = workspace
-            .build_context(payload.root_directory.as_deref())
-            .await?;
-        let build_permit = Arc::clone(&self.build_permits)
-            .acquire_owned()
-            .await
-            .map_err(|_| {
-                RuntimeError::Execution("build concurrency scheduler is unavailable".to_owned())
-            })?;
-        let build = tokio::time::timeout(
-            applied_timeouts.build,
-            self.builder.build(
-                &BuildRequest {
+        let image = plan.image();
+        // A reused image was built the way its labels say, so everything after
+        // the build behaves exactly as it did for the deployment that built it.
+        let build = match plan {
+            ImagePlan::Reuse { build, .. } => build.clone(),
+            ImagePlan::Build { .. } => {
+                self.build_image(
                     project_id,
                     deployment_id,
-                    workspace: workspace.root().to_owned(),
-                    repository: workspace.canonical_source().await?,
-                    source: context,
-                    image: image.to_owned(),
-                    requested: payload.builder,
-                    environment: build_environment(payload),
-                    build_command: command_field(payload.build_command.as_deref()),
-                    start_command: command_field(payload.start_command.as_deref()),
-                },
-                reporter_ref,
-            ),
-        )
-        .await
-        .map_err(|_| RuntimeError::Timeout {
-            operation: "deployment-build".to_owned(),
-            seconds: applied_timeouts.build.as_secs(),
-        })??;
-        // Build concurrency protects builder capacity only; start/readiness and routing
-        // must not prevent another deployment from entering the build phase.
-        drop(build_permit);
+                    payload,
+                    workspace,
+                    image,
+                    applied_timeouts.build,
+                    reporter_ref,
+                )
+                .await?
+            }
+        };
 
         // Once per deployment, before anything of the new version starts: until
         // the route moves, the previous deployment keeps serving.
@@ -827,6 +832,57 @@ impl DockerRuntimeExecutor {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Builds the deployment's image from its checkout, under the node's build
+    /// concurrency limit and the deployment's build deadline.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_image(
+        &self,
+        project_id: Uuid,
+        deployment_id: Uuid,
+        payload: &DeployProjectPayload,
+        workspace: &DeploymentWorkspace,
+        image: &str,
+        build_timeout: std::time::Duration,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<BuildOutput, RuntimeError> {
+        let context = workspace
+            .build_context(payload.root_directory.as_deref())
+            .await?;
+        let build_permit = Arc::clone(&self.build_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                RuntimeError::Execution("build concurrency scheduler is unavailable".to_owned())
+            })?;
+        let build = tokio::time::timeout(
+            build_timeout,
+            self.builder.build(
+                &BuildRequest {
+                    project_id,
+                    deployment_id,
+                    workspace: workspace.root().to_owned(),
+                    repository: workspace.canonical_source().await?,
+                    source: context,
+                    image: image.to_owned(),
+                    requested: payload.builder,
+                    environment: build_environment(payload),
+                    build_command: command_field(payload.build_command.as_deref()),
+                    start_command: command_field(payload.start_command.as_deref()),
+                },
+                reporter,
+            ),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout {
+            operation: "deployment-build".to_owned(),
+            seconds: build_timeout.as_secs(),
+        })??;
+        // Build concurrency protects builder capacity only; start/readiness and routing
+        // must not prevent another deployment from entering the build phase.
+        drop(build_permit);
+        Ok(build)
     }
 
     /// Runs the deployment's release command in its own container and waits for
