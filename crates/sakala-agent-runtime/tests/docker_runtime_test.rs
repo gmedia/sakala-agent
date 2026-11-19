@@ -21,8 +21,8 @@ use sakala_agent_core::{
 };
 use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, CrashedWorkloadDetail, DeploymentEvent,
-    DeploymentLog, DesiredWorkloadState, LogBounds, LogStream, ReconcileWorkloadAction,
-    RuntimeCleanupTarget, SleepingPage,
+    DeploymentEventLevel, DeploymentLog, DesiredWorkloadState, LogBounds, LogStream,
+    ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage,
 };
 use sakala_agent_runtime::{
     CommandSpec, DockerRuntimeConfig, DockerRuntimeExecutor, ProcessOutput, ProcessOutputSink,
@@ -4522,9 +4522,9 @@ async fn deploy_outcome(
 fn build_context(arguments: &[String]) -> &str {
     let label = arguments
         .iter()
-        .position(|argument| argument.starts_with("dev.sakala.deployment-id="))
-        .expect("deployment label");
-    &arguments[label + 1]
+        .rposition(|argument| argument == "--label")
+        .expect("image labels");
+    &arguments[label + 2]
 }
 
 fn is_docker_run(spec: &CommandSpec) -> bool {
@@ -6295,6 +6295,463 @@ async fn a_deployment_without_a_free_address_range_fails_as_node_capacity() {
     assert_eq!(runner.count_commands(is_workload_run), 0);
 }
 
+/// The deployment that built the image a reuse asks for.
+const REUSE_SOURCE: &str = "0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b";
+/// Where the Agent looks for that image: the requesting project's repository,
+/// the payload's commit, and the source deployment.
+const REUSED_IMAGE: &str =
+    "sakala/project-ff66ed4a-6303-4be6-8ef4-63c28b112680:0123456789ab-0b5c3f9e";
+/// The image the deployment of `deploy_command` builds itself.
+const BUILT_IMAGE: &str =
+    "sakala/project-ff66ed4a-6303-4be6-8ef4-63c28b112680:0123456789ab-4f1f21ef";
+fn reuse_command(extra: serde_json::Value) -> AgentCommand {
+    let mut command = deploy_with_config("auto", extra);
+    if command
+        .payload
+        .get("reuse_image_from_deployment_id")
+        .is_none()
+    {
+        command.payload["reuse_image_from_deployment_id"] = json!(REUSE_SOURCE);
+    }
+    command
+}
+
+/// The labels a build of `REUSE_SOURCE` in `PROJECT` writes.
+fn source_labels(builder: &str, package_directory: Option<&str>) -> serde_json::Value {
+    let mut labels = json!({
+        "dev.sakala.managed": "true",
+        "dev.sakala.project-id": PROJECT,
+        "dev.sakala.deployment-id": REUSE_SOURCE,
+        "dev.sakala.builder": builder,
+    });
+    if let Some(directory) = package_directory {
+        labels["dev.sakala.package-directory"] = json!(directory);
+    }
+    labels
+}
+
+fn is_image_labels_inspect(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec
+            .args
+            .first()
+            .is_some_and(|argument| argument == "image")
+        && spec.args.iter().any(|argument| argument == "inspect")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument == "{{json .Config.Labels}}")
+}
+
+/// Every event type in order, the `.resolved` ones included.
+fn all_event_types(reporter: &RecordingReporter) -> Vec<String> {
+    reporter
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .map(|event| event.event_type.clone())
+        .collect()
+}
+
+fn event_of(reporter: &RecordingReporter, event_type: &str) -> DeploymentEvent {
+    reporter
+        .events
+        .lock()
+        .expect("event lock")
+        .iter()
+        .find(|event| event.event_type == event_type)
+        .cloned()
+        .unwrap_or_else(|| panic!("{event_type} should be reported"))
+}
+
+const BUILD_PATH_EVENTS: [&str; 4] = [
+    "deployment.checkout.started",
+    "deployment.analysis.started",
+    "deployment.workspace.detected",
+    "deployment.build.started",
+];
+
+#[tokio::test]
+async fn a_reused_image_starts_with_the_new_environment_without_checkout_or_build() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_reuse_image_labels(source_labels("dockerfile", None)));
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = reuse_command(json!({
+        "environment": { "APP_ENV": "staging" },
+        "start_command": "node server.js",
+    }));
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("the reused deployment completes");
+
+    let types = all_event_types(&reporter);
+    assert_eq!(
+        types[..3],
+        [
+            "deployment.resources.resolved",
+            "deployment.timeouts.resolved",
+            "deployment.image.reused",
+        ],
+        "{types:?}"
+    );
+    for event in BUILD_PATH_EVENTS {
+        assert!(
+            !types.iter().any(|seen| seen == event),
+            "{event}: {types:?}"
+        );
+    }
+    assert!(types.iter().any(|seen| seen == "deployment.runtime.ready"));
+    let reused = event_of(&reporter, "deployment.image.reused");
+    assert_eq!(reused.level, DeploymentEventLevel::Info);
+    assert_eq!(
+        reused.metadata,
+        json!({
+            "image": REUSED_IMAGE,
+            "source_deployment_id": REUSE_SOURCE,
+            "builder": "dockerfile",
+        })
+    );
+    let ready = event_of(&reporter, "deployment.runtime.ready");
+    assert_eq!(ready.metadata["image"], REUSED_IMAGE);
+    assert_eq!(ready.metadata["builder"], "dockerfile");
+
+    let inspect = string_arguments(&find_command(&runner, is_image_labels_inspect));
+    assert_eq!(inspect.last().map(String::as_str), Some(REUSED_IMAGE));
+    assert_eq!(runner.count_commands(|spec| spec.program == "git"), 0);
+    assert_eq!(runner.count_commands(is_buildx_build), 0);
+    assert_eq!(runner.count_commands(is_sandbox), 0);
+    assert_eq!(
+        runner.count_commands(|spec| spec.program == "df"),
+        0,
+        "a reused image needs no build space"
+    );
+
+    let run = string_arguments(&find_command(&runner, is_workload_run));
+    let image = run
+        .iter()
+        .position(|argument| argument == REUSED_IMAGE)
+        .expect("the replica runs the reused image");
+    assert_eq!(
+        run[image - 2..],
+        [
+            "--entrypoint".to_owned(),
+            "sh".to_owned(),
+            REUSED_IMAGE.to_owned(),
+            "-c".to_owned(),
+            "node server.js".to_owned(),
+        ],
+        "a Dockerfile image takes the start command at run time"
+    );
+    let env_file = run
+        .iter()
+        .position(|argument| argument == "--env-file")
+        .map(|position| std::path::PathBuf::from(&run[position + 1]))
+        .expect("the new environment reaches the replica");
+    assert!(env_file.starts_with(temp.path().join("builds")));
+    assert!(
+        !temp
+            .path()
+            .join("builds")
+            .join(command.id.to_string())
+            .exists(),
+        "the empty workspace is cleaned up like a checkout"
+    );
+}
+
+#[tokio::test]
+async fn a_reused_railpack_image_keeps_its_baked_start_command_and_runs_release_in_its_package() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(false).with_reuse_image_labels(source_labels("railpack", Some("apps/web"))),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = reuse_command(json!({
+        "root_directory": "apps/web",
+        "start_command": "pnpm run preview",
+        "release_command": "pnpm run migrate",
+    }));
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("the reused deployment completes");
+
+    let release = string_arguments(&find_command(&runner, is_release_run));
+    assert!(release.iter().any(|argument| argument == REUSED_IMAGE));
+    assert_eq!(
+        release.last().map(String::as_str),
+        Some("cd 'apps/web' && pnpm run migrate"),
+        "the release command runs where it ran for the build: {release:?}"
+    );
+    let types = all_event_types(&reporter);
+    let position = |event: &str| {
+        types
+            .iter()
+            .position(|seen| seen == event)
+            .unwrap_or_else(|| panic!("{event}: {types:?}"))
+    };
+    assert!(position("deployment.image.reused") < position("deployment.release.started"));
+    assert!(position("deployment.release.completed") < position("deployment.container.started"));
+
+    let run = string_arguments(&find_command(&runner, is_workload_run));
+    assert_eq!(run.last().map(String::as_str), Some(REUSED_IMAGE));
+    assert!(
+        !run.iter().any(|argument| argument == "--entrypoint"),
+        "a Railpack image already starts with its command: {run:?}"
+    );
+    assert_eq!(
+        event_of(&reporter, "deployment.runtime.ready").metadata["builder"],
+        "railpack"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_reused_deployment_never_removes_the_image_it_reused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(source_labels("dockerfile", None))
+            .with_failed_workload_run(),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &reuse_command(json!({})),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("the replica cannot start");
+
+    assert!(
+        runner.count_commands(is_candidate_removal) > 0,
+        "the candidate's container is still removed"
+    );
+    assert_eq!(
+        image_removals(&runner),
+        Vec::<Vec<String>>::new(),
+        "the reused image belongs to the deployment still serving"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_build_still_removes_the_image_it_built() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_failed_workload_run());
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("auto"),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("the replica cannot start");
+
+    assert_eq!(
+        image_removals(&runner),
+        [vec!["--force".to_owned(), BUILT_IMAGE.to_owned()]]
+    );
+}
+
+/// The reason in `deployment.image.reuse_skipped`, which must come before the
+/// checkout of the build it falls back to.
+fn fallback_reason(reporter: &RecordingReporter) -> serde_json::Value {
+    let types = all_event_types(reporter);
+    let skipped = types
+        .iter()
+        .position(|seen| seen == "deployment.image.reuse_skipped")
+        .unwrap_or_else(|| panic!("reuse_skipped should be reported: {types:?}"));
+    let checkout = types
+        .iter()
+        .position(|seen| seen == "deployment.checkout.started")
+        .expect("the fallback checks out");
+    assert!(skipped < checkout, "{types:?}");
+    assert!(!types.iter().any(|seen| seen == "deployment.image.reused"));
+    let event = event_of(reporter, "deployment.image.reuse_skipped");
+    assert_eq!(event.level, DeploymentEventLevel::Warning);
+    event.metadata
+}
+
+#[tokio::test]
+async fn a_missing_image_falls_back_to_a_build_that_labels_its_image() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &reuse_command(json!({ "start_command": "node server.js" })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("the fallback build deploys");
+
+    assert_eq!(
+        fallback_reason(&reporter),
+        json!({ "source_deployment_id": REUSE_SOURCE, "reason": "image_missing" })
+    );
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    let tag = build
+        .iter()
+        .position(|argument| argument == "--tag")
+        .expect("tag");
+    assert_eq!(build[tag + 1], BUILT_IMAGE);
+    assert!(
+        build
+            .iter()
+            .any(|argument| argument == "dev.sakala.builder=dockerfile")
+    );
+    assert!(
+        !build
+            .iter()
+            .any(|argument| argument.starts_with("dev.sakala.package-directory=")),
+        "only a workspace build has a package directory: {build:?}"
+    );
+    let run = string_arguments(&find_command(&runner, is_workload_run));
+    assert!(run.iter().any(|argument| argument == BUILT_IMAGE));
+    assert!(run.iter().any(|argument| argument == "--entrypoint"));
+}
+
+#[tokio::test]
+async fn an_image_labelled_for_another_project_is_never_reused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut labels = source_labels("dockerfile", None);
+    labels["dev.sakala.project-id"] = json!("11111111-1111-4111-8111-111111111111");
+    let runner = Arc::new(FakeRunner::new(true).with_reuse_image_labels(labels));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &reuse_command(json!({})),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("the project builds its own image");
+
+    assert_eq!(fallback_reason(&reporter)["reason"], "image_not_owned");
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .filter(|spec| is_workload_run(spec) || is_release_run(spec))
+            .any(|spec| string_arguments(spec)
+                .iter()
+                .any(|argument| argument == REUSED_IMAGE)),
+        "nothing ever runs the foreign image"
+    );
+}
+
+#[tokio::test]
+async fn an_image_without_a_builder_label_is_rebuilt() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut labels = source_labels("dockerfile", None);
+    labels
+        .as_object_mut()
+        .expect("labels")
+        .remove("dev.sakala.builder");
+    let runner = Arc::new(FakeRunner::new(true).with_reuse_image_labels(labels));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &reuse_command(json!({})),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("the deployment builds instead");
+
+    assert_eq!(
+        fallback_reason(&reporter)["reason"],
+        "image_metadata_missing"
+    );
+    assert_eq!(runner.count_commands(is_buildx_build), 1);
+}
+
+#[tokio::test]
+async fn a_reuse_reference_that_is_not_a_uuid_builds_without_looking_for_an_image() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &reuse_command(json!({ "reuse_image_from_deployment_id": "../../other-project" })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("the deployment builds instead");
+
+    assert_eq!(
+        fallback_reason(&reporter),
+        json!({ "source_deployment_id": null, "reason": "invalid_reference" })
+    );
+    assert_eq!(runner.count_commands(is_image_labels_inspect), 0);
+    assert_eq!(runner.count_commands(is_buildx_build), 1);
+}
+
+#[tokio::test]
+async fn a_deployment_without_reuse_never_looks_for_an_image() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("auto"),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("deployment completes");
+
+    assert_eq!(runner.count_commands(is_image_labels_inspect), 0);
+    let types = all_event_types(&reporter);
+    assert!(
+        !types
+            .iter()
+            .any(|seen| seen.starts_with("deployment.image.")),
+        "{types:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_build_labels_its_builder_and_package_directory() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_js_workspace());
+    let reporter = Arc::new(RecordingReporter::default());
+    let command = deploy_with_config("auto", json!({ "root_directory": "apps/web" }));
+
+    deploy_outcome(runner.clone(), &temp, &command, Arc::clone(&reporter))
+        .await
+        .expect("deployment completes");
+
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    for label in [
+        "dev.sakala.managed=true",
+        "dev.sakala.project-id=ff66ed4a-6303-4be6-8ef4-63c28b112680",
+        "dev.sakala.deployment-id=4f1f21ef-730d-42d5-a46d-d965353cb993",
+        "dev.sakala.builder=railpack",
+        "dev.sakala.package-directory=apps/web",
+    ] {
+        let position = build
+            .iter()
+            .position(|argument| argument == label)
+            .unwrap_or_else(|| panic!("{label} missing from {build:?}"));
+        assert_eq!(build[position - 1], "--label");
+    }
+}
+
 async fn dispatch<R>(
     executor: DockerRuntimeExecutor,
     command: &AgentCommand,
@@ -6570,6 +7027,9 @@ struct FakeRunner {
     release_oom_killed: bool,
     /// Exit code of a `docker run` of the release container that fails.
     release_run_failure: Option<(i32, &'static str)>,
+    /// What `docker image inspect` prints for the labels of an image to reuse.
+    /// `None` answers as Docker does for a reference without an image.
+    reuse_image_labels: Option<String>,
 }
 
 /// Fails a test that would otherwise hang: how long a test waits for spawned
@@ -6836,7 +7296,13 @@ impl FakeRunner {
             release_exit_stdout: "0\n".to_owned(),
             release_oom_killed: false,
             release_run_failure: None,
+            reuse_image_labels: None,
         }
+    }
+
+    fn with_reuse_image_labels(mut self, labels: serde_json::Value) -> Self {
+        self.reuse_image_labels = Some(labels.to_string());
+        self
     }
 
     fn with_js_workspace(mut self) -> Self {
@@ -7153,6 +7619,25 @@ impl ProcessRunner for FakeRunner {
         }
         if let Some(output) = self.release_output(spec) {
             return Ok(output);
+        }
+        if is_image_labels_inspect(spec) {
+            return Ok(match &self.reuse_image_labels {
+                Some(labels) => ProcessOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: format!("{labels}\n"),
+                    stderr: String::new(),
+                },
+                None => ProcessOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Error response from daemon: No such image: {}\n",
+                        spec.args.last().expect("image").to_string_lossy()
+                    ),
+                },
+            });
         }
         let previous_stop = spec.program == "docker"
             && spec.args.first().is_some_and(|argument| argument == "stop")

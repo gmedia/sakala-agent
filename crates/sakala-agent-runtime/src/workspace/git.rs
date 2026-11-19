@@ -25,6 +25,18 @@ impl GitWorkspaceManager {
     pub fn new(root: PathBuf, runner: Arc<dyn ProcessRunner>) -> Self {
         Self { root, runner }
     }
+
+    /// An empty, owner-only directory for the command, replacing whatever an
+    /// interrupted attempt of the same command left there.
+    async fn fresh_workspace(&self, command_id: Uuid) -> Result<DeploymentWorkspace, RuntimeError> {
+        let workspace = DeploymentWorkspace::new(self.root.join(command_id.to_string()));
+        if fs::try_exists(workspace.root()).await? {
+            fs::remove_dir_all(workspace.root()).await?;
+        }
+        fs::create_dir_all(workspace.root()).await?;
+        restrict_workspace_permissions(workspace.root()).await?;
+        Ok(workspace)
+    }
 }
 
 #[async_trait]
@@ -36,12 +48,7 @@ impl WorkspaceManager for GitWorkspaceManager {
         reporter: &dyn RuntimeReporter,
         cancellation: CancellationToken,
     ) -> Result<DeploymentWorkspace, RuntimeError> {
-        let workspace = DeploymentWorkspace::new(self.root.join(command_id.to_string()));
-        if fs::try_exists(workspace.root()).await? {
-            fs::remove_dir_all(workspace.root()).await?;
-        }
-        fs::create_dir_all(workspace.root()).await?;
-        restrict_workspace_permissions(workspace.root()).await?;
+        let workspace = self.fresh_workspace(command_id).await?;
 
         let askpass = match &source.credential {
             Some(_) => Some(write_askpass(workspace.root()).await?),
@@ -122,6 +129,10 @@ impl WorkspaceManager for GitWorkspaceManager {
         }
 
         Ok(workspace)
+    }
+
+    async fn empty(&self, command_id: Uuid) -> Result<DeploymentWorkspace, RuntimeError> {
+        self.fresh_workspace(command_id).await
     }
 
     async fn cleanup(&self, workspace: &DeploymentWorkspace) -> Result<(), RuntimeError> {
@@ -404,6 +415,50 @@ mod tests {
         assert_eq!(cleaned, 1);
         assert!(!stale.exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn an_empty_workspace_runs_nothing_and_is_cleaned_like_a_checkout() {
+        let temp = TempDir::new().expect("temporary directory should be available");
+        let manager = GitWorkspaceManager::new(temp.path().to_owned(), Arc::new(UnusedRunner));
+        let command_id = Uuid::new_v4();
+        let leftover = temp.path().join(command_id.to_string()).join("runtime.env");
+        tokio::fs::create_dir_all(leftover.parent().expect("parent"))
+            .await
+            .expect("leftover directory");
+        tokio::fs::write(&leftover, "SECRET=old\n")
+            .await
+            .expect("leftover file");
+
+        let workspace = manager.empty(command_id).await.expect("empty workspace");
+
+        assert_eq!(workspace.root(), temp.path().join(command_id.to_string()));
+        assert!(!leftover.exists(), "an interrupted attempt leaves nothing");
+        assert_eq!(
+            std::fs::read_dir(workspace.root())
+                .expect("listing")
+                .count(),
+            0
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(workspace.root())
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        assert_eq!(
+            manager
+                .cleanup_stale(Duration::ZERO)
+                .await
+                .expect("workspace GC"),
+            1
+        );
+        let workspace = manager.empty(command_id).await.expect("empty workspace");
+        manager.cleanup(&workspace).await.expect("cleanup");
+        assert!(!workspace.root().exists());
     }
 
     #[tokio::test]
