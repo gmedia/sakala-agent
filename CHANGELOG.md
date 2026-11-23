@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Container project yang sedang tidur tidak lagi dilaporkan sebagai orphan. Sleep otomatis menghentikan container deployment aktif dan menyimpannya untuk dibangunkan, tetapi rekonsiliasi saat Agent start menggolongkan setiap container `Exited`/`Dead` sebagai `stale stopped deployment container`, sehingga setelah restart Agent v0.15.0 di production menulis peringatan `orphaned Sakala container detected` untuk enam container milik project yang tidur. Agent kini membaca route tidur di direktori site Caddy, satu-satunya catatan lokal yang ditulis saat sleep: container berhenti yang project dan deployment-nya sama dengan route berakhiran `(sleeping)` dilaporkan di `sleeping_workloads`, bukan `orphans`. Deployment lama project yang sama dan container tanpa route tetap orphan. `workloads.stopped` tetap menghitung keduanya, dan route tidur tetap dianggap dikenal sehingga cleanup route tidak menghapusnya. Aditif di protocol revision 4; lihat [Sakala Agent API](docs/AGENT_API.md#heartbeat-payload) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-additions-for-sleeping-workloads).
+
 ### Security
 
 - Update `url` to 2.5.9 for RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).

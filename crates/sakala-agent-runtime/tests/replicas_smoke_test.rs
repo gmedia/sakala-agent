@@ -2,7 +2,8 @@
 //! the agent writes is accepted, requests reach every replica, a killed replica
 //! does not cost a single failed request and is started again by replica
 //! restore, and sleep, wake, and stop handle the whole set through the
-//! executor's own lifecycle code.
+//! executor's own lifecycle code. An Agent restarted while the project sleeps
+//! reports the stopped replicas as sleeping, not as orphans, and wakes them.
 //!
 //! Opt-in, because it needs a daemon plus `caddy:2.11.3-alpine` and
 //! `busybox:1.37` locally:
@@ -254,16 +255,23 @@ async fn real_caddy_balances_replicas_and_survives_a_killed_one() {
         ]);
     }
 
-    let runner = Arc::new(TokioProcessRunner::new(Duration::from_secs(30)));
-    let executor = DockerRuntimeExecutor::with_runner(
-        DockerRuntimeConfig {
-            caddy_container: ROUTER.to_owned(),
-            caddy_sites_dir: sites.clone(),
-            public_api_url: "https://api.staging.sakala.dev".to_owned(),
-            ..DockerRuntimeConfig::default()
-        },
-        runner,
-    );
+    // Reconciliation also sweeps the workspace root, so it points at the
+    // test's own directory instead of the node default.
+    let workspace = temp.path().join("builds");
+    std::fs::create_dir_all(&workspace).expect("workspace directory");
+    let agent = || {
+        DockerRuntimeExecutor::with_runner(
+            DockerRuntimeConfig {
+                caddy_container: ROUTER.to_owned(),
+                caddy_sites_dir: sites.clone(),
+                workspace_root: workspace.clone(),
+                public_api_url: "https://api.staging.sakala.dev".to_owned(),
+                ..DockerRuntimeConfig::default()
+            },
+            Arc::new(TokioProcessRunner::new(Duration::from_secs(30))),
+        )
+    };
+    let executor = agent();
     let lifecycle = || WorkloadLifecycleRequest {
         command_id: Uuid::new_v4(),
         project_id,
@@ -351,8 +359,42 @@ async fn real_caddy_balances_replicas_and_survives_a_killed_one() {
     let (status, _) = request(DOMAIN);
     assert!(status.ends_with(" 503 Service Unavailable"), "{status}");
 
-    // Wake starts all three again, the killed one included, and restores the
-    // balanced route.
+    // The Agent restarts while the project sleeps. Its startup reconciliation
+    // finds the stopped replicas through the sleeping route and reports them as
+    // sleeping, not as orphans, and keeps the route.
+    let executor = agent();
+    let report = executor.reconcile().await.expect("reconciliation");
+    let mut sleeping = report
+        .sleeping_workloads
+        .iter()
+        .filter(|workload| workload.project_id == project_id)
+        .map(|workload| {
+            assert_eq!(workload.deployment_id, deployment_id);
+            workload.container_id.clone()
+        })
+        .collect::<Vec<_>>();
+    sleeping.sort();
+    println!("--- after restart, sleeping containers {sleeping:?}");
+    assert_eq!(sleeping.len(), REPLICAS as usize);
+    assert!(
+        !report
+            .orphans
+            .iter()
+            .any(|orphan| orphan.project_id == Some(project_id)),
+        "{:?}",
+        report.orphans
+    );
+    assert!(
+        !report
+            .stale_routes
+            .iter()
+            .any(|route| route.project_id == project_id),
+        "{:?}",
+        report.stale_routes
+    );
+
+    // Wake, from the restarted Agent, starts all three again, the killed one
+    // included, and restores the balanced route.
     let woken = executor
         .wake_project(lifecycle(), Arc::new(NoopReporter))
         .await

@@ -989,6 +989,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "detail_counts": {
       "unhealthy_details": 0,
       "recovered_workloads": 0,
+      "sleeping_workloads": 0,
       "orphans": 0,
       "stale_routes": 0,
       "stale_images": 0,
@@ -1049,6 +1050,7 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
       "reattached_log_followers": 1,
       "recovered_execution_records": 2,
       "recovered_workloads": [],
+      "sleeping_workloads": [],
       "orphans": [],
       "stale_routes": [],
       "stale_images": [],
@@ -1064,12 +1066,23 @@ Bentuk item pada collection detail `startup_reconciliation`:
 ```json
 {
   "recovered_workloads": [{ "container_id": "…", "project_id": "…", "deployment_id": "…", "status": "Up 3 minutes" }],
+  "sleeping_workloads": [{ "container_id": "…", "project_id": "…", "deployment_id": "…", "status": "Exited (143) 2 hours ago" }],
   "orphans": [{ "container_id": "…", "project_id": "…", "reason": "stale stopped deployment container" }],
   "stale_routes": [{ "path": "/var/lib/sakala/caddy/sites/….Caddyfile", "project_id": "…", "deployment_id": "…" }],
   "stale_images": [{ "image_id": "…", "project_id": "…", "deployment_id": "…" }],
   "compatibility_issues": [{ "container_id": "…", "project_id": "…", "deployment_id": "…", "reason": "…" }]
 }
 ```
+
+`sleeping_workloads` berisi container yang berhenti karena project-nya tidur:
+container itu milik deployment yang disebut route tidur project (baris pertama
+route file berakhiran `(sleeping)`), dan disimpan supaya `WakeProject` bisa
+menyalakannya lagi. Container seperti itu tidak masuk `orphans`. Container berhenti
+yang tidak ditunjuk route tidur, misalnya deployment lama project yang sama atau
+container tanpa route, tetap dilaporkan sebagai orphan dengan alasan
+`stale stopped deployment container`. `workloads.stopped` tetap menghitung keduanya.
+Field ini aditif pada revision 4; Agent v0.15.0 dan sebelumnya melaporkan container
+project yang tidur sebagai orphan.
 
 `project_id`/`deployment_id` bernilai `null` bila label tidak dapat dibaca;
 `stale_routes.deployment_id` juga `null` untuk route generasi legacy tanpa
@@ -1395,7 +1408,7 @@ eksplisit; status workload terkini berada pada bagian `workloads` heartbeat dan
 hasil command reconciliation eksplisit.
 
 Collection detail yang berpotensi membesar (`unhealthy_details`,
-`crashed_details`, `recovered_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
+`crashed_details`, `recovered_workloads`, `sleeping_workloads`, `orphans`, `stale_routes`, `stale_images`, dan
 `compatibility_issues`) dibatasi maksimal 50 item per heartbeat. `traffic` dan
 `replicas` memakai batas `SAKALA_MAX_ACTIVE_CONTAINERS`, dan `metrics` memakai batas
 `SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT`, seperti dijelaskan

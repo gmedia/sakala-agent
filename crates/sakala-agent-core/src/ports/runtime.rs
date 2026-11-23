@@ -222,6 +222,10 @@ pub struct RuntimeReconciliationReport {
     pub cleaned_workspaces: usize,
     pub reclaimed_image_bytes: u64,
     pub workloads: Vec<RuntimeWorkload>,
+    /// Stopped containers of a sleeping project: the deployment its sleeping
+    /// route names. Kept on purpose so a wake can start them again, so they are
+    /// neither active workloads nor orphans.
+    pub sleeping_workloads: Vec<RuntimeWorkload>,
     pub orphans: Vec<RuntimeOrphan>,
     pub stale_routes: Vec<RuntimeStaleRoute>,
     pub stale_images: Vec<RuntimeStaleImage>,

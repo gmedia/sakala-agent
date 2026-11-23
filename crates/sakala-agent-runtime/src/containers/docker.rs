@@ -46,6 +46,7 @@ use crate::{
     },
     logs::ReporterOutputSink,
     process::run_checked,
+    routing::RouteIdentity,
 };
 
 const MANAGED_LABEL: &str = "dev.sakala.managed=true";
@@ -64,6 +65,8 @@ const DEPLOYMENT_ID_LABEL: &str = "dev.sakala.deployment-id";
 const RELEASE_ROLE_LABEL: &str = "dev.sakala.role=release";
 /// Key of [`RELEASE_ROLE_LABEL`], read back by listings that must skip it.
 const ROLE_LABEL_KEY: &str = "dev.sakala.role";
+/// Why a stopped container no sleeping route points at is an orphan.
+const STALE_STOPPED_REASON: &str = "stale stopped deployment container";
 /// Prefix of the release container's output in the deployment log, next to
 /// `build` and `runtime`.
 const RELEASE_LOG_PHASE: &str = "release";
@@ -496,7 +499,10 @@ impl ContainerEngine for DockerContainerEngine {
         Ok(())
     }
 
-    async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError> {
+    async fn detect_orphans(
+        &self,
+        sleeping_routes: &HashSet<RouteIdentity>,
+    ) -> Result<RuntimeReconciliationReport, RuntimeError> {
         let command = CommandSpec::new("docker")
             .arg("ps")
             .arg("--all")
@@ -520,14 +526,32 @@ impl ContainerEngine for DockerContainerEngine {
             let status = fields.get(1).copied().unwrap_or_default();
             let project_id = fields.get(2).and_then(|value| Uuid::parse_str(value).ok());
             let deployment_id = fields.get(3).and_then(|value| Uuid::parse_str(value).ok());
+            let stopped = status.starts_with("Exited") || status.starts_with("Dead");
+            // Idle sleep stops the active deployment's containers and keeps
+            // them for the wake; its sleeping route is the local record of that.
+            if let (true, Some(project_id), Some(deployment_id)) =
+                (stopped, project_id, deployment_id)
+                && sleeping_routes.contains(&RouteIdentity {
+                    project_id,
+                    deployment_id: Some(deployment_id),
+                })
+            {
+                report.sleeping_workloads.push(RuntimeWorkload {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    status: status.to_owned(),
+                });
+                continue;
+            }
             let reason = if project_id.is_none() {
                 Some("managed container has an unknown project identity")
             } else if deployment_id.is_none() {
                 Some("managed container has incomplete deployment identity labels")
             } else if status.starts_with("Created") {
                 Some("dangling candidate container was never started")
-            } else if status.starts_with("Exited") || status.starts_with("Dead") {
-                Some("stale stopped deployment container")
+            } else if stopped {
+                Some(STALE_STOPPED_REASON)
             } else {
                 None
             };
@@ -553,16 +577,17 @@ impl ContainerEngine for DockerContainerEngine {
     }
 
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError> {
-        let report = self.detect_orphans().await?;
+        // A sleeping container is still a stopped one, so which of them sleep
+        // does not change the count and the route files are not read here.
+        let report = self.detect_orphans(&HashSet::new()).await?;
+        let stale_stopped = report
+            .orphans
+            .iter()
+            .filter(|orphan| orphan.reason == STALE_STOPPED_REASON)
+            .count();
         Ok(RuntimeCapacity {
             active_workloads: Some(report.workloads.len()),
-            stopped_workloads: Some(
-                report
-                    .orphans
-                    .iter()
-                    .filter(|orphan| orphan.reason == "stale stopped deployment container")
-                    .count(),
-            ),
+            stopped_workloads: Some(report.sleeping_workloads.len() + stale_stopped),
             maximum_active_workloads: Some(self.max_active_containers as usize),
             active_builds: None,
             maximum_concurrent_builds: None,

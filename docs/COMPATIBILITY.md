@@ -339,6 +339,16 @@ result field. Either side can be deployed first.
 | --- | --- | --- |
 | `InspectProject` result field `frameworks` | Sent, always, as an array. | Sorted, unique strings from the closed set `astro`, `docusaurus`, `eleventy`, `gatsby`, `next`, `nuxt`, `react-router`, `remix`, `sveltekit`, `tanstack-start`, `vitepress`: build-time-rendering frameworks named by exact package names in `dependencies` or `devDependencies` of the inspected directory's `package.json` (the package directory in a JavaScript workspace). `[]` when none match or there is no readable `package.json`; an invalid or oversized file never fails the inspection. A result without the field comes from an older Agent, and the API then falls back to Railpack signals. An older API copies known keys only, so it ignores the field. Rules and the package table in [Sakala Agent API](AGENT_API.md#framework-yang-merender-saat-build). |
 
+## Revision 4 additions for sleeping workloads
+
+Still revision 4: no new command type or payload field, only additive heartbeat keys.
+Either side can be deployed first. The API persists heartbeat metadata as reported,
+so an older API keeps the new keys without reading them.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| `metadata.startup_reconciliation.sleeping_workloads` and `metadata.detail_counts.sleeping_workloads` | Sent, always. | Items `{ container_id, project_id, deployment_id, status }`, at most 50, for stopped containers of the deployment a project's sleeping route names. These were reported under `orphans` with reason `stale stopped deployment container` by Agent v0.15.0 and older; a stopped container no sleeping route names still is. `metadata.workloads.stopped` counts both, as before. See [Sakala Agent API](AGENT_API.md#heartbeat-payload). |
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.
