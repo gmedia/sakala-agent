@@ -1,8 +1,10 @@
 //! Proves that a Railpack image carries the Sakala labels, against a real
 //! Docker daemon, a real Railpack sandbox and frontend, and a real Caddy:
-//! Railpack's frontend ignores `--label`, so the Agent writes them with a
-//! commit after the build. The labelled image keeps the config Railpack wrote,
-//! the unlabelled name is gone, a second deployment marks the first image as
+//! Railpack's frontend ignores `--label`, so the Agent writes them after the
+//! build: with Docker's containerd image store by a build of the pinned image
+//! on the daemon's BuildKit, with no container, otherwise by a commit. The
+//! labelled image keeps the config Railpack wrote, the unlabelled name is
+//! gone, the deployment log says when labelling starts and how long it took, a second deployment marks the first image as
 //! the previous one, and a rollback to it starts without a build. Image GC
 //! collects an unlabelled image named only in a deleted project's repository,
 //! as earlier Agents left Railpack images, and keeps one that has another name.
@@ -96,6 +98,11 @@ fn image_exists(reference: &str) -> bool {
     docker(&["image", "inspect", "--format", "{{.Id}}", reference]).0
 }
 
+/// Docker reports the containerd image store as the storage driver type.
+fn containerd_image_store() -> bool {
+    must(&["info", "--format", "{{json .DriverStatus}}"]).contains("io.containerd.snapshotter")
+}
+
 fn image_id(reference: &str) -> String {
     must(&["image", "inspect", "--format", "{{.Id}}", reference])
 }
@@ -129,11 +136,13 @@ fn serve(domain: &str) -> String {
 
 /// Real processes, except Git: `git init` writes the static site, and the
 /// other Git commands succeed without doing anything. Records the config of
-/// every image a label container is created from, before the commit.
+/// every unlabelled image when the label step inspects it, before it is
+/// labelled, and every label container the step creates.
 struct SmokeRunner {
     real: TokioProcessRunner,
     builder: Option<String>,
     unlabelled_configs: Mutex<Vec<Value>>,
+    label_containers: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -169,20 +178,25 @@ impl ProcessRunner for SmokeRunner {
                 ..ProcessOutput::default()
             });
         }
-        if spec
+        let arguments: Vec<String> = spec
             .args
-            .first()
-            .is_some_and(|argument| argument == "container")
-            && spec
-                .args
-                .get(1)
-                .is_some_and(|argument| argument == "create")
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let target = arguments.last().cloned().unwrap_or_default();
+        if arguments.starts_with(&["image".to_owned(), "inspect".to_owned()])
+            && target.ends_with("-unlabelled")
         {
-            let image = spec.args.last().expect("image").to_string_lossy();
             self.unlabelled_configs
                 .lock()
                 .expect("config lock")
-                .push(image_json(&image, ".Config"));
+                .push(image_json(&target, ".Config"));
+        }
+        if arguments.starts_with(&["container".to_owned(), "create".to_owned()]) {
+            self.label_containers
+                .lock()
+                .expect("container lock")
+                .push(target);
         }
         let mut spec = spec.clone();
         if let Some(builder) = &self.builder
@@ -197,6 +211,7 @@ impl ProcessRunner for SmokeRunner {
 #[derive(Default)]
 struct RecordingReporter {
     events: Mutex<Vec<DeploymentEvent>>,
+    label_lines: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -211,6 +226,12 @@ impl RuntimeReporter for RecordingReporter {
         if message.contains("[railpack-label]") || message.to_lowercase().contains("error") {
             println!("log: {message}");
         }
+        if message.starts_with("[railpack-label]") {
+            self.label_lines
+                .lock()
+                .expect("log lock")
+                .push(message.clone());
+        }
         Ok(())
     }
 }
@@ -218,6 +239,7 @@ impl RuntimeReporter for RecordingReporter {
 struct Deployed {
     id: Uuid,
     events: Vec<DeploymentEvent>,
+    label_lines: Vec<String>,
 }
 
 impl Deployed {
@@ -275,6 +297,7 @@ impl Harness {
             real: TokioProcessRunner::new(Duration::from_secs(900)),
             builder,
             unlabelled_configs: Mutex::new(Vec::new()),
+            label_containers: Mutex::new(Vec::new()),
         });
         let executor = DockerRuntimeExecutor::with_runner(
             DockerRuntimeConfig {
@@ -340,9 +363,11 @@ impl Harness {
                     .collect::<Vec<_>>()
             );
         }
+        let label_lines = reporter.label_lines.lock().expect("log lock").clone();
         Deployed {
             id: deployment_id,
             events,
+            label_lines,
         }
     }
 }
@@ -447,8 +472,31 @@ async fn a_railpack_image_carries_its_labels_and_can_be_rolled_back_to_without_a
     assert_eq!(
         without_labels(image_json(&first_image, ".Config")),
         without_labels(before),
-        "the commit changes nothing but the labels"
+        "labelling changes nothing but the labels"
     );
+    let lines = &first.label_lines;
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("[railpack-label] Writing the Sakala labels onto the image."),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .last()
+            .is_some_and(|line| line.starts_with("[railpack-label] Image labelled in ")),
+        "{lines:?}"
+    );
+    if containerd_image_store() {
+        assert_eq!(
+            *harness
+                .runner
+                .label_containers
+                .lock()
+                .expect("container lock"),
+            Vec::<String>::new(),
+            "the containerd image store labels without a container"
+        );
+    }
 
     let second = harness.deploy(None).await;
     assert!(serve(&domain(project)).contains(PAGE));
