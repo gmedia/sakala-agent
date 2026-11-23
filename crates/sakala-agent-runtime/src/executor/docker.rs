@@ -2440,8 +2440,6 @@ impl Drop for ReleaseContainer {
     }
 }
 
-/// Adds every replica's container to an event of a deployment with several.
-/// One replica keeps the event every earlier Agent sent.
 /// Best effort: the deployment already succeeded, and the operator log has
 /// the reason.
 async fn report_images_retained(project_id: Uuid, reporter: &dyn RuntimeReporter) {
@@ -2455,6 +2453,8 @@ async fn report_images_retained(project_id: Uuid, reporter: &dyn RuntimeReporter
     .await;
 }
 
+/// Adds every replica's container to an event of a deployment with several.
+/// One replica keeps the event every earlier Agent sent.
 fn with_replicas(mut details: serde_json::Value, containers: &[String]) -> serde_json::Value {
     if containers.len() > 1 {
         details["replicas"] = json!(containers.len());
