@@ -31,6 +31,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         runtime_driver = %config.runtime_driver,
         "starting Sakala agent"
     );
+    for setting in &config.ignored_settings {
+        warn!(
+            setting,
+            "configuration setting is no longer used and is ignored"
+        );
+    }
 
     let client = match config.agent.mode {
         AgentMode::Local => None,

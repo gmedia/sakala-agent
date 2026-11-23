@@ -1418,8 +1418,7 @@ async fn approved_image_cleanup_removes_old_project_images_but_keeps_active_and_
             ])
             .with_image_users("sha256:active\n"),
     );
-    let mut config = runtime_config(&temp);
-    config.image_gc_max_age = Duration::from_secs(3_600);
+    let config = runtime_config(&temp);
     let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
 
     let output = clean_images(&executor).await;
@@ -3000,8 +2999,7 @@ async fn repeated_redeploy_soak_keeps_runtime_artifacts_bounded() {
     const MEMORY_GROWTH_LIMIT_BYTES: u64 = 64 * 1_024 * 1_024;
 
     let temp = TempDir::new().expect("temp directory should be available");
-    let mut config = runtime_config(&temp);
-    config.image_gc_max_age = Duration::from_secs(1);
+    let config = runtime_config(&temp);
     let workspace_root = config.workspace_root.clone();
     let sites_dir = config.caddy_sites_dir.clone();
     let soak_project = Uuid::new_v4();
@@ -7090,6 +7088,11 @@ struct FakeRunner {
     image_list_stdout: String,
     image_inspect_stdout: String,
     image_users_stdout: String,
+    /// `docker container inspect` of a project's containers after a cutover:
+    /// name, image ID, running, created.
+    project_containers_stdout: String,
+    /// Fails `docker image inspect` of the image inventory, not of reuse.
+    fail_image_inventory: bool,
     follow_delay: Option<Duration>,
     follow_lines: Vec<String>,
     live_caddy: AtomicBool,
@@ -7364,6 +7367,8 @@ impl FakeRunner {
             image_list_stdout: String::new(),
             image_inspect_stdout: String::new(),
             image_users_stdout: String::new(),
+            project_containers_stdout: String::new(),
+            fail_image_inventory: false,
             follow_delay: None,
             follow_lines: Vec::new(),
             live_caddy: AtomicBool::new(true),
@@ -7676,6 +7681,16 @@ impl FakeRunner {
         self
     }
 
+    fn with_project_containers(mut self, stdout: impl Into<String>) -> Self {
+        self.project_containers_stdout = stdout.into();
+        self
+    }
+
+    fn with_failed_image_inventory(mut self) -> Self {
+        self.fail_image_inventory = true;
+        self
+    }
+
     /// One container of `project` on an image outside the listing, so the
     /// project is not orphaned and keeps the active-and-previous rule.
     fn with_project_container(self, project: Uuid) -> Self {
@@ -7718,6 +7733,35 @@ impl ProcessRunner for FakeRunner {
         }
         if let Some(output) = self.release_output(spec) {
             return Ok(output);
+        }
+        if spec.program == "docker"
+            && spec
+                .args
+                .iter()
+                .any(|argument| argument == PROJECT_CONTAINER_FORMAT)
+        {
+            return Ok(ProcessOutput {
+                success: true,
+                code: Some(0),
+                stdout: self.project_containers_stdout.clone(),
+                stderr: String::new(),
+            });
+        }
+        if self.fail_image_inventory
+            && spec.program == "docker"
+            && spec
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+            && spec.args.iter().any(|argument| argument == "inspect")
+            && !is_image_labels_inspect(spec)
+        {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated image inspection failure".to_owned(),
+            });
         }
         if is_image_labels_inspect(spec) {
             return Ok(match &self.reuse_image_labels {
@@ -9732,6 +9776,149 @@ async fn lifecycle_commands_never_run_a_release_command() {
     );
 }
 
+/// What the agent asks `docker container inspect` for after a cutover.
+const PROJECT_CONTAINER_FORMAT: &str = "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}";
+
+fn previous_reference() -> String {
+    format!("sakala/project-{PROJECT}:previous")
+}
+
+fn image_tags(runner: &FakeRunner) -> Vec<Vec<String>> {
+    commands_starting_with(runner, "image")
+        .into_iter()
+        .filter(|args| args.get(1).is_some_and(|argument| argument == "tag"))
+        .collect()
+}
+
+/// The new replica runs `sha256:new`; the one it replaced ran `replaced`.
+fn after_cutover(replaced: &str) -> String {
+    format!(
+        "/{BASE_NAME}\tsha256:new\ttrue\t2026-11-23T01:00:00Z\n/old-name\t{replaced}\ttrue\t2026-11-22T01:00:00Z\n"
+    )
+}
+
+#[tokio::test]
+async fn a_deployment_tags_the_replaced_image_previous_and_prunes_the_rest() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project = Uuid::parse_str(PROJECT).expect("project UUID");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_previous_containers(&[("old", true, "old-name")])
+            .with_project_containers(after_cutover("sha256:replaced"))
+            .with_images(&[
+                ("sha256:oldest", project, "2020-01-01T00:00:00Z", 10),
+                ("sha256:stale-previous", project, "2020-01-02T00:00:00Z", 20),
+                ("sha256:replaced", project, "2020-01-03T00:00:00Z", 30),
+            ])
+            .with_image_users(format!("sha256:new\t{project}\n")),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect("deployment should succeed");
+
+    assert_eq!(
+        image_tags(&runner),
+        [["image", "tag", "sha256:replaced", &previous_reference()]]
+    );
+    // Tagged while the replaced container still exists, then removed.
+    let tagged =
+        command_position(&runner, |args| args.get(1).is_some_and(|a| a == "tag")).expect("tag");
+    let removed_old = command_position(&runner, |args| args == ["rm", "old"]).expect("rm old");
+    assert!(tagged < removed_old);
+    // The fake listing never shows the new tag, so the rule for untagged
+    // images keeps `replaced` here; the selection tests cover the tag.
+    assert_eq!(
+        image_removals(&runner),
+        [
+            [format!(
+                "sakala/project-{project}:sha256:stale-previous-tag"
+            )],
+            [format!("sakala/project-{project}:sha256:oldest-tag")],
+        ]
+    );
+    assert!(!event_types(&reporter).contains(&"deployment.images.retained".to_owned()));
+}
+
+#[tokio::test]
+async fn a_redeploy_on_the_live_image_leaves_the_previous_tag_alone() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_previous_containers(&[("old", true, "old-name")])
+            .with_project_containers(after_cutover("sha256:new")),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment should succeed");
+
+    assert!(image_tags(&runner).is_empty());
+}
+
+#[tokio::test]
+async fn an_image_prune_failure_never_fails_the_deployment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project = Uuid::parse_str(PROJECT).expect("project UUID");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_previous_containers(&[("old", true, "old-name")])
+            .with_project_containers(after_cutover("sha256:replaced"))
+            .with_images(&[("sha256:replaced", project, "2020-01-03T00:00:00Z", 30)])
+            .with_failed_image_inventory(),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = dispatch(executor, &deploy_command("auto"), Arc::clone(&reporter))
+        .await
+        .expect("the deployment succeeds without the prune");
+
+    assert!(output.result["applied_resources"].is_object());
+    assert!(image_removals(&runner).is_empty());
+    let events = reporter.events.lock().expect("event lock");
+    let retained = events
+        .iter()
+        .find(|event| event.event_type == "deployment.images.retained")
+        .expect("retained event");
+    assert_eq!(retained.level, DeploymentEventLevel::Warning);
+    assert_eq!(retained.metadata, json!({ "project_id": project }));
+}
+
+#[tokio::test]
+async fn a_failed_deployment_never_moves_the_previous_tag() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_previous_containers(&[("old", true, "old-name")])
+            .with_project_containers(after_cutover("sha256:replaced"))
+            .with_failed_caddy_validate(),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("the router refuses the route");
+
+    assert!(image_tags(&runner).is_empty());
+    assert!(
+        image_removals(&runner)
+            .iter()
+            .all(|references| references.iter().all(|r| !r.ends_with(":previous")))
+    );
+}
+
 #[tokio::test]
 async fn restart_starts_a_crashed_workload_again() {
     for status in ["Exited (1) 1 minute ago", "Restarting (1) 5 seconds ago"] {
@@ -9785,4 +9972,62 @@ async fn restart_refuses_a_sleeping_workload() {
         fs::read_to_string(route).expect("route"),
         sleeping_route(PROJECT, DEPLOYMENT)
     );
+}
+
+#[tokio::test]
+async fn image_gc_leaves_alone_a_project_whose_command_runs() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let busy = Uuid::parse_str(PROJECT).expect("project UUID");
+    let idle = Uuid::new_v4();
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_build_delay(Duration::from_millis(500))
+            .with_images(&[
+                ("sha256:busy-old", busy, "2020-01-01T00:00:00Z", 1),
+                ("sha256:busy-new", busy, "2020-01-02T00:00:00Z", 1),
+                ("sha256:idle-old", idle, "2020-01-01T00:00:00Z", 1),
+                ("sha256:idle-new", idle, "2020-01-02T00:00:00Z", 1),
+            ])
+            .with_docker_ps("container\n")
+            .with_image_users(format!(
+                "sha256:elsewhere\t{busy}\nsha256:elsewhere\t{idle}\n"
+            )),
+    );
+    let executor = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let deployment = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &deploy_command("auto"),
+                    Arc::new(RecordingReporter::default()),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while command_position(&runner, |args| args.iter().any(|a| a == "buildx")).is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the deployment builds");
+
+    let cleanup = RuntimeExecutor::collect_stale_images(executor.as_ref())
+        .await
+        .expect("image GC should run");
+
+    assert_eq!(cleanup.removed_images, 1);
+    assert_eq!(
+        image_removals(&runner),
+        [[format!("sakala/project-{idle}:sha256:idle-old-tag")]]
+    );
+    deployment
+        .await
+        .expect("deployment task")
+        .expect("deployment should succeed");
 }

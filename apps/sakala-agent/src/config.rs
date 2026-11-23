@@ -9,7 +9,8 @@ use sakala_agent_core::{
     ports::SecretString,
 };
 use sakala_agent_protocol::{
-    DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, MANAGED_POSTGRES_CAPABILITY,
+    DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
+    MANAGED_POSTGRES_CAPABILITY,
 };
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
@@ -24,6 +25,12 @@ use sakala_agent_runtime::{
 pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
 
 const RELEASE_COMMAND_TIMEOUT_ENV: &str = "SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS";
+
+/// No longer used: a project with containers keeps its live and previous
+/// images, whatever their age, and nothing else. Still read and checked, so a
+/// configuration that sets it keeps loading, and the startup log says it is
+/// ignored.
+pub const IMAGE_GC_MAX_AGE_ENV: &str = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS";
 
 /// Turns on the database host role: `none` (default) or `postgres`.
 const DATABASE_DRIVER_ENV: &str = "SAKALA_DATABASE_DRIVER";
@@ -111,6 +118,9 @@ pub struct AppConfig {
     /// `None` unless the node is a database host.
     pub database: Option<DatabaseHostConfig>,
     pub log_level: String,
+    /// Settings that are set but no longer have any effect, for one startup
+    /// warning each.
+    pub ignored_settings: Vec<&'static str>,
 }
 
 #[derive(Debug, Parser)]
@@ -168,7 +178,8 @@ struct Cli {
     #[arg(long, env = "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS")]
     workspace_gc_max_age_seconds: Option<String>,
 
-    #[arg(long, env = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS")]
+    /// Deprecated and ignored; see [`IMAGE_GC_MAX_AGE_ENV`].
+    #[arg(long, env = "SAKALA_IMAGE_GC_MAX_AGE_SECONDS", hide = true)]
     image_gc_max_age_seconds: Option<String>,
 
     #[arg(long, env = "SAKALA_ORPHANED_IMAGE_GRACE_SECONDS")]
@@ -311,7 +322,7 @@ pub fn load() -> Result<AppConfig, CoreError> {
     );
     insert(
         &mut values,
-        "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
+        IMAGE_GC_MAX_AGE_ENV,
         cli.image_gc_max_age_seconds,
     );
     insert(
@@ -477,7 +488,16 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         )));
     }
 
+    let ignored_settings = if values.contains_key(IMAGE_GC_MAX_AGE_ENV) {
+        // Checked as before, so a value that stopped an older Agent still
+        // stops this one, but not used any more. The default is never read.
+        positive_u64(values, IMAGE_GC_MAX_AGE_ENV, u64::default())?;
+        vec![IMAGE_GC_MAX_AGE_ENV]
+    } else {
+        Vec::new()
+    };
     Ok(AppConfig {
+        ignored_settings,
         docker_runtime: DockerRuntimeConfig {
             agent_id: agent.agent_id.clone(),
             workspace_root: get(values, "SAKALA_RUNTIME_WORKSPACE", "/var/lib/sakala/builds")
@@ -486,11 +506,6 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
                 values,
                 "SAKALA_WORKSPACE_GC_MAX_AGE_SECONDS",
                 86_400,
-            )?),
-            image_gc_max_age: std::time::Duration::from_secs(positive_u64(
-                values,
-                "SAKALA_IMAGE_GC_MAX_AGE_SECONDS",
-                604_800,
             )?),
             orphaned_image_grace: std::time::Duration::from_secs(orphaned_image_grace_seconds),
             min_workspace_free_bytes,
@@ -639,6 +654,9 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             // `DeployProject.reuse_image_from_deployment_id`: start from an image
             // built earlier instead of building.
             IMAGE_REUSE_CAPABILITY,
+            // The live and the previous image of every project stay on the
+            // node, so a rollback to the previous deployment needs no build.
+            IMAGE_ROLLBACK_CAPABILITY,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1117,6 +1135,40 @@ mod tests {
                 .capabilities
                 .contains(&IMAGE_REUSE_CAPABILITY.to_owned())
         );
+    }
+
+    #[test]
+    fn image_rollback_is_advertised_only_by_the_docker_runtime() {
+        let docker = HashMap::from([("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned())]);
+        let docker = from_values(&docker).expect("Docker app config should load");
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&IMAGE_ROLLBACK_CAPABILITY.to_owned())
+        );
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(
+            !noop
+                .agent
+                .capabilities
+                .contains(&IMAGE_ROLLBACK_CAPABILITY.to_owned())
+        );
+    }
+
+    #[test]
+    fn the_image_gc_max_age_still_loads_but_is_reported_as_ignored() {
+        let config = from_values(&HashMap::new()).expect("default app config should load");
+        assert!(config.ignored_settings.is_empty());
+
+        let set = HashMap::from([(IMAGE_GC_MAX_AGE_ENV.to_owned(), "604800".to_owned())]);
+        let config = from_values(&set).expect("a configuration that sets it keeps loading");
+        assert_eq!(config.ignored_settings, [IMAGE_GC_MAX_AGE_ENV]);
+
+        for invalid in ["0", "seven days"] {
+            let values = HashMap::from([(IMAGE_GC_MAX_AGE_ENV.to_owned(), invalid.to_owned())]);
+            assert!(from_values(&values).is_err(), "{invalid} is still refused");
+        }
     }
 
     #[test]

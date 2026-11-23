@@ -10,6 +10,12 @@ use crate::RepositoryAccess;
 /// The control plane sends the field only to a node that advertises it.
 pub const IMAGE_REUSE_CAPABILITY: &str = "image-reuse";
 
+/// Capability of a node that keeps, per project, the live image and the image
+/// of the workload the last successful deployment replaced, and removes the
+/// rest. Reusing the previous image for a rollback then needs no build, as long
+/// as the rollback targets the deployment that built it.
+pub const IMAGE_ROLLBACK_CAPABILITY: &str = "image-rollback";
+
 /// Event of a deployment that starts from the image of an earlier deployment
 /// instead of building one.
 pub const IMAGE_REUSED_EVENT: &str = "deployment.image.reused";

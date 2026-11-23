@@ -19,8 +19,9 @@ use sakala_agent_core::ports::{
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
-    DeploymentBuilder, DeploymentLog, InspectProjectPayload, LogBounds, LogStream,
-    ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadMetrics, WorkloadTraffic,
+    DeploymentBuilder, DeploymentEventLevel, DeploymentLog, InspectProjectPayload, LogBounds,
+    LogStream, ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadMetrics,
+    WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -47,7 +48,7 @@ use crate::{
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
-    logs::emit_event,
+    logs::{emit_event, emit_event_at},
     railpack::{RailpackSandbox, is_pinned_image},
     routing::{
         CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, KnownRoutes,
@@ -60,6 +61,10 @@ use crate::{
         requested_root_directory, validate_root_directory,
     },
 };
+
+/// A deployment went live, but older images of its project could not be
+/// removed after it. Level `warning`; periodic image GC removes them later.
+const IMAGES_RETAINED_EVENT: &str = "deployment.images.retained";
 
 pub struct DockerRuntimeExecutor {
     workspace: Arc<dyn WorkspaceManager>,
@@ -142,7 +147,6 @@ impl DockerRuntimeExecutor {
         let max_replicas_per_project = config.max_replicas_per_project;
         let workspace_gc_max_age = config.workspace_gc_max_age;
         let image_retention = ImageRetention {
-            max_age: config.image_gc_max_age,
             orphaned_grace: config.orphaned_image_grace,
         };
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
@@ -783,6 +787,8 @@ impl DockerRuntimeExecutor {
                     .await;
             }
         }
+        // Before the replaced containers go, so their image is still known.
+        let previous_marked = self.mark_previous_image(project_id, &containers).await;
         let finalization_error = match self
             .containers
             .cleanup_previous(project_id, &containers, reporter_ref)
@@ -831,7 +837,66 @@ impl DockerRuntimeExecutor {
         if let Some(error) = finalization_error {
             return Err(error);
         }
+        if previous_marked {
+            self.prune_project_images(project_id, reporter_ref).await;
+        } else {
+            report_images_retained(project_id, reporter_ref).await;
+        }
         Ok(())
+    }
+
+    /// Tags the image the deployment replaced as the project's previous one.
+    /// Returns whether the project's images may be pruned now: not when the
+    /// tag could not be written, because the replaced image would then be
+    /// removed instead of kept for a rollback. Periodic image GC applies the
+    /// same rule later, without that image if the tag is still missing.
+    async fn mark_previous_image(&self, project_id: Uuid, current: &[String]) -> bool {
+        match self
+            .containers
+            .mark_previous_image(project_id, current)
+            .await
+        {
+            Ok(image) => {
+                if let Some(image) = image {
+                    tracing::debug!(%project_id, %image, "previous image marked");
+                }
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %project_id,
+                    %error,
+                    "the replaced image was not marked as previous; images are left to image GC"
+                );
+                false
+            }
+        }
+    }
+
+    /// Leaves the project with its live image and its previous image. The
+    /// deployment already succeeded, so a failure only becomes a warning event
+    /// and the images are left to periodic image GC.
+    async fn prune_project_images(&self, project_id: Uuid, reporter: &dyn RuntimeReporter) {
+        match self
+            .containers
+            .prune_project_images(project_id, self.image_retention)
+            .await
+        {
+            Ok(cleanup) => {
+                if cleanup.removed_images > 0 {
+                    tracing::info!(
+                        %project_id,
+                        removed_images = cleanup.removed_images,
+                        reclaimed_bytes = cleanup.reclaimed_bytes,
+                        "older project images removed after the deployment"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%project_id, %error, "project images were not pruned after the deployment");
+                report_images_retained(project_id, reporter).await;
+            }
+        }
     }
 
     /// Builds the deployment's image from its checkout, under the node's build
@@ -2151,7 +2216,9 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     async fn collect_stale_images(&self) -> Result<RuntimeImageCleanup, RuntimeExecutionError> {
         let cleanup = self
             .containers
-            .cleanup_stale_images(self.image_retention)
+            .cleanup_stale_images(self.image_retention, &|project_id| {
+                self.project_locks.try_lock(project_id)
+            })
             .await?;
         Ok(RuntimeImageCleanup {
             removed_images: cleanup.removed_images,
@@ -2188,7 +2255,9 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 RuntimeCleanupTarget::StaleImages => {
                     let images = self
                         .containers
-                        .cleanup_stale_images(self.image_retention)
+                        .cleanup_stale_images(self.image_retention, &|project_id| {
+                            self.project_locks.try_lock(project_id)
+                        })
                         .await?;
                     removed_images += images.removed_images;
                     reclaimed_image_bytes += images.reclaimed_bytes;
@@ -2373,6 +2442,19 @@ impl Drop for ReleaseContainer {
 
 /// Adds every replica's container to an event of a deployment with several.
 /// One replica keeps the event every earlier Agent sent.
+/// Best effort: the deployment already succeeded, and the operator log has
+/// the reason.
+async fn report_images_retained(project_id: Uuid, reporter: &dyn RuntimeReporter) {
+    let _ = emit_event_at(
+        reporter,
+        DeploymentEventLevel::Warning,
+        IMAGES_RETAINED_EVENT,
+        "Older images of this project could not be removed now; image GC removes them later.",
+        json!({ "project_id": project_id }),
+    )
+    .await;
+}
+
 fn with_replicas(mut details: serde_json::Value, containers: &[String]) -> serde_json::Value {
     if containers.len() > 1 {
         details["replicas"] = json!(containers.len());
