@@ -331,6 +331,7 @@ impl ImageBuilder for ImageBuildService {
                 crate::railpack::label_image(
                     &self.runner,
                     reporter,
+                    &request.workspace,
                     &unlabelled,
                     &request.image,
                     &image_labels::image_labels(request.project_id, request.deployment_id, &output),
