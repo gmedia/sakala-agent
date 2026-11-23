@@ -216,7 +216,39 @@ Railpack menghasilkan `null`, sehingga reuse dan rollback selalu jatuh ke build 
 menyentuh image itu.
 
 Karena itu build Railpack kini diberi nama sementara `<image>-unlabelled`, lalu Agent
-menulis label di langkah `railpack-label`:
+menulis label di langkah `railpack-label`. Log deployment mendapat satu baris saat langkah
+ini mulai (`[railpack-label] Writing the Sakala labels onto the image.`) dan satu baris
+berisi durasinya saat selesai (`[railpack-label] Image labelled in 0.6 s.`).
+
+Agent lebih dulu membaca image itu dengan `docker image inspect --format '{{json .}}'`.
+Dengan containerd image store, image punya `Descriptor`, yaitu digest manifest yang
+disimpan image store, dan label ditulis lewat build yang hanya berisi `FROM`:
+
+```bash
+# <workspace>/railpack-label-<uuid>/Dockerfile berisi satu baris:
+#   FROM <image>-unlabelled@sha256:<digest manifest>
+docker buildx build --builder default --pull=false --provenance=false --sbom=false \
+  --network none --quiet --label dev.sakala.managed=true ... \
+  --file <workspace>/railpack-label-<uuid>/Dockerfile --tag <image> <workspace>/railpack-label-<uuid>
+docker image rm <image>-unlabelled
+```
+
+Builder `default` adalah BuildKit milik daemon sendiri (driver `docker`), satu-satunya
+builder yang membaca image store Docker. `--builder` mengalahkan `BUILDX_BUILDER` dan
+builder pilihan `docker buildx use`, jadi build Railpack boleh tetap memakai builder
+`docker-container`. Build ini tidak menjalankan step apa pun dan tidak membaca konteks
+selain Dockerfile-nya; BuildKit hanya menulis config dan manifest baru di atas layer yang
+sama. Referensinya dipin ke digest dari image store, sehingga build tidak bisa memakai
+image lain: bila lookup lokal meleset, BuildKit meminta digest persis itu ke Docker Hub,
+yang gagal atau mengembalikan byte yang sama. Nilai label dikirim sebagai argumen
+`--label`, bukan baris Dockerfile, jadi tidak ada yang perlu di-escape. Tanpa attestation
+image tetap satu manifest, bukan index. Image tanpa label tidak lagi disimpan sebagai
+parent; layernya dipakai bersama image berlabel. `Created` image berlabel sama dengan
+image Railpack, yaitu waktu build selesai.
+
+Tanpa containerd image store (image store klasik tidak punya `Descriptor`), atau bila
+output inspect tidak terbaca, Agent memakai cara lama, commit container yang tidak pernah
+dijalankan:
 
 ```bash
 docker container create --pull never --network none --name sakala-label-<uuid> <image>-unlabelled
@@ -225,28 +257,41 @@ docker container rm --force --volumes sakala-label-<uuid>
 docker image rm <image>-unlabelled
 ```
 
-Container itu tidak pernah dijalankan dan tidak membawa label Sakala, jadi rekonsiliasi,
-pencarian replika, dan metrik tidak pernah melihatnya. Commit container yang tidak
-berubah tidak menambah layer, dan Docker menyusun config baru dari config image, jadi
-CMD, ENTRYPOINT, ENV, WORKDIR, USER, EXPOSE, dan VOLUME tetap seperti tulisan Railpack.
-Nilai label dikutip dengan `\`, `"`, dan `$` di-escape, karena Docker membaca
-`--change` sebagai baris Dockerfile dan mengekspansi variabel; nilai berisi karakter
-kontrol ditolak. Langkah ini hanya memakai daemon, sehingga tidak bergantung pada
-builder buildx. Build `FROM <image lokal>` dengan `--label` sengaja tidak dipakai: dengan
-builder `docker-container` image lokal tidak terlihat, dan BuildKit lalu menarik
-`docker.io/sakala/project-...` dari registry. Image tanpa label tetap disimpan Docker
-sebagai parent tanpa nama dari image berlabel dan ikut terhapus bersamanya.
+Container itu tidak membawa label Sakala, jadi rekonsiliasi, pencarian replika, dan
+metrik tidak pernah melihatnya. Nilai label di `--change` dikutip dengan `\`, `"`, dan `$`
+di-escape, karena Docker membacanya sebagai baris Dockerfile dan mengekspansi variabel.
+Nilai berisi karakter kontrol ditolak di kedua cara, sebelum perintah apa pun berjalan,
+supaya hasilnya tidak bergantung pada image store node.
+
+Dengan containerd image store, commit inilah yang membuat langkah ini lambat. Commit
+tidak menambah layer, tetapi Docker tetap menelusuri seluruh filesystem container. Di
+staging (Agent v0.16.1, Docker 29.10, 23 November 2026, diukur dengan `docker events`)
+langkah ini memakan 27,1 detik untuk image 197 MB, serta 50,5 dan 63,4 detik untuk image
+526 MB. Di laptop pengembang (Docker 29.10, containerd image store, image 484 MB berisi
+sekitar 34.000 file, 5 putaran berselang-seling, termasuk inspect dan pembersihan):
+
+| Cara | Image 13 MB | Image 484 MB |
+| --- | --- | --- |
+| commit container | median 0,65 detik | median 4,38 detik (4,31 sampai 8,15) |
+| build `FROM` dengan digest | median 0,61 detik | median 0,64 detik (0,61 sampai 0,74) |
+
+Waktu build tidak bergantung pada ukuran image, sedangkan commit tumbuh seiring ukuran.
+Kedua cara mempertahankan CMD, ENTRYPOINT, ENV, WORKDIR, USER, EXPOSE, dan VOLUME seperti
+tulisan Railpack; build juga mempertahankan `ArgsEscaped`, yang dibuang commit (field ini
+hanya dipakai Windows).
 
 Bila langkah ini gagal, build gagal dengan `runtime_build_failed`
-(`railpack-label failed with exit code N`), stderr Docker masuk log deployment, dan
-container serta nama sementara tetap dihapus. Bila timeout build memotong langkah ini,
-container tetap dihapus (container yang tertinggal akan menahan image itu selamanya,
-karena GC menyimpan setiap image yang dipakai container), dan nama sementara yang
-tersisa dibersihkan image GC. Image tanpa label tidak pernah dijalankan,
+(`railpack-label failed with exit code N`), stderr Docker masuk log deployment, dan nama
+sementara tetap dihapus, begitu pula container commit. Bila timeout build memotong
+langkah ini, proses `docker` dihentikan dan container commit tetap dihapus (container
+yang tertinggal akan menahan image itu selamanya, karena GC menyimpan setiap image yang
+dipakai container); nama sementara yang tersisa dibersihkan image GC, dan direktori
+Dockerfile ikut terhapus bersama workspace. Image tanpa label tidak pernah dijalankan,
 karena reuse, rollback, dan image GC akan diam-diam tidak berfungsi untuk image itu.
 Smoke test `railpack_labels_smoke_test` membuktikan jalur ini dengan build Railpack
-sungguhan: label lengkap, config sama persis selain label, image pertama menjadi
-`previous` setelah deployment kedua, dan rollback ke image itu berjalan tanpa build.
+sungguhan: label lengkap, config sama persis selain label, baris log awal dan akhir,
+tanpa container label pada containerd image store, image pertama menjadi `previous`
+setelah deployment kedua, dan rollback ke image itu berjalan tanpa build.
 
 ### Image sebelumnya dan rollback
 

@@ -7,18 +7,37 @@
 //! project's previous image, and is never collected.
 //!
 //! So a Railpack build is tagged under [`unlabelled_reference`], and the labels
-//! are written afterwards by committing a container of that image that never
-//! runs. A commit of an unchanged container adds no layer, and Docker builds
-//! the new config from the old one, so CMD, ENTRYPOINT, ENV, WORKDIR, USER,
-//! EXPOSE, and VOLUME stay as Railpack wrote them. It needs only the daemon: a build
-//! `FROM` the local image would depend on the buildx builder seeing Docker's
-//! image store, and would pull `docker.io/sakala/project-…` when it does not.
+//! are written afterwards. With Docker's containerd image store, the image
+//! store the Agent targets, they are written by a build of nothing but
+//! `FROM <unlabelled>@<digest>` with `--label`, on the `default` builder: that
+//! builder is the daemon's own BuildKit, which reads the image store, and the
+//! build only writes a new config and manifest over the same layers, in well
+//! under a second at any image size. The digest is the one the image store
+//! holds for the unlabelled name, so the build cannot resolve to anything but
+//! the image this node just built: if the local lookup misses, BuildKit asks
+//! Docker Hub for that exact digest, which fails or returns the same bytes.
 //!
-//! The container carries none of the labels, so nothing that looks for Sakala's
-//! containers ever sees it; the labels go onto the image through `--change`.
+//! Without the containerd image store an image has no manifest digest to pin,
+//! and the labels are written as before, by committing a container of the
+//! image that never runs. With the containerd image store that commit is what
+//! made the step slow: it took 17 to 37 seconds for a 526 MB image on staging,
+//! growing with the image, although it adds no layer. Either way CMD,
+//! ENTRYPOINT, ENV, WORKDIR, USER, EXPOSE, and VOLUME stay as Railpack wrote
+//! them, and no layer is added.
+//!
+//! Neither the build nor the container carries the labels as its own, so
+//! nothing that looks for Sakala's containers ever sees them; the labels go
+//! onto the image only.
 
-use std::sync::Arc;
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use sakala_agent_protocol::{DeploymentLog, LogStream};
+use time::OffsetDateTime;
+use tokio::fs;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -33,9 +52,18 @@ const UNLABELLED_TAG_SUFFIX: &str = "-unlabelled";
 /// Names the container the labels are committed from, so an operator can tell
 /// what one left behind by a crash is.
 const LABEL_CONTAINER_PREFIX: &str = "sakala-label-";
-/// The phase both label commands report under. Its prefix makes a failure a
+/// Names the workspace directory that holds the Dockerfile of the label build.
+const LABEL_BUILD_DIRECTORY_PREFIX: &str = "railpack-label-";
+/// The buildx builder that is the daemon's own BuildKit, the only one that
+/// reads Docker's image store. `--builder` overrides `BUILDX_BUILDER` and the
+/// builder `docker buildx use` picked, which may be a `docker-container` one.
+const DAEMON_BUILDER: &str = "default";
+/// The phase every label command reports under. Its prefix makes a failure a
 /// build failure.
 const LABEL_PHASE: &str = "railpack-label";
+/// The digest algorithm Docker's image store names manifests with.
+const DIGEST_ALGORITHM: &str = "sha256:";
+const DIGEST_HEX_LENGTH: usize = 64;
 
 /// The name a Railpack build is tagged with until [`label_image`] moves it,
 /// labelled, to `image`. It stays in the project's repository, so image GC
@@ -46,68 +74,133 @@ pub fn unlabelled_reference(image: &str) -> String {
 }
 
 /// Labels the image under `unlabelled` and names the result `image`. The
-/// container and the unlabelled name are removed either way; when a build
-/// timeout drops this future, the container still goes, and image GC collects
-/// the unlabelled name later. A failure fails the build: an image without
-/// labels would break rollback and image GC without a word.
+/// unlabelled name is removed either way, and so is the container of a commit;
+/// when a build timeout drops this future, that container still goes, and
+/// image GC collects the unlabelled name later. A failure fails the build: an
+/// image without labels would break rollback and image GC without a word.
+/// The deployment log gets one line when the step starts and one with its
+/// duration when it succeeds, so a slow daemon does not look like a hang.
 pub(crate) async fn label_image(
     runner: &Arc<dyn ProcessRunner>,
     reporter: &dyn RuntimeReporter,
+    workspace: &Path,
     unlabelled: &str,
     image: &str,
     labels: &[String],
 ) -> Result<(), RuntimeError> {
-    let container = format!("{LABEL_CONTAINER_PREFIX}{}", Uuid::new_v4());
-    let mut cleanup = vec![remove_image_command(unlabelled)];
-    let mut guard = None;
-    let labelled = match commit_command(&container, image, labels) {
-        Ok(commit) => {
-            guard = Some(RemoveOnDrop {
-                runner: Arc::clone(runner),
-                name: Some(container.clone()),
-            });
-            cleanup.insert(0, remove_container_command(&container));
-            let runner = runner.as_ref();
-            match run_step(runner, reporter, &create_command(unlabelled, &container)).await {
-                Ok(()) => run_step(runner, reporter, &commit).await,
-                Err(error) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    };
-
-    for command in cleanup {
-        match runner.run(&command, &NullOutputSink).await {
-            Ok(output) if output.success => {}
-            Ok(output) => warn!(
-                command = ?command.args,
-                stderr = %output.stderr.trim(),
-                "cleanup after labelling the Railpack image failed"
-            ),
-            Err(error) => warn!(
-                command = ?command.args,
-                %error,
-                "cleanup after labelling the Railpack image failed"
-            ),
-        }
-    }
-    if let Some(guard) = guard {
-        guard.disarm();
+    let started = Instant::now();
+    report(
+        reporter,
+        "Writing the Sakala labels onto the image.".to_owned(),
+    )
+    .await;
+    let labelled = write_labels(runner, reporter, workspace, unlabelled, image, labels).await;
+    cleanup(runner.as_ref(), &remove_image_command(unlabelled)).await;
+    if labelled.is_ok() {
+        report(reporter, labelled_message(started.elapsed())).await;
     }
     labelled
 }
 
-/// Docker's errors go to the deployment log; the ID it prints on success does
-/// not.
+async fn write_labels(
+    runner: &Arc<dyn ProcessRunner>,
+    reporter: &dyn RuntimeReporter,
+    workspace: &Path,
+    unlabelled: &str,
+    image: &str,
+    labels: &[String],
+) -> Result<(), RuntimeError> {
+    // Built before anything else, so a label that cannot be written fails the
+    // same way on every image store, before anything exists.
+    let commit = commit_command(image, labels)?;
+    let inspected = run_step(runner.as_ref(), reporter, &inspect_command(unlabelled)).await?;
+    match manifest_digest(&inspected) {
+        Some(digest) => {
+            let dockerfile = write_label_dockerfile(workspace, unlabelled, &digest).await?;
+            run_step(
+                runner.as_ref(),
+                reporter,
+                &label_build_command(&dockerfile, image, labels),
+            )
+            .await
+            .map(drop)
+        }
+        None => commit_labels(runner, reporter, unlabelled, commit).await,
+    }
+}
+
+/// Creates a container of the image and commits it with the labels. The
+/// container goes whether the commit succeeds, fails, or is dropped.
+async fn commit_labels(
+    runner: &Arc<dyn ProcessRunner>,
+    reporter: &dyn RuntimeReporter,
+    unlabelled: &str,
+    commit: CommitCommand,
+) -> Result<(), RuntimeError> {
+    let container = format!("{LABEL_CONTAINER_PREFIX}{}", Uuid::new_v4());
+    let guard = RemoveOnDrop {
+        runner: Arc::clone(runner),
+        name: Some(container.clone()),
+    };
+    let committed = match run_step(
+        runner.as_ref(),
+        reporter,
+        &create_command(unlabelled, &container),
+    )
+    .await
+    {
+        Ok(_) => run_step(runner.as_ref(), reporter, &commit.of(&container))
+            .await
+            .map(drop),
+        Err(error) => Err(error),
+    };
+    cleanup(runner.as_ref(), &remove_container_command(&container)).await;
+    guard.disarm();
+    committed
+}
+
+async fn cleanup(runner: &dyn ProcessRunner, command: &CommandSpec) {
+    match runner.run(command, &NullOutputSink).await {
+        Ok(output) if output.success => {}
+        Ok(output) => warn!(
+            command = ?command.args,
+            stderr = %output.stderr.trim(),
+            "cleanup after labelling the Railpack image failed"
+        ),
+        Err(error) => warn!(
+            command = ?command.args,
+            %error,
+            "cleanup after labelling the Railpack image failed"
+        ),
+    }
+}
+
+/// Logs are telemetry: a line that cannot be delivered does not fail the build.
+async fn report(reporter: &dyn RuntimeReporter, message: String) {
+    let _ = reporter
+        .log(DeploymentLog {
+            stream: LogStream::System,
+            message: format!("[{LABEL_PHASE}] {message}"),
+            recorded_at: OffsetDateTime::now_utc(),
+        })
+        .await;
+}
+
+fn labelled_message(elapsed: Duration) -> String {
+    format!("Image labelled in {:.1} s.", elapsed.as_secs_f64())
+}
+
+/// Docker's errors go to the deployment log; what it prints on stdout does
+/// not, and is returned for the caller to read.
 async fn run_step(
     runner: &dyn ProcessRunner,
     reporter: &dyn RuntimeReporter,
     command: &CommandSpec,
-) -> Result<(), RuntimeError> {
+) -> Result<String, RuntimeError> {
     let sink = StderrOnly(ReporterOutputSink::new(reporter, LABEL_PHASE));
     let output = runner.run(command, &sink).await?;
     if output.success {
-        Ok(())
+        Ok(output.stdout)
     } else {
         Err(RuntimeError::failed_process(
             LABEL_PHASE,
@@ -115,6 +208,85 @@ async fn run_step(
             &output.stderr,
         ))
     }
+}
+
+/// The whole inspect document. A template that names `.Descriptor` fails the
+/// command on an image store without one, since Docker formats image inspect
+/// with `missingkey=error`.
+fn inspect_command(unlabelled: &str) -> CommandSpec {
+    CommandSpec::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{json .}}")
+        .arg(unlabelled)
+}
+
+/// The digest of the manifest the containerd image store holds for the image,
+/// from `docker image inspect --format '{{json .}}'`. `None` on the classic
+/// image store, which has no `Descriptor`, and for output it cannot read, so
+/// the slower commit labels the image instead.
+fn manifest_digest(inspected: &str) -> Option<String> {
+    let document = match serde_json::from_str::<serde_json::Value>(inspected.trim()) {
+        Ok(document) => document,
+        Err(error) => {
+            warn!(%error, "unreadable image inspect output; labelling by commit");
+            return None;
+        }
+    };
+    let digest = document.get("Descriptor")?.get("digest")?.as_str()?;
+    let hex = digest.strip_prefix(DIGEST_ALGORITHM)?;
+    let valid = hex.len() == DIGEST_HEX_LENGTH
+        && hex
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character));
+    valid.then(|| digest.to_owned())
+}
+
+/// The Dockerfile of the label build, alone in its own directory of the
+/// workspace, which is also the build context. It has no parser directive, so
+/// the daemon's built-in Dockerfile frontend reads it.
+async fn write_label_dockerfile(
+    workspace: &Path,
+    unlabelled: &str,
+    digest: &str,
+) -> Result<std::path::PathBuf, RuntimeError> {
+    let directory = workspace.join(format!("{LABEL_BUILD_DIRECTORY_PREFIX}{}", Uuid::new_v4()));
+    fs::create_dir(&directory).await?;
+    let dockerfile = directory.join("Dockerfile");
+    fs::write(&dockerfile, label_dockerfile(unlabelled, digest)).await?;
+    Ok(dockerfile)
+}
+
+fn label_dockerfile(unlabelled: &str, digest: &str) -> String {
+    format!("FROM {unlabelled}@{digest}\n")
+}
+
+/// Changes only the config: no step runs, so `--network none` and the absent
+/// secrets are a formality, and nothing is cached that another project could
+/// read. `--pull=false` lets the base resolve from the image store; the digest
+/// keeps it to this image. Attestations would make the image an index and add
+/// nothing a node uses. `--quiet` keeps BuildKit's progress out of the
+/// deployment log; errors still reach it.
+fn label_build_command(dockerfile: &Path, image: &str, labels: &[String]) -> CommandSpec {
+    let context = dockerfile.parent().unwrap_or(dockerfile);
+    let command = CommandSpec::new("docker")
+        .arg("buildx")
+        .arg("build")
+        .arg("--builder")
+        .arg(DAEMON_BUILDER)
+        .arg("--pull=false")
+        .arg("--provenance=false")
+        .arg("--sbom=false")
+        .arg("--network")
+        .arg("none")
+        .arg("--quiet");
+    crate::builders::with_image_labels(command, labels)
+        .arg("--file")
+        .arg(dockerfile.as_os_str())
+        .arg("--tag")
+        .arg(image)
+        .arg(context.as_os_str())
 }
 
 /// A container of the image that is never started, so `commit` has nothing
@@ -133,18 +305,32 @@ fn create_command(unlabelled: &str, container: &str) -> CommandSpec {
         .arg(unlabelled)
 }
 
-/// Built before the container is created, so a label that cannot be written
-/// fails before anything exists.
-fn commit_command(
-    container: &str,
-    image: &str,
-    labels: &[String],
-) -> Result<CommandSpec, RuntimeError> {
-    let mut command = CommandSpec::new("docker").arg("container").arg("commit");
-    for label in labels {
-        command = command.arg("--change").arg(label_instruction(label)?);
+/// A commit of the labels onto `image`, short of the container it commits.
+struct CommitCommand {
+    image: String,
+    changes: Vec<String>,
+}
+
+impl CommitCommand {
+    fn of(&self, container: &str) -> CommandSpec {
+        let mut command = CommandSpec::new("docker").arg("container").arg("commit");
+        for change in &self.changes {
+            command = command.arg("--change").arg(change);
+        }
+        command.arg(container).arg(&self.image)
     }
-    Ok(command.arg(container).arg(image))
+}
+
+/// Every label as the `--change` of a commit. A label that cannot be written
+/// as one is refused here, whichever way the image is then labelled.
+fn commit_command(image: &str, labels: &[String]) -> Result<CommitCommand, RuntimeError> {
+    Ok(CommitCommand {
+        image: image.to_owned(),
+        changes: labels
+            .iter()
+            .map(|label| label_instruction(label))
+            .collect::<Result<_, _>>()?,
+    })
 }
 
 /// `--volumes` also removes the anonymous volumes a `VOLUME` of the image made
@@ -194,41 +380,112 @@ fn label_instruction(label: &str) -> Result<String, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex, time::Duration};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use sakala_agent_core::ports::RuntimeExecutionError;
-    use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
+    use sakala_agent_protocol::DeploymentEvent;
 
     use super::*;
     use crate::{ProcessOutput, ProcessOutputSink};
 
-    /// Records every command. A commit never finishes, as when Docker hangs.
+    /// Records every command. `inspect` prints `inspected`; a commit never
+    /// finishes when `hang_on_commit` is set, as when Docker hangs; a build
+    /// fails with `build_error` when it is set.
     #[derive(Default)]
-    struct HangingCommit {
+    struct Docker {
         commands: Mutex<Vec<Vec<String>>>,
+        inspected: String,
+        hang_on_commit: bool,
+        build_error: Option<&'static str>,
+    }
+
+    impl Docker {
+        fn hanging_commit() -> Self {
+            Self {
+                hang_on_commit: true,
+                ..Self::default()
+            }
+        }
+
+        fn containerd_store() -> Self {
+            Self {
+                inspected: CONTAINERD_INSPECT.to_owned(),
+                ..Self::default()
+            }
+        }
+
+        fn commands(&self) -> Vec<Vec<String>> {
+            self.commands.lock().expect("command lock").clone()
+        }
     }
 
     #[async_trait]
-    impl ProcessRunner for HangingCommit {
+    impl ProcessRunner for Docker {
         async fn run(
             &self,
             spec: &CommandSpec,
-            _sink: &dyn ProcessOutputSink,
+            sink: &dyn ProcessOutputSink,
         ) -> Result<ProcessOutput, RuntimeError> {
             let arguments = arguments(spec);
-            let commit = arguments
-                .get(1)
-                .is_some_and(|argument| argument == "commit");
+            let subcommand = arguments.get(1).cloned().unwrap_or_default();
             self.commands.lock().expect("command lock").push(arguments);
-            if commit {
-                std::future::pending::<()>().await;
+            match subcommand.as_str() {
+                "commit" if self.hang_on_commit => std::future::pending::<()>().await,
+                "build" => {
+                    if let Some(error) = self.build_error {
+                        sink.line(crate::ProcessStream::Stderr, error).await?;
+                        return Ok(ProcessOutput {
+                            success: false,
+                            code: Some(1),
+                            stderr: error.to_owned(),
+                            ..ProcessOutput::default()
+                        });
+                    }
+                }
+                "inspect" => {
+                    return Ok(ProcessOutput {
+                        success: true,
+                        code: Some(0),
+                        stdout: format!("{}\n", self.inspected),
+                        ..ProcessOutput::default()
+                    });
+                }
+                _ => {}
             }
             Ok(ProcessOutput {
                 success: true,
                 code: Some(0),
                 ..ProcessOutput::default()
             })
+        }
+    }
+
+    /// Shaped like what Docker 29.10 with the containerd image store prints
+    /// for a Railpack image, cut down.
+    const CONTAINERD_INSPECT: &str = r#"{"Id":"sha256:cf5b881311537a7813fa2264161560073aad45d5999c46eeb9210933841a0df7","Descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cf5b881311537a7813fa2264161560073aad45d5999c46eeb9210933841a0df7","size":1442},"Config":{"Cmd":["echo hi"]}}"#;
+    const DIGEST: &str = "sha256:cf5b881311537a7813fa2264161560073aad45d5999c46eeb9210933841a0df7";
+
+    /// Shaped like the classic image store: no `Descriptor`.
+    const CLASSIC_INSPECT: &str = r#"{"Id":"sha256:cf5b881311537a7813fa2264161560073aad45d5999c46eeb9210933841a0df7","Config":{"Cmd":["echo hi"]}}"#;
+
+    #[derive(Default)]
+    struct RecordingReporter {
+        lines: Mutex<Vec<(LogStream, String)>>,
+    }
+
+    #[async_trait]
+    impl RuntimeReporter for RecordingReporter {
+        async fn event(&self, _event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+            Ok(())
+        }
+
+        async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+            self.lines
+                .lock()
+                .expect("log lock")
+                .push((log.stream, log.message));
+            Ok(())
         }
     }
 
@@ -250,7 +507,7 @@ mod tests {
     /// since image GC keeps every image a container uses.
     #[tokio::test]
     async fn a_timeout_during_the_commit_still_removes_the_container() {
-        let runner = Arc::new(HangingCommit::default());
+        let runner = Arc::new(Docker::hanging_commit());
         let dyn_runner: Arc<dyn ProcessRunner> = runner.clone();
         let labels = ["dev.sakala.managed=true".to_owned()];
 
@@ -259,6 +516,7 @@ mod tests {
             label_image(
                 &dyn_runner,
                 &NoopReporter,
+                Path::new("/nonexistent"),
                 "sakala/project-x:t-unlabelled",
                 "sakala/project-x:t",
                 &labels,
@@ -274,25 +532,23 @@ mod tests {
             })
         };
         for _ in 0..100 {
-            if removed(&runner.commands.lock().expect("command lock")) {
+            if removed(&runner.commands()) {
                 return;
             }
             tokio::task::yield_now().await;
         }
-        panic!(
-            "the container was not removed: {:?}",
-            runner.commands.lock().expect("command lock")
-        );
+        panic!("the container was not removed: {:?}", runner.commands());
     }
 
     #[tokio::test]
     async fn a_label_that_cannot_be_written_creates_nothing() {
-        let runner = Arc::new(HangingCommit::default());
+        let runner = Arc::new(Docker::containerd_store());
         let dyn_runner: Arc<dyn ProcessRunner> = runner.clone();
 
         let error = label_image(
             &dyn_runner,
             &NoopReporter,
+            Path::new("/nonexistent"),
             "sakala/project-x:t-unlabelled",
             "sakala/project-x:t",
             &["dev.sakala.package-directory=a\nb".to_owned()],
@@ -302,7 +558,7 @@ mod tests {
 
         assert!(matches!(error, RuntimeError::Build(_)), "{error}");
         assert_eq!(
-            *runner.commands.lock().expect("command lock"),
+            runner.commands(),
             [["image", "rm", "sakala/project-x:t-unlabelled"]]
         );
     }
@@ -354,7 +610,9 @@ mod tests {
             "dev.sakala.builder=railpack".to_owned(),
             "dev.sakala.package-directory=apps/web".to_owned(),
         ];
-        let command = commit_command("sakala-label-1", IMAGE, &labels).expect("command");
+        let command = commit_command(IMAGE, &labels)
+            .expect("command")
+            .of("sakala-label-1");
         assert_eq!(
             arguments(&command),
             [
@@ -416,6 +674,209 @@ mod tests {
         assert_eq!(
             arguments(&remove_image_command("sakala/project-x:t-unlabelled")),
             ["image", "rm", "sakala/project-x:t-unlabelled"]
+        );
+    }
+
+    const UNLABELLED: &str = "sakala/project-x:t-unlabelled";
+    const LABELLED: &str = "sakala/project-x:t";
+
+    /// With the containerd image store the labels come from a build of the
+    /// pinned image: no container is created, and the unlabelled name goes.
+    #[tokio::test]
+    async fn the_containerd_image_store_labels_by_a_build_of_the_pinned_image() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runner = Arc::new(Docker::containerd_store());
+        let dyn_runner: Arc<dyn ProcessRunner> = runner.clone();
+        let reporter = RecordingReporter::default();
+
+        label_image(
+            &dyn_runner,
+            &reporter,
+            workspace.path(),
+            UNLABELLED,
+            LABELLED,
+            &["dev.sakala.managed=true".to_owned()],
+        )
+        .await
+        .expect("labelled");
+
+        let commands = runner.commands();
+        let subcommands: Vec<_> = commands
+            .iter()
+            .map(|command| command[..2].join(" "))
+            .collect();
+        assert_eq!(subcommands, ["image inspect", "buildx build", "image rm"]);
+        let build = &commands[1];
+        let dockerfile = std::path::PathBuf::from(&build[build.len() - 4]);
+        assert!(dockerfile.starts_with(workspace.path()), "{build:?}");
+        assert_eq!(
+            std::fs::read_to_string(&dockerfile).expect("Dockerfile"),
+            format!("FROM {UNLABELLED}@{DIGEST}\n")
+        );
+        assert_eq!(commands[2], ["image", "rm", UNLABELLED]);
+
+        let lines = reporter.lines.lock().expect("log lock").clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[0],
+            (
+                LogStream::System,
+                "[railpack-label] Writing the Sakala labels onto the image.".to_owned()
+            )
+        );
+        assert_eq!(lines[1].0, LogStream::System);
+        assert!(
+            lines[1]
+                .1
+                .starts_with("[railpack-label] Image labelled in "),
+            "{lines:?}"
+        );
+    }
+
+    /// The classic image store has no manifest digest to pin, so the image is
+    /// labelled by a commit, and the container goes afterwards.
+    #[tokio::test]
+    async fn the_classic_image_store_labels_by_a_commit() {
+        let runner = Arc::new(Docker {
+            inspected: CLASSIC_INSPECT.to_owned(),
+            ..Docker::default()
+        });
+        let dyn_runner: Arc<dyn ProcessRunner> = runner.clone();
+
+        label_image(
+            &dyn_runner,
+            &NoopReporter,
+            Path::new("/nonexistent"),
+            UNLABELLED,
+            LABELLED,
+            &["dev.sakala.managed=true".to_owned()],
+        )
+        .await
+        .expect("labelled");
+
+        let commands = runner.commands();
+        let subcommands: Vec<_> = commands
+            .iter()
+            .map(|command| command[..2].join(" "))
+            .collect();
+        assert_eq!(
+            subcommands,
+            [
+                "image inspect",
+                "container create",
+                "container commit",
+                "container rm",
+                "image rm"
+            ]
+        );
+    }
+
+    /// A failed build fails the step with Docker's error in the deployment
+    /// log, without the line that reports success, and still removes the
+    /// unlabelled name.
+    #[tokio::test]
+    async fn a_failed_label_build_fails_with_dockers_error() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runner = Arc::new(Docker {
+            build_error: Some("ERROR: failed to build: pull access denied"),
+            ..Docker::containerd_store()
+        });
+        let dyn_runner: Arc<dyn ProcessRunner> = runner.clone();
+        let reporter = RecordingReporter::default();
+
+        let error = label_image(
+            &dyn_runner,
+            &reporter,
+            workspace.path(),
+            UNLABELLED,
+            LABELLED,
+            &["dev.sakala.managed=true".to_owned()],
+        )
+        .await
+        .expect_err("failed");
+
+        assert!(error.to_string().contains("railpack-label"), "{error}");
+        let lines = reporter.lines.lock().expect("log lock").clone();
+        assert_eq!(
+            lines[1..],
+            [(
+                LogStream::Stderr,
+                "[railpack-label] ERROR: failed to build: pull access denied".to_owned()
+            )]
+        );
+        assert_eq!(
+            runner.commands().last().expect("command"),
+            &["image", "rm", UNLABELLED]
+        );
+    }
+
+    #[test]
+    fn only_a_sha256_manifest_digest_is_pinned() {
+        assert_eq!(manifest_digest(CONTAINERD_INSPECT).as_deref(), Some(DIGEST));
+        for inspected in [
+            CLASSIC_INSPECT,
+            "",
+            "not json",
+            r#"{"Descriptor":null}"#,
+            r#"{"Descriptor":{"digest":"sha512:abc"}}"#,
+            r#"{"Descriptor":{"digest":"sha256:CF5B881311537A7813FA2264161560073AAD45D5999C46EEB9210933841A0DF7"}}"#,
+            r#"{"Descriptor":{"digest":"sha256:cf5b\n"}}"#,
+        ] {
+            assert_eq!(manifest_digest(inspected), None, "{inspected:?}");
+        }
+    }
+
+    #[test]
+    fn the_label_build_uses_the_daemons_buildkit_and_never_runs_or_attests_anything() {
+        let labels = [
+            "dev.sakala.managed=true".to_owned(),
+            "dev.sakala.package-directory=apps/my \"web\" $HOME".to_owned(),
+        ];
+        let command = label_build_command(
+            Path::new("/workspace/railpack-label-1/Dockerfile"),
+            IMAGE,
+            &labels,
+        );
+        assert_eq!(command.program, "docker");
+        assert_eq!(
+            arguments(&command),
+            [
+                "buildx",
+                "build",
+                "--builder",
+                "default",
+                "--pull=false",
+                "--provenance=false",
+                "--sbom=false",
+                "--network",
+                "none",
+                "--quiet",
+                "--label",
+                "dev.sakala.managed=true",
+                "--label",
+                "dev.sakala.package-directory=apps/my \"web\" $HOME",
+                "--file",
+                "/workspace/railpack-label-1/Dockerfile",
+                "--tag",
+                IMAGE,
+                "/workspace/railpack-label-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_inspect_template_names_no_field() {
+        assert_eq!(
+            arguments(&inspect_command(UNLABELLED)),
+            ["image", "inspect", "--format", "{{json .}}", UNLABELLED]
+        );
+    }
+
+    #[test]
+    fn the_duration_is_reported_in_tenths_of_a_second() {
+        assert_eq!(
+            labelled_message(Duration::from_millis(540)),
+            "Image labelled in 0.5 s."
         );
     }
 }
