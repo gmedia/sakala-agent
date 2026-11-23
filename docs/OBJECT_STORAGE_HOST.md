@@ -180,7 +180,7 @@ Hasil pada 2026-11-23 (RustFS 1.0.6, rc 0.1.37, Docker 29.10):
 
 Perilaku RustFS 1.0.6 yang perlu diketahui:
 
-- Tulisan pertama ke sebuah bucket setelah kuotanya diset atau diubah dijawab `503 SlowDown` sekali; tulisan berikutnya berhasil. SDK S3 me-retry `503 SlowDown` secara otomatis, dan test ini juga me-retry sekali. Ini terjadi setelah `CreateBucket` dan setiap `SetBucketQuota`.
+- Tulisan pertama ke sebuah bucket setelah kuotanya diset atau diubah dijawab `503 SlowDown`. Biasanya hanya sekali dan tulisan berikutnya berhasil (sekitar 160 ms, diukur enam kali). Tetapi di salah satu dari beberapa run smoke test, jawaban itu bertahan lebih dari tiga percobaan dalam sekitar 0,6 detik. SDK S3 me-retry `503 SlowDown` otomatis, tetapi aplikasi yang menulis tepat setelah `CreateBucket` atau `SetBucketQuota` bisa melihat error bila retry-nya habis. Test me-retry hingga 5 kali dengan jeda 0,5 sampai 2 detik.
 - `rc mb` pada bucket yang sudah ada tetap sukses, jadi Agent menentukan `created` dari daftar bucket, bukan dari `mb`.
 - `rc quota set` pada bucket yang tidak ada gagal dengan exit 3 (seperti error jaringan), jadi Agent memeriksa keberadaan bucket lebih dulu.
 - `rc admin policy create` menimpa policy dengan nama yang sama, jadi policy selalu bisa disamakan lagi.

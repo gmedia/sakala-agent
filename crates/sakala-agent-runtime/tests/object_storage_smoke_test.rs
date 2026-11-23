@@ -56,8 +56,12 @@ const TOTAL_QUOTA_MB: u64 = 64;
 const MIB: u64 = 1_024 * 1_024;
 /// A bucket that predates the agent, like the staging script's `w-...` ones.
 const UNMANAGED_BUCKET: &str = "w-smoke-unlimited";
-/// Attempts of a request S3 SDKs make in their standard retry mode.
-const SDK_ATTEMPTS: u32 = 3;
+/// Attempts of a write answered `503 SlowDown`. RustFS 1.0.6 usually answers
+/// one write after a quota change that way, but under load more than three in
+/// a row were seen, so the test retries longer than an SDK's standard mode.
+const SLOWDOWN_ATTEMPTS: u32 = 5;
+/// The pause before retry `n` is `n` times this, as SDKs back off.
+const SLOWDOWN_BACKOFF: Duration = Duration::from_millis(500);
 
 struct SilentReporter;
 
@@ -272,20 +276,20 @@ fn url(path: &str) -> String {
 }
 
 /// A PUT, retried on `503 SlowDown` with a growing pause, the way S3 SDKs
-/// retry it (three attempts in their standard mode): RustFS
-/// 1.0.6 answers the first write after every quota change with that.
+/// retry it: RustFS 1.0.6 answers the first write after every quota change
+/// with that. `slowdowns` counts the retries.
 fn put(tenant: &Tenant, path: &str, arguments: &[&str], slowdowns: &Mutex<u32>) -> S3Response {
     let target = url(path);
     let mut request = vec!["-X", "PUT"];
     request.extend_from_slice(arguments);
     request.push(&target);
     let mut response = s3(tenant, &request);
-    for attempt in 1..SDK_ATTEMPTS {
+    for attempt in 1..SLOWDOWN_ATTEMPTS {
         if !(response.status == 503 && response.body.contains("SlowDown")) {
             break;
         }
         *slowdowns.lock().expect("slowdowns") += 1;
-        std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+        std::thread::sleep(SLOWDOWN_BACKOFF * attempt);
         response = s3(tenant, &request);
     }
     response
