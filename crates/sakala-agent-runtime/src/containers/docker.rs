@@ -34,10 +34,10 @@ use crate::{
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LABELS_FORMAT,
             IMAGE_LIST_FORMAT, InspectedImage, ListedImage, NO_SUCH_IMAGE,
-            PROJECT_CONTAINER_FORMAT, Retention, StaleImage, owned_references,
-            parse_container_usage, parse_image_inspect, parse_image_labels, parse_image_list,
-            parse_project_containers, previous_image_reference, replaced_image,
-            select_project_images, select_stale_images,
+            PROJECT_CONTAINER_FORMAT, Retention, StaleImage, adopt_unlabelled_images,
+            owned_references, parse_container_usage, parse_image_inspect, parse_image_labels,
+            parse_image_list, parse_project_containers, previous_image_reference, replaced_image,
+            select_project_images, select_stale_images, with_named_images,
         },
         metrics::{
             METRICS_INSPECT_FORMAT, STATS_FORMAT, join_sample, parse_inspected_states,
@@ -243,13 +243,24 @@ impl DockerContainerEngine {
         ))
     }
 
-    /// Managed images, of one project or all, with what containers use.
-    /// `None` when there is no such image.
+    /// Managed images, of one project or all, with what containers use, plus
+    /// the unlabelled images named in a project's repository. `None` when there
+    /// is no such image.
     async fn image_inventory(
         &self,
         project_id: Option<Uuid>,
     ) -> Result<Option<(Vec<ListedImage>, Vec<InspectedImage>, ContainerUsage)>, RuntimeError> {
-        let listed = self.image_listing(project_id).await?;
+        let labelled = self.image_listing(project_id).await?;
+        // Unfiltered: a `reference` filter would hide an image's other names,
+        // and those decide that the image is not the project's.
+        let all = CommandSpec::new("docker")
+            .arg("image")
+            .arg("ls")
+            .arg("--no-trunc")
+            .arg("--format")
+            .arg(IMAGE_LIST_FORMAT);
+        let all = parse_image_list(&self.read_docker(&all, "image listing").await?);
+        let listed = with_named_images(labelled, all, project_id);
         if listed.is_empty() {
             return Ok(None);
         }
@@ -261,11 +272,12 @@ impl DockerContainerEngine {
         for image in &listed {
             inspect = inspect.arg(&image.id);
         }
-        let inspected = parse_image_inspect(
+        let mut inspected = parse_image_inspect(
             &self
                 .read_docker(&inspect, "Sakala image inspection")
                 .await?,
         )?;
+        adopt_unlabelled_images(&listed, &mut inspected);
 
         // Every container counts, Sakala's or not, stopped or running.
         let containers = CommandSpec::new("docker")

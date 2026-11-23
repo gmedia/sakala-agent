@@ -1,7 +1,10 @@
 mod commands;
+mod labels;
 mod sandbox;
 
 pub use commands::build_command;
+pub(crate) use labels::label_image;
+pub use labels::unlabelled_reference;
 pub use sandbox::{RailpackSandbox, is_pinned_image};
 
 /// Railpack's settings for the build command, the start command, and the directory

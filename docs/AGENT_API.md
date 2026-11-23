@@ -377,7 +377,10 @@ build":
 - Deployment yang gagal tidak pernah menggeser previous dan tetap hanya menghapus image
   kandidat yang dibangunnya sendiri.
 - Hanya image yang semua namanya `sakala/project-<project_id>:<tag>` dan berlabel
-  `dev.sakala.project-id` project itu yang pernah diberi tag atau dihapus.
+  `dev.sakala.project-id` project itu yang pernah diberi tag. Image GC juga menghapus
+  image tanpa label project sama sekali yang semua namanya ada di repository satu
+  project, yaitu image Railpack dari Agent sebelum label Railpack diperbaiki; lihat
+  [Approved Runtime Cleanup](#approved-runtime-cleanup).
 
 Jadi rollback tanpa build hanya bisa ke deployment yang membangun image live atau image
 previous di node yang sama. Rollback ke deployment lain tetap jalan, hanya lewat build.
@@ -715,7 +718,17 @@ yang cocok sebelum dihapus dan Caddy di-reload.
 
 Image hanya dipilih bila berlabel `dev.sakala.managed=true`, punya label
 `dev.sakala.project-id` yang valid, dan semua namanya `sakala/project-<project_id>:<tag>`.
-Image dangling atau yang di-tag ulang dengan nama lain tidak pernah dipilih.
+Satu pengecualian: image yang tidak punya label `dev.sakala.project-id` sama sekali
+dianggap milik project yang namanya dipakai, bila semua namanya
+`sakala/project-<project_id>:<tag>` untuk satu project yang sama. Image Railpack yang
+dibangun Agent sampai v0.16.0 tidak membawa label apa pun, karena frontend Railpack
+mengabaikan `--label`, sehingga tanpa pengecualian ini image itu, termasuk milik project
+yang sudah dihapus, tidak pernah dibersihkan. Image seperti itu mengikuti aturan simpan
+yang sama di bawah, tetapi tidak pernah diberi tag `previous`, dan tidak pernah dipakai
+ulang karena reuse tetap mensyaratkan label. Nama-nama image dibaca dari
+`docker image ls` tanpa filter, karena filter `reference` menyembunyikan nama lain
+sebuah image. Image dangling, image berlabel project yang tidak valid, dan image yang
+punya nama di luar repository project itu tidak pernah dipilih.
 
 Per project yang masih punya container (berlabel project itu, atau memakai salah satu
 image-nya), Agent mempertahankan setiap image yang dipakai container mana pun, dalam

@@ -303,8 +303,9 @@ fn mentions_local_image(value: &Value) -> bool {
 }
 
 /// Stdout carries the result, which is not a log. Railpack's own output arrives on
-/// stderr, because the image's entrypoint sends it there.
-struct StderrOnly<'a>(ReporterOutputSink<'a>);
+/// stderr, because the image's entrypoint sends it there. Labelling uses it too:
+/// what Docker prints on stdout there is only an ID.
+pub(super) struct StderrOnly<'a>(pub(super) ReporterOutputSink<'a>);
 
 #[async_trait]
 impl ProcessOutputSink for StderrOnly<'_> {
@@ -316,13 +317,15 @@ impl ProcessOutputSink for StderrOnly<'_> {
     }
 }
 
-struct RemoveOnDrop {
-    runner: Arc<dyn ProcessRunner>,
-    name: Option<String>,
+/// Removes the named container when dropped before [`RemoveOnDrop::disarm`],
+/// as when a timeout drops the future that runs it.
+pub(super) struct RemoveOnDrop {
+    pub(super) runner: Arc<dyn ProcessRunner>,
+    pub(super) name: Option<String>,
 }
 
 impl RemoveOnDrop {
-    fn disarm(mut self) {
+    pub(super) fn disarm(mut self) {
         self.name = None;
     }
 }
