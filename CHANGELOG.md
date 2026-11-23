@@ -24,6 +24,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 - Update `url` to 2.5.9 for RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).
 
+### Documentation
+
+- Document that tenant dumps are restored with an unprivileged role, never as superuser (`docs/DATABASE_HOST.md`).
+
 ## [0.15.0] - 2026-11-20
 
 ### Added
