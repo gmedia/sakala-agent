@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Event deployment yang tidak terkirim tidak lagi menggagalkan deployment. Sebelumnya `reporter.event` menyerah setelah 3 percobaan dalam sekitar 1,5 detik, dan error-nya menggagalkan langkah yang mengirim event itu, jadi outage API yang jatuh tepat saat pergantian tahap (seperti 77 detik di staging 2026-11-19) bisa menggagalkan deploy yang sebenarnya berjalan baik (ledger X-14). Kini setiap event memakai satu `Idempotency-Key` dan body yang sama di setiap percobaan, kegagalan transient (`408`, `429`, `5xx`, koneksi, timeout, body tidak terbaca) di-retry dengan backoff eksponensial 1 sampai 15 detik plus jitter (`backon`) dan tidak kurang dari `Retry-After`, selama paling lama 90 detik per event. Event yang tetap tidak di-ack, atau ditolak `413`, `422`, `4xx` lain, atau `200` tanpa acknowledgement valid, dibuang dengan warning `deployment event was not delivered` dan dihitung; sebelum `complete`/`fail` Agent mencatat totalnya (`deployment events could not be fully delivered`). Setelah satu event dibuang, event berikutnya command itu hanya dicoba sekali sampai ada yang terkirim lagi, supaya outage panjang hanya menahan command satu budget. `command.claimed` ikut aturan ini, dan batas waktu eksekusi command kini dihitung sejak awal pemrosesan (claim), bukan setelah event itu, supaya penantiannya tidak membuat lease API habis. `409` tetap error karena API tidak lagi menerima report command itu, dan `complete`/`fail` tidak berubah. Tanpa perubahan wire maupun API: API sudah men-dedupe event per key dan hash payload. Lihat [Event and Log Payloads](docs/AGENT_API.md#event-and-log-payloads) dan [Compatibility](docs/COMPATIBILITY.md#revision-4-behaviour-change-event-delivery-retries).
+
 ## [0.16.1] - 2026-11-23
 
 ### Fixed

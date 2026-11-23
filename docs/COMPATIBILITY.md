@@ -335,6 +335,17 @@ semantics, and acknowledgement. Either side can be deployed first.
 | Lines dropped by the Agent | Marked in the timeline. | The Agent queues at most 10,000 lines and 2 MiB per command besides the batch in flight; past that the oldest queued lines are dropped and a `system` line `<n> log lines are missing here: ...` is sent where they were. It is an ordinary log line and counts toward `max_total_bytes`. |
 | Other `4xx` on log reports | Stop delivery, as `409`/`413`/`422` do. | No change in practice: these were never retried. |
 
+## Revision 4 behaviour change: event delivery retries
+
+Still revision 4, with no wire change: the same endpoint, body, `Idempotency-Key`
+semantics, and acknowledgement. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Transient failures on `POST /commands/{id}/events` | Retried for up to 90 s per event, then given up. | Same key and body on every attempt, 1 to 15 s exponential backoff plus jitter, never sooner than `Retry-After` (capped at 5 minutes). After one event is given up, later events of the command get one attempt each until one is delivered. Agent v0.16.1 and older gave up after 3 attempts and failed the deployment step that sent the event. |
+| Undeliverable events | **Behaviour change.** Dropped with a warning; the command continues. | Applies to the budget running out, `413`, `422`, other `4xx`, and a `200` without a valid acknowledgement. Dropped events are not resent later. The API may therefore see a deployment complete while its status still shows an earlier stage, or without `deployment.runtime.ready` and so without `image_reference`. `complete`/`fail` are unchanged. |
+| `409` on events | Unchanged. | Still an error that stops the step, because the API no longer accepts reports for the command. |
+
 ## Revision 4 additions for env and database suggestions
 
 Still revision 4: no new command type or payload field, only two additive inspection

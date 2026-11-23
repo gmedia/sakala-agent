@@ -955,6 +955,8 @@ Lihat `examples/commands/deploy-project.json`. `builder=auto` memilih root Docke
 
 Resource request berbentuk `memory_mb`, `cpu_millis`, dan `pids_limit`. API adalah source of truth untuk policy produk; agent hanya memakai fallback lokal saat field kosong dan menolak nilai yang melampaui hard maximum node. Completion result mengembalikan nilai `requested_resources` dan `applied_resources` agar API dapat menyimpan konfigurasi runtime aktual. Jika finalisasi setelah route cutover ditunda, result juga membawa `finalization_deferred=true`; API wajib menghentikan deployment sebelumnya dengan `StopProject` karena Agent tidak menghapus running superseded workload secara otomatis.
 
+Event tahap deployment (`deployment.checkout.started` sampai `deployment.runtime.ready`) dikirim lewat reporter core. Event yang tidak bisa dikirim karena API tidak terjangkau atau menolak isinya dibuang dengan warning setelah retry paling lama 90 detik, dan deployment berjalan terus; hanya `409` (command tidak lagi diterima API) yang menghentikan langkah itu. Aturan lengkapnya di [Event and Log Payloads](AGENT_API.md#event-and-log-payloads).
+
 Kegagalan cepat saat menghentikan atau menghapus container deployment sebelumnya tidak diabaikan. Agent tetap mencoba ready event serta memasang log follower untuk deployment baru, kemudian mengembalikan post-commit error supaya completion membawa `finalization_deferred_reason=runtime_error`.
 
 ## Verifikasi

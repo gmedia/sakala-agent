@@ -16,7 +16,9 @@ use crate::{
     commands::CommandDispatcher,
     logs::redactor::ValueRedactor,
     ports::{CommandOutput, DatabaseAdmin, RuntimeExecutor, RuntimeReporter},
-    reporting::{ApiRuntimeReporter, ApiRuntimeReporterFactory},
+    reporting::{
+        ApiRuntimeReporter, ApiRuntimeReporterFactory, EventDelivery, EventDeliveryPolicy,
+    },
     repositories::ApiRepositoryCredentialProvider,
 };
 
@@ -39,6 +41,7 @@ pub struct CommandProcessor {
     command_timeout: Duration,
     post_commit_finalization_grace: Duration,
     final_log_flush_grace: Duration,
+    event_delivery: EventDeliveryPolicy,
 }
 
 impl CommandProcessor {
@@ -76,6 +79,7 @@ impl CommandProcessor {
             command_timeout,
             post_commit_finalization_grace: POST_COMMIT_FINALIZATION_GRACE,
             final_log_flush_grace: FINAL_LOG_FLUSH_GRACE,
+            event_delivery: EventDeliveryPolicy::default(),
         }
     }
 
@@ -92,6 +96,14 @@ impl CommandProcessor {
     #[must_use]
     pub fn with_final_log_flush_grace(mut self, grace: Duration) -> Self {
         self.final_log_flush_grace = grace;
+        self
+    }
+
+    /// Overrides the event retry limits. Primarily useful for deterministic
+    /// integration tests.
+    #[must_use]
+    pub fn with_event_delivery_policy(mut self, policy: EventDeliveryPolicy) -> Self {
+        self.event_delivery = policy;
         self
     }
 
@@ -122,17 +134,21 @@ impl CommandProcessor {
             }
             return Err(error);
         }
-        self.client
-            .event(
-                command.id,
-                &DeploymentEvent {
-                    event_type: "command.claimed".to_owned(),
-                    level: DeploymentEventLevel::Info,
-                    message: "Agent claimed command.".to_owned(),
-                    metadata: json!({}),
-                    occurred_at: OffsetDateTime::now_utc(),
-                },
-            )
+        // One delivery for the whole command, so an outage that begins here
+        // costs the command one retry budget, not one per event.
+        let events = Arc::new(EventDelivery::new(
+            self.client.clone(),
+            command.id,
+            self.event_delivery,
+        ));
+        events
+            .send(&DeploymentEvent {
+                event_type: "command.claimed".to_owned(),
+                level: DeploymentEventLevel::Info,
+                message: "Agent claimed command.".to_owned(),
+                metadata: json!({}),
+                occurred_at: OffsetDateTime::now_utc(),
+            })
             .await?;
 
         let (execution_timeout, log_bounds, redactor) = match self.command_policy(command) {
@@ -146,7 +162,8 @@ impl CommandProcessor {
         };
         let reporter = Arc::new(
             ApiRuntimeReporter::new(self.client.clone(), command.id, log_bounds)
-                .with_redactor(redactor),
+                .with_redactor(redactor)
+                .with_event_delivery(events),
         );
 
         let deadline_cancellation = cancellation.clone();
@@ -154,10 +171,14 @@ impl CommandProcessor {
             .dispatcher
             .dispatch(command, reporter.clone(), cancellation);
         tokio::pin!(execution);
+        // The control-plane lease starts at the claim, and `command.claimed`
+        // may have waited out its retry budget since then, so the deadline is
+        // counted from there too.
+        let execution_deadline = tokio::time::Instant::from_std(started) + execution_timeout;
         let execution = tokio::select! {
             biased;
             result = &mut execution => result,
-            () = tokio::time::sleep(execution_timeout) => {
+            () = tokio::time::sleep_until(execution_deadline) => {
                 if reporter.deployment_committed() {
                     warn!(
                         command_id = %command.id,
@@ -239,6 +260,16 @@ impl CommandProcessor {
         );
         if let Err(error) = reporter.flush_within(flush_grace).await {
             warn!(command_id = %command.id, %error, "deployment logs could not be fully delivered");
+        }
+        // Each given-up event was already logged when it was dropped; this is
+        // the command-level total next to the log warning above.
+        let undelivered_events = reporter.undelivered_events();
+        if undelivered_events > 0 {
+            warn!(
+                command_id = %command.id,
+                undelivered_events,
+                "deployment events could not be fully delivered"
+            );
         }
 
         match execution {

@@ -1613,6 +1613,44 @@ per command pada satu waktu. Setiap batch membawa header `Idempotency-Key`
 di-ack, sehingga retry transport aman: API mendeduplikasi per item berdasarkan
 key dan index batch, dan sequence yang diberikan API mengikuti urutan baris.
 
+Event adalah telemetry timeline. Status deployment yang digerakkannya hanya
+diselesaikan oleh `complete`/`fail`, yang punya jalur sendiri dan tetap ketat
+(retry terbatas, lalu error). Karena itu event yang tidak bisa dikirim tidak
+menggagalkan command:
+
+- Satu event dikirim dengan satu `Idempotency-Key` dan body yang sama di setiap
+  percobaan, jadi retry setelah response hilang dijawab sebagai duplikat dan
+  tidak tersimpan dua kali.
+- Kegagalan transient di-retry dengan backoff eksponensial 1–15 detik plus
+  jitter, tidak kurang dari `Retry-After` (dibatasi 5 menit), selama paling
+  lama 90 detik per event, termasuk waktu request. Angka ini melewati outage
+  API 77 detik di staging 2026-11-19 dan jauh di bawah timeout command default
+  900 detik. Bila jeda berikutnya akan melewati budget, event langsung
+  dibuang tanpa menunggu.
+- Event yang tetap tidak di-ack setelah budget itu, atau ditolak `413`, `422`,
+  `4xx` lain, atau `200` tanpa acknowledgement valid, dibuang dengan warning
+  `deployment event was not delivered; the command continues without it`
+  (field `event_type`, `undelivered_events`, `error`), dan langkah yang
+  mengirimnya berjalan terus.
+- Setelah satu event dibuang, event berikutnya command itu hanya dicoba sekali
+  sampai ada yang terkirim lagi, supaya outage panjang menahan command satu
+  budget saja, bukan satu budget per event. `command.claimed` dan event runtime
+  memakai state yang sama.
+- Sebelum `complete`/`fail`, Agent mencatat total per command sebagai warning
+  `deployment events could not be fully delivered` (`undelivered_events`).
+  Event yang dibuang tidak dikirim ulang belakangan, karena API memberi
+  sequence menurut urutan tiba dan event tahap yang datang terlambat akan
+  tampil di urutan yang salah.
+- `409` tetap error: API tidak lagi menerima report untuk command itu (terminal,
+  kedaluwarsa, atau bukan node pemilik), jadi pekerjaan yang dijelaskan event
+  itu harus berhenti. Sebelum cutover, ini menggagalkan deployment seperti
+  sebelumnya.
+
+Akibatnya bagi API: selama outage, status deployment bisa tertinggal di tahap
+terakhir yang terkirim sampai `complete`/`fail` datang, dan bila
+`deployment.runtime.ready` yang dibuang, `image_reference` deployment itu
+tetap kosong.
+
 ```http
 POST /api/agent/v1/commands/{command}/events
 Idempotency-Key: 8b4a0d3e-6f7c-4a3e-9c3f-3f2f1c1c0a11
@@ -1707,12 +1745,12 @@ Respons yang diperlakukan Agent:
 | Respons | Arti | Perilaku Agent |
 | --- | --- | --- |
 | `200` dengan acknowledgement valid, atau `204` | Diterima (duplikat tetap di-ack). | Lanjut. |
-| `200` dengan body tidak sesuai kontrak | Tidak diketahui apakah tersimpan. | Hentikan delivery log command ini; batch tidak dianggap terkirim. |
-| `408`, `429`, `5xx`, kegagalan transport | Transien. | Log: retry dengan key dan isi yang sama, backoff eksponensial 1–15 s plus jitter, tidak kurang dari `Retry-After` (dibatasi 5 menit), tanpa batas jumlah selama command berjalan; baris berikutnya menunggu di buffer berbatas (lihat [Logging](LOGGING.md)). Event: maksimum 3 percobaan, backoff 500 ms–5 s. |
-| `4xx` lain | Tidak akan berhasil bila diulang. | Hentikan delivery log command ini tanpa retry. |
-| `409` | Command terminal, bukan node pemilik, atau `Idempotency-Key` dipakai untuk payload berbeda. | Hentikan delivery log command ini tanpa retry. |
-| `422` | Budget `max_total_bytes` habis atau field tidak valid. | Hentikan delivery log command ini tanpa retry. |
-| `413` | Body melebihi `SAKALA_LOG_MAX_REQUEST_BYTES` (1 MiB). | Hentikan delivery; batas lokal Agent sengaja jauh di bawah nilai ini. |
+| `200` dengan body tidak sesuai kontrak | Tidak diketahui apakah tersimpan. | Log: hentikan delivery log command ini; batch tidak dianggap terkirim. Event: buang event itu dengan warning, command lanjut. |
+| `408`, `429`, `5xx`, kegagalan transport | Transien. | Log: retry dengan key dan isi yang sama, backoff eksponensial 1–15 s plus jitter, tidak kurang dari `Retry-After` (dibatasi 5 menit), tanpa batas jumlah selama command berjalan; baris berikutnya menunggu di buffer berbatas (lihat [Logging](LOGGING.md)). Event: retry dengan key dan isi yang sama dan backoff yang sama, paling lama 90 detik per event, lalu dibuang dengan warning; command lanjut. |
+| `4xx` lain | Tidak akan berhasil bila diulang. | Log: hentikan delivery log command ini tanpa retry. Event: buang event itu tanpa retry, command lanjut. |
+| `409` | Command terminal, bukan node pemilik, atau `Idempotency-Key` dipakai untuk payload berbeda. | Log: hentikan delivery log command ini tanpa retry. Event: error tanpa retry; langkah yang mengirimnya gagal. |
+| `422` | Budget `max_total_bytes` habis atau field tidak valid. | Log: hentikan delivery log command ini tanpa retry. Event: buang event itu tanpa retry, command lanjut. |
+| `413` | Body melebihi `SAKALA_LOG_MAX_REQUEST_BYTES` (1 MiB). | Hentikan delivery log, atau buang event itu; batas lokal Agent sengaja jauh di bawah nilai ini. |
 
 Log tetap dikirim **setelah** `complete` untuk `DeployProject`: setelah
 cutover, Agent menjalankan `docker logs --follow` dan melaporkan output
@@ -1884,9 +1922,10 @@ failure sebagai request error. Polling dan heartbeat tidak di-retry; keduanya
 melanjutkan worker loop pada tick berikutnya. Claim tidak di-retry (lihat
 [Polling and Claim Semantics](#polling-and-claim-semantics)). Report event/log
 serta `complete`/`fail` di-retry hanya untuk kegagalan transient dan memakai
-`Idempotency-Key` yang sama pada setiap percobaan: event dan `complete`/`fail`
-dengan backoff terbatas (3 percobaan), log sampai di-ack, ditolak, atau batas
-flush akhir habis (lihat tabel respons di atas). Lease
+`Idempotency-Key` yang sama pada setiap percobaan: `complete`/`fail` dengan
+backoff terbatas (3 percobaan), event sampai di-ack atau budget 90 detik per
+event habis, log sampai di-ack, ditolak, atau batas flush akhir habis (lihat
+tabel respons di atas). Lease
 expiry, offline detection, dan recovery command yang terputus dimiliki
 `sakala-api` dan dijelaskan pada
 [Semantik control plane yang diandalkan Agent](#semantik-control-plane-yang-diandalkan-agent).
