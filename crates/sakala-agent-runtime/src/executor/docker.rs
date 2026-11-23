@@ -53,7 +53,7 @@ use crate::{
     routing::{
         CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, KnownRoutes,
         RouteIdentity, RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec,
-        traffic::TrafficTracker, wake_url,
+        check_public_console_url, traffic::TrafficTracker, wake_url,
     },
     telemetry::NodeTelemetryCollector,
     workspace::{
@@ -87,6 +87,8 @@ pub struct DockerRuntimeExecutor {
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
     public_api_url: String,
+    /// Checked at agent start; a value that fails here is dropped with a warning.
+    public_console_url: Option<Url>,
     router_metrics: DockerExecCaddyMetrics,
     traffic: std::sync::Mutex<TrafficTracker>,
     /// Keeps a router without readable counters to one warning, not one per heartbeat.
@@ -155,6 +157,7 @@ impl DockerRuntimeExecutor {
         let restore_policy = RestorePolicy::new(config.crash_stable_window);
         let router_container = config.caddy_container.clone();
         let public_api_url = config.public_api_url.clone();
+        let public_console_url = config.public_console_url.clone();
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -209,6 +212,7 @@ impl DockerRuntimeExecutor {
             min_workspace_free_bytes,
             preflight,
             public_api_url,
+            public_console_url,
             restore_policy,
         )
     }
@@ -232,8 +236,19 @@ impl DockerRuntimeExecutor {
         min_workspace_free_bytes: u64,
         preflight: DockerPreflight,
         public_api_url: String,
+        public_console_url: Option<String>,
         restore_policy: RestorePolicy,
     ) -> Self {
+        let public_console_url = public_console_url.and_then(|value| {
+            check_public_console_url(&value)
+                .inspect_err(|reason| {
+                    tracing::warn!(
+                        reason,
+                        "the public Console URL is not used: sleeping pages name the Console without a link"
+                    );
+                })
+                .ok()
+        });
         let telemetry = NodeTelemetryCollector::new(
             Arc::clone(&preflight.runner),
             preflight.workspace_root.clone(),
@@ -267,6 +282,7 @@ impl DockerRuntimeExecutor {
             preflight,
             telemetry,
             public_api_url,
+            public_console_url,
             router_metrics,
             traffic: std::sync::Mutex::new(TrafficTracker::new(OffsetDateTime::now_utc())),
             traffic_unreadable: AtomicBool::new(false),
@@ -1391,6 +1407,7 @@ impl DockerRuntimeExecutor {
             deployment_id: workload.deployment_id,
             domain: workload.domain.clone(),
             page,
+            console_url: self.public_console_url.clone(),
         });
         let result = match sleeping {
             Ok(route) => self.routes.activate_sleeping(&route, reporter).await,

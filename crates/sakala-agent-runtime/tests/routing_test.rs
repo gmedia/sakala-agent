@@ -246,6 +246,7 @@ fn sleeping_with(
         deployment_id,
         domain: "portfolio.run.sakala.localhost".to_owned(),
         page,
+        console_url: None,
     }
 }
 

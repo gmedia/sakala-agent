@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 base64 = "0.23"
+sha2 = "0.11.1"
 globset = "0.4.21"
 nix = { version = "0.32.0", features = ["signal", "process"] }
 oci-spec = { version = "0.10.0", default-features = false, features = ["distribution"] }

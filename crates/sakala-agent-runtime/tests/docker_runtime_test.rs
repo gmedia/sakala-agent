@@ -2344,7 +2344,7 @@ async fn sleep_can_put_the_unavailable_page_on_the_project_domain() {
         "{content}"
     );
     assert!(
-        content.contains("\t\t<h1>Proyek tidak tersedia</h1>\n"),
+        content.contains("\t\t<h1>Aplikasi ini sedang tidak tersedia</h1>\n"),
         "{content}"
     );
     assert!(
@@ -2367,16 +2367,36 @@ async fn sleep_can_put_the_unavailable_page_on_the_project_domain() {
 #[tokio::test]
 async fn sleep_without_a_page_still_shows_the_waking_page() {
     let temp = TempDir::new().expect("temp directory should be available");
-    let config = runtime_config(&temp);
+    let mut config = runtime_config(&temp);
+    config.public_console_url = Some("https://app.staging.sakala.dev".to_owned());
 
     let route = sleep_with_page(&config, SleepingPage::default()).await;
 
     let content = fs::read_to_string(&route).expect("route");
     assert!(
-        content.contains("\t\t<title>Proyek sedang dinyalakan</title>\n"),
+        content.contains("\t\t<title>Aplikasi ini sedang dinyalakan</title>\n"),
         "{content}"
     );
     assert!(content.contains("\t\tRetry-After \"5\"\n"), "{content}");
+    // The owner is linked to the Console the agent was configured with.
+    assert!(
+        content.contains("<a href=\"https://app.staging.sakala.dev/\">Console Sakala</a>"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
+async fn a_console_url_that_fails_its_check_leaves_the_console_unlinked() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut config = runtime_config(&temp);
+    config.public_console_url = Some("https://app.sakala.dev/it's".to_owned());
+
+    let route = sleep_with_page(&config, SleepingPage::default()).await;
+
+    let content = fs::read_to_string(&route).expect("the page is still written");
+    assert!(content.contains("\t\tRetry-After \"5\"\n"), "{content}");
+    assert!(!content.contains("<a "), "{content}");
+    assert!(content.contains("di Console Sakala.</p>"), "{content}");
 }
 
 #[tokio::test]
@@ -2404,7 +2424,10 @@ async fn wake_replaces_the_unavailable_page_with_the_serving_route() {
         )),
         "{content}"
     );
-    assert!(!content.contains("Proyek tidak tersedia"), "{content}");
+    assert!(
+        !content.contains("Aplikasi ini sedang tidak tersedia"),
+        "{content}"
+    );
 }
 
 #[tokio::test]

@@ -21,7 +21,8 @@ use sakala_agent_runtime::{
     DockerRuntimeConfig, DockerRuntimeExecutor, TokioProcessRunner,
     routing::{
         CaddyFileRouteManager, DockerExecCaddyMetrics, DockerExecCaddyReloader, RouteIdentity,
-        RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec, wake_url,
+        RouteManager, RouteSpec, SleepingRoutePage, SleepingRouteSpec, check_public_console_url,
+        wake_url,
     },
 };
 use tempfile::TempDir;
@@ -48,6 +49,31 @@ import /etc/caddy/sites/*.Caddyfile
 \trespond \"Not found\" 404
 }
 ";
+
+/// The `Content-Security-Policy` Caddy sent allows exactly the inline blocks
+/// of the body Caddy sent, hashed the way a browser hashes them.
+fn assert_policy_covers_inline_blocks(head: &str, body: &str) {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::{Digest as _, Sha256};
+
+    let policy = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+        .expect("a Content-Security-Policy header");
+    assert!(policy.starts_with("default-src 'none'; "), "{policy}");
+    for (open, close) in [("<script>", "</script>"), ("<style>", "</style>")] {
+        let Some(start) = body.find(open) else {
+            continue;
+        };
+        let start = start + open.len();
+        let end = body[start..].find(close).expect("closing tag") + start;
+        let hash = STANDARD.encode(Sha256::digest(&body.as_bytes()[start..end]));
+        assert!(
+            policy.contains(&format!("'sha256-{hash}'")),
+            "{open} block not covered by {policy}"
+        );
+    }
+}
 
 fn docker(args: &[&str]) -> (bool, String) {
     let output = Command::new("timeout")
@@ -200,6 +226,9 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         page: SleepingRoutePage::Waking {
             wake_url: wake_url("https://api.staging.sakala.dev", "portfolio").expect("wake URL"),
         },
+        console_url: Some(
+            check_public_console_url("https://app.staging.sakala.dev").expect("Console URL"),
+        ),
     };
     routes
         .activate_sleeping(&route, &NoopReporter)
@@ -229,7 +258,9 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         "{body}"
     );
     assert!(body.ends_with("</html>"), "{body}");
-    assert!(body.contains("<title>Proyek sedang dinyalakan</title>"));
+    assert!(body.contains("<title>Aplikasi ini sedang dinyalakan</title>"));
+    assert!(body.contains("<a href=\"https://app.staging.sakala.dev/\">Console Sakala</a>"));
+    assert_policy_covers_inline_blocks(head, body);
     assert!(body.contains(
         "const wakeUrl=\"https://api.staging.sakala.dev/api/v1/public/projects/portfolio/wake\";"
     ));
@@ -237,15 +268,18 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         "fetch(wakeUrl,{method:\"POST\",mode:\"no-cors\",keepalive:true}).catch(()=>0);"
     ));
     // Caddy left the script's blocks alone: none of them is a placeholder.
-    assert!(
-        body.contains("const reloadMs=3000,maxReloads=40,slowReloadMs=15000,visitGapMs=60000;")
-    );
-    assert!(body.contains("if(reloads<maxReloads){reloadIn(reloadMs);return;}"));
+    assert!(body.contains(
+        "const reloadMs=3000,maxReloads=40,wakeEvery=5,slowReloadMs=15000,visitGapMs=60000;"
+    ));
+    assert!(body.contains("if(reloads<maxReloads){\nif(reloads%wakeEvery===0)wake();"));
     assert!(body.contains(
         "const read=(key)=>{try{return sessionStorage.getItem(key);}catch(error){return null;}};"
     ));
     assert!(body.contains(
-        "body{display:flex;align-items:center;justify-content:center;background:#08413D;"
+        "body{min-height:100%;margin:0;display:flex;flex-direction:column;background:#08413D;"
+    ));
+    assert!(body.contains(
+        "@keyframes sakala-bar{from{transform:translateX(-100%)}to{transform:translateX(250%)}}"
     ));
     assert!(!body.contains('\t'), "the heredoc indentation is stripped");
     // Another domain still falls through to the node's 404.
@@ -345,13 +379,14 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
         "{head}"
     );
     assert!(
-        body.contains("<title>Proyek tidak tersedia</title>"),
+        body.contains("<title>Aplikasi ini sedang tidak tersedia</title>"),
         "{body}"
     );
     assert!(
-        body.contains("<p>Proyek ini sedang tidak tersedia.</p>"),
+        body.contains("<p class=\"lead\">Untuk sementara aplikasi ini tidak bisa dibuka.</p>"),
         "{body}"
     );
+    assert_policy_covers_inline_blocks(head, body);
     for active in ["<script", "<noscript", "fetch", "reload"] {
         assert!(!body.contains(active), "{active} in {body}");
     }

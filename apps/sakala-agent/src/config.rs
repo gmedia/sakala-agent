@@ -17,12 +17,16 @@ use sakala_agent_runtime::{
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
     TimeoutSafetyConfig,
     database::{DATABASE_ADMIN_DSN_ENV, PostgresAdminConfig},
-    routing::check_public_api_url,
+    routing::{check_public_api_url, check_public_console_url},
 };
 
 /// The control plane as visitors' browsers reach it, for browser-facing URLs
 /// such as the sleeping page's wake request. Defaults to `SAKALA_API_URL`.
 pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
+
+/// The Console as project owners' browsers reach it, which a sleeping page
+/// links its owner to. Optional: without it the page names the Console only.
+pub const PUBLIC_CONSOLE_URL_ENV: &str = "SAKALA_PUBLIC_CONSOLE_URL";
 
 const RELEASE_COMMAND_TIMEOUT_ENV: &str = "SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS";
 
@@ -144,6 +148,9 @@ struct Cli {
 
     #[arg(long, env = PUBLIC_API_URL_ENV)]
     public_api_url: Option<String>,
+
+    #[arg(long, env = PUBLIC_CONSOLE_URL_ENV)]
+    public_console_url: Option<String>,
 
     #[arg(long, env = "SAKALA_POLL_INTERVAL_SECONDS")]
     poll_interval_seconds: Option<String>,
@@ -281,6 +288,7 @@ pub fn load() -> Result<AppConfig, CoreError> {
     insert(&mut values, "SAKALA_AGENT_TOKEN", cli.agent_token);
     insert(&mut values, "SAKALA_API_URL", cli.api_url);
     insert(&mut values, PUBLIC_API_URL_ENV, cli.public_api_url);
+    insert(&mut values, PUBLIC_CONSOLE_URL_ENV, cli.public_console_url);
     insert(
         &mut values,
         "SAKALA_POLL_INTERVAL_SECONDS",
@@ -538,6 +546,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             max_replicas_per_project: max_replicas_per_project(values)?,
             release_command_timeout,
             public_api_url: public_api_url(values, &agent.api_url)?,
+            public_console_url: public_console_url(values)?,
             ..DockerRuntimeConfig::default()
         },
         runtime_health_interval: Duration::from_secs(positive_u64(
@@ -793,6 +802,22 @@ fn public_api_url(values: &HashMap<String, String>, api_url: &str) -> Result<Str
         CoreError::InvalidConfiguration(format!("{PUBLIC_API_URL_ENV} {reason}"))
     })?;
     Ok(value.to_owned())
+}
+
+/// `SAKALA_PUBLIC_CONSOLE_URL` when set, checked at start like
+/// `SAKALA_PUBLIC_API_URL`. An empty value counts as unset.
+fn public_console_url(values: &HashMap<String, String>) -> Result<Option<String>, CoreError> {
+    let Some(value) = values
+        .get(PUBLIC_CONSOLE_URL_ENV)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    check_public_console_url(value).map_err(|reason| {
+        CoreError::InvalidConfiguration(format!("{PUBLIC_CONSOLE_URL_ENV} {reason}"))
+    })?;
+    Ok(Some(value.to_owned()))
 }
 
 fn max_replicas_per_project(values: &HashMap<String, String>) -> Result<u32, CoreError> {
@@ -1285,6 +1310,37 @@ mod tests {
                 .expect_err(invalid)
                 .to_string();
             assert!(error.contains(PUBLIC_API_URL_ENV), "{invalid}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_sleeping_page_links_the_console_only_when_a_valid_url_is_set() {
+        let public_console_url = |console: Option<&str>| {
+            let mut values = HashMap::new();
+            if let Some(console) = console {
+                values.insert(PUBLIC_CONSOLE_URL_ENV.to_owned(), console.to_owned());
+            }
+            from_values(&values).map(|config| config.docker_runtime.public_console_url)
+        };
+
+        assert_eq!(public_console_url(None).expect("unset"), None);
+        assert_eq!(public_console_url(Some("  ")).expect("empty"), None);
+        for console in ["https://app.sakala.dev", "https://example.ac.id/console/"] {
+            assert_eq!(
+                public_console_url(Some(console)).expect(console).as_deref(),
+                Some(console)
+            );
+        }
+        for invalid in [
+            "app.sakala.dev",
+            "javascript:alert(1)",
+            "https://app.sakala.dev/?next=/",
+            "https://app.sakala.dev/it's",
+        ] {
+            let error = public_console_url(Some(invalid))
+                .expect_err(invalid)
+                .to_string();
+            assert!(error.contains(PUBLIC_CONSOLE_URL_ENV), "{invalid}: {error}");
         }
     }
 
