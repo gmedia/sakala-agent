@@ -308,6 +308,21 @@ advertises `image-reuse`.
 | Image labels `dev.sakala.builder` and `dev.sakala.package-directory` | Written on every image built from this release on. | `dev.sakala.builder` is `dockerfile` or `railpack`. `dev.sakala.package-directory` is written only for an image built from a JavaScript workspace root. Images built by an older Agent lack them, so the first configuration redeploy after the upgrade builds once with `image_metadata_missing`. |
 | Failure cleanup | Behaviour change for reuse only. | A reused deployment that fails before its route switches removes its candidate containers but never the image, which the serving deployment still uses. Image GC is unchanged. |
 
+## Revision 4 additions for image rollback
+
+Still revision 4: no new command type, payload field, error code, or completion field.
+A rollback is an ordinary `DeployProject` that reuses the target's image through
+`reuse_image_from_deployment_id`. Either side can be deployed first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Rollback request | No change on the wire. | The API sends the target's `commit_sha` and, as `reuse_image_from_deployment_id`, the deployment that built the target's image. It may send that field only to a node that advertises `image-reuse`; any other node gets a plain build of that commit. A node with `image-reuse` but without `image-rollback` (Agent v0.14.0 to v0.15.0) still reuses the image when its old GC rule kept it, and builds with `image_missing` otherwise. |
+| Node capability `image-rollback` | Advertised by the `docker` driver only. | Promises that the live image and the previous image of every project stay on the node, so the API may promise a rollback "tanpa build" when the target built one of those two images on that node. Not sent on the heartbeat otherwise. |
+| Previous image | Kept and marked. | After a successful `DeployProject`, the image of the workload it replaced, when different from the new live image, gets the extra tag `sakala/project-<project_id>:previous`; a redeploy on the live image does not move it, a failed deployment never does. The original tag stays, so reuse lookup is unchanged. Only images whose every name is in the project's repository and whose `dev.sakala.project-id` label names the project are tagged. |
+| Post-deployment prune | New. | Still under the project lock, every other image of the project that no container uses is removed with `docker image rm` by name, never `--force`. A failure there does not fail the deployment: the Agent sends `deployment.images.retained` (level `warning`, metadata `{ project_id }`) after `deployment.runtime.ready` and leaves the images to periodic GC. Maps to no status. |
+| Image GC of a project with containers | **Behaviour change.** | Keeps every image a container uses, in any state, plus the image tagged `previous`; without that tag (images of an older Agent) the newest image older than the newest one in use, as before. Age no longer protects anything: `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` is ignored, still parsed so existing configuration loads, and logged as ignored at startup. GC removes a project's images only while it holds that project's command lock, choosing them again under the lock. Projects without containers keep the `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` rule unchanged. |
+| `RestartProject` on a project whose replicas all exited | **Behaviour change.** | Restarted after the same capacity check as a wake, instead of `runtime_workload_not_running`. A crash-looping deployment (Docker status `Restarting`) is restarted too. A deployment whose project route is the sleeping page for it is still refused with `runtime_workload_not_running`. The API should send `RestartProject` only for `runtime_status` `running` or `crashed`: a project whose sleeping page could not be installed has no sleeping route, and the Agent cannot tell it from a crash. |
+
 ## Revision 4 behaviour change: log delivery retries
 
 Still revision 4, with no wire change: the same endpoint, body, `Idempotency-Key`

@@ -30,7 +30,7 @@ Boundary ini memungkinkan:
 | `WorkspaceManager` | `GitWorkspaceManager` | Checkout immutable commit dan cleanup workspace. |
 | `ProjectInspector` | `RailpackProjectInspector` | Jalankan `railpack info` dan scanner metadata ringan. |
 | `ImageBuilder` | `ImageBuildService` | Pilih Dockerfile/Railpack dan bangun image. |
-| `ContainerEngine` | `DockerContainerEngine` | Start, logs, replacement, dan failure cleanup. |
+| `ContainerEngine` | `DockerContainerEngine` | Start, logs, replacement, failure cleanup, dan retensi image (live dan previous). |
 | `HealthChecker` | `DockerHealthChecker` | Menunggu status running/healthy. |
 | `RouteManager` | `CaddyFileRouteManager` | Tulis route atomik, activate, dan rollback. |
 
