@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-23
+
 ### Fixed
 
 - Image yang dibangun Railpack kini membawa label Sakala. Frontend BuildKit Railpack mengabaikan `--label` (diperiksa di source v0.23.0 yang dipin dan di `main` per 12 November 2026), sehingga di staging dengan Agent v0.16.0 setiap image Railpack punya label `null`: redeploy tanpa build dan rollback selalu jatuh ke build dengan `image_not_owned` walaupun Console menjanjikan "tidak perlu build", tag `previous` tidak pernah dibuat untuk project Railpack, dan image GC tidak pernah menyentuh image itu. Build Railpack kini diberi nama sementara `<image>-unlabelled`, lalu langkah baru `railpack-label` membuat container yang tidak pernah dijalankan (`docker container create --pull never --network none`, tanpa label Sakala) dan menulis semua label lewat `docker container commit --change 'LABEL ...'` ke nama image deployment, lalu menghapus container dan nama sementara. Commit ini tidak menambah layer dan tidak mengubah CMD, ENTRYPOINT, ENV, WORKDIR, USER, EXPOSE, atau VOLUME. Cara ini dipilih daripada build `FROM <image lokal>` karena hanya bergantung pada daemon: dengan builder buildx `docker-container`, image lokal tidak terlihat dan BuildKit akan menarik `docker.io/sakala/project-...`. Kegagalan langkah ini menggagalkan build dengan `runtime_build_failed`, karena image tanpa label diam-diam mematikan reuse, rollback, dan GC. Smoke test baru `railpack_labels_smoke_test` membuktikannya dengan build Railpack sungguhan (Docker 29.10, containerd image store): label lengkap, config sama persis selain label, image pertama menjadi `previous`, dan rollback ke image itu tanpa build. Lihat [Label image Railpack](docs/DOCKER_RUNTIME.md#label-image-railpack).
@@ -334,7 +336,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/gmedia/sakala-agent/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/gmedia/sakala-agent/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...v0.14.0
