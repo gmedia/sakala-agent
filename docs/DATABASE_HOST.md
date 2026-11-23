@@ -115,6 +115,12 @@ Hal berikut bukan dikerjakan Agent, tetapi wajib di host database (repo deployme
 - Disk minimal beberapa ratus operasi fdatasync per detik di `pg_test_fsync` sebelum melayani.
 - Backup malam per database dengan `pg_dump -Fc` dan enkripsi age, disimpan di luar host. Database yang di-lock tetap bisa di-backup.
 
+## Restore dump tenant
+
+Dump milik tenant tidak pernah di-restore sebagai superuser. Saat restore, fungsi yang dibuat tenant ikut berjalan, misalnya di CHECK constraint atau expression index, dan fungsi itu berjalan dengan hak sesi yang me-restore. `pg_restore --role` tidak cukup, karena selama user sesinya superuser, fungsi tenant bisa memanggil `RESET ROLE` lalu membuat role superuser baru. Hal ini terbukti di uji lokal sebelum pilot production.
+
+Karena itu restore selalu login sebagai role tanpa hak istimewa: role milik tenant itu sendiri untuk restore sungguhan, atau role `drill_` sekali pakai untuk uji restore (`scripts/restore-database.sh` di repo deployment). Fungsi tenant tetap berjalan, tetapi tidak bisa menaikkan hak. Keputusan ini juga dicatat di ADR-020.
+
 ## Ukuran database di heartbeat
 
 Heartbeat membaca `pg_database_size()` untuk setiap database yang namanya cocok
