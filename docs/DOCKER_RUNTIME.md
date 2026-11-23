@@ -147,7 +147,8 @@ Image ditag berdasarkan project, commit, dan deployment. Image dan container dib
 - `dev.sakala.agent-id=<agent-id>`
 
 Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
-Railpack. Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
+Railpack (untuk Railpack lewat langkah terpisah, lihat
+[Label image Railpack](#label-image-railpack)). Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
 menjadi dangling, dan `docker image prune` tanpa `-a` tidak menghapus apa pun. Karena
 itu GC memilih per project. Project yang masih punya container mempertahankan image
 yang dipakai container mana pun (berjalan, tidur, atau berhenti, dan semua replika) dan
@@ -160,6 +161,23 @@ yang sudah dihapus, hanya mempertahankan image yang lebih muda dari
 `docker image rm <nama>...` tanpa `--force`, tag `previous` lebih dulu. Hanya image
 berlabel `dev.sakala.managed=true` dengan project yang valid, dan yang semua namanya
 `sakala/project-<project>:<tag>`, yang pernah dipilih.
+
+Pengecualiannya image tanpa label `dev.sakala.project-id` sama sekali yang semua namanya
+`sakala/project-<project>:<tag>` untuk satu project: GC menganggapnya milik project itu
+dan menerapkan aturan yang sama. Image Railpack dari Agent sampai v0.16.0 tidak punya
+label apa pun, dan di staging sekitar 37 image seperti itu, termasuk milik project yang
+sudah dihapus, menumpuk karena tidak pernah terpilih. GC membaca nama image dari
+`docker image ls` tanpa filter, karena filter `reference` hanya menampilkan nama yang
+cocok dan menyembunyikan nama lain image yang sama; image yang punya satu saja nama di
+luar repository project itu tidak pernah dipilih. Image tanpa label tidak pernah diberi
+tag `previous` dan tidak pernah dipakai ulang, karena keduanya tetap mensyaratkan label.
+Container yang memakai image itu, berjalan maupun berhenti, tetap melindunginya.
+
+Label image dibaca dari `{{json .Config}}` dalam satu `docker image inspect` untuk semua
+kandidat. `{{index .Config.Labels "..."}}` maupun `{{json .Config.Labels}}` tidak dipakai:
+bila satu perintah menyebut beberapa image, Docker 29.10 menggagalkan seluruh perintah
+dengan `map has no entry for key "Labels"` untuk image yang tidak punya label sama sekali,
+dan satu image Railpack lama saja sudah cukup untuk menggagalkan setiap putaran GC.
 
 Image yang punya dua tag (tag asli dan `previous`) dihapus lewat kedua namanya. Docker
 dengan containerd image store menolak `docker image rm <id>` untuk image seperti itu
@@ -186,6 +204,49 @@ Versi sebelumnya membaca label dengan `{{.Label "..."}}` pada `docker image ls`,
 ditolak Docker (`can't evaluate field Label in type *formatter.imageContext`), sehingga
 deteksi gagal dan tidak ada image yang pernah dihapus. Label kini dibaca lewat
 `docker image inspect`.
+
+### Label image Railpack
+
+Frontend BuildKit Railpack mengabaikan `--label`: menurut source v0.23.0 (versi yang
+dipin) dan `main` per 12 November 2026, frontend itu hanya membaca `build-arg:*`,
+`platform`, dan `filename`, lalu menyerahkan config image buatannya sendiri ke BuildKit.
+Di staging, `docker image inspect -f '{{json .Config.Labels}}'` pada setiap image
+Railpack menghasilkan `null`, sehingga reuse dan rollback selalu jatuh ke build dengan
+`image_not_owned`, tag `previous` tidak pernah dibuat, dan image GC tidak pernah
+menyentuh image itu.
+
+Karena itu build Railpack kini diberi nama sementara `<image>-unlabelled`, lalu Agent
+menulis label di langkah `railpack-label`:
+
+```bash
+docker container create --pull never --network none --name sakala-label-<uuid> <image>-unlabelled
+docker container commit --change 'LABEL dev.sakala.managed="true"' ... sakala-label-<uuid> <image>
+docker container rm --force --volumes sakala-label-<uuid>
+docker image rm <image>-unlabelled
+```
+
+Container itu tidak pernah dijalankan dan tidak membawa label Sakala, jadi rekonsiliasi,
+pencarian replika, dan metrik tidak pernah melihatnya. Commit container yang tidak
+berubah tidak menambah layer, dan Docker menyusun config baru dari config image, jadi
+CMD, ENTRYPOINT, ENV, WORKDIR, USER, EXPOSE, dan VOLUME tetap seperti tulisan Railpack.
+Nilai label dikutip dengan `\`, `"`, dan `$` di-escape, karena Docker membaca
+`--change` sebagai baris Dockerfile dan mengekspansi variabel; nilai berisi karakter
+kontrol ditolak. Langkah ini hanya memakai daemon, sehingga tidak bergantung pada
+builder buildx. Build `FROM <image lokal>` dengan `--label` sengaja tidak dipakai: dengan
+builder `docker-container` image lokal tidak terlihat, dan BuildKit lalu menarik
+`docker.io/sakala/project-...` dari registry. Image tanpa label tetap disimpan Docker
+sebagai parent tanpa nama dari image berlabel dan ikut terhapus bersamanya.
+
+Bila langkah ini gagal, build gagal dengan `runtime_build_failed`
+(`railpack-label failed with exit code N`), stderr Docker masuk log deployment, dan
+container serta nama sementara tetap dihapus. Bila timeout build memotong langkah ini,
+container tetap dihapus (container yang tertinggal akan menahan image itu selamanya,
+karena GC menyimpan setiap image yang dipakai container), dan nama sementara yang
+tersisa dibersihkan image GC. Image tanpa label tidak pernah dijalankan,
+karena reuse, rollback, dan image GC akan diam-diam tidak berfungsi untuk image itu.
+Smoke test `railpack_labels_smoke_test` membuktikan jalur ini dengan build Railpack
+sungguhan: label lengkap, config sama persis selain label, image pertama menjadi
+`previous` setelah deployment kedua, dan rollback ke image itu berjalan tanpa build.
 
 ### Image sebelumnya dan rollback
 

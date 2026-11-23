@@ -12,14 +12,23 @@
 //! grace period, which is how images of a deleted project leave the node.
 //!
 //! Only an image labelled with a valid project whose every name is
-//! `sakala/project-<that project>:<tag>` is ever chosen or tagged.
+//! `sakala/project-<that project>:<tag>` is ever chosen or tagged. One
+//! exception for garbage collection: an image without any project label whose
+//! every name is in one project's repository counts as that project's
+//! ([`adopt_unlabelled_images`]). Railpack images that earlier Agents built
+//! carry no labels at all, because Railpack's frontend ignores them, and
+//! nothing else would ever collect them. Such an image is never tagged as the
+//! previous one.
 
 use std::collections::{BTreeMap, HashSet};
 
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::RuntimeError;
+use crate::{
+    RuntimeError,
+    builders::image_labels::{DEPLOYMENT_ID_LABEL, PROJECT_ID_LABEL},
+};
 
 /// Tag, in the project's repository, of the image the last successful
 /// deployment replaced. Moving it never removes an image by itself: the image
@@ -29,8 +38,11 @@ pub const PREVIOUS_IMAGE_TAG: &str = "previous";
 /// The repository every image of `project_id` is named in.
 #[must_use]
 pub fn project_repository(project_id: Uuid) -> String {
-    format!("sakala/project-{project_id}")
+    format!("{PROJECT_REPOSITORY_PREFIX}{project_id}")
 }
+
+/// Every project repository starts with this.
+const PROJECT_REPOSITORY_PREFIX: &str = "sakala/project-";
 
 /// `sakala/project-<project_id>:previous`.
 #[must_use]
@@ -41,9 +53,13 @@ pub fn previous_image_reference(project_id: Uuid) -> String {
 /// `docker image ls --no-trunc` prints one row per tag, and `<none>` for a
 /// dangling image.
 pub(crate) const IMAGE_LIST_FORMAT: &str = "{{.ID}}\t{{.Repository}}\t{{.Tag}}";
-/// `docker image ls` has no field for labels, so they come from inspect. A
-/// missing label prints `<no value>`.
-pub(crate) const IMAGE_INSPECT_FORMAT: &str = "{{.Id}}\t{{index .Config.Labels \"dev.sakala.project-id\"}}\t{{index .Config.Labels \"dev.sakala.deployment-id\"}}\t{{.Created}}\t{{.Size}}";
+/// `docker image ls` has no field for labels, so they come from inspect: the
+/// whole config as JSON, last on the line, since JSON escapes tabs and
+/// newlines. Not `.Config.Labels`: when one `docker image inspect` names
+/// several images, Docker 29.10 fails the whole command with `map has no entry
+/// for key "Labels"` for an image without any label, such as a Railpack image
+/// of an earlier Agent, whether the field is read with `index` or `json`.
+pub(crate) const IMAGE_INSPECT_FORMAT: &str = "{{.Id}}\t{{.Created}}\t{{.Size}}\t{{json .Config}}";
 /// Every label of one image as a JSON object, or `null` when it has none. JSON,
 /// because a label value may hold a tab or a newline.
 pub(crate) const IMAGE_LABELS_FORMAT: &str = "{{json .Config.Labels}}";
@@ -66,6 +82,9 @@ pub(crate) struct ListedImage {
 pub(crate) struct InspectedImage {
     pub id: String,
     pub project_id: Option<Uuid>,
+    /// The image has no project label at all, as opposed to one that names no
+    /// valid project. Only such an image may be adopted by its names.
+    pub unlabelled: bool,
     pub deployment_id: Option<Uuid>,
     pub created: OffsetDateTime,
     pub size_bytes: u64,
@@ -139,13 +158,30 @@ pub(crate) fn parse_image_labels(stdout: &str) -> Result<BTreeMap<String, String
         })
 }
 
+/// The labels in what `{{json .Config}}` prints. An image without labels has
+/// no `Labels` key, or `null`.
+fn parse_config_labels(config: &str) -> Result<BTreeMap<String, String>, RuntimeError> {
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(rename = "Labels", default)]
+        labels: Option<BTreeMap<String, String>>,
+    }
+    serde_json::from_str::<Config>(config)
+        .map(|config| config.labels.unwrap_or_default())
+        .map_err(|error| {
+            RuntimeError::Container(format!(
+                "docker image inspect returned an unreadable image config: {error}"
+            ))
+        })
+}
+
 pub(crate) fn parse_image_inspect(stdout: &str) -> Result<Vec<InspectedImage>, RuntimeError> {
     stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-            let [id, project, deployment, created, size] = fields[..] else {
+            let fields = line.splitn(4, '\t').map(str::trim).collect::<Vec<_>>();
+            let [id, created, size, config] = fields[..] else {
                 return Err(RuntimeError::Container(
                     "docker image inspect returned an unknown format".to_owned(),
                 ));
@@ -155,15 +191,79 @@ pub(crate) fn parse_image_inspect(stdout: &str) -> Result<Vec<InspectedImage>, R
                     "Docker returned an invalid image creation timestamp: {error}"
                 ))
             })?;
+            let labels = parse_config_labels(config)?;
+            let uuid = |key: &str| {
+                labels
+                    .get(key)
+                    .and_then(|value| Uuid::parse_str(value).ok())
+            };
             Ok(InspectedImage {
                 id: id.to_owned(),
-                project_id: Uuid::parse_str(project).ok(),
-                deployment_id: Uuid::parse_str(deployment).ok(),
+                project_id: uuid(PROJECT_ID_LABEL),
+                unlabelled: !labels.contains_key(PROJECT_ID_LABEL),
+                deployment_id: uuid(DEPLOYMENT_ID_LABEL),
                 created,
                 size_bytes: size.parse().unwrap_or(0),
             })
         })
         .collect()
+}
+
+/// The project whose repository every name of an image is in, when the names
+/// are exactly `sakala/project-<project>:<tag>` as [`project_repository`] writes
+/// them. `None` for a dangling image, or one with any name outside a single
+/// project's repository.
+pub(crate) fn repository_project(references: &[String]) -> Option<Uuid> {
+    let mut project = None;
+    for reference in references {
+        let (repository, tag) = reference.rsplit_once(':')?;
+        let id = Uuid::parse_str(repository.strip_prefix(PROJECT_REPOSITORY_PREFIX)?).ok()?;
+        if tag.is_empty()
+            || project_repository(id) != repository
+            || *project.get_or_insert(id) != id
+        {
+            return None;
+        }
+    }
+    project
+}
+
+/// `all` lists every image of the node with all its names. Adds to `labelled`
+/// each image of `all` not in it that has a name in a project's repository, or
+/// in `project_id`'s when given, so the unlabelled ones can be adopted.
+pub(crate) fn with_named_images(
+    mut labelled: Vec<ListedImage>,
+    all: Vec<ListedImage>,
+    project_id: Option<Uuid>,
+) -> Vec<ListedImage> {
+    let prefix = project_id.map_or_else(
+        || PROJECT_REPOSITORY_PREFIX.to_owned(),
+        |project_id| format!("{}:", project_repository(project_id)),
+    );
+    for image in all {
+        let named = image
+            .references
+            .iter()
+            .any(|reference| reference.starts_with(&prefix));
+        if named && !labelled.iter().any(|listed| listed.id == image.id) {
+            labelled.push(image);
+        }
+    }
+    labelled
+}
+
+/// Gives each image without any project label the project of its names, when
+/// [`repository_project`] finds one. Everything else stays as it is.
+pub(crate) fn adopt_unlabelled_images(listed: &[ListedImage], inspected: &mut [InspectedImage]) {
+    for image in inspected
+        .iter_mut()
+        .filter(|image| image.unlabelled && image.project_id.is_none())
+    {
+        image.project_id = listed
+            .iter()
+            .find(|listed| listed.id == image.id)
+            .and_then(|listed| repository_project(&listed.references));
+    }
 }
 
 /// How long images of a project without any container are kept.
@@ -441,25 +541,39 @@ mod tests {
         assert_eq!(listed[1].references.len(), 2);
         assert!(listed[2].references.is_empty());
 
+        // Shaped like what Docker 29.10 (containerd image store) prints for
+        // one command naming three images: a Sakala image, an image with only
+        // other labels, and one without any label at all.
         let inspected = parse_image_inspect(
-            "sha256:09828b7b816011b44621fb15f0d96a8d9df465225684dc33059a5a9ba87691df\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\t2026-11-11T07:06:15.079750824+07:00\t243473312\n\
-             sha256:f03e71043c3b79a782101af9f6721ea5c8a5d13c4cd6000a16149f975471536d\t<no value>\t<no value>\t2026-11-11T07:06:16.287934974+07:00\t243473183\n",
+            "sha256:09828b7b816011b44621fb15f0d96a8d9df465225684dc33059a5a9ba87691df\t2026-11-11T07:06:15.079750824+07:00\t243473312\t{\"Cmd\":[\"sh\"],\"Labels\":{\"dev.sakala.deployment-id\":\"22222222-2222-4222-8222-222222222222\",\"dev.sakala.managed\":\"true\",\"dev.sakala.project-id\":\"11111111-1111-4111-8111-111111111111\"}}\n\
+             sha256:86deaf5e3d3408a6ccec08fbb79989783dd26e206ae10bcf78a801dc8c9ab794\t2026-05-12T21:45:14.04652884Z\t88649265\t{\"Env\":[\"A=b\\tc\"],\"Labels\":{\"org.opencontainers.image.title\":\"Caddy\"}}\n\
+             sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec\t2024-09-26T21:31:42Z\t6767335\t{\"Cmd\":[\"sh\"],\"Env\":[\"PATH=/bin\"]}\n",
         )
         .expect("inspect output");
         assert_eq!(
             inspected[0].project_id,
             Some(Uuid::parse_str(PROJECT).expect("uuid"))
         );
+        assert_eq!(
+            inspected[0].deployment_id,
+            Some(Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid"))
+        );
         assert_eq!(inspected[0].created, at("2026-11-11T00:06:15.079750824Z"));
         assert_eq!(inspected[0].size_bytes, 243_473_312);
-        assert_eq!(inspected[1].project_id, None);
+        let unlabelled = inspected
+            .iter()
+            .map(|image| (image.project_id.is_some(), image.unlabelled))
+            .collect::<Vec<_>>();
+        assert_eq!(unlabelled, [(true, false), (false, true), (false, true)]);
         assert!(parse_image_inspect("sha256:x\tonly-two-fields\n").is_err());
+        assert!(parse_image_inspect("sha256:x\t2026-01-01T00:00:00Z\t1\t<no value>\n").is_err());
     }
 
     fn image(id: &str, project: &str, created: &str) -> InspectedImage {
         InspectedImage {
             id: id.to_owned(),
             project_id: Uuid::parse_str(project).ok(),
+            unlabelled: false,
             deployment_id: None,
             created: at(created),
             size_bytes: 10,
@@ -940,5 +1054,168 @@ mod tests {
         listed[0].references.pop();
         tag_previous(&mut listed, "c", PROJECT);
         assert!(keep_rule(&listed, &inspected, &["b"]).is_empty());
+    }
+
+    fn unlabelled(id: &str, created: &str) -> InspectedImage {
+        InspectedImage {
+            unlabelled: true,
+            ..image(id, "<no value>", created)
+        }
+    }
+
+    fn named(id: &str, references: &[&str]) -> ListedImage {
+        ListedImage {
+            id: id.to_owned(),
+            references: references.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn reads_whether_an_image_has_a_project_label_at_all() {
+        let inspected = parse_image_inspect(&format!(
+            "sha256:a\t2026-01-01T00:00:00Z\t1\t{{\"Labels\":null}}\n\
+             sha256:b\t2026-01-01T00:00:00Z\t1\t{{\"Labels\":{{\"dev.sakala.managed\":\"true\"}}}}\n\
+             sha256:c\t2026-01-01T00:00:00Z\t1\t{{\"Labels\":{{\"dev.sakala.project-id\":\"not-a-uuid\"}}}}\n\
+             sha256:d\t2026-01-01T00:00:00Z\t1\t{{\"Labels\":{{\"dev.sakala.project-id\":\"{PROJECT}\"}}}}\n"
+        ))
+        .expect("inspect output");
+        let unlabelled = inspected
+            .iter()
+            .map(|image| image.unlabelled)
+            .collect::<Vec<_>>();
+        assert_eq!(unlabelled, [true, true, false, false]);
+    }
+
+    #[test]
+    fn only_names_all_in_one_project_repository_name_a_project() {
+        let project = Uuid::parse_str(PROJECT).expect("uuid");
+        let own = format!("sakala/project-{PROJECT}:0123456789ab-22222222");
+        let previous = format!("sakala/project-{PROJECT}:previous");
+        assert_eq!(
+            repository_project(&[own.clone(), previous.clone()]),
+            Some(project)
+        );
+        for references in [
+            vec![],
+            vec![own.clone(), "nginx:latest".to_owned()],
+            vec![own.clone(), format!("sakala/project-{OTHER}:t")],
+            vec![format!("sakala/project-{PROJECT}:")],
+            vec![format!("sakala/project-{PROJECT}")],
+            vec!["sakala/project-FF66ED4A-6303-4BE6-8EF4-63C28B112680:t".to_owned()],
+            vec![format!("sakala/project-{}:t", PROJECT.replace('-', ""))],
+            vec!["sakala/project-not-a-uuid:t".to_owned()],
+            vec![format!("registry.example/sakala/project-{PROJECT}:t")],
+            vec![format!("sakala/project-{PROJECT}-x:t")],
+        ] {
+            assert_eq!(repository_project(&references), None, "{references:?}");
+        }
+    }
+
+    #[test]
+    fn unlabelled_images_named_in_a_project_repository_join_the_listing() {
+        let labelled = vec![named("labelled", &[&format!("sakala/project-{PROJECT}:a")])];
+        let all = vec![
+            named("labelled", &[&format!("sakala/project-{PROJECT}:a")]),
+            named("legacy", &[&format!("sakala/project-{PROJECT}:b")]),
+            named("other", &[&format!("sakala/project-{OTHER}:c")]),
+            named(
+                "mixed",
+                &[&format!("sakala/project-{PROJECT}:d"), "nginx:latest"],
+            ),
+            named("foreign", &["caddy:2.11.3-alpine"]),
+            named("dangling", &[]),
+        ];
+        let ids = |listed: &[ListedImage]| {
+            listed
+                .iter()
+                .map(|image| image.id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&with_named_images(labelled.clone(), all.clone(), None)),
+            ["labelled", "legacy", "other", "mixed"]
+        );
+        let project = Uuid::parse_str(PROJECT).expect("uuid");
+        let scoped = with_named_images(labelled, all, Some(project));
+        assert_eq!(ids(&scoped), ["labelled", "legacy", "mixed"]);
+        assert_eq!(
+            scoped[2].references,
+            [
+                format!("sakala/project-{PROJECT}:d"),
+                "nginx:latest".to_owned()
+            ],
+            "every name is kept, so ownership is decided on all of them"
+        );
+    }
+
+    #[test]
+    fn only_an_image_without_any_project_label_is_adopted_by_its_names() {
+        let listed = vec![
+            named("legacy", &[&format!("sakala/project-{PROJECT}:a")]),
+            named(
+                "mixed",
+                &[&format!("sakala/project-{PROJECT}:b"), "nginx:latest"],
+            ),
+            named("invalid-label", &[&format!("sakala/project-{PROJECT}:c")]),
+            named("other-label", &[&format!("sakala/project-{PROJECT}:d")]),
+        ];
+        let mut inspected = vec![
+            unlabelled("legacy", "2026-01-01T00:00:00Z"),
+            unlabelled("mixed", "2026-01-01T00:00:00Z"),
+            image("invalid-label", "not-a-uuid", "2026-01-01T00:00:00Z"),
+            image("other-label", OTHER, "2026-01-01T00:00:00Z"),
+        ];
+        adopt_unlabelled_images(&listed, &mut inspected);
+        let projects = inspected
+            .iter()
+            .map(|image| image.project_id)
+            .collect::<Vec<_>>();
+        let project = Uuid::parse_str(PROJECT).expect("uuid");
+        let other = Uuid::parse_str(OTHER).expect("uuid");
+        assert_eq!(projects, [Some(project), None, None, Some(other)]);
+    }
+
+    /// Railpack images of an earlier Agent: no labels, a live one, a previous
+    /// one, an older one, and the images of a project that is gone.
+    #[test]
+    fn adopted_images_follow_the_same_keep_rules() {
+        let inspected_before = [
+            unlabelled("old", "2026-01-01T00:00:00Z"),
+            unlabelled("previous", "2026-01-02T00:00:00Z"),
+            unlabelled("live", "2026-01-03T00:00:00Z"),
+            unlabelled("stopped", "2026-01-04T00:00:00Z"),
+            unlabelled("gone", "2026-01-01T00:00:00Z"),
+            unlabelled("shared", "2026-01-01T00:00:00Z"),
+        ];
+        let listed = vec![
+            named("old", &[&format!("sakala/project-{PROJECT}:old")]),
+            named(
+                "previous",
+                &[&format!("sakala/project-{PROJECT}:previous-one")],
+            ),
+            named("live", &[&format!("sakala/project-{PROJECT}:live")]),
+            named("stopped", &[&format!("sakala/project-{PROJECT}:stopped")]),
+            named("gone", &[&format!("sakala/project-{OTHER}:gone")]),
+            named(
+                "shared",
+                &[&format!("sakala/project-{OTHER}:x"), "nginx:latest"],
+            ),
+        ];
+        let mut inspected = inspected_before.to_vec();
+        adopt_unlabelled_images(&listed, &mut inspected);
+        // A sleeping replica keeps its image as much as a running one does.
+        let usage = usage(&["live", "stopped"], &[PROJECT]);
+        let stale = select_stale_images(
+            &listed,
+            &inspected,
+            &usage,
+            at("2026-02-01T00:00:00Z"),
+            RETENTION,
+        );
+        assert_eq!(chosen(&stale), ["old", "gone"]);
+        assert_eq!(
+            stale[1].references,
+            [format!("sakala/project-{OTHER}:gone")]
+        );
     }
 }

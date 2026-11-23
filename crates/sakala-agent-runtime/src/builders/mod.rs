@@ -315,23 +315,27 @@ impl ImageBuilder for ImageBuildService {
                         .as_ref()
                         .map(|workspace| workspace.package_directory().to_owned()),
                 };
+                let unlabelled = crate::railpack::unlabelled_reference(&request.image);
                 let build = with_build_secrets(
                     crate::railpack::build_command(
                         context,
                         &plan,
-                        &request.image,
+                        &unlabelled,
                         &self.railpack_frontend,
                         request.project_id,
-                        &image_labels::image_labels(
-                            request.project_id,
-                            request.deployment_id,
-                            &output,
-                        ),
                         self.secrets_fingerprint(&environment).as_deref(),
                     ),
                     &environment,
                 );
                 run_checked(self.runner.as_ref(), &build, "railpack-build", reporter).await?;
+                crate::railpack::label_image(
+                    &self.runner,
+                    reporter,
+                    &unlabelled,
+                    &request.image,
+                    &image_labels::image_labels(request.project_id, request.deployment_id, &output),
+                )
+                .await?;
                 output
             }
             DeploymentBuilder::Auto => unreachable!("auto builder must be resolved before build"),

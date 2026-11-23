@@ -2,18 +2,16 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::{
-    CommandSpec,
-    builders::{with_image_labels, with_tenant_isolation},
-};
+use crate::{CommandSpec, builders::with_tenant_isolation};
 
+/// `image` is where the build lands without labels: Railpack's frontend
+/// ignores `--label`, so [`super::label_image`] writes them afterwards.
 pub fn build_command(
     source: &Path,
     plan: &Path,
     image: &str,
     frontend: &str,
     project_id: Uuid,
-    labels: &[String],
     secrets_fingerprint: Option<&str>,
 ) -> CommandSpec {
     let command = CommandSpec::new("docker")
@@ -35,10 +33,10 @@ pub fn build_command(
             .arg("--build-arg")
             .arg(format!("secrets-hash={fingerprint}"));
     }
-    let command = command
+    command
         .arg("--file")
         .arg(plan.as_os_str())
         .arg("--tag")
-        .arg(image);
-    with_image_labels(command, labels).arg(source.as_os_str())
+        .arg(image)
+        .arg(source.as_os_str())
 }

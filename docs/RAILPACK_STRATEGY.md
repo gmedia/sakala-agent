@@ -78,9 +78,14 @@ docker buildx build \
   --build-arg cache-key=PROJECT_ID \
   --build-arg BUILDKIT_SYNTAX=ghcr.io/railwayapp/railpack-frontend:v0.23.0 \
   --file railpack-plan.json \
-  --tag IMAGE_NAME \
+  --tag IMAGE_NAME-unlabelled \
   APP_DIR
 ```
+
+Frontend Railpack mengabaikan `--label`, jadi label Sakala ditulis sesudahnya dengan
+`docker container commit --change 'LABEL ...'` ke `IMAGE_NAME`, lalu nama
+`-unlabelled` dihapus. Detailnya ada di
+[Label image Railpack](DOCKER_RUNTIME.md#label-image-railpack).
 
 `--load` wajib untuk builder lokal agar hasil build tersedia bagi `docker run`. Railpack di image sandbox dan frontend harus memakai versi kompatibel; operator dapat mengganti pin melalui `SAKALA_RAILPACK_FRONTEND`.
 

@@ -1402,6 +1402,83 @@ async fn clean_images(executor: &DockerRuntimeExecutor) -> CommandOutput {
     .expect("approved cleanup should complete")
 }
 
+/// Railpack images of earlier Agents have no labels at all. Image GC finds
+/// them by their names, and applies the same rules: the active and the
+/// previous image stay, and an image with a name outside the project's
+/// repository is never touched.
+#[tokio::test]
+async fn approved_image_cleanup_also_collects_unlabelled_images_by_their_names() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project = Uuid::new_v4();
+    let deleted = Uuid::new_v4();
+    let own = |tag: &str| format!("sakala/project-{project}:{tag}");
+    let (old, previous, shared) = (own("old"), own("previous-one"), own("shared"));
+    let gone = format!("sakala/project-{deleted}:gone");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps("active-container\n")
+            .with_images(&[("sha256:active", project, "2020-01-03T00:00:00Z", 3_000)])
+            .with_unlabelled_images(&[
+                ("sha256:old", &[old.as_str()], "2020-01-01T00:00:00Z", 1_000),
+                (
+                    "sha256:previous",
+                    &[previous.as_str()],
+                    "2020-01-02T00:00:00Z",
+                    2_000,
+                ),
+                (
+                    "sha256:shared",
+                    &[shared.as_str(), "nginx:latest"],
+                    "2020-01-01T00:00:00Z",
+                    4_000,
+                ),
+                (
+                    "sha256:gone",
+                    &[gone.as_str()],
+                    "2020-01-01T00:00:00Z",
+                    5_000,
+                ),
+                (
+                    "sha256:caddy",
+                    &["caddy:2.11.3-alpine"],
+                    "2020-01-01T00:00:00Z",
+                    6_000,
+                ),
+            ])
+            .with_image_users(format!("sha256:active\t{project}\n")),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = clean_images(&executor).await;
+
+    let mut removals = image_removals(&runner);
+    removals.sort();
+    let mut expected = vec![vec![gone], vec![old]];
+    expected.sort();
+    assert_eq!(removals, expected);
+    assert_eq!(output.result["removed_images"], 2);
+    assert_eq!(output.result["reclaimed_image_bytes"], 6_000);
+    let commands = runner.commands.lock().expect("command lock");
+    let inspected = commands
+        .iter()
+        .filter(|command| {
+            command
+                .args
+                .first()
+                .is_some_and(|argument| argument == "image")
+                && command
+                    .args
+                    .get(1)
+                    .is_some_and(|argument| argument == "inspect")
+        })
+        .flat_map(string_arguments)
+        .collect::<Vec<_>>();
+    assert!(
+        !inspected.contains(&"sha256:caddy".to_owned()),
+        "an image outside every project repository is not even inspected"
+    );
+}
+
 /// Every deployment image keeps its own tag, so none is ever dangling and
 /// `docker image prune` without `-a` removed nothing at all.
 #[tokio::test]
@@ -4636,13 +4713,14 @@ async fn deploy_outcome(
     dispatch(executor, command, reporter).await
 }
 
-/// The positional context comes right after the labels. Secrets follow it.
+/// The positional context comes right after the tag, or after the labels
+/// when the build writes any. Secrets follow it.
 fn build_context(arguments: &[String]) -> &str {
-    let label = arguments
+    let last_option = arguments
         .iter()
-        .rposition(|argument| argument == "--label")
-        .expect("image labels");
-    &arguments[label + 2]
+        .rposition(|argument| argument == "--label" || argument == "--tag")
+        .expect("image tag");
+    &arguments[last_option + 2]
 }
 
 fn is_docker_run(spec: &CommandSpec) -> bool {
@@ -6856,20 +6934,148 @@ async fn a_workspace_build_labels_its_builder_and_package_directory() {
         .await
         .expect("deployment completes");
 
-    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    let commit = string_arguments(&find_command(&runner, is_image_commit));
     for label in [
-        "dev.sakala.managed=true",
-        "dev.sakala.project-id=ff66ed4a-6303-4be6-8ef4-63c28b112680",
-        "dev.sakala.deployment-id=4f1f21ef-730d-42d5-a46d-d965353cb993",
-        "dev.sakala.builder=railpack",
-        "dev.sakala.package-directory=apps/web",
+        "LABEL dev.sakala.managed=\"true\"",
+        "LABEL dev.sakala.project-id=\"ff66ed4a-6303-4be6-8ef4-63c28b112680\"",
+        "LABEL dev.sakala.deployment-id=\"4f1f21ef-730d-42d5-a46d-d965353cb993\"",
+        "LABEL dev.sakala.builder=\"railpack\"",
+        "LABEL dev.sakala.package-directory=\"apps/web\"",
     ] {
-        let position = build
+        let position = commit
             .iter()
             .position(|argument| argument == label)
-            .unwrap_or_else(|| panic!("{label} missing from {build:?}"));
-        assert_eq!(build[position - 1], "--label");
+            .unwrap_or_else(|| panic!("{label} missing from {commit:?}"));
+        assert_eq!(commit[position - 1], "--change");
     }
+    assert_eq!(commit.last().map(String::as_str), Some(BUILT_IMAGE));
+}
+
+fn is_image_commit(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec
+            .args
+            .first()
+            .is_some_and(|argument| argument == "container")
+        && spec
+            .args
+            .get(1)
+            .is_some_and(|argument| argument == "commit")
+}
+
+fn is_label_container(spec: &CommandSpec, action: &str) -> bool {
+    spec.program == "docker"
+        && spec
+            .args
+            .first()
+            .is_some_and(|argument| argument == "container")
+        && spec.args.get(1).is_some_and(|argument| argument == action)
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument.to_string_lossy().starts_with("sakala-label-"))
+}
+
+/// Railpack's frontend ignores `--label`, so a Railpack build lands under a
+/// name of its own and gets its labels from a commit that names the image
+/// the deployment runs.
+#[tokio::test]
+async fn a_railpack_image_gets_its_labels_from_a_commit_after_the_build() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false));
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("deployment completes");
+
+    let unlabelled = format!("{BUILT_IMAGE}-unlabelled");
+    let build = string_arguments(&find_command(&runner, is_buildx_build));
+    assert!(
+        !build.iter().any(|argument| argument == "--label"),
+        "{build:?}"
+    );
+    let tag = build
+        .iter()
+        .position(|argument| argument == "--tag")
+        .expect("tag");
+    assert_eq!(build[tag + 1], unlabelled);
+
+    let create = string_arguments(&find_command(&runner, |spec| {
+        is_label_container(spec, "create")
+    }));
+    assert_eq!(create.last(), Some(&unlabelled));
+    assert!(
+        create.windows(2).any(|pair| pair == ["--pull", "never"]),
+        "{create:?}"
+    );
+    assert!(
+        !create.iter().any(|argument| argument == "--label"),
+        "the container must not look like a Sakala workload: {create:?}"
+    );
+    let container = create[create.len() - 2].clone();
+    let commit = string_arguments(&find_command(&runner, is_image_commit));
+    assert_eq!(
+        commit[commit.len() - 2..],
+        [container.clone(), BUILT_IMAGE.to_owned()]
+    );
+
+    let commands = runner.commands.lock().expect("command lock").clone();
+    let index = |matches: &dyn Fn(&CommandSpec) -> bool| {
+        commands.iter().position(matches).expect("command ran")
+    };
+    let built = index(&is_buildx_build);
+    let created = index(&|spec| is_label_container(spec, "create"));
+    let committed = index(&is_image_commit);
+    let removed_container = index(&|spec| is_label_container(spec, "rm"));
+    let removed_unlabelled = index(&|spec| {
+        string_arguments(spec) == ["image".to_owned(), "rm".to_owned(), unlabelled.clone()]
+    });
+    let started = index(&is_workload_run);
+    assert!(built < created && created < committed, "{commands:?}");
+    assert!(committed < removed_container && removed_container < removed_unlabelled);
+    assert!(removed_unlabelled < started);
+    assert!(string_arguments(&commands[removed_container]).contains(&"--volumes".to_owned()));
+}
+
+/// An unlabelled image would never be reused, rolled back to, or collected,
+/// so a failed commit fails the build, and nothing of it stays behind.
+#[tokio::test]
+async fn a_railpack_image_that_cannot_be_labelled_fails_the_build_and_is_cleaned_up() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(false).with_failed_image_label());
+
+    let error = deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("railpack"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("an unlabelled image must not be deployed");
+
+    assert_eq!(error.code(), "runtime_build_failed");
+    assert!(
+        error.to_string().contains("railpack-label failed"),
+        "{error}"
+    );
+    assert_eq!(runner.count_commands(is_workload_run), 0);
+    assert_eq!(
+        runner.count_commands(|spec| is_label_container(spec, "rm")),
+        1
+    );
+    let unlabelled = format!("{BUILT_IMAGE}-unlabelled");
+    assert!(
+        image_removals(&runner)
+            .iter()
+            .any(|removal| removal.as_slice() == std::slice::from_ref(&unlabelled)),
+        "{:?}",
+        image_removals(&runner)
+    );
 }
 
 async fn dispatch<R>(
@@ -7109,6 +7315,9 @@ struct FakeRunner {
     previous_containers: HashMap<String, String>,
     fail_previous_stop: bool,
     image_list_stdout: String,
+    /// Rows only an unfiltered `docker image ls` prints: images without the
+    /// managed label.
+    unlabelled_image_list_stdout: String,
     image_inspect_stdout: String,
     image_users_stdout: String,
     /// `docker container inspect` of a project's containers after a cutover:
@@ -7116,6 +7325,7 @@ struct FakeRunner {
     project_containers_stdout: String,
     /// Fails `docker image inspect` of the image inventory, not of reuse.
     fail_image_inventory: bool,
+    fail_image_label: bool,
     follow_delay: Option<Duration>,
     follow_lines: Vec<String>,
     live_caddy: AtomicBool,
@@ -7388,10 +7598,12 @@ impl FakeRunner {
             previous_containers: HashMap::new(),
             fail_previous_stop: false,
             image_list_stdout: String::new(),
+            unlabelled_image_list_stdout: String::new(),
             image_inspect_stdout: String::new(),
             image_users_stdout: String::new(),
             project_containers_stdout: String::new(),
             fail_image_inventory: false,
+            fail_image_label: false,
             follow_delay: None,
             follow_lines: Vec::new(),
             live_caddy: AtomicBool::new(true),
@@ -7691,9 +7903,27 @@ impl FakeRunner {
         self.image_inspect_stdout = images
             .iter()
             .map(|(id, project, created, size)| {
-                format!("{id}\t{project}\t<no value>\t{created}\t{size}\n")
+                format!(
+                    "{id}\t{created}\t{size}\t{{\"Labels\":{{\"dev.sakala.managed\":\"true\",\"dev.sakala.project-id\":\"{project}\"}}}}\n"
+                )
             })
             .collect();
+        self
+    }
+
+    /// Images without any label, as earlier Agents left Railpack images.
+    /// `images` holds `(id, names, created, size)`. Only an unfiltered listing
+    /// prints them.
+    fn with_unlabelled_images(mut self, images: &[(&str, &[&str], &str, u64)]) -> Self {
+        for (id, names, created, size) in images {
+            for name in *names {
+                let (repository, tag) = name.rsplit_once(':').expect("repository:tag");
+                self.unlabelled_image_list_stdout
+                    .push_str(&format!("{id}\t{repository}\t{tag}\n"));
+            }
+            self.image_inspect_stdout
+                .push_str(&format!("{id}\t{created}\t{size}\t{{\"Cmd\":[\"sh\"]}}\n"));
+        }
         self
     }
 
@@ -7711,6 +7941,11 @@ impl FakeRunner {
 
     fn with_failed_image_inventory(mut self) -> Self {
         self.fail_image_inventory = true;
+        self
+    }
+
+    fn with_failed_image_label(mut self) -> Self {
+        self.fail_image_label = true;
         self
     }
 
@@ -7803,6 +8038,14 @@ impl ProcessRunner for FakeRunner {
                         spec.args.last().expect("image").to_string_lossy()
                     ),
                 },
+            });
+        }
+        if self.fail_image_label && is_image_commit(spec) {
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "Error response from daemon: simulated commit failure".to_owned(),
             });
         }
         let previous_stop = spec.program == "docker"
@@ -8099,7 +8342,15 @@ impl ProcessRunner for FakeRunner {
                 .is_some_and(|argument| argument == "image")
             && spec.args.iter().any(|argument| argument == "ls")
         {
-            &self.image_list_stdout
+            if spec.args.iter().any(|argument| argument == "--filter") {
+                &self.image_list_stdout
+            } else {
+                scripted_state = format!(
+                    "{}{}",
+                    self.image_list_stdout, self.unlabelled_image_list_stdout
+                );
+                &scripted_state
+            }
         } else if spec.program == "docker" && spec.args.iter().any(|argument| argument == "logs") {
             "application listening\n"
         } else if spec.program == "df" {
