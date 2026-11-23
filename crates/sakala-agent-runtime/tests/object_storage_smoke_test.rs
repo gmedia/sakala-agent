@@ -130,13 +130,15 @@ fn docker(arguments: &[&str]) -> std::process::Output {
         .expect("docker runs")
 }
 
-fn docker_ok(arguments: &[&str]) -> String {
+/// Runs docker and returns its stdout. A failure names only `what` and the
+/// exit status: arguments and stderr can carry key file paths and presigned
+/// URLs, so they never reach the test output.
+fn docker_ok(what: &str, arguments: &[&str]) -> String {
     let output = docker(arguments);
     assert!(
         output.status.success(),
-        "docker {}: {}",
-        arguments.first().copied().unwrap_or_default(),
-        String::from_utf8_lossy(&output.stderr)
+        "docker could not {what} ({:?}); rerun the step by hand to see its output",
+        output.status.code()
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -144,55 +146,58 @@ fn docker_ok(arguments: &[&str]) -> String {
 fn start_rustfs(secrets: &Path, data: &Path) -> Container {
     let _ = docker(&["rm", "-f", CONTAINER]);
     let image = std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_owned());
-    let access = format!(
+    let access_key_mount = format!(
         "{}:/run/secrets/rustfs-access-key:ro",
         secrets.join("access-key").display()
     );
-    let secret = format!(
+    let root_key_mount = format!(
         "{}:/run/secrets/rustfs-secret-key:ro",
         secrets.join("secret-key").display()
     );
     let volume = format!("{}:/data", data.display());
-    docker_ok(&[
-        "run",
-        "-d",
-        "--name",
-        CONTAINER,
-        "--read-only",
-        "--tmpfs",
-        "/tmp:size=64m,mode=1777",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges:true",
-        "--ulimit",
-        "nofile=65536:65536",
-        "-e",
-        "RUSTFS_VOLUMES=/data",
-        "-e",
-        &format!("RUSTFS_ADDRESS={S3_ADDRESS}"),
-        "-e",
-        "RUSTFS_REGION=us-east-1",
-        "-e",
-        "RUSTFS_CONSOLE_ENABLE=false",
-        "-e",
-        "RUSTFS_ACCESS_KEY_FILE=/run/secrets/rustfs-access-key",
-        "-e",
-        "RUSTFS_SECRET_KEY_FILE=/run/secrets/rustfs-secret-key",
-        "-e",
-        "RUSTFS_OBS_LOG_DIRECTORY=",
-        "-e",
-        "RUSTFS_OBS_LOGGER_LEVEL=info",
-        "-e",
-        "RC_CONFIG_DIR=/tmp/rc",
-        "-v",
-        &access,
-        "-v",
-        &secret,
-        "-v",
-        &volume,
-        &image,
-    ]);
+    docker_ok(
+        "start the RustFS container",
+        &[
+            "run",
+            "-d",
+            "--name",
+            CONTAINER,
+            "--read-only",
+            "--tmpfs",
+            "/tmp:size=64m,mode=1777",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--ulimit",
+            "nofile=65536:65536",
+            "-e",
+            "RUSTFS_VOLUMES=/data",
+            "-e",
+            &format!("RUSTFS_ADDRESS={S3_ADDRESS}"),
+            "-e",
+            "RUSTFS_REGION=us-east-1",
+            "-e",
+            "RUSTFS_CONSOLE_ENABLE=false",
+            "-e",
+            "RUSTFS_ACCESS_KEY_FILE=/run/secrets/rustfs-access-key",
+            "-e",
+            "RUSTFS_SECRET_KEY_FILE=/run/secrets/rustfs-secret-key",
+            "-e",
+            "RUSTFS_OBS_LOG_DIRECTORY=",
+            "-e",
+            "RUSTFS_OBS_LOGGER_LEVEL=info",
+            "-e",
+            "RC_CONFIG_DIR=/tmp/rc",
+            "-v",
+            &access_key_mount,
+            "-v",
+            &root_key_mount,
+            "-v",
+            &volume,
+            &image,
+        ],
+    );
     Container
 }
 
@@ -297,17 +302,20 @@ fn presign(tenant: &Tenant, path: &str) -> String {
 }
 
 fn anonymous_status(target: &str) -> u16 {
-    let output = docker_ok(&[
-        "exec",
-        CONTAINER,
-        "curl",
-        "-sS",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code}",
-        target,
-    ]);
+    let output = docker_ok(
+        "send an anonymous request",
+        &[
+            "exec",
+            CONTAINER,
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            target,
+        ],
+    );
     output.trim().parse().expect("status")
 }
 
@@ -554,13 +562,16 @@ async fn the_object_storage_role_isolates_tenants_on_a_real_rustfs() {
     assert_eq!(anonymous_status(&presigned), 200);
 
     // The hard quota (6 MiB) refuses a single PUT over it...
-    docker_ok(&[
-        "exec",
-        CONTAINER,
-        "sh",
-        "-c",
-        "head -c 7340032 /dev/zero > /tmp/seven-mib; head -c 5242880 /dev/urandom > /tmp/part-one; head -c 2097152 /dev/urandom > /tmp/part-two",
-    ]);
+    docker_ok(
+        "write the upload test files",
+        &[
+            "exec",
+            CONTAINER,
+            "sh",
+            "-c",
+            "head -c 7340032 /dev/zero > /tmp/seven-mib; head -c 5242880 /dev/urandom > /tmp/part-one; head -c 2097152 /dev/urandom > /tmp/part-two",
+        ],
+    );
     let too_big = put(
         &a,
         &format!("{}/too-big", a.bucket),
