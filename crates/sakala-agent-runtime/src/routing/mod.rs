@@ -54,6 +54,13 @@ pub trait RouteManager: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The deployments whose route is the sleeping page: the project was put to
+    /// sleep with that deployment active, and its stopped containers are kept
+    /// for the wake. Read-only.
+    async fn sleeping_routes(&self) -> Result<HashSet<RouteIdentity>, RuntimeError> {
+        Ok(HashSet::new())
+    }
+
     async fn activate(
         &self,
         route: &RouteSpec,

@@ -88,6 +88,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             info!(
                 inspected_containers = report.inspected_containers,
                 discovered_workloads = report.workloads.len(),
+                sleeping_workloads = report.sleeping_workloads.len(),
                 orphaned_containers = report.orphans.len(),
                 cleaned_workspaces = report.cleaned_workspaces,
                 reattached_log_followers = report.reattached_log_followers,

@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, num::NonZeroU32, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
@@ -7,7 +12,7 @@ use sakala_agent_protocol::{
 };
 use uuid::Uuid;
 
-use crate::{RuntimeError, RuntimeReporter};
+use crate::{RuntimeError, RuntimeReporter, routing::RouteIdentity};
 use sakala_agent_core::ports::{
     RuntimeCapacity, RuntimeHealthSnapshot, RuntimeNetworkReconciliation,
     RuntimeReconciliationReport, RuntimeStaleImage,
@@ -158,7 +163,14 @@ pub trait ContainerEngine: Send + Sync {
         replicas: NonZeroU32,
     ) -> Result<(), RuntimeError>;
 
-    async fn detect_orphans(&self) -> Result<RuntimeReconciliationReport, RuntimeError>;
+    /// Sorts every managed container into running workloads, sleeping
+    /// workloads, and orphans. A stopped container is sleeping when
+    /// `sleeping_routes` holds its project and deployment, and an orphan
+    /// otherwise.
+    async fn detect_orphans(
+        &self,
+        sleeping_routes: &HashSet<RouteIdentity>,
+    ) -> Result<RuntimeReconciliationReport, RuntimeError>;
 
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError>;
 

@@ -1783,8 +1783,8 @@ async fn directory_check(name: &str, path: &std::path::Path, fatal: bool) -> Run
 }
 
 /// A serving route needs a running workload. A sleeping route needs only its
-/// container, which stays `exited` while the project sleeps and is listed with
-/// the orphans for that reason.
+/// container, in any state: the stopped one it keeps for the wake, or one that
+/// is still listed with the orphans.
 fn known_routes(report: &RuntimeReconciliationReport) -> KnownRoutes {
     let serving = report
         .workloads
@@ -1798,6 +1798,7 @@ fn known_routes(report: &RuntimeReconciliationReport) -> KnownRoutes {
     let sleeping = report
         .workloads
         .iter()
+        .chain(&report.sleeping_workloads)
         .map(|workload| (Some(workload.project_id), Some(workload.deployment_id)))
         .chain(
             report
@@ -1823,7 +1824,8 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     }
 
     async fn reconcile(&self) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
-        let mut report = self.containers.detect_orphans().await?;
+        let sleeping_routes = self.routes.sleeping_routes().await?;
+        let mut report = self.containers.detect_orphans(&sleeping_routes).await?;
         let known_routes = known_routes(&report);
         report.stale_routes = self.routes.discover_stale_routes(&known_routes).await?;
         report.stale_images = self
@@ -2173,7 +2175,8 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     reclaimed_image_bytes += images.reclaimed_bytes;
                 }
                 RuntimeCleanupTarget::StaleRoutes => {
-                    let discovered = self.containers.detect_orphans().await?;
+                    let sleeping_routes = self.routes.sleeping_routes().await?;
+                    let discovered = self.containers.detect_orphans(&sleeping_routes).await?;
                     let known_routes = known_routes(&discovered);
                     cleaned_routes += self
                         .routes
