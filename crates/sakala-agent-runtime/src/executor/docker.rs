@@ -1135,13 +1135,32 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let workloads = self.workloads(&request).await?;
-        // A sleeping deployment stays asleep; a running one gets every replica
-        // back, including one that stopped on its own.
-        if !workloads.iter().any(ManagedWorkload::is_running) {
-            return Err(RuntimeError::WorkloadNotRunning);
-        }
-        for workload in &workloads {
-            self.containers.restart(workload, 10).await?;
+        // A running deployment gets every replica back, including one that
+        // stopped on its own. A crashed one, where no replica runs because
+        // they exited or Docker is between two restarts of a crash loop, is
+        // started like a wake. A sleeping one stays asleep: its sleeping route
+        // is the local record of the sleep, the same one orphan detection
+        // reads, and the only thing that tells it apart from a crash.
+        if workloads.iter().any(ManagedWorkload::is_running) {
+            for workload in &workloads {
+                self.containers.restart(workload, 10).await?;
+            }
+        } else {
+            let identity = RouteIdentity {
+                project_id: request.project_id,
+                deployment_id: Some(request.deployment_id),
+            };
+            if self.routes.sleeping_routes().await?.contains(&identity) {
+                return Err(RuntimeError::WorkloadNotRunning);
+            }
+            let admission = self.container_admission.lock().await;
+            self.containers
+                .ensure_capacity(request.project_id, replica_count(workloads.len()))
+                .await?;
+            for workload in &workloads {
+                self.containers.restart(workload, 10).await?;
+            }
+            drop(admission);
         }
         let restarted = workloads
             .iter()

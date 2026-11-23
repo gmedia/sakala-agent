@@ -9731,3 +9731,58 @@ async fn lifecycle_commands_never_run_a_release_command() {
             })
     );
 }
+
+#[tokio::test]
+async fn restart_starts_a_crashed_workload_again() {
+    for status in ["Exited (1) 1 minute ago", "Restarting (1) 5 seconds ago"] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+            "crashed\t{status}\tportfolio.run.sakala.localhost\t3000\n"
+        )));
+        let config = runtime_config(&temp);
+        let route = route_path(&config, PROJECT);
+        let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+        let output = RuntimeExecutor::restart_project(
+            &executor,
+            lifecycle_request(),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{status}: restart should start it again: {error}"));
+
+        assert_eq!(output.result["status"], "ready");
+        assert!(route.exists());
+        assert_eq!(
+            commands_starting_with(&runner, "restart"),
+            [["restart", "--time", "10", "crashed"]],
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_refuses_a_sleeping_workload() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
+        "asleep\tExited (143) 2 hours ago\tportfolio.run.sakala.localhost\t3000\n",
+    ));
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::restart_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a sleeping project stays asleep");
+
+    assert_eq!(error.code(), "runtime_workload_not_running");
+    assert!(commands_starting_with(&runner, "restart").is_empty());
+    assert_eq!(
+        fs::read_to_string(route).expect("route"),
+        sleeping_route(PROJECT, DEPLOYMENT)
+    );
+}
