@@ -5,12 +5,16 @@ use sakala_agent_core::{
     AgentMode, NodeLifecycle,
     api::ApiClient,
     heartbeat,
-    ports::{DatabaseAdmin, RuntimeExecutor, RuntimePreflightReport, RuntimeReconciliationReport},
+    ports::{
+        DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor, RuntimePreflightReport,
+        RuntimeReconciliationReport,
+    },
     reporting::ApiRuntimeReporterFactory,
     scheduler,
 };
 use sakala_agent_runtime::{
     DockerRuntimeExecutor, NoopRuntimeExecutor, database::PostgresDatabaseAdmin,
+    object_storage::RcObjectStorageAdmin,
 };
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -79,6 +83,28 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 error_code = error.code(),
                 %error,
                 "managed PostgreSQL instance is not ready; database commands fail until it is"
+            ),
+        }
+    }
+    let object_storage = config.object_storage.map(|object_storage| {
+        let admin: Arc<dyn ObjectStorageAdmin> =
+            Arc::new(RcObjectStorageAdmin::new(object_storage.admin));
+        (admin, object_storage.identity)
+    });
+    if let Some((admin, identity)) = &object_storage {
+        // Not fatal: the instance may still be starting. The node reports
+        // `degraded` and bucket commands fail until it answers.
+        match admin.check().await {
+            Ok(()) => info!(
+                endpoint = %identity.endpoint,
+                region = %identity.region,
+                capacity_mb = identity.capacity_mb,
+                "managed object storage instance is reachable"
+            ),
+            Err(error) => warn!(
+                error_code = error.code(),
+                %error,
+                "managed object storage instance is not ready; bucket commands fail until it is"
             ),
         }
     }
@@ -187,6 +213,12 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             database: database.as_ref().map(|(admin, endpoint)| {
                 heartbeat::databases::DatabaseHeartbeat::new(Arc::clone(admin), endpoint.clone())
             }),
+            object_storage: object_storage.as_ref().map(|(admin, identity)| {
+                heartbeat::object_storage::ObjectStorageHeartbeat::new(
+                    Arc::clone(admin),
+                    identity.clone(),
+                )
+            }),
         },
         shutdown_rx.clone(),
     ));
@@ -196,7 +228,10 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         Arc::clone(&runtime),
         node_lifecycle,
         scheduler_metrics,
-        database.map(|(admin, _)| admin),
+        scheduler::poller::ResourceAdmins {
+            database: database.map(|(admin, _)| admin),
+            object_storage: object_storage.map(|(admin, _)| admin),
+        },
         shutdown_rx,
     ));
 

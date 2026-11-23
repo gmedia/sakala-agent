@@ -15,7 +15,7 @@ use crate::{
     api::ApiClient,
     commands::CommandDispatcher,
     logs::redactor::ValueRedactor,
-    ports::{CommandOutput, DatabaseAdmin, RuntimeExecutor, RuntimeReporter},
+    ports::{CommandOutput, DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor, RuntimeReporter},
     reporting::{
         ApiRuntimeReporter, ApiRuntimeReporterFactory, EventDelivery, EventDeliveryPolicy,
     },
@@ -34,6 +34,9 @@ const MIN_FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(10);
 
 /// Payload field of `CreateDatabase` and `RotateDatabasePassword`.
 const DATABASE_PASSWORD_FIELD: &str = "password";
+
+/// Payload field of `CreateBucket` and `RotateBucketKey`.
+const BUCKET_SECRET_FIELD: &str = "secret_access_key";
 
 pub struct CommandProcessor {
     client: ApiClient,
@@ -111,6 +114,19 @@ impl CommandProcessor {
     #[must_use]
     pub fn with_database_admin(mut self, database_admin: Arc<dyn DatabaseAdmin>) -> Self {
         self.dispatcher = self.dispatcher.with_database_admin(database_admin);
+        self
+    }
+
+    /// Lets the processor run managed object storage commands on an object
+    /// storage host.
+    #[must_use]
+    pub fn with_object_storage_admin(
+        mut self,
+        object_storage_admin: Arc<dyn ObjectStorageAdmin>,
+    ) -> Self {
+        self.dispatcher = self
+            .dispatcher
+            .with_object_storage_admin(object_storage_admin);
         self
     }
 
@@ -322,7 +338,7 @@ impl CommandProcessor {
             return Ok((
                 self.command_timeout,
                 LogBounds::default(),
-                ValueRedactor::new(command_password(command)),
+                ValueRedactor::new(command_secret(command)),
             ));
         }
         let payload = command.deploy_payload().map_err(|error| {
@@ -350,21 +366,17 @@ impl CommandProcessor {
     }
 }
 
-/// The tenant password a database command carries, hidden from its failure
-/// message like a deployment's environment values.
-fn command_password(command: &AgentCommand) -> Option<String> {
-    matches!(
-        command.command_type,
-        CommandType::CreateDatabase | CommandType::RotateDatabasePassword
-    )
-    .then(|| {
-        command
-            .payload
-            .get(DATABASE_PASSWORD_FIELD)?
-            .as_str()
-            .map(str::to_owned)
-    })
-    .flatten()
+/// The tenant credential a database or bucket command carries, hidden from its
+/// failure message like a deployment's environment values.
+fn command_secret(command: &AgentCommand) -> Option<String> {
+    let field = match command.command_type {
+        CommandType::CreateDatabase | CommandType::RotateDatabasePassword => {
+            DATABASE_PASSWORD_FIELD
+        }
+        CommandType::CreateBucket | CommandType::RotateBucketKey => BUCKET_SECRET_FIELD,
+        _ => return None,
+    };
+    command.payload.get(field)?.as_str().map(str::to_owned)
 }
 
 fn deferred_committed_output(
@@ -414,7 +426,7 @@ mod tests {
             CommandType::CreateDatabase,
             CommandType::RotateDatabasePassword,
         ] {
-            let password = command_password(&command(
+            let password = command_secret(&command(
                 command_type,
                 json!({ "role": "p_0123456789abcdef", "password": PASSWORD }),
             ));
@@ -427,7 +439,35 @@ mod tests {
             command(CommandType::CreateDatabase, json!({ "password": 7 })),
             command(CommandType::CreateDatabase, Value::Null),
         ] {
-            assert_eq!(command_password(&command), None);
+            assert_eq!(command_secret(&command), None);
+        }
+    }
+
+    #[test]
+    fn a_bucket_secret_is_redacted_from_the_failure_message() {
+        const SECRET: &str = "c2VjcmV0YWNjZXNza2V5dmFsdWUxMjM0NTY3ODkw";
+        for command_type in [CommandType::CreateBucket, CommandType::RotateBucketKey] {
+            let secret = command_secret(&command(
+                command_type,
+                json!({ "bucket": "b-0123456789abcdef", "secret_access_key": SECRET }),
+            ));
+            let redacted =
+                ValueRedactor::new(secret).redact(&format!("rc refused the secret {SECRET}"));
+            assert!(!redacted.contains(SECRET), "{command_type:?}: {redacted}");
+        }
+        for command in [
+            command(
+                CommandType::LockBucket,
+                json!({ "secret_access_key": SECRET }),
+            ),
+            command(CommandType::CreateBucket, json!({ "password": SECRET })),
+            command(
+                CommandType::CreateDatabase,
+                json!({ "secret_access_key": SECRET }),
+            ),
+            command(CommandType::RotateBucketKey, Value::Null),
+        ] {
+            assert_eq!(command_secret(&command), None);
         }
     }
 }

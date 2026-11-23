@@ -14,9 +14,18 @@ use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
     api::ApiClient,
     commands::CommandProcessor,
-    ports::{DatabaseAdmin, RuntimeExecutor},
+    ports::{DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor},
     scheduler::metrics::SchedulerMetrics,
 };
+
+/// The managed resource roles of a node, each `None` unless the node has it.
+#[derive(Clone, Default)]
+pub struct ResourceAdmins {
+    /// Managed PostgreSQL (`SAKALA_DATABASE_DRIVER`).
+    pub database: Option<Arc<dyn DatabaseAdmin>>,
+    /// Managed object storage (`SAKALA_OBJECT_STORAGE_DRIVER`).
+    pub object_storage: Option<Arc<dyn ObjectStorageAdmin>>,
+}
 
 pub async fn run(
     config: AgentConfig,
@@ -24,20 +33,23 @@ pub async fn run(
     runtime: Arc<dyn RuntimeExecutor>,
     node_lifecycle: Arc<NodeLifecycle>,
     metrics: Arc<SchedulerMetrics>,
-    database_admin: Option<Arc<dyn DatabaseAdmin>>,
+    admins: ResourceAdmins,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let handler = client.as_ref().map(|client| {
-        let processor = CommandProcessor::with_node_lifecycle(
+        let mut processor = CommandProcessor::with_node_lifecycle(
             client.clone(),
             runtime,
             config.command_timeout(),
             Arc::clone(&node_lifecycle),
         );
-        Arc::new(match database_admin {
-            Some(database_admin) => processor.with_database_admin(database_admin),
-            None => processor,
-        })
+        if let Some(database_admin) = admins.database {
+            processor = processor.with_database_admin(database_admin);
+        }
+        if let Some(object_storage_admin) = admins.object_storage {
+            processor = processor.with_object_storage_admin(object_storage_admin);
+        }
+        Arc::new(processor)
     });
     let mut executions =
         CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));

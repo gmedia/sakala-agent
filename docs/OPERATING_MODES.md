@@ -84,6 +84,14 @@ runtime mana pun: Agent mengelola satu instance PostgreSQL lokal untuk database
 terkelola dan mengiklankan capability `managed-postgres`. Host database khusus
 memakai driver runtime `noop`. Lihat [Database Host](DATABASE_HOST.md).
 
+### Peran object storage
+
+`SAKALA_OBJECT_STORAGE_DRIVER=rustfs` menambahkan peran host object storage di
+samping driver runtime dan peran database mana pun: Agent mengelola bucket terkelola
+di satu instance RustFS lewat `rc` di dalam container-nya dan mengiklankan
+capability `managed-s3`. VM storage khusus memakai driver runtime `noop`. Lihat
+[Object Storage Host](OBJECT_STORAGE_HOST.md).
+
 ## Topologi Caddy MVP
 
 Implementasi runtime saat ini memakai topologi referensi `sakala-infra`:

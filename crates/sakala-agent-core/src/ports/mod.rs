@@ -1,8 +1,10 @@
 mod database;
+mod object_storage;
 mod repository;
 mod runtime;
 
 pub use database::DatabaseAdmin;
+pub use object_storage::{BUCKET_USAGE_BUSY, ObjectStorageAdmin};
 pub use repository::{
     RepositoryCredential, RepositoryCredentialProvider, SecretString,
     UnavailableRepositoryCredentialProvider,

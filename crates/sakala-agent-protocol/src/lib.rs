@@ -6,6 +6,7 @@
 /// control plane can reject an incompatible agent before assigning work.
 pub const PROTOCOL_VERSION: u32 = 4;
 
+pub mod buckets;
 pub mod commands;
 pub mod databases;
 pub mod deployments;
@@ -18,6 +19,12 @@ pub mod placement;
 pub mod repositories;
 pub mod status;
 
+pub use buckets::{
+    AccessKeyId, BUCKET_NAME_PATTERN, BucketKeyPayload, BucketName, BucketPayloadError,
+    BucketQuotaMb, CreateBucketPayload, DeleteBucketPayload, MANAGED_S3_CAPABILITY,
+    ManagedBucketUsage, ObjectStorageMetadata, RotateBucketKeyPayload, SecretAccessKey,
+    SetBucketQuotaPayload,
+};
 pub use commands::{
     AgentCommand, CleanupRuntimePayload, CommandPoll, CommandType, CompleteCommandPayload,
     DesiredWorkloadState, ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,

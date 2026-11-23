@@ -3,9 +3,10 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    CommandStatus, CreateDatabasePayload, DatabasePayloadError, DatabaseTargetPayload,
-    DeployProjectPayload, DropDatabasePayload, InspectProjectPayload,
-    InstallDatabaseExtensionPayload, RotateDatabasePasswordPayload,
+    BucketKeyPayload, BucketPayloadError, CommandStatus, CreateBucketPayload,
+    CreateDatabasePayload, DatabasePayloadError, DatabaseTargetPayload, DeployProjectPayload,
+    DropDatabasePayload, InspectProjectPayload, InstallDatabaseExtensionPayload,
+    RotateBucketKeyPayload, RotateDatabasePasswordPayload, SetBucketQuotaPayload,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -98,6 +99,13 @@ pub enum CommandType {
     LockDatabase,
     UnlockDatabase,
     InstallDatabaseExtension,
+    /// Managed object storage, only on nodes that advertise `managed-s3`.
+    CreateBucket,
+    DeleteBucket,
+    RotateBucketKey,
+    SetBucketQuota,
+    LockBucket,
+    UnlockBucket,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -163,6 +171,23 @@ impl AgentCommand {
         &self,
     ) -> Result<InstallDatabaseExtensionPayload, DatabasePayloadError> {
         InstallDatabaseExtensionPayload::from_value(&self.payload)
+    }
+
+    pub fn create_bucket_payload(&self) -> Result<CreateBucketPayload, BucketPayloadError> {
+        CreateBucketPayload::from_value(&self.payload)
+    }
+
+    /// The payload of `DeleteBucket`, `LockBucket`, and `UnlockBucket`.
+    pub fn bucket_key_payload(&self) -> Result<BucketKeyPayload, BucketPayloadError> {
+        BucketKeyPayload::from_value(&self.payload)
+    }
+
+    pub fn rotate_bucket_key_payload(&self) -> Result<RotateBucketKeyPayload, BucketPayloadError> {
+        RotateBucketKeyPayload::from_value(&self.payload)
+    }
+
+    pub fn set_bucket_quota_payload(&self) -> Result<SetBucketQuotaPayload, BucketPayloadError> {
+        SetBucketQuotaPayload::from_value(&self.payload)
     }
 
     /// A missing or `null` payload reads as an empty object. An unknown `page`

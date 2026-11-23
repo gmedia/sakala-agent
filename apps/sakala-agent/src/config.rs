@@ -1,22 +1,31 @@
-use std::{collections::HashMap, env, fmt, str::FromStr, time::Duration};
+use std::{collections::HashMap, env, fmt, path::PathBuf, str::FromStr, time::Duration};
 
 use clap::Parser;
 use sakala_agent_core::{
     AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV,
-    heartbeat::metrics::{
-        DEFAULT_METRICS_INTERVAL, MAX_METRICS_INTERVAL, METRICS_INTERVAL_ENV, MIN_METRICS_INTERVAL,
+    heartbeat::{
+        metrics::{
+            DEFAULT_METRICS_INTERVAL, MAX_METRICS_INTERVAL, METRICS_INTERVAL_ENV,
+            MIN_METRICS_INTERVAL,
+        },
+        object_storage::ObjectStorageIdentity,
     },
     ports::SecretString,
 };
 use sakala_agent_protocol::{
     DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
-    MANAGED_POSTGRES_CAPABILITY,
+    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, Region,
 };
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
     TimeoutSafetyConfig,
     database::{DATABASE_ADMIN_DSN_ENV, PostgresAdminConfig},
+    object_storage::{
+        DEFAULT_OBJECT_STORAGE_CONTAINER, DEFAULT_OBJECT_STORAGE_DATA_DIR,
+        DEFAULT_OBJECT_STORAGE_MIN_FREE_MB, DEFAULT_OBJECT_STORAGE_REGION, RustfsAdminConfig,
+        check_container_name, check_public_endpoint,
+    },
     routing::{check_public_api_url, check_public_console_url},
 };
 
@@ -79,6 +88,54 @@ pub struct DatabaseHostConfig {
     pub endpoint: DatabaseEndpoint,
 }
 
+/// Turns on the object storage host role: `none` (default) or `rustfs`.
+const OBJECT_STORAGE_DRIVER_ENV: &str = "SAKALA_OBJECT_STORAGE_DRIVER";
+/// The container running RustFS, which holds the root key files.
+const OBJECT_STORAGE_CONTAINER_ENV: &str = "SAKALA_OBJECT_STORAGE_CONTAINER";
+/// Where tenants and browsers reach the instance, reported as
+/// `metadata.object_storage.endpoint`.
+const OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV: &str = "SAKALA_OBJECT_STORAGE_PUBLIC_ENDPOINT";
+/// The S3 signing region, equal to RustFS's `RUSTFS_REGION`.
+const OBJECT_STORAGE_REGION_ENV: &str = "SAKALA_OBJECT_STORAGE_REGION";
+/// The most all bucket quotas may add up to, in MiB.
+const OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV: &str = "SAKALA_OBJECT_STORAGE_TOTAL_QUOTA_MB";
+/// Disk to keep free when every bucket is full, in MiB.
+const OBJECT_STORAGE_MIN_FREE_MB_ENV: &str = "SAKALA_OBJECT_STORAGE_MIN_FREE_MB";
+/// The instance's data directory, read for free space.
+const OBJECT_STORAGE_DATA_DIR_ENV: &str = "SAKALA_OBJECT_STORAGE_DATA_DIR";
+
+/// Which object storage engine the agent administers, independent of the
+/// runtime and database drivers (ADR-021).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectStorageDriver {
+    #[default]
+    None,
+    Rustfs,
+}
+
+impl FromStr for ObjectStorageDriver {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "rustfs" => Ok(Self::Rustfs),
+            _ => Err(CoreError::InvalidConfiguration(format!(
+                "{OBJECT_STORAGE_DRIVER_ENV} must be none or rustfs, received {value}"
+            ))),
+        }
+    }
+}
+
+/// The object storage host role's settings, present only with
+/// `SAKALA_OBJECT_STORAGE_DRIVER=rustfs`. Holds no credential: the root key
+/// stays in the RustFS container.
+#[derive(Clone, Debug)]
+pub struct ObjectStorageHostConfig {
+    pub admin: RustfsAdminConfig,
+    pub identity: ObjectStorageIdentity,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
     #[default]
@@ -121,6 +178,8 @@ pub struct AppConfig {
     pub metrics_interval: Duration,
     /// `None` unless the node is a database host.
     pub database: Option<DatabaseHostConfig>,
+    /// `None` unless the node is an object storage host.
+    pub object_storage: Option<ObjectStorageHostConfig>,
     pub log_level: String,
     /// Settings that are set but no longer have any effect, for one startup
     /// warning each.
@@ -275,6 +334,27 @@ struct Cli {
 
     // SAKALA_DATABASE_ADMIN_DSN has no flag on purpose: it holds the superuser
     // password, which must not appear in the process arguments.
+    #[arg(long, env = OBJECT_STORAGE_DRIVER_ENV)]
+    object_storage_driver: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_CONTAINER_ENV)]
+    object_storage_container: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV)]
+    object_storage_public_endpoint: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_REGION_ENV)]
+    object_storage_region: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV)]
+    object_storage_total_quota_mb: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_MIN_FREE_MB_ENV)]
+    object_storage_min_free_mb: Option<String>,
+
+    #[arg(long, env = OBJECT_STORAGE_DATA_DIR_ENV)]
+    object_storage_data_dir: Option<String>,
+
     #[arg(long, env = "SAKALA_LOG_LEVEL")]
     log_level: Option<String>,
 }
@@ -449,6 +529,26 @@ pub fn load() -> Result<AppConfig, CoreError> {
         DATABASE_PUBLIC_PORT_ENV,
         cli.database_public_port,
     );
+    for (key, value) in [
+        (OBJECT_STORAGE_DRIVER_ENV, cli.object_storage_driver),
+        (OBJECT_STORAGE_CONTAINER_ENV, cli.object_storage_container),
+        (
+            OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV,
+            cli.object_storage_public_endpoint,
+        ),
+        (OBJECT_STORAGE_REGION_ENV, cli.object_storage_region),
+        (
+            OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV,
+            cli.object_storage_total_quota_mb,
+        ),
+        (
+            OBJECT_STORAGE_MIN_FREE_MB_ENV,
+            cli.object_storage_min_free_mb,
+        ),
+        (OBJECT_STORAGE_DATA_DIR_ENV, cli.object_storage_data_dir),
+    ] {
+        insert(&mut values, key, value);
+    }
     insert(&mut values, "SAKALA_LOG_LEVEL", cli.log_level);
 
     from_values(&values)
@@ -463,6 +563,10 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         agent
             .capabilities
             .push(MANAGED_POSTGRES_CAPABILITY.to_owned());
+    }
+    let object_storage = object_storage_host(values, agent.command_timeout())?;
+    if object_storage.is_some() {
+        agent.capabilities.push(MANAGED_S3_CAPABILITY.to_owned());
     }
     let resource_safety = resource_safety(values)?;
     let min_workspace_free_bytes = positive_u64(values, "SAKALA_MIN_WORKSPACE_FREE_MB", 1_024)?
@@ -561,6 +665,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         )?),
         metrics_interval: metrics_interval(values)?,
         database,
+        object_storage,
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -721,6 +826,84 @@ fn database_host(
         CoreError::InvalidConfiguration(format!("{key} {reason}"))
     })?;
     Ok(Some(DatabaseHostConfig { admin, endpoint }))
+}
+
+/// Reads the object storage host role. With `rustfs`, the public endpoint and
+/// the total quota are required and every value is checked now, so a typo stops
+/// the agent instead of failing every bucket command later.
+fn object_storage_host(
+    values: &HashMap<String, String>,
+    command_timeout: Duration,
+) -> Result<Option<ObjectStorageHostConfig>, CoreError> {
+    let driver: ObjectStorageDriver = get(values, OBJECT_STORAGE_DRIVER_ENV, "none")
+        .trim()
+        .parse()?;
+    if driver == ObjectStorageDriver::None {
+        return Ok(None);
+    }
+    let value = |key: &str| {
+        values
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    let invalid =
+        |key: &str, reason: &str| CoreError::InvalidConfiguration(format!("{key} {reason}"));
+    let required = |key: &str| {
+        value(key).ok_or_else(|| {
+            CoreError::InvalidConfiguration(format!(
+                "{key} is required when {OBJECT_STORAGE_DRIVER_ENV}=rustfs"
+            ))
+        })
+    };
+
+    let container = value(OBJECT_STORAGE_CONTAINER_ENV).unwrap_or(DEFAULT_OBJECT_STORAGE_CONTAINER);
+    check_container_name(container)
+        .map_err(|reason| invalid(OBJECT_STORAGE_CONTAINER_ENV, reason))?;
+    let endpoint = check_public_endpoint(required(OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV)?)
+        .map_err(|reason| invalid(OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV, reason))?;
+    let region =
+        Region::parse(value(OBJECT_STORAGE_REGION_ENV).unwrap_or(DEFAULT_OBJECT_STORAGE_REGION))
+            .map_err(|reason| invalid(OBJECT_STORAGE_REGION_ENV, &reason.to_string()))?;
+    let total_quota_mb = required(OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV)?
+        .parse::<u64>()
+        .ok()
+        .filter(|total| *total > 0)
+        .ok_or_else(|| {
+            invalid(
+                OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV,
+                "must be a whole number above 0",
+            )
+        })?;
+    let min_free_mb = match value(OBJECT_STORAGE_MIN_FREE_MB_ENV) {
+        None => DEFAULT_OBJECT_STORAGE_MIN_FREE_MB,
+        Some(min_free) => min_free
+            .parse::<u64>()
+            .map_err(|_| invalid(OBJECT_STORAGE_MIN_FREE_MB_ENV, "must be a whole number"))?,
+    };
+    let data_dir = PathBuf::from(
+        value(OBJECT_STORAGE_DATA_DIR_ENV).unwrap_or(DEFAULT_OBJECT_STORAGE_DATA_DIR),
+    );
+    if !data_dir.is_absolute() {
+        return Err(invalid(
+            OBJECT_STORAGE_DATA_DIR_ENV,
+            "must be an absolute path",
+        ));
+    }
+    Ok(Some(ObjectStorageHostConfig {
+        admin: RustfsAdminConfig {
+            container: container.to_owned(),
+            data_dir,
+            total_quota_mb,
+            min_free_mb,
+            command_timeout,
+        },
+        identity: ObjectStorageIdentity {
+            endpoint,
+            region,
+            capacity_mb: total_quota_mb,
+        },
+    }))
 }
 
 /// An empty value means unset, which leaves the choice to Docker. Other values become
@@ -1593,5 +1776,152 @@ mod tests {
         let config = from_values(&database_values(&[])).expect("config");
         let printed = format!("{config:?}");
         assert!(!printed.contains("admin-secret-value"), "{printed}");
+    }
+
+    fn object_storage_values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut values = HashMap::from([
+            (OBJECT_STORAGE_DRIVER_ENV.to_owned(), "rustfs".to_owned()),
+            (
+                OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV.to_owned(),
+                "https://s3.sakala.app".to_owned(),
+            ),
+            (
+                OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV.to_owned(),
+                "5120".to_owned(),
+            ),
+        ]);
+        for (key, value) in pairs {
+            values.insert((*key).to_owned(), (*value).to_owned());
+        }
+        values
+    }
+
+    #[test]
+    fn the_object_storage_role_is_off_by_default_and_none_means_off() {
+        for values in [
+            HashMap::new(),
+            HashMap::from([(OBJECT_STORAGE_DRIVER_ENV.to_owned(), "none".to_owned())]),
+            HashMap::from([(OBJECT_STORAGE_DRIVER_ENV.to_owned(), String::new())]),
+        ] {
+            let config = from_values(&values).expect("config");
+            assert!(config.object_storage.is_none());
+            assert!(
+                !config
+                    .agent
+                    .capabilities
+                    .contains(&MANAGED_S3_CAPABILITY.to_owned())
+            );
+        }
+        assert!(
+            from_values(&HashMap::from([(
+                OBJECT_STORAGE_DRIVER_ENV.to_owned(),
+                "minio".to_owned()
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_object_storage_host_advertises_managed_s3_next_to_its_runtime() {
+        let noop = from_values(&object_storage_values(&[])).expect("config");
+        assert_eq!(
+            noop.agent.capabilities,
+            ["noop-runtime", MANAGED_S3_CAPABILITY]
+        );
+        let object_storage = noop.object_storage.expect("object storage role");
+        assert_eq!(
+            object_storage.identity,
+            ObjectStorageIdentity {
+                endpoint: "https://s3.sakala.app".to_owned(),
+                region: Region::parse("us-east-1").expect("region"),
+                capacity_mb: 5_120,
+            }
+        );
+        assert_eq!(
+            object_storage.admin.container,
+            "sakala-object-storage-rustfs-1"
+        );
+        assert_eq!(
+            object_storage.admin.data_dir,
+            PathBuf::from("/var/lib/sakala/object-storage")
+        );
+        assert_eq!(object_storage.admin.total_quota_mb, 5_120);
+        assert_eq!(object_storage.admin.min_free_mb, 1_024);
+        assert_eq!(
+            object_storage.admin.command_timeout,
+            noop.agent.command_timeout()
+        );
+
+        let docker = from_values(&object_storage_values(&[
+            ("SAKALA_RUNTIME_DRIVER", "docker"),
+            (DATABASE_DRIVER_ENV, "postgres"),
+            (
+                DATABASE_ADMIN_DSN_ENV,
+                "host=/var/run/postgresql user=postgres",
+            ),
+            (DATABASE_PUBLIC_HOST_ENV, "10.0.47.10"),
+        ]))
+        .expect("config");
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&"docker-runtime".to_owned())
+        );
+        assert_eq!(
+            &docker.agent.capabilities[docker.agent.capabilities.len() - 2..],
+            [MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY]
+        );
+
+        let custom = from_values(&object_storage_values(&[
+            (OBJECT_STORAGE_CONTAINER_ENV, "rustfs"),
+            (OBJECT_STORAGE_REGION_ENV, "id-jog-1"),
+            (OBJECT_STORAGE_MIN_FREE_MB_ENV, "0"),
+            (OBJECT_STORAGE_DATA_DIR_ENV, "/srv/rustfs"),
+            (OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV, "http://127.0.0.1:9000"),
+        ]))
+        .expect("config")
+        .object_storage
+        .expect("object storage role");
+        assert_eq!(custom.admin.container, "rustfs");
+        assert_eq!(custom.identity.region.as_str(), "id-jog-1");
+        assert_eq!(custom.identity.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(custom.admin.min_free_mb, 0);
+        assert_eq!(custom.admin.data_dir, PathBuf::from("/srv/rustfs"));
+    }
+
+    #[test]
+    fn an_object_storage_host_refuses_to_start_on_missing_or_invalid_values() {
+        for (key, value) in [
+            (OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV, ""),
+            (OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV, "http://s3.sakala.app"),
+            (
+                OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV,
+                "https://s3.sakala.app/bucket",
+            ),
+            (
+                OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV,
+                "https://s3.sakala.app?x=1",
+            ),
+            (
+                OBJECT_STORAGE_PUBLIC_ENDPOINT_ENV,
+                "https://key:secret@s3.sakala.app",
+            ),
+            (OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV, ""),
+            (OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV, "0"),
+            (OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV, "-5"),
+            (OBJECT_STORAGE_TOTAL_QUOTA_MB_ENV, "5 GB"),
+            (OBJECT_STORAGE_MIN_FREE_MB_ENV, "-1"),
+            (OBJECT_STORAGE_CONTAINER_ENV, "-e"),
+            (OBJECT_STORAGE_CONTAINER_ENV, "rustfs;id"),
+            (OBJECT_STORAGE_REGION_ENV, "US-East-1"),
+            (OBJECT_STORAGE_DATA_DIR_ENV, "data"),
+        ] {
+            let error = from_values(&object_storage_values(&[(key, value)]))
+                .expect_err("invalid object storage host config")
+                .to_string();
+            assert!(error.contains(key), "{key}={value:?}: {error}");
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 }

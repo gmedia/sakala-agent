@@ -375,6 +375,33 @@ so an older API keeps the new keys without reading them.
 | --- | --- | --- |
 | `metadata.startup_reconciliation.sleeping_workloads` and `metadata.detail_counts.sleeping_workloads` | Sent, always. | Items `{ container_id, project_id, deployment_id, status }`, at most 50, for stopped containers of the deployment a project's sleeping route names. These were reported under `orphans` with reason `stale stopped deployment container` by Agent v0.15.0 and older; a stopped container no sleeping route names still is. `metadata.workloads.stopped` counts both, as before. See [Sakala Agent API](AGENT_API.md#heartbeat-payload). |
 
+## Revision 4 additions for managed object storage
+
+Still revision 4, but this release adds six command types (ADR-021). An older Agent
+fails to deserialize a poll response that holds one of them, so the API must only
+assign them to a node that advertises `managed-s3`, and must not raise
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS` for it. A new Agent with
+`SAKALA_OBJECT_STORAGE_DRIVER=none` (the default) changes nothing. A new Agent with
+`rustfs` against an older API sends heartbeat keys the API must ignore, and never
+receives bucket commands; check the API with the heartbeat example below before
+switching a node on.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `managed-s3` | Advertised when `SAKALA_OBJECT_STORAGE_DRIVER=rustfs`, after the runtime driver's capabilities and `managed-postgres`. | A dedicated storage VM runs `SAKALA_RUNTIME_DRIVER=noop`; a co-located node runs `docker` with the role. See [Object Storage Host](OBJECT_STORAGE_HOST.md). |
+| Command types `CreateBucket`, `DeleteBucket`, `RotateBucketKey`, `SetBucketQuota`, `LockBucket`, `UnlockBucket` | Handled by the object storage role, appended to `CommandType` in the API's order. | `project_id` and `deployment_id` are `null`. Buckets match `^b-[a-z0-9]{16,40}$`, access key IDs `^SK[A-Z0-9]{16,38}$`, secrets `^[A-Za-z0-9]{32,128}$`, and `quota_mb` is 1 to 1048576. Every command is idempotent, and a repeated `CreateBucket` never unlocks a locked key. Payloads, results, and semantics in [Sakala Agent API](AGENT_API.md#object-storage-host); example in `examples/commands/bucket-commands.json`. |
+| `error_code` values `bucket_name_invalid`, `bucket_key_invalid`, `bucket_quota_invalid`, `bucket_capacity_exceeded`, `bucket_admin_unavailable`, `bucket_not_found`, `bucket_conflict`, `bucket_operation_failed`, `bucket_outcome_unknown` | Sent on `fail` of bucket commands. | Additive. `bucket_outcome_unknown` (only `RotateBucketKey`) means the old secret may already be dead: resend the same command. Example bodies in `examples/failures/bucket-failures.json`. Meaning and suggested API handling in [Sakala Agent API](AGENT_API.md#kode-kegagalan-bucket). |
+| `metadata.object_storage` | Sent on every heartbeat of an object storage host. | `{ endpoint, region, capacity_mb, available }`. `available: false` also makes the node `degraded`. |
+| `metadata.buckets` and `metadata.detail_counts.buckets` | Sent after a fresh usage read, at most once per 60 s, bound 1000. | Items `{ name, size_bytes }`, managed buckets only, sorted by name. A heartbeat without them carries no new reading. Example in `examples/heartbeat/object-storage-host.json`. |
+| Lock semantics | `rc admin user disable`, not a policy detach. | rc 0.1.37 supports disable and enable, so the fallback in the contract (detach the policy and a `locked` hint on `CreateBucket`) is not needed. The key and the presigned URLs it signed are refused while locked. |
+
+New configuration: `SAKALA_OBJECT_STORAGE_DRIVER`, `SAKALA_OBJECT_STORAGE_CONTAINER`,
+`SAKALA_OBJECT_STORAGE_PUBLIC_ENDPOINT`, `SAKALA_OBJECT_STORAGE_REGION`,
+`SAKALA_OBJECT_STORAGE_TOTAL_QUOTA_MB`, `SAKALA_OBJECT_STORAGE_MIN_FREE_MB`,
+`SAKALA_OBJECT_STORAGE_DATA_DIR`, see [Configuration](CONFIGURATION.md) and
+[Object Storage Host](OBJECT_STORAGE_HOST.md). None of them holds a credential: the
+RustFS root key stays in the RustFS container.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.
