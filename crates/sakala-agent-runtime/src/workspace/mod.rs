@@ -47,6 +47,7 @@ pub fn validate_root_directory(root_directory: &str) -> Result<(), RuntimeError>
 }
 
 pub use git::GitWorkspaceManager;
+pub(crate) use git::parse_available_disk_bytes;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySource {

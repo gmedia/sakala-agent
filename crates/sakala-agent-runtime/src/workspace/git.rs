@@ -186,7 +186,7 @@ impl WorkspaceManager for GitWorkspaceManager {
     }
 }
 
-fn parse_available_disk_bytes(output: &str) -> Result<u64, RuntimeError> {
+pub(crate) fn parse_available_disk_bytes(output: &str) -> Result<u64, RuntimeError> {
     let line = output
         .lines()
         .rev()

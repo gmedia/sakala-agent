@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::{
     databases::DatabaseHeartbeat,
     metrics::{WorkloadMetricsSampler, insert_metrics},
+    object_storage::ObjectStorageHeartbeat,
 };
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
@@ -53,6 +54,9 @@ pub struct HeartbeatRuntimeContext {
     /// `metadata.database` and `metadata.databases` on a database host, `None`
     /// on a node without `SAKALA_DATABASE_DRIVER`.
     pub database: Option<DatabaseHeartbeat>,
+    /// `metadata.object_storage` and `metadata.buckets` on an object storage
+    /// host, `None` on a node without `SAKALA_OBJECT_STORAGE_DRIVER`.
+    pub object_storage: Option<ObjectStorageHeartbeat>,
 }
 
 pub async fn run(
@@ -230,11 +234,16 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         Some(database) => database.insert(&mut metadata).await,
         None => true,
     };
+    let object_storage_available = match &context.object_storage {
+        Some(object_storage) => object_storage.insert(&mut metadata).await,
+        None => true,
+    };
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
                 if !telemetry_available
                     || !database_available
+                    || !object_storage_available
                     || resources.runtime_operational == Some(false)
                     || !workloads.capacity_available
                     || !workloads.health_available
@@ -620,6 +629,7 @@ mod tests {
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
+            object_storage: None,
         }
     }
 
@@ -646,6 +656,7 @@ mod tests {
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
+            object_storage: None,
         };
         let heartbeat = payload(&config, &context).await;
 
@@ -1570,6 +1581,98 @@ mod tests {
         assert!(heartbeat.metadata.get("databases").is_none());
     }
 
+    struct BucketUsage {
+        result: Result<Vec<sakala_agent_protocol::ManagedBucketUsage>, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::ObjectStorageAdmin for BucketUsage {
+        async fn bucket_usage(
+            &self,
+        ) -> Result<Vec<sakala_agent_protocol::ManagedBucketUsage>, RuntimeExecutionError> {
+            self.result
+                .clone()
+                .map_err(|()| RuntimeExecutionError::new("bucket_admin_unavailable", "refused"))
+        }
+    }
+
+    fn object_storage_context(
+        result: Result<Vec<sakala_agent_protocol::ManagedBucketUsage>, ()>,
+    ) -> HeartbeatRuntimeContext {
+        let mut context = heartbeat_context(
+            Arc::new(EmptyRuntime),
+            RuntimeReconciliationReport::default(),
+        );
+        context.object_storage = Some(super::ObjectStorageHeartbeat::new(
+            Arc::new(BucketUsage { result }),
+            super::super::object_storage::ObjectStorageIdentity {
+                endpoint: "https://s3.sakala.app".to_owned(),
+                region: sakala_agent_protocol::Region::parse("us-east-1").expect("region"),
+                capacity_mb: 5_120,
+            },
+        ));
+        context
+    }
+
+    #[tokio::test]
+    async fn an_object_storage_host_reports_its_endpoint_and_bucket_usage() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let context = object_storage_context(Ok(vec![sakala_agent_protocol::ManagedBucketUsage {
+            name: "b-8k2m4q7x9z1c3v5b6n0d".to_owned(),
+            size_bytes: 1_048_576,
+        }]));
+
+        let heartbeat = payload(&config, &context).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Ready);
+        assert_eq!(
+            heartbeat.metadata["object_storage"],
+            json!({
+                "endpoint": "https://s3.sakala.app",
+                "region": "us-east-1",
+                "capacity_mb": 5120,
+                "available": true,
+            })
+        );
+        assert_eq!(
+            heartbeat.metadata["buckets"],
+            json!([{ "name": "b-8k2m4q7x9z1c3v5b6n0d", "size_bytes": 1_048_576 }])
+        );
+        assert_eq!(heartbeat.metadata["detail_counts"]["buckets"], 1);
+        assert!(heartbeat.metadata.get("database").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_object_storage_host_that_cannot_read_its_instance_is_degraded() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+
+        let heartbeat = payload(&config, &object_storage_context(Err(()))).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Degraded);
+        assert_eq!(heartbeat.metadata["object_storage"]["available"], false);
+        assert!(heartbeat.metadata.get("buckets").is_none());
+        assert!(heartbeat.metadata["detail_counts"].get("buckets").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_node_sends_no_object_storage_keys() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert!(heartbeat.metadata.get("object_storage").is_none());
+        assert!(heartbeat.metadata.get("buckets").is_none());
+    }
+
     #[tokio::test]
     async fn a_runtime_without_the_capability_never_samples_metrics() {
         let config = AgentConfig::from_values(&HashMap::new())
@@ -1650,6 +1753,7 @@ mod tests {
             max_traffic_items: 20,
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
+            object_storage: None,
         };
 
         assert_eq!(

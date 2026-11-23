@@ -11,6 +11,7 @@ pub mod health;
 mod inspections;
 pub mod js_workspace;
 pub mod logs;
+pub mod object_storage;
 pub mod process;
 pub mod railpack;
 mod repository_file;

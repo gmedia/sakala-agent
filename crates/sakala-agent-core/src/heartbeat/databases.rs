@@ -7,15 +7,12 @@
 //! successful read, like `workloads.metrics`. A heartbeat without it says
 //! nothing new about sizes; it never means the databases are gone.
 
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
-use sakala_agent_protocol::{DatabaseEndpoint, ManagedDatabaseSize};
+use sakala_agent_protocol::DatabaseEndpoint;
 use serde_json::{Value, json};
-use tracing::{info, warn};
 
+use super::periodic_read::{PeriodicRead, ReadMessages};
 use crate::ports::DatabaseAdmin;
 
 /// How often the sizes are read. `pg_database_size()` walks every file of every
@@ -49,15 +46,8 @@ fn read_timeout() -> Duration {
 pub struct DatabaseHeartbeat {
     admin: Arc<dyn DatabaseAdmin>,
     endpoint: DatabaseEndpoint,
-    interval: Duration,
     max_items: usize,
-    state: Mutex<ReadState>,
-}
-
-#[derive(Default)]
-struct ReadState {
-    last_attempt: Option<Instant>,
-    failing: bool,
+    reads: PeriodicRead,
 }
 
 impl DatabaseHeartbeat {
@@ -81,9 +71,15 @@ impl DatabaseHeartbeat {
         Self {
             admin,
             endpoint,
-            interval,
             max_items,
-            state: Mutex::new(ReadState::default()),
+            reads: PeriodicRead::new(
+                interval,
+                read_timeout(),
+                ReadMessages {
+                    failing: "managed databases could not be read; the node reports degraded until a read succeeds",
+                    recovered: "managed databases are read again",
+                },
+            ),
         }
     }
 
@@ -91,8 +87,8 @@ impl DatabaseHeartbeat {
     /// a read was due and succeeded. Returns whether the instance answered the
     /// last read, which keeps a node that cannot reach it `degraded`.
     pub(crate) async fn insert(&self, metadata: &mut Value) -> bool {
-        let sizes = self.read_if_due().await;
-        let available = !self.state.lock().map(|state| state.failing).unwrap_or(true);
+        let sizes = self.reads.read_if_due(|| self.admin.database_sizes()).await;
+        let available = self.reads.available();
         metadata[DATABASE_METADATA_KEY] = json!({
             "endpoint": self.endpoint,
             "available": available,
@@ -109,55 +105,13 @@ impl DatabaseHeartbeat {
         }
         available
     }
-
-    /// Reads when no attempt was made within the interval. A failed read waits
-    /// for the next interval too, so an instance that hangs costs one timeout
-    /// per interval rather than one per heartbeat.
-    async fn read_if_due(&self) -> Option<Vec<ManagedDatabaseSize>> {
-        {
-            let mut state = self.state.lock().ok()?;
-            if state
-                .last_attempt
-                .is_some_and(|last| last.elapsed() < self.interval)
-            {
-                return None;
-            }
-            state.last_attempt = Some(Instant::now());
-        }
-        let error = match tokio::time::timeout(read_timeout(), self.admin.database_sizes()).await {
-            Ok(Ok(sizes)) => {
-                self.set_failing(false, None);
-                return Some(sizes);
-            }
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => format!(
-                "the read did not finish within {} seconds",
-                read_timeout().as_secs_f64()
-            ),
-        };
-        self.set_failing(true, Some(&error));
-        None
-    }
-
-    fn set_failing(&self, failing: bool, error: Option<&str>) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let was_failing = std::mem::replace(&mut state.failing, failing);
-        match (was_failing, failing) {
-            (false, true) => warn!(
-                error = error.unwrap_or_default(),
-                "managed databases could not be read; the node reports degraded until a read succeeds"
-            ),
-            (true, false) => info!("managed databases are read again"),
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use sakala_agent_protocol::ManagedDatabaseSize;
 
     use super::*;
     use crate::ports::RuntimeExecutionError;

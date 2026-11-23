@@ -422,7 +422,7 @@ async fn run_poller_until_terminal(
         Arc::clone(&executor),
         Arc::new(NodeLifecycle::new()),
         Arc::new(scheduler::metrics::SchedulerMetrics::default()),
-        None,
+        scheduler::poller::ResourceAdmins::default(),
         shutdown_rx,
     ));
 

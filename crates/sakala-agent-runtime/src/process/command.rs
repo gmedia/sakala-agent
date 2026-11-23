@@ -71,6 +71,12 @@ impl CommandSpec {
         self.secret_environment.keys().map(String::as_str)
     }
 
+    /// The value a test expects the child to receive under `key`.
+    #[cfg(test)]
+    pub(crate) fn secret_environment_value(&self, key: &str) -> Option<&str> {
+        self.secret_environment.get(key).map(SecretString::expose)
+    }
+
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);

@@ -1,9 +1,9 @@
 use sakala_agent_protocol::{
-    AgentCommand, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
+    AgentCommand, BucketName, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
     DatabaseExtension, DeployProjectResult, FinalizationDeferredReason, HeartbeatPayload,
-    MANAGED_POSTGRES_CAPABILITY, ManagedDatabaseSize, ManagedName, NodePlacement,
-    RequestedImageReuse, RequestedReplicas, SleepingPage, WorkloadMetrics, WorkloadReplicas,
-    WorkloadTraffic,
+    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, ManagedBucketUsage, ManagedDatabaseSize,
+    ManagedName, NodePlacement, ObjectStorageMetadata, RequestedImageReuse, RequestedReplicas,
+    SleepingPage, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
 
 #[test]
@@ -514,5 +514,114 @@ fn database_host_heartbeat_fixture_matches_the_protocol_types() {
     assert_eq!(heartbeat.metadata["detail_counts"]["databases"], 2);
     for database in databases {
         ManagedName::parse(&database.name).expect("managed name");
+    }
+}
+
+#[test]
+fn api_bucket_command_fixtures_carry_valid_payloads_without_workload_identity() {
+    let poll: CommandPoll =
+        serde_json::from_str(include_str!("../examples/commands/bucket-commands.json"))
+            .expect("bucket command fixture must deserialize");
+
+    let types: Vec<_> = poll
+        .data
+        .iter()
+        .map(|command| command.command_type)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            CommandType::CreateBucket,
+            CommandType::RotateBucketKey,
+            CommandType::SetBucketQuota,
+            CommandType::LockBucket,
+            CommandType::UnlockBucket,
+            CommandType::DeleteBucket,
+        ]
+    );
+    for command in &poll.data {
+        assert!(command.project_id.is_none());
+        assert!(command.deployment_id.is_none());
+    }
+    let create = poll.data[0]
+        .create_bucket_payload()
+        .expect("CreateBucket payload must be valid");
+    assert_eq!(create.bucket.as_str(), "b-8k2m4q7x9z1c3v5b6n0d");
+    assert_eq!(create.access_key_id.as_str(), "SK7Q2M9X4K1C8V5B3N0D");
+    assert_eq!(create.quota_mb.get(), 256);
+    poll.data[1]
+        .rotate_bucket_key_payload()
+        .expect("RotateBucketKey payload must be valid");
+    assert_eq!(
+        poll.data[2]
+            .set_bucket_quota_payload()
+            .expect("SetBucketQuota payload must be valid")
+            .quota_mb
+            .get(),
+        512
+    );
+    for command in &poll.data[3..] {
+        command
+            .bucket_key_payload()
+            .expect("LockBucket, UnlockBucket, and DeleteBucket payloads must be valid");
+    }
+}
+
+#[test]
+fn bucket_command_types_have_the_api_wire_names_in_the_api_order() {
+    let names: Vec<_> = [
+        CommandType::CreateBucket,
+        CommandType::DeleteBucket,
+        CommandType::RotateBucketKey,
+        CommandType::SetBucketQuota,
+        CommandType::LockBucket,
+        CommandType::UnlockBucket,
+    ]
+    .into_iter()
+    .map(|command_type| serde_json::to_value(command_type).expect("serialize"))
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "CreateBucket",
+            "DeleteBucket",
+            "RotateBucketKey",
+            "SetBucketQuota",
+            "LockBucket",
+            "UnlockBucket",
+        ]
+    );
+}
+
+#[test]
+fn object_storage_host_heartbeat_fixture_matches_the_protocol_types() {
+    let heartbeat: HeartbeatPayload = serde_json::from_str(include_str!(
+        "../examples/heartbeat/object-storage-host.json"
+    ))
+    .expect("object storage host heartbeat fixture must deserialize");
+
+    assert!(
+        heartbeat
+            .node
+            .capabilities
+            .contains(&MANAGED_S3_CAPABILITY.to_owned())
+    );
+    let object_storage: ObjectStorageMetadata =
+        serde_json::from_value(heartbeat.metadata["object_storage"].clone())
+            .expect("object_storage");
+    assert_eq!(object_storage.endpoint, "https://s3.sakala.app");
+    assert_eq!(
+        sakala_agent_runtime::object_storage::check_public_endpoint(&object_storage.endpoint),
+        Ok(object_storage.endpoint.clone())
+    );
+    assert_eq!(object_storage.region.as_str(), "us-east-1");
+    assert_eq!(object_storage.capacity_mb, 5_120);
+    assert!(object_storage.available);
+    let buckets: Vec<ManagedBucketUsage> =
+        serde_json::from_value(heartbeat.metadata["buckets"].clone()).expect("buckets");
+    assert_eq!(buckets.len(), 2);
+    assert_eq!(heartbeat.metadata["detail_counts"]["buckets"], 2);
+    for bucket in buckets {
+        BucketName::parse(&bucket.name).expect("managed bucket name");
     }
 }

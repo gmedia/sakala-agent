@@ -9,11 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NodeLifecycle, NodeLifecycleState,
-    commands::handlers::{database, deploy_project, inspect_project},
+    commands::handlers::{bucket, database, deploy_project, inspect_project},
     ports::{
-        CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ReconcileWorkloadRequest,
-        RepositoryCredentialProvider, RuntimeExecutionError, RuntimeExecutor, RuntimeReporter,
-        RuntimeReporterFactory, UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
+        CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ObjectStorageAdmin,
+        ReconcileWorkloadRequest, RepositoryCredentialProvider, RuntimeExecutionError,
+        RuntimeExecutor, RuntimeReporter, RuntimeReporterFactory,
+        UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
     },
 };
 
@@ -23,6 +24,7 @@ pub struct CommandDispatcher {
     node_lifecycle: Arc<NodeLifecycle>,
     reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     database_admin: Option<Arc<dyn DatabaseAdmin>>,
+    object_storage_admin: Option<Arc<dyn ObjectStorageAdmin>>,
 }
 
 impl CommandDispatcher {
@@ -34,6 +36,7 @@ impl CommandDispatcher {
             node_lifecycle: Arc::new(NodeLifecycle::new()),
             reporter_factory: None,
             database_admin: None,
+            object_storage_admin: None,
         }
     }
 
@@ -48,6 +51,7 @@ impl CommandDispatcher {
             node_lifecycle: Arc::new(NodeLifecycle::new()),
             reporter_factory: None,
             database_admin: None,
+            object_storage_admin: None,
         }
     }
 
@@ -63,6 +67,7 @@ impl CommandDispatcher {
             node_lifecycle,
             reporter_factory: None,
             database_admin: None,
+            object_storage_admin: None,
         }
     }
 
@@ -83,6 +88,17 @@ impl CommandDispatcher {
     #[must_use]
     pub fn with_database_admin(mut self, database_admin: Arc<dyn DatabaseAdmin>) -> Self {
         self.database_admin = Some(database_admin);
+        self
+    }
+
+    /// Handles the managed object storage commands on an object storage host.
+    /// Without it every bucket command fails with `unsupported_runtime_command`.
+    #[must_use]
+    pub fn with_object_storage_admin(
+        mut self,
+        object_storage_admin: Arc<dyn ObjectStorageAdmin>,
+    ) -> Self {
+        self.object_storage_admin = Some(object_storage_admin);
         self
     }
 
@@ -251,6 +267,14 @@ impl CommandDispatcher {
             | CommandType::UnlockDatabase
             | CommandType::InstallDatabaseExtension => {
                 database::handle(command, self.database_admin.as_deref()).await
+            }
+            CommandType::CreateBucket
+            | CommandType::DeleteBucket
+            | CommandType::RotateBucketKey
+            | CommandType::SetBucketQuota
+            | CommandType::LockBucket
+            | CommandType::UnlockBucket => {
+                bucket::handle(command, self.object_storage_admin.as_deref()).await
             }
         }
     }
