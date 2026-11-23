@@ -109,8 +109,10 @@ tidak boleh menghapus route deployment baru pada project yang sama.
 Permintaan batal dari API sampai lewat `cancel_requested` pada polling, dan memakai token yang sama dengan shutdown. Detailnya ada di [Sakala Agent API](AGENT_API.md#pembatalan-command).
 
 Aktivasi route candidate adalah deployment commit point. Cancellation, deadline,
-atau kegagalan reporting sebelum cutover membatalkan deployment dan membersihkan
-candidate. Setelah cutover berhasil, Agent memberi finalisasi committed deployment
+atau `409` pada report sebelum cutover (API tidak lagi menerima report command
+itu) membatalkan deployment dan membersihkan candidate. Event yang tidak
+terkirim karena API tidak terjangkau tidak membatalkannya; lihat
+[Event and Log Payloads](AGENT_API.md#event-and-log-payloads). Setelah cutover berhasil, Agent memberi finalisasi committed deployment
 grace maksimum 30 detik. Jika grace habis atau finalisasi gagal, Agent memakai
 hasil yang disimpan saat cutover untuk mengirim `Complete` dengan
 `finalization_deferred=true`. Control plane wajib mengirim `StopProject` untuk

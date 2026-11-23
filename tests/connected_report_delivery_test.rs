@@ -1,8 +1,10 @@
 use std::{
+    collections::HashMap,
+    io::Write,
     net::{SocketAddr, TcpListener},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -11,7 +13,7 @@ use sakala_agent_core::{
     CoreError,
     api::ApiClient,
     ports::RuntimeReporter,
-    reporting::{ApiRuntimeReporter, LogDeliveryPolicy},
+    reporting::{ApiRuntimeReporter, EventDeliveryPolicy, LogDeliveryPolicy},
     support::retry::RetryPolicy,
 };
 use sakala_agent_protocol::{
@@ -878,4 +880,339 @@ async fn flush_gives_up_after_its_grace_and_delivery_resumes_for_later_lines() {
         ],
         "the abandoned batch is not retried any more"
     );
+}
+
+fn events_path() -> String {
+    format!("/api/agent/v1/commands/{COMMAND_ID}/events")
+}
+
+/// Short enough that a test outlasts the budget in well under a second.
+fn fast_event_policy() -> EventDeliveryPolicy {
+    EventDeliveryPolicy {
+        retry_min_delay: Duration::from_millis(10),
+        retry_max_delay: Duration::from_millis(40),
+        budget: Duration::from_millis(400),
+    }
+}
+
+fn event_reporter(server: &MockServer) -> ApiRuntimeReporter {
+    reporter_with(&server.uri(), LogBounds::default(), fast_policy())
+        .with_event_policy(fast_event_policy())
+}
+
+fn event(event_type: &str) -> DeploymentEvent {
+    DeploymentEvent {
+        event_type: event_type.to_owned(),
+        level: DeploymentEventLevel::Info,
+        message: format!("{event_type} message"),
+        metadata: json!({ "port": 3000 }),
+        occurred_at: OffsetDateTime::now_utc(),
+    }
+}
+
+async fn event_requests(server: &MockServer) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .expect("requests should be recorded")
+        .into_iter()
+        .filter(|request| request.url.path() == events_path())
+        .collect()
+}
+
+fn event_type_of(request: &Request) -> String {
+    request.body_json::<serde_json::Value>().expect("json body")["events"][0]["type"]
+        .as_str()
+        .expect("event type")
+        .to_owned()
+}
+
+/// Answers `503` while `down` is set, then acknowledges the one event.
+struct EventOutage {
+    down: Arc<AtomicBool>,
+}
+
+impl Respond for EventOutage {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.down.load(Ordering::SeqCst) {
+            ResponseTemplate::new(503)
+        } else {
+            accepted(1)
+        }
+    }
+}
+
+/// Answers `503` to the first `failures` requests, then acknowledges.
+struct FailTimes {
+    failures: usize,
+    seen: AtomicUsize,
+}
+
+impl FailTimes {
+    fn new(failures: usize) -> Self {
+        Self {
+            failures,
+            seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Respond for FailTimes {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.seen.fetch_add(1, Ordering::SeqCst) < self.failures {
+            ResponseTemplate::new(503)
+        } else {
+            accepted(1)
+        }
+    }
+}
+
+/// Collects what `tracing` writes in this test binary.
+///
+/// It is the global subscriber rather than a thread-local one: with a single
+/// dispatcher, `tracing` caches a callsite's interest from whichever thread
+/// hits it first, so a thread-local subscriber misses the Agent's warnings
+/// when a parallel test reached the same `warn!` before it. Tests that read it
+/// look for a value only they use.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn global() -> &'static Self {
+        static LOGS: OnceLock<CapturedLogs> = OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = Self::default();
+            let sink = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || sink.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test in this binary installs a subscriber");
+            logs
+        })
+    }
+
+    fn lines_with(&self, needle: &str) -> Vec<String> {
+        String::from_utf8_lossy(&self.0.lock().expect("log lock"))
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Before X-14 an event gave up after three attempts within about 1.5 s and
+/// the error failed the deployment step that sent it.
+#[tokio::test]
+async fn an_event_is_retried_with_the_same_key_and_body_until_the_api_recovers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(events_path()))
+        .respond_with(FailTimes::new(4))
+        .mount(&server)
+        .await;
+    let reporter = event_reporter(&server);
+
+    reporter
+        .event(event("deployment.build.started"))
+        .await
+        .expect("the event is delivered once the API answers");
+
+    let requests = event_requests(&server).await;
+    assert_eq!(requests.len(), 5, "four failures, then the delivery");
+    let key = idempotency_key(&requests[0]);
+    for request in &requests {
+        assert_eq!(idempotency_key(request), key, "every retry reuses the key");
+        assert_eq!(
+            request.body, requests[0].body,
+            "every retry resends the same body"
+        );
+    }
+    assert_eq!(reporter.undelivered_events(), 0);
+
+    reporter
+        .event(event("deployment.container.started"))
+        .await
+        .expect("the next event is delivered");
+    let requests = event_requests(&server).await;
+    assert_ne!(
+        idempotency_key(&requests[5]),
+        key,
+        "each event is its own idempotent request"
+    );
+}
+
+#[tokio::test]
+async fn an_event_the_api_never_takes_is_dropped_with_a_warning_and_the_command_continues() {
+    // Unique to this test, so its warning can be told apart from others.
+    const EVENT_TYPE: &str = "deployment.undeliverable.test";
+    let logs = CapturedLogs::global();
+    let server = MockServer::start().await;
+    let down = Arc::new(AtomicBool::new(true));
+    Mock::given(method("POST"))
+        .and(path(events_path()))
+        .respond_with(EventOutage {
+            down: Arc::clone(&down),
+        })
+        .mount(&server)
+        .await;
+    let reporter = event_reporter(&server);
+
+    let started = Instant::now();
+    reporter
+        .event(event(EVENT_TYPE))
+        .await
+        .expect("an undeliverable event must not fail the step that sent it");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "delivery stays within its budget: {:?}",
+        started.elapsed()
+    );
+    let first_attempts = event_requests(&server).await.len();
+    assert!(
+        first_attempts >= 2,
+        "the first event is retried: {first_attempts}"
+    );
+    assert_eq!(reporter.undelivered_events(), 1);
+    let warnings = logs.lines_with(EVENT_TYPE);
+    assert!(
+        warnings.iter().any(|line| line.contains("WARN")
+            && line.contains("deployment event was not delivered")
+            && line.contains("undelivered_events=1")),
+        "{warnings:#?}"
+    );
+
+    // While the API stays down, later events cost one attempt each.
+    reporter
+        .event(event("deployment.container.started"))
+        .await
+        .expect("still not an error");
+    assert_eq!(event_requests(&server).await.len(), first_attempts + 1);
+    assert_eq!(reporter.undelivered_events(), 2);
+
+    // Once it is back, events are delivered again and the count stays.
+    down.store(false, Ordering::SeqCst);
+    reporter
+        .event(event("deployment.health.started"))
+        .await
+        .expect("delivered after recovery");
+    let requests = event_requests(&server).await;
+    assert_eq!(requests.len(), first_attempts + 2);
+    assert_eq!(
+        event_type_of(requests.last().expect("a request")),
+        "deployment.health.started"
+    );
+    assert_eq!(reporter.undelivered_events(), 2);
+}
+
+/// A fake control plane that stores events by `Idempotency-Key` the way
+/// `ReportDeploymentEventAction` does, and loses the response to the first
+/// request after storing it.
+struct DedupingApi {
+    stored: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    lose_next_response: AtomicBool,
+}
+
+impl Respond for DedupingApi {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let key = idempotency_key(request);
+        let mut stored = self.stored.lock().expect("store lock");
+        if let Some(body) = stored.get(&key) {
+            if *body != request.body {
+                return ResponseTemplate::new(409);
+            }
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "accepted_count": 1,
+                    "duplicate_count": 1,
+                    "first_sequence": 1,
+                    "last_sequence": 1
+                }
+            }));
+        }
+        stored.insert(key, request.body.clone());
+        if self.lose_next_response.swap(false, Ordering::SeqCst) {
+            return ResponseTemplate::new(502);
+        }
+        accepted(1)
+    }
+}
+
+#[tokio::test]
+async fn an_event_stored_before_its_response_was_lost_is_not_stored_twice() {
+    let server = MockServer::start().await;
+    let stored = Arc::new(Mutex::new(HashMap::new()));
+    Mock::given(method("POST"))
+        .and(path(events_path()))
+        .respond_with(DedupingApi {
+            stored: Arc::clone(&stored),
+            lose_next_response: AtomicBool::new(true),
+        })
+        .mount(&server)
+        .await;
+    let reporter = event_reporter(&server);
+
+    reporter
+        .event(event("deployment.runtime.ready"))
+        .await
+        .expect("the retry is acknowledged as a duplicate");
+
+    assert_eq!(event_requests(&server).await.len(), 2);
+    assert_eq!(stored.lock().expect("store lock").len(), 1);
+    assert_eq!(reporter.undelivered_events(), 0);
+}
+
+#[tokio::test]
+async fn a_conflict_still_fails_the_event_without_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(events_path()))
+        .respond_with(ResponseTemplate::new(409).set_body_json(json!({
+            "status": "Cancelled",
+            "terminal_at": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reporter = event_reporter(&server);
+
+    let error = reporter
+        .event(event("deployment.route.started"))
+        .await
+        .expect_err("a command the API no longer accepts reports for must stop");
+    assert!(error.to_string().contains("Cancelled"), "{error}");
+    assert_eq!(reporter.undelivered_events(), 0);
+}
+
+#[tokio::test]
+async fn an_event_rejected_for_its_content_is_dropped_without_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(events_path()))
+        .respond_with(ResponseTemplate::new(422).set_body_json(json!({
+            "message": "The message exceeds the command limit."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let reporter = event_reporter(&server);
+
+    reporter
+        .event(event("deployment.build.started"))
+        .await
+        .expect("a rejected event does not fail the deployment");
+    assert_eq!(reporter.undelivered_events(), 1);
 }

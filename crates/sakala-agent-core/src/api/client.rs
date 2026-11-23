@@ -325,6 +325,24 @@ impl ApiClient {
         .await
     }
 
+    /// Sends one batch of redacted events once, under the caller's
+    /// `Idempotency-Key`. The caller owns the retry, under the same rules as
+    /// [`Self::logs_attempt`].
+    pub async fn events_attempt(
+        &self,
+        command_id: Uuid,
+        idempotency_key: &str,
+        events: &[DeploymentEvent],
+    ) -> Result<ReportAcknowledgement, ReportAttemptError> {
+        self.report_attempt(
+            &endpoints::command_action(command_id, "events"),
+            idempotency_key,
+            &json!({ "events": events }),
+            events.len(),
+        )
+        .await
+    }
+
     /// Sends one report batch under one `Idempotency-Key`, retrying transient
     /// outcomes with the bounded [`RetryPolicy`].
     ///

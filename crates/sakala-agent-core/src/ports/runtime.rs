@@ -306,6 +306,10 @@ impl RuntimeExecutionError {
 
 #[async_trait]
 pub trait RuntimeReporter: Send + Sync {
+    /// Reports one timeline event. Implementations may retry and may give an
+    /// undeliverable event up without an error; a returned error means the
+    /// control plane no longer accepts reports for this command, so the work
+    /// it describes should stop.
     async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError>;
 
     /// Queues one log line. Implementations may batch delivery; a returned

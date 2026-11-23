@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::events::{EventDelivery, EventDeliveryPolicy};
 use crate::{
     api::{ApiClient, ReportAttemptError},
     logs::redactor::ValueRedactor,
@@ -39,11 +40,11 @@ const MAX_BUFFERED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUFFERED_LINES: usize = 10_000;
 /// First retry delay after a transient failure. Each later step doubles up to
 /// `RETRY_MAX_DELAY`, and jitter adds up to the same amount again.
-const RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
-const RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
+pub(super) const RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
+pub(super) const RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 /// A server's `Retry-After` is honoured up to this, so one odd header cannot
 /// park delivery for hours.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+pub(super) const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
 /// How long [`RuntimeReporter::flush`] waits for the queue to drain while the
 /// control plane is unreachable before it gives the queued lines up as lost.
 const FLUSH_GRACE: Duration = Duration::from_secs(120);
@@ -113,6 +114,10 @@ impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
 
 /// Reports events immediately and delivers logs in bounded, ordered batches.
 ///
+/// Events are sent one request each, retried within a time budget, and given
+/// up with a warning when the control plane stays unreachable; see
+/// [`EventDeliveryPolicy`]. Only a `409` fails `event`.
+///
 /// `log` redacts and bounds a line and queues it; it never waits for the
 /// network, so a slow or unreachable control plane cannot stall the build or
 /// container output that produces the lines. One background worker per
@@ -139,6 +144,7 @@ impl RuntimeReporterFactory for ApiRuntimeReporterFactory {
 pub struct ApiRuntimeReporter {
     inner: Arc<ReporterInner>,
     redactor: ValueRedactor,
+    events: Arc<EventDelivery>,
 }
 
 struct ReporterInner {
@@ -223,6 +229,11 @@ impl ApiRuntimeReporter {
             .and_then(|lines| usize::try_from(lines).ok())
             .map_or(DEFAULT_BATCH_LINES, |lines| lines.min(DEFAULT_BATCH_LINES))
             .max(1);
+        let events = Arc::new(EventDelivery::new(
+            client.clone(),
+            command_id,
+            EventDeliveryPolicy::default(),
+        ));
         Self {
             inner: Arc::new(ReporterInner {
                 client,
@@ -237,7 +248,34 @@ impl ApiRuntimeReporter {
                 committed_output: StdMutex::new(None),
             }),
             redactor: ValueRedactor::default(),
+            events,
         }
+    }
+
+    /// Overrides the event retry limits. Primarily useful for deterministic
+    /// integration tests.
+    #[must_use]
+    pub fn with_event_policy(self, policy: EventDeliveryPolicy) -> Self {
+        let events = Arc::new(EventDelivery::new(
+            self.inner.client.clone(),
+            self.inner.command_id,
+            policy,
+        ));
+        self.with_event_delivery(events)
+    }
+
+    /// Shares event delivery with reports sent before this reporter existed,
+    /// so the undelivered count and the outage state cover the whole command.
+    #[must_use]
+    pub(crate) fn with_event_delivery(mut self, events: Arc<EventDelivery>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Number of events of this command that were given up.
+    #[must_use]
+    pub fn undelivered_events(&self) -> u64 {
+        self.events.undelivered()
     }
 
     /// Adds the command's environment values to what this reporter hides.
@@ -550,12 +588,7 @@ impl RuntimeReporter for ApiRuntimeReporter {
     async fn event(&self, mut event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
         event.message = self.redactor.redact(&event.message);
         redact_strings(&mut event.metadata, &self.redactor);
-        self.inner
-            .client
-            .event(self.inner.command_id, &event)
-            .await
-            .map(|_| ())
-            .map_err(|error| RuntimeExecutionError::reporting(error.to_string()))
+        self.events.send(&event).await
     }
 
     async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError> {

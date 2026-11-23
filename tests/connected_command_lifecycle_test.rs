@@ -9,6 +9,7 @@ use sakala_agent_core::{
         CommandOutput, DeployProjectRequest, RuntimeExecutionError, RuntimeExecutor,
         RuntimeReporter,
     },
+    reporting::EventDeliveryPolicy,
     scheduler,
 };
 use sakala_agent_protocol::{AgentCommand, CommandStatus, CommandType, CompleteCommandPayload};
@@ -318,6 +319,83 @@ async fn logs_survive_a_brief_api_outage_and_land_before_completion() {
     assert!(
         last_log < complete,
         "logs must be delivered before completion: {paths:?}"
+    );
+}
+
+/// Ledger X-14: an event the control plane cannot take used to fail the
+/// deployment step that sent it. Now every event is given up after its budget
+/// and the command still completes.
+#[tokio::test]
+async fn a_command_completes_although_no_event_reaches_the_api() {
+    let server = MockServer::start().await;
+    mount_claim_mock(&server).await;
+    let events = format!("/api/agent/v1/commands/{COMMAND_ID}/events");
+    Mock::given(method("POST"))
+        .and(path(events.clone()))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/agent/v1/commands/{COMMAND_ID}/logs")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {
+                "accepted_count": 1,
+                "duplicate_count": 0,
+                "first_sequence": 1,
+                "last_sequence": 1
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/agent/v1/commands/{COMMAND_ID}/complete"
+        )))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = ApiClient::new(server.uri(), "runtime-01", "test-agent-token")
+        .expect("test client should be valid");
+    let command: AgentCommand =
+        serde_json::from_value(command_fixture()).expect("command fixture should deserialize");
+
+    let runtime: Arc<dyn RuntimeExecutor> = Arc::new(NoopRuntimeExecutor);
+    CommandProcessor::new(client, runtime, std::time::Duration::from_secs(900))
+        .with_event_delivery_policy(EventDeliveryPolicy {
+            retry_min_delay: std::time::Duration::from_millis(10),
+            retry_max_delay: std::time::Duration::from_millis(40),
+            budget: std::time::Duration::from_millis(300),
+        })
+        .process(&command, CancellationToken::new())
+        .await
+        .expect("the command completes without its events");
+
+    let event_types = server
+        .received_requests()
+        .await
+        .expect("requests should be recorded")
+        .into_iter()
+        .filter(|request| request.url.path() == events)
+        .map(|request| {
+            request.body_json::<serde_json::Value>().expect("json body")["events"][0]["type"]
+                .as_str()
+                .expect("event type")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let claimed = event_types
+        .iter()
+        .filter(|event_type| *event_type == "command.claimed")
+        .count();
+    assert!(claimed >= 2, "the first event is retried: {event_types:?}");
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| *event_type == "runtime.noop.completed")
+            .count(),
+        1,
+        "the runtime's event shares the command's outage state: {event_types:?}"
     );
 }
 
