@@ -1736,6 +1736,7 @@ dependencies = [
  "sakala-agent-protocol",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "time",

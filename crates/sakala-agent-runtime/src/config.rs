@@ -140,6 +140,10 @@ pub struct DockerRuntimeConfig {
     /// plane as visitors' browsers reach it. A sleeping project's page sends
     /// them to the public wake endpoint under it. Used for nothing else.
     pub public_api_url: String,
+    /// `SAKALA_PUBLIC_CONSOLE_URL`: the Console as project owners' browsers
+    /// reach it. A sleeping project's page links its owner there; without it
+    /// the page names the Console without a link. Used for nothing else.
+    pub public_console_url: Option<String>,
 }
 
 impl Default for DockerRuntimeConfig {
@@ -170,6 +174,7 @@ impl Default for DockerRuntimeConfig {
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,
             release_command_timeout: DEFAULT_RELEASE_COMMAND_TIMEOUT,
             public_api_url: "http://localhost:8000".to_owned(),
+            public_console_url: None,
         }
     }
 }
