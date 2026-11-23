@@ -136,6 +136,8 @@ peringatan bila pembuatan network gagal, atau bila sisanya lebih kecil dari
 Docker can create only about 17 more bridge networks (31 in Docker's default address pools, 14 exist), fewer than SAKALA_MAX_ACTIVE_CONTAINERS (20). ...
 ```
 
+## Image dan GC
+
 Image ditag berdasarkan project, commit, dan deployment. Image dan container diberi ownership labels agar discovery dan cleanup tidak menyentuh workload di luar Sakala:
 
 - `dev.sakala.managed=true`
@@ -148,25 +150,99 @@ Label `project-id` dan `deployment-id` juga dipasang pada image Dockerfile dan
 Railpack. Setiap image deployment punya tag sendiri, jadi image lama tidak pernah
 menjadi dangling, dan `docker image prune` tanpa `-a` tidak menghapus apa pun. Karena
 itu GC memilih per project. Project yang masih punya container mempertahankan image
-yang dipakai container mana pun, image deployment sebelumnya untuk rollback, dan image
-yang lebih muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` (default tujuh hari). Project
-tanpa container sama sekali, misalnya project yang sudah dihapus, hanya mempertahankan
-image yang lebih muda dari `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam).
-Sisanya dihapus dengan `docker image rm` tanpa `--force`. Hanya image berlabel
-`dev.sakala.managed=true` dengan project yang valid, dan yang semua namanya
+yang dipakai container mana pun (berjalan, tidur, atau berhenti, dan semua replika) dan
+image previous untuk rollback, berapa pun umurnya, dan tidak ada yang lain. Image
+previous adalah image bertag `sakala/project-<project>:previous`; bila belum ada image
+dengan tag itu (image dari Agent yang belum mengenal tag ini), aturan lama berlaku: image terbaru yang
+lebih tua dari image aktif terbaru. Project tanpa container sama sekali, misalnya project
+yang sudah dihapus, hanya mempertahankan image yang lebih muda dari
+`SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam). Sisanya dihapus dengan
+`docker image rm <nama>...` tanpa `--force`, tag `previous` lebih dulu. Hanya image
+berlabel `dev.sakala.managed=true` dengan project yang valid, dan yang semua namanya
 `sakala/project-<project>:<tag>`, yang pernah dipilih.
+
+Image yang punya dua tag (tag asli dan `previous`) dihapus lewat kedua namanya. Docker
+dengan containerd image store menolak `docker image rm <id>` untuk image seperti itu
+(`image is referenced in multiple repositories`, juga bila kedua tag di repository yang
+sama), sedangkan menghapus per nama melepas tag satu per satu dan menghapus image saat
+nama terakhirnya hilang. Bila sebuah container mulai memakai image itu di tengah jalan,
+Docker hanya menolak nama terakhir, dan karena `previous` dilepas lebih dulu image itu
+tetap memegang nama aslinya, nama yang dicari reuse.
 
 GC ini berjalan sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS` (default satu jam),
 dan dilewati selama ada command aktif. Command `CleanupRuntime` dengan `approved: true`
 menjalankan aturan yang sama sekali jalan, dan startup reconciliation hanya melaporkan
-kandidatnya. `StopProject` dengan `remove_images: true`, yang dikirim API saat project
-dihapus, langsung menghapus semua image project itu setelah container-nya hilang. Aturan
+kandidatnya. Karena umur tidak lagi melindungi image baru, GC hanya menghapus image
+sebuah project sambil memegang lock project yang sama dengan command: project yang
+sedang di-deploy dilewati sampai putaran berikutnya, dan image project yang lock-nya
+didapat dipilih ulang dulu. Deployment yang baru selesai build tetapi belum menyalakan
+container-nya karena itu tidak pernah kehilangan image-nya.
+
+`StopProject` dengan `remove_images: true`, yang dikirim API saat project dihapus,
+langsung menghapus semua image project itu setelah container-nya hilang. Aturan
 lengkapnya ada di [Sakala Agent API](AGENT_API.md#approved-runtime-cleanup).
 
 Versi sebelumnya membaca label dengan `{{.Label "..."}}` pada `docker image ls`, yang
 ditolak Docker (`can't evaluate field Label in type *formatter.imageContext`), sehingga
 deteksi gagal dan tidak ada image yang pernah dihapus. Label kini dibaca lewat
 `docker image inspect`.
+
+### Image sebelumnya dan rollback
+
+Setelah `DeployProject` sukses, masih di bawah lock project, Agent:
+
+1. membaca container project itu dan image-nya. Workload yang digantikan adalah container
+   lain yang berjalan, atau, bila tidak ada yang berjalan (project tidur), container lain
+   yang ada; container terbarunya yang menentukan;
+2. memberi image workload itu tag `sakala/project-<project>:previous`, bila image-nya
+   berbeda dari image yang sekarang melayani dan semua namanya ada di repository project
+   itu. Ini terjadi setelah route pindah dan sebelum container lama dihapus, jadi bila
+   Agent mati di antaranya, tag-nya sudah benar dan container lama dibersihkan sebagai
+   orphan;
+3. menghapus container lama seperti sebelumnya;
+4. menjalankan aturan GC di atas untuk project itu saja, sehingga yang tersisa hanya image
+   live dan image previous.
+
+Langkah 2 dan 4 idempoten: tag yang sudah ada tidak ditulis ulang, dan image yang sudah
+hilang hanya membuat `docker image rm` gagal tanpa efek. Kegagalan di langkah 2 atau 4
+tidak menggagalkan deployment; Agent mengirim `deployment.images.retained` dan image GC
+berkala menyelesaikannya. Bila tag tidak bisa ditulis, langkah 4 dilewati, karena image
+yang baru digantikan akan terhapus. Kontraknya ada di
+[Rollback dan image sebelumnya](AGENT_API.md#rollback-dan-image-sebelumnya).
+
+Rollback adalah deployment yang memakai ulang image deployment lama lewat
+`reuse_image_from_deployment_id`. Smoke test `image_rollback_smoke_test` membuktikan
+urutannya pada Docker sungguhan: setelah deploy A, B, C hanya C (live) dan B (previous,
+dua tag) yang tersisa; rollback ke B memakai image B tanpa checkout dan build
+(`deployment.image.reused`), lalu B live dan C previous; image GC berkala sesudahnya
+tidak menghapus apa pun; rollback ke A, yang image-nya sudah dihapus, build ulang dengan
+`image_missing`.
+
+### Dampak disk
+
+Per project yang masih punya container, node kini menyimpan paling banyak dua image
+deployment (live dan previous), ditambah image yang dipakai container lain bila ada
+(misalnya selama deployment bergulir). Sebelumnya node menyimpan image previous ditambah
+semua image yang lebih muda dari tujuh hari, jadi project yang di-deploy 20 kali seminggu
+bisa memegang sekitar 21 image.
+
+Ukuran yang terukur lokal (Docker 29.10, containerd image store, 2026-11-23) dari contoh
+gmedia/sakala-examples:
+
+| Image | Ukuran di disk | Ukuran konten (terkompresi) | Unik per deployment setelah perubahan kode satu baris |
+| --- | --- | --- | --- |
+| `node-express`, Railpack v0.23.0 (Node) | 526 MB | 125 MB | sekitar 94 kB |
+| `laravel`, Dockerfile FrankenPHP | 349 MB | 84,5 MB | sekitar 1,9 MB |
+
+Layer dipakai bersama antar-image: dua deployment yang hanya berbeda kode berbagi base
+image dan layer dependency, jadi image tambahan hanya memakan layer aplikasinya. Untuk
+deployment yang hanya mengubah kode, aturan lama dan baru hampir sama besar (puluhan kB
+sampai beberapa MB per image). Bedanya terasa saat dependency atau base image berubah:
+setiap image lalu membawa layer sebesar `node_modules` atau `vendor`-nya, puluhan sampai
+ratusan MB. Dalam kasus terburuk, setiap image unik penuh, aturan lama bisa memegang
+sekitar 21 x 350 sampai 530 MB, yaitu 7 sampai 11 GB per project, sedangkan aturan baru
+paling banyak 2 x 350 sampai 530 MB, yaitu 0,7 sampai 1,1 GB. `reclaimed_image_bytes`
+tetap batas atas, karena menjumlahkan ukuran penuh image termasuk layer bersama.
 
 ## Readiness
 

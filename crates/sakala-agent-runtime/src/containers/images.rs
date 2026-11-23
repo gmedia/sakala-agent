@@ -1,15 +1,18 @@
-//! Chooses which Sakala images garbage collection may remove.
+//! Chooses which Sakala images garbage collection may remove, and which image
+//! a successful deployment marks as the previous one.
 //!
 //! Every deployment image carries its own tag, so an old image never becomes
 //! dangling and `docker image prune` without `-a` never removes it. Selection
 //! therefore works on tagged images, per project, and keeps what a project still
-//! needs: every image a container uses, the image of the deployment before the
-//! active one, and anything younger than the retention age. A project without
-//! any container needs none of its images once they are older than a grace
-//! period, which is how images of a deleted project leave the node.
+//! needs: every image a container uses and the previous image, the one a
+//! rollback starts from without a build. A deployment marks that image with the
+//! extra tag [`PREVIOUS_IMAGE_TAG`] in the project's own repository; it keeps
+//! its original tag, so reuse still finds it under the computed name. A project
+//! without any container needs none of its images once they are older than a
+//! grace period, which is how images of a deleted project leave the node.
 //!
 //! Only an image labelled with a valid project whose every name is
-//! `sakala/project-<that project>:<tag>` is ever chosen.
+//! `sakala/project-<that project>:<tag>` is ever chosen or tagged.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -17,6 +20,23 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::RuntimeError;
+
+/// Tag, in the project's repository, of the image the last successful
+/// deployment replaced. Moving it never removes an image by itself: the image
+/// it leaves keeps its own tag.
+pub const PREVIOUS_IMAGE_TAG: &str = "previous";
+
+/// The repository every image of `project_id` is named in.
+#[must_use]
+pub fn project_repository(project_id: Uuid) -> String {
+    format!("sakala/project-{project_id}")
+}
+
+/// `sakala/project-<project_id>:previous`.
+#[must_use]
+pub fn previous_image_reference(project_id: Uuid) -> String {
+    format!("{}:{PREVIOUS_IMAGE_TAG}", project_repository(project_id))
+}
 
 /// `docker image ls --no-trunc` prints one row per tag, and `<none>` for a
 /// dangling image.
@@ -146,23 +166,24 @@ pub(crate) fn parse_image_inspect(stdout: &str) -> Result<Vec<InspectedImage>, R
         .collect()
 }
 
-/// How long images are kept, by whether their project still has a container.
+/// How long images of a project without any container are kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Retention {
-    /// A project with containers keeps every image younger than this.
-    pub min_age: Duration,
     /// A project without containers keeps only images younger than this.
     pub orphaned_grace: Duration,
 }
 
-/// Per project with a container, keeps every image a container uses, the newest
-/// image older than the newest one in use (the previous deployment, for
-/// rollback), or the newest image when no container uses any, plus everything
-/// younger than `min_age`.
+/// Per project with a container, keeps every image a container uses, in any
+/// state, and the previous image: the one tagged [`PREVIOUS_IMAGE_TAG`], or,
+/// when no image carries that tag yet (images of an older Agent), the newest
+/// image older than the newest one in use, or the newest image when no
+/// container uses any. Age protects none of them: a deployment still between
+/// build and start holds its project, and garbage collection leaves a held
+/// project alone.
 ///
 /// A project with no container at all, and none of whose images a container
-/// uses, keeps only what is younger than `orphaned_grace`: its newest image
-/// goes too, since nothing will roll back to it.
+/// uses, keeps only what is younger than `orphaned_grace`: its newest and
+/// previous images go too, since nothing will roll back to them.
 pub(crate) fn select_stale_images(
     listed: &[ListedImage],
     inspected: &[InspectedImage],
@@ -187,32 +208,158 @@ pub(crate) fn select_stale_images(
         });
         let orphaned = !usage.projects.contains(&project_id)
             && !images.iter().any(|image| in_use.contains(&image.id));
-        let (previous, min_age) = if orphaned {
-            (None, retention.orphaned_grace)
-        } else {
-            let newest_in_use = images
-                .iter()
-                .find(|image| in_use.contains(&image.id))
-                .map(|image| image.created);
-            let previous = images
-                .iter()
-                .find(|image| {
-                    !in_use.contains(&image.id)
-                        && newest_in_use.is_none_or(|active| image.created < active)
-                })
-                .map(|image| image.id.clone());
-            (previous, retention.min_age)
-        };
+        if orphaned {
+            for image in images {
+                if now - image.created >= retention.orphaned_grace {
+                    stale.extend(stale_image(listed, image, project_id));
+                }
+            }
+            continue;
+        }
+        let previous = tagged_previous(listed, &images, project_id)
+            .or_else(|| untagged_previous(&images, in_use));
         for image in images {
-            let kept = in_use.contains(&image.id)
-                || previous.as_deref() == Some(image.id.as_str())
-                || now - image.created < min_age;
+            let kept = in_use.contains(&image.id) || previous.as_deref() == Some(image.id.as_str());
             if !kept {
                 stale.extend(stale_image(listed, image, project_id));
             }
         }
     }
     stale
+}
+
+/// The image of the project that carries `sakala/project-<project>:previous`.
+/// Docker gives one reference to one image, so there is at most one.
+fn tagged_previous(
+    listed: &[ListedImage],
+    images: &[&InspectedImage],
+    project_id: Uuid,
+) -> Option<String> {
+    let reference = previous_image_reference(project_id);
+    images
+        .iter()
+        .find(|image| {
+            listed
+                .iter()
+                .any(|listed| listed.id == image.id && listed.references.contains(&reference))
+        })
+        .map(|image| image.id.clone())
+}
+
+/// The rule before the previous tag existed: the newest image older than the
+/// newest one in use, or the newest image when no container uses any.
+/// `images` is sorted newest first.
+fn untagged_previous(images: &[&InspectedImage], in_use: &HashSet<String>) -> Option<String> {
+    let newest_in_use = images
+        .iter()
+        .find(|image| in_use.contains(&image.id))
+        .map(|image| image.created);
+    images
+        .iter()
+        .find(|image| {
+            !in_use.contains(&image.id) && newest_in_use.is_none_or(|active| image.created < active)
+        })
+        .map(|image| image.id.clone())
+}
+
+/// One container of a project as the post-deployment image step sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectContainer {
+    /// Without Docker's leading `/`.
+    pub name: String,
+    /// The image ID the container was created from.
+    pub image: String,
+    pub running: bool,
+    pub created: OffsetDateTime,
+}
+
+/// `docker container inspect` of every container of a project, for
+/// [`parse_project_containers`].
+pub(crate) const PROJECT_CONTAINER_FORMAT: &str =
+    "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}";
+
+pub(crate) fn parse_project_containers(
+    stdout: &str,
+) -> Result<Vec<ProjectContainer>, RuntimeError> {
+    stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
+            let [name, image, running, created] = fields[..] else {
+                return Err(RuntimeError::Container(
+                    "docker container inspect returned an unknown format".to_owned(),
+                ));
+            };
+            let created = OffsetDateTime::parse(created, &Rfc3339).map_err(|error| {
+                RuntimeError::Container(format!(
+                    "Docker returned an invalid container creation timestamp: {error}"
+                ))
+            })?;
+            Ok(ProjectContainer {
+                name: name.trim_start_matches('/').to_owned(),
+                image: image.to_owned(),
+                running: running == "true",
+                created,
+            })
+        })
+        .collect()
+}
+
+/// The image a deployment that just went live replaced, which becomes the
+/// project's previous image, or `None` when the previous image stays as it is.
+///
+/// `current` names the new deployment's replicas. The replaced deployment is
+/// what else of the project runs, or, when nothing else runs (a sleeping
+/// project), what else exists; its newest container decides. When that image
+/// is one the new deployment runs, the deployment reused the live image (a
+/// configuration redeploy), and the previous image does not move. A first
+/// deployment replaces nothing.
+pub(crate) fn replaced_image(
+    containers: &[ProjectContainer],
+    current: &[String],
+) -> Option<String> {
+    let live = containers
+        .iter()
+        .filter(|container| current.contains(&container.name))
+        .map(|container| container.image.as_str())
+        .collect::<HashSet<_>>();
+    let replaced = containers
+        .iter()
+        .filter(|container| !current.contains(&container.name))
+        .collect::<Vec<_>>();
+    let any_running = replaced.iter().any(|container| container.running);
+    replaced
+        .into_iter()
+        .filter(|container| container.running || !any_running)
+        .max_by(|left, right| {
+            left.created
+                .cmp(&right.created)
+                .then_with(|| left.name.cmp(&right.name))
+        })
+        .map(|container| container.image.clone())
+        .filter(|image| !live.contains(image.as_str()))
+}
+
+/// The names of `image_id` when it may carry the previous tag of
+/// `project_id`: it is labelled with that project (the listing is filtered by
+/// that label) and every name it has is in that project's repository.
+pub(crate) fn owned_references(
+    listed: &[ListedImage],
+    image_id: &str,
+    project_id: Uuid,
+) -> Option<Vec<String>> {
+    let prefix = format!("{}:", project_repository(project_id));
+    let references = listed
+        .iter()
+        .find(|listed| listed.id == image_id)
+        .map(|listed| listed.references.clone())
+        .unwrap_or_default();
+    let owned = !references.is_empty()
+        && references
+            .iter()
+            .all(|reference| reference.len() > prefix.len() && reference.starts_with(&prefix));
+    owned.then_some(references)
 }
 
 /// Every image of one project that no container uses, whatever its age. For a
@@ -233,22 +380,23 @@ pub(crate) fn select_project_images(
 
 /// `None` unless every name of the image is `sakala/project-<project_id>:<tag>`,
 /// so an image someone tagged elsewhere, or a dangling one, is never removed.
+///
+/// The previous tag comes first among the names: `docker image rm` untags
+/// one name after another, and when a container started using the image in
+/// the meantime Docker refuses only the last one, so the image keeps its
+/// original name, the one reuse looks it up under.
 fn stale_image(
     listed: &[ListedImage],
     image: &InspectedImage,
     project_id: Uuid,
 ) -> Option<StaleImage> {
-    let prefix = format!("sakala/project-{project_id}:");
-    let references = listed
-        .iter()
-        .find(|listed| listed.id == image.id)
-        .map(|listed| listed.references.clone())
-        .unwrap_or_default();
-    let owned = !references.is_empty()
-        && references
-            .iter()
-            .all(|reference| reference.len() > prefix.len() && reference.starts_with(&prefix));
-    owned.then(|| StaleImage {
+    if image.project_id != Some(project_id) {
+        return None;
+    }
+    let previous = previous_image_reference(project_id);
+    let mut references = owned_references(listed, &image.id, project_id)?;
+    references.sort_by_key(|reference| *reference != previous);
+    Some(StaleImage {
         id: image.id.clone(),
         references,
         project_id,
@@ -346,7 +494,6 @@ mod tests {
     }
 
     const RETENTION: Retention = Retention {
-        min_age: Duration::days(7),
         orphaned_grace: Duration::days(1),
     };
 
@@ -392,20 +539,22 @@ mod tests {
         );
     }
 
+    /// Before the previous tag, every image younger than seven days stayed.
     #[test]
-    fn keeps_what_is_younger_than_the_retention_age() {
+    fn age_no_longer_protects_an_image_of_a_project_with_containers() {
         let inspected = [
-            image("old", PROJECT, "2026-01-01T00:00:00Z"),
-            image("recent", PROJECT, "2026-01-30T00:00:00Z"),
-            image("newest", PROJECT, "2026-01-31T00:00:00Z"),
+            image("old", PROJECT, "2026-01-31T00:00:00Z"),
+            image("recent", PROJECT, "2026-01-31T22:00:00Z"),
+            image("newest", PROJECT, "2026-01-31T23:00:00Z"),
         ];
         let stale = select_stale_images(
             &listed(&inspected),
             &inspected,
-            &usage(&[], &[PROJECT]),
+            &usage(&["newest"], &[PROJECT]),
             at("2026-02-01T00:00:00Z"),
             RETENTION,
         );
+        // `recent` is the previous image by the rule for untagged images.
         assert_eq!(chosen(&stale), ["old"]);
     }
 
@@ -421,7 +570,6 @@ mod tests {
             &usage(&["a", "b"], &[]),
             at("2027-01-01T00:00:00Z"),
             Retention {
-                min_age: Duration::ZERO,
                 orphaned_grace: Duration::ZERO,
             },
         );
@@ -533,5 +681,264 @@ mod tests {
             Uuid::parse_str(PROJECT).expect("uuid"),
         );
         assert_eq!(chosen(&stale), ["fresh", "old"]);
+    }
+
+    fn project(id: &str) -> Uuid {
+        Uuid::parse_str(id).expect("uuid")
+    }
+
+    /// Adds `sakala/project-<project>:previous` to the names of `id`.
+    fn tag_previous(listed: &mut [ListedImage], id: &str, project_id: &str) {
+        listed
+            .iter_mut()
+            .find(|image| image.id == id)
+            .expect("listed image")
+            .references
+            .push(previous_image_reference(project(project_id)));
+    }
+
+    /// Deployments I1 to I4, each built a day after the one before.
+    fn four_deployments() -> [InspectedImage; 4] {
+        [
+            image("i1", PROJECT, "2026-01-01T00:00:00Z"),
+            image("i2", PROJECT, "2026-01-02T00:00:00Z"),
+            image("i3", PROJECT, "2026-01-03T00:00:00Z"),
+            image("i4", PROJECT, "2026-01-04T00:00:00Z"),
+        ]
+    }
+
+    fn keep_rule(
+        listed: &[ListedImage],
+        inspected: &[InspectedImage],
+        in_use: &[&str],
+    ) -> Vec<String> {
+        select_stale_images(
+            listed,
+            inspected,
+            &usage(in_use, &[PROJECT]),
+            at("2026-01-04T00:00:01Z"),
+            RETENTION,
+        )
+        .into_iter()
+        .map(|image| image.id)
+        .collect()
+    }
+
+    #[test]
+    fn the_tagged_previous_image_is_kept_instead_of_the_newest_older_one() {
+        let inspected = four_deployments();
+        let mut listed = listed(&inspected);
+        // I4 runs after a rollback from I3 to I2... and back to I4; I2 is previous.
+        tag_previous(&mut listed, "i2", PROJECT);
+        assert_eq!(keep_rule(&listed, &inspected, &["i4"]), ["i3", "i1"]);
+    }
+
+    #[test]
+    fn without_the_tag_the_newest_image_older_than_the_live_one_is_previous() {
+        let inspected = four_deployments();
+        let listed = listed(&inspected);
+        // A failed deployment's I4 is newer than the live I3 and goes too.
+        assert_eq!(keep_rule(&listed, &inspected, &["i3"]), ["i4", "i1"]);
+    }
+
+    #[test]
+    fn every_image_a_container_uses_is_kept_in_any_state_and_for_every_replica() {
+        let inspected = four_deployments();
+        let mut listed = listed(&inspected);
+        tag_previous(&mut listed, "i1", PROJECT);
+        // Two replicas of I4 running, and a sleeping (stopped) container of I2
+        // that `docker ps --all` still lists.
+        let usage =
+            parse_container_usage(&format!("i4\t{PROJECT}\ni4\t{PROJECT}\ni2\t{PROJECT}\n"));
+        let stale = select_stale_images(
+            &listed,
+            &inspected,
+            &usage,
+            at("2026-01-04T00:00:01Z"),
+            RETENTION,
+        );
+        assert_eq!(chosen(&stale), ["i3"]);
+    }
+
+    #[test]
+    fn a_previous_tag_outside_the_project_or_on_a_foreign_image_is_never_followed() {
+        let inspected = four_deployments();
+        let mut listed = listed(&inspected);
+        // Someone tagged I1 as OTHER's previous: not PROJECT's previous, and
+        // not PROJECT's to remove either.
+        tag_previous(&mut listed, "i1", OTHER);
+        // I2 carries PROJECT's previous tag but also a foreign name.
+        tag_previous(&mut listed, "i2", PROJECT);
+        listed[1]
+            .references
+            .push("registry.example/app:latest".to_owned());
+        assert_eq!(keep_rule(&listed, &inspected, &["i4"]), ["i3"]);
+    }
+
+    #[test]
+    fn an_orphaned_project_loses_its_previous_image_past_the_grace_with_that_tag_first() {
+        let inspected = four_deployments();
+        let mut listed = listed(&inspected);
+        tag_previous(&mut listed, "i3", PROJECT);
+        let stale = select_stale_images(
+            &listed,
+            &inspected,
+            &usage(&[], &[]),
+            at("2026-02-01T00:00:00Z"),
+            RETENTION,
+        );
+        assert_eq!(chosen(&stale), ["i4", "i3", "i2", "i1"]);
+        assert_eq!(
+            stale[1].references,
+            [
+                previous_image_reference(project(PROJECT)),
+                format!("sakala/project-{PROJECT}:i3"),
+            ]
+        );
+    }
+
+    fn container(name: &str, image: &str, running: bool, created: &str) -> ProjectContainer {
+        ProjectContainer {
+            name: name.to_owned(),
+            image: image.to_owned(),
+            running,
+            created: at(created),
+        }
+    }
+
+    fn current(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn reads_every_container_of_a_project() {
+        let containers = parse_project_containers(
+            "/sakala-app-11111111-a\tsha256:a\ttrue\t2026-11-23T01:02:03.456789Z\n\
+             /sakala-app-11111111-b\tsha256:b\tfalse\t2026-11-23T08:02:03+07:00\n",
+        )
+        .expect("containers");
+        assert_eq!(
+            containers,
+            [
+                container(
+                    "sakala-app-11111111-a",
+                    "sha256:a",
+                    true,
+                    "2026-11-23T01:02:03.456789Z"
+                ),
+                container(
+                    "sakala-app-11111111-b",
+                    "sha256:b",
+                    false,
+                    "2026-11-23T01:02:03Z"
+                ),
+            ]
+        );
+        assert!(parse_project_containers("/a\tsha256:a\ttrue\n").is_err());
+    }
+
+    #[test]
+    fn a_deployment_marks_the_image_of_the_workload_it_replaced() {
+        let containers = [
+            container("new-0", "i5", true, "2026-01-05T00:00:00Z"),
+            container("new-1", "i5", true, "2026-01-05T00:00:01Z"),
+            container("old-0", "i4", true, "2026-01-04T00:00:00Z"),
+            container("old-1", "i4", true, "2026-01-04T00:00:01Z"),
+        ];
+        assert_eq!(
+            replaced_image(&containers, &current(&["new-0", "new-1"])),
+            Some("i4".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_redeploy_that_reuses_the_live_image_does_not_move_previous() {
+        let containers = [
+            container("new", "i4", true, "2026-01-05T00:00:00Z"),
+            container("old", "i4", true, "2026-01-04T00:00:00Z"),
+        ];
+        assert_eq!(replaced_image(&containers, &current(&["new"])), None);
+    }
+
+    #[test]
+    fn a_rollback_from_i5_to_i3_makes_i5_previous() {
+        let containers = [
+            container("rollback", "i3", true, "2026-01-06T00:00:00Z"),
+            container("live", "i5", true, "2026-01-05T00:00:00Z"),
+        ];
+        assert_eq!(
+            replaced_image(&containers, &current(&["rollback"])),
+            Some("i5".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_first_deployment_replaces_nothing() {
+        let containers = [container("first", "i1", true, "2026-01-01T00:00:00Z")];
+        assert_eq!(replaced_image(&containers, &current(&["first"])), None);
+    }
+
+    #[test]
+    fn the_running_workload_is_the_replaced_one_even_beside_a_newer_stopped_container() {
+        let containers = [
+            container("new", "i5", true, "2026-01-05T00:00:00Z"),
+            container("serving", "i3", true, "2026-01-03T00:00:00Z"),
+            container("left-behind", "i4", false, "2026-01-04T00:00:00Z"),
+        ];
+        assert_eq!(
+            replaced_image(&containers, &current(&["new"])),
+            Some("i3".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_deployment_of_a_sleeping_project_replaces_its_stopped_workload() {
+        let containers = [
+            container("new", "i5", true, "2026-01-05T00:00:00Z"),
+            container("asleep", "i4", false, "2026-01-04T00:00:00Z"),
+            container("older", "i3", false, "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(
+            replaced_image(&containers, &current(&["new"])),
+            Some("i4".to_owned())
+        );
+    }
+
+    /// The whole post-deployment decision: deploy A, B, C, then roll back to B.
+    #[test]
+    fn deploying_a_b_c_keeps_c_and_b_and_a_rollback_to_b_keeps_b_and_c() {
+        let inspected = [
+            image("a", PROJECT, "2026-01-01T00:00:00Z"),
+            image("b", PROJECT, "2026-01-02T00:00:00Z"),
+            image("c", PROJECT, "2026-01-03T00:00:00Z"),
+        ];
+        let mut listed = listed(&inspected);
+
+        // C goes live over B.
+        let after_c = [
+            container("c", "c", true, "2026-01-03T00:00:00Z"),
+            container("b", "b", true, "2026-01-02T00:00:00Z"),
+        ];
+        let previous = replaced_image(&after_c, &current(&["c"])).expect("b is replaced");
+        assert_eq!(previous, "b");
+        tag_previous(&mut listed, &previous, PROJECT);
+        // B's container is removed before the prune.
+        assert_eq!(keep_rule(&listed, &inspected, &["c"]), ["a"]);
+
+        // Roll back to B, reusing its image, over C. A is gone by now.
+        let inspected = [inspected[1].clone(), inspected[2].clone()];
+        let mut listed = self::listed(&inspected);
+        tag_previous(&mut listed, "b", PROJECT);
+        let after_rollback = [
+            container("rollback", "b", true, "2026-01-04T00:00:00Z"),
+            container("c", "c", true, "2026-01-03T00:00:00Z"),
+        ];
+        let previous =
+            replaced_image(&after_rollback, &current(&["rollback"])).expect("c is replaced");
+        assert_eq!(previous, "c");
+        // Moving the tag leaves B with its own name only.
+        listed[0].references.pop();
+        tag_previous(&mut listed, "c", PROJECT);
+        assert!(keep_rule(&listed, &inspected, &["b"]).is_empty());
     }
 }

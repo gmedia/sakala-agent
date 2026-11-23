@@ -2555,7 +2555,6 @@ async fn image_gc_removes_old_project_images_and_keeps_active_and_previous() {
         agent_id: format!("{PREFIX}-agent"),
         workspace_root: temp.path().join("builds"),
         caddy_sites_dir: temp.path().join("sites"),
-        image_gc_max_age: Duration::ZERO,
         // `other` has no container, and its images are younger than this.
         orphaned_image_grace: Duration::from_secs(3_600),
         ..DockerRuntimeConfig::default()

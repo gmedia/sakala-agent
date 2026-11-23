@@ -348,6 +348,45 @@ menghapus image itu, karena image tersebut masih dipakai deployment yang sedang
 melayani. Container kandidatnya tetap dihapus seperti biasa. Detail runtime ada di
 [Memakai ulang image](DOCKER_RUNTIME.md#memakai-ulang-image).
 
+### Rollback dan image sebelumnya
+
+Rollback tidak punya command atau field sendiri. API mengirim `DeployProject` biasa
+dengan `commit_sha` milik deployment tujuan dan `reuse_image_from_deployment_id` berisi
+deployment yang membangun image tujuan itu. Agent memperlakukannya persis seperti
+redeploy konfigurasi di atas: image dicari di bawah nama yang dihitung sendiri, label
+diperiksa, dan bila image sudah tidak ada Agent build commit itu lagi dengan
+`deployment.image.reuse_skipped` (`image_missing`).
+
+Node yang mengiklankan capability `image-rollback` (hanya driver `docker`) menjanjikan
+image mana yang masih ada, sehingga API tahu kapan rollback bisa dijanjikan "tanpa
+build":
+
+- Setelah `DeployProject` sukses, yaitu workload baru melayani dan workload lama sudah
+  dihapus, Agent menyimpan tepat dua image project itu: image yang sedang melayani
+  (*live*) dan image sebelumnya (*previous*). Image `sakala/project-<project_id>:*` lain
+  yang tidak dipakai container mana pun dihapus, masih di bawah lock project yang sama
+  dengan deployment itu.
+- *Previous* adalah image workload yang digantikan deployment sukses terakhir, bila
+  berbeda dari image live yang baru. Redeploy yang memakai ulang image live (redeploy
+  konfigurasi) tidak menggeser previous. Setelah rollback dari I5 ke I3, previous
+  menjadi I5, jadi kembali maju ke I5 juga tanpa build.
+- Penandanya tag Docker kedua di repository yang sama:
+  `sakala/project-<project_id>:previous`. Image itu tetap punya tag aslinya, jadi
+  pencarian reuse lewat nama yang dihitung tetap menemukannya. Memindahkan tag tidak
+  pernah menghapus image dengan sendirinya.
+- Deployment yang gagal tidak pernah menggeser previous dan tetap hanya menghapus image
+  kandidat yang dibangunnya sendiri.
+- Hanya image yang semua namanya `sakala/project-<project_id>:<tag>` dan berlabel
+  `dev.sakala.project-id` project itu yang pernah diberi tag atau dihapus.
+
+Jadi rollback tanpa build hanya bisa ke deployment yang membangun image live atau image
+previous di node yang sama. Rollback ke deployment lain tetap jalan, hanya lewat build.
+Bila langkah tag atau penghapusan ini gagal, deployment tetap sukses: Agent mengirim
+event `deployment.images.retained` (level `warning`, metadata `project_id`), dan image GC
+berkala merapikannya kemudian. Agent yang tidak mengiklankan `image-rollback` tetap
+menerima rollback lewat `reuse_image_from_deployment_id`, tetapi image-nya diatur aturan
+GC lama, jadi API sebaiknya tidak menjanjikan "tanpa build".
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -368,6 +407,20 @@ Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
 Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
 mengirim nama Docker, domain, port, command shell, atau credential pada payload
 lifecycle.
+
+`RestartProject` menyalakan ulang semua replika deployment itu dari container yang ada,
+tanpa build dan tanpa deployment baru. Bila minimal satu replika berjalan, semua replika
+di-restart seperti sebelumnya. Bila tidak ada yang berjalan, karena container-nya exited
+atau Docker sedang di antara dua restart crash loop (`Restarting`), Agent memeriksa
+kapasitas node seperti wake lalu me-restart semuanya. Deployment yang sedang tidur, yaitu
+yang route project-nya halaman tidur untuk deployment itu, tetap ditolak dengan
+`runtime_workload_not_running`; project seperti itu dibangunkan lewat `WakeProject`.
+Route tidur adalah satu-satunya catatan lokal sebuah sleep, sama dengan yang dipakai
+deteksi orphan. Bila halaman tidur gagal dipasang saat sleep dan Agent menghapus route
+sebagai gantinya, Agent tidak bisa membedakan project itu dari yang crash, jadi API hanya
+boleh mengirim `RestartProject` untuk project yang `runtime_status`-nya `running` atau
+`crashed`. Agent v0.15.0 dan sebelumnya juga menolak project yang crash dengan
+`runtime_workload_not_running`.
 
 Ada dua pengecualian. Yang pertama `StopProject` untuk project yang dihapus. Payload-nya
 boleh membawa `remove_images: true` (boolean, opsional, default `false`):
@@ -665,19 +718,28 @@ Image hanya dipilih bila berlabel `dev.sakala.managed=true`, punya label
 Image dangling atau yang di-tag ulang dengan nama lain tidak pernah dipilih.
 
 Per project yang masih punya container (berlabel project itu, atau memakai salah satu
-image-nya), Agent mempertahankan setiap image yang dipakai container mana pun (berjalan
-atau berhenti), image deployment sebelumnya (image terbaru yang lebih tua dari image
-aktif terbaru, atau image terbaru bila tidak ada yang aktif), dan semua image yang lebih
-muda dari `SAKALA_IMAGE_GC_MAX_AGE_SECONDS`. Project tanpa container sama sekali, misalnya
-project yang sudah dihapus, hanya mempertahankan image yang lebih muda dari
-`SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam, dihitung dari waktu image dibuat);
-image terbarunya ikut dihapus karena tidak ada yang akan di-rollback.
+image-nya), Agent mempertahankan setiap image yang dipakai container mana pun, dalam
+state apa pun (jadi container yang tidur dan semua replika ikut dihitung), ditambah image
+previous: image bertag `sakala/project-<project_id>:previous`, atau, bila belum ada image
+dengan tag itu (image dari Agent lama), image terbaru yang lebih tua dari image aktif
+terbaru, atau image terbaru bila tidak ada yang aktif. Umur image tidak lagi melindungi
+image project seperti ini; `SAKALA_IMAGE_GC_MAX_AGE_SECONDS` sudah tidak dipakai. Project
+tanpa container sama sekali, misalnya project yang sudah dihapus, hanya mempertahankan
+image yang lebih muda dari `SAKALA_ORPHANED_IMAGE_GRACE_SECONDS` (default 24 jam,
+dihitung dari waktu image dibuat); image terbaru dan image previous-nya ikut dihapus
+karena tidak ada yang akan di-rollback.
 
-Sisanya dihapus dengan `docker image rm` tanpa `--force`, jadi Docker tetap menolak
-image yang mulai dipakai container setelah pemilihan. Selain lewat command ini, Agent
-menjalankan aturan yang sama sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS`, kecuali
-saat ada command aktif. `startup_reconciliation.stale_images` pada heartbeat memuat
-daftar yang sama, tanpa menghapus apa pun.
+Sisanya dihapus dengan `docker image rm <nama>...` tanpa `--force`, per nama, dengan tag
+`previous` lebih dulu. Docker tetap menolak image yang mulai dipakai container setelah
+pemilihan, dan image yang ditolak tetap memegang nama aslinya. Image sebuah project hanya
+dihapus selama tidak ada command project itu yang berjalan: GC memegang lock project yang
+sama dengan command, melewati project yang sedang dipegang, dan memilih ulang image
+project itu setelah lock didapat. Selain lewat command ini, Agent menjalankan aturan yang
+sama sendiri setiap `SAKALA_IMAGE_GC_INTERVAL_SECONDS`, kecuali saat ada command aktif,
+dan setelah setiap `DeployProject` yang sukses (lihat
+[Rollback dan image sebelumnya](#rollback-dan-image-sebelumnya)).
+`startup_reconciliation.stale_images` pada heartbeat memuat daftar yang sama, tanpa
+menghapus apa pun.
 
 Result menambah `removed_images`, jumlah image yang terhapus. `reclaimed_image_bytes`
 adalah jumlah ukuran image itu menurut Docker, termasuk layer yang masih dipakai image
@@ -974,7 +1036,8 @@ telemetry yang tidak dapat diketahui runtime dengan aman boleh bernilai `null`;
     "replicas",
     "release-command",
     "workload-metrics",
-    "image-reuse"
+    "image-reuse",
+    "image-rollback"
   ],
   "metadata": {
     "version": "0.15.0",
@@ -1592,6 +1655,7 @@ dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
 | `deployment.health.started` | Container sudah jalan, probe readiness dimulai. | `health_checking` |
 | `deployment.route.started` | Aplikasi sudah menjawab, route akan diaktifkan. | `routing` |
 | `deployment.runtime.ready` | Route aktif dan cleanup selesai. Bukan penanda routing. | tidak ada; `succeeded` hanya dari `complete` |
+| `deployment.images.retained` | Hanya bila deployment sudah melayani tetapi image lama project-nya tidak bisa ditandai atau dihapus sesudahnya. Level `warning`, metadata `project_id`. Datang setelah `deployment.runtime.ready`; deployment tetap sukses dan image GC berkala merapikannya. | tidak ada |
 
 Health check selalu terjadi sebelum routing. Route tidak boleh aktif sebelum
 aplikasi terbukti menjawab.

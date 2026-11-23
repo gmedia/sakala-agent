@@ -26,6 +26,7 @@ pub(crate) mod network;
 pub(crate) mod replicas;
 
 pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
+pub use images::{PREVIOUS_IMAGE_TAG, previous_image_reference, project_repository};
 pub use limits::ResourceSafetyConfig;
 pub use network::project_network_name;
 pub use replicas::{MAX_REPLICAS_PER_PROJECT_CEILING, ReplicaSlot};
@@ -333,31 +334,69 @@ pub trait ContainerEngine: Send + Sync {
     }
 
     /// Removes old images of Sakala projects. Per project with a container it
-    /// keeps every image a container uses, the previous deployment's image, and
-    /// anything younger than `retention.max_age`. A project without containers
-    /// keeps only images younger than `retention.orphaned_grace`. Docker itself
-    /// still refuses an image a container uses.
+    /// keeps every image a container uses, in any state, and the previous
+    /// image (the one tagged [`PREVIOUS_IMAGE_TAG`]). A project without containers keeps only images
+    /// younger than `retention.orphaned_grace`. Docker itself still refuses an
+    /// image a container uses.
+    ///
+    /// The images of a project are removed only while `claim` gives that
+    /// project, and are chosen again under the claim, so a command of the
+    /// project never runs between the choice and the removal. A project
+    /// `claim` refuses keeps its images until the next run.
     async fn cleanup_stale_images(
         &self,
         retention: ImageRetention,
+        claim: &ClaimProject<'_>,
     ) -> Result<ImageCleanup, RuntimeError>;
 
     /// Removes every image of one project that no container uses, whatever its
     /// age. Called once the containers of a deleted project are gone.
     async fn remove_project_images(&self, project_id: Uuid) -> Result<ImageCleanup, RuntimeError>;
 
+    /// Tags the image of the workload a deployment that just went live
+    /// replaced as `sakala/project-<project_id>:previous`, when it differs
+    /// from the image the new replicas (`current`) run and is provably the
+    /// project's. Returns the tagged image ID, or `None` when the previous
+    /// image stays as it was. Called with the project held, after the route
+    /// moved and before the replaced containers are removed, so a crash in
+    /// between leaves the tag right and the containers to orphan cleanup.
+    async fn mark_previous_image(
+        &self,
+        _project_id: Uuid,
+        _current: &[String],
+    ) -> Result<Option<String>, RuntimeError> {
+        Ok(None)
+    }
+
+    /// Applies the rule of [`Self::cleanup_stale_images`] to one project, with
+    /// the project held by the caller. After a successful deployment that
+    /// leaves the live image and the previous image.
+    async fn prune_project_images(
+        &self,
+        _project_id: Uuid,
+        _retention: ImageRetention,
+    ) -> Result<ImageCleanup, RuntimeError> {
+        Ok(ImageCleanup::default())
+    }
+
     async fn shutdown(&self);
 }
 
-/// How long image GC keeps the images of Sakala projects.
+/// How long image GC keeps the images of a project without containers. A
+/// project with containers keeps its live and previous images whatever their
+/// age, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageRetention {
-    /// A project that still has a container keeps every image younger than this.
-    pub max_age: std::time::Duration,
     /// A project without any container keeps only images younger than this,
     /// counted from when the image was built.
     pub orphaned_grace: std::time::Duration,
 }
+
+/// A project held away from its commands while image GC removes its images.
+pub type ProjectClaim = tokio::sync::OwnedMutexGuard<()>;
+
+/// Gives image GC a project, or `None` while a command of that project runs.
+pub type ClaimProject<'a> = dyn Fn(Uuid) -> Option<ProjectClaim> + Send + Sync + 'a;
 
 /// What one image GC run removed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -366,6 +405,13 @@ pub struct ImageCleanup {
     /// Docker's sizes of the removed images added up. Layers shared with images
     /// that remain are counted too, so this is an upper bound.
     pub reclaimed_bytes: u64,
+}
+
+impl std::ops::AddAssign for ImageCleanup {
+    fn add_assign(&mut self, other: Self) {
+        self.removed_images += other.removed_images;
+        self.reclaimed_bytes += other.reclaimed_bytes;
+    }
 }
 
 /// What the last output of a failed candidate showed.
@@ -380,7 +426,8 @@ pub struct FailureOutput {
 #[must_use]
 pub fn image_name(project_id: Uuid, deployment_id: Uuid, commit_sha: &str) -> String {
     format!(
-        "sakala/project-{project_id}:{}-{}",
+        "{}:{}-{}",
+        images::project_repository(project_id),
         &commit_sha[..12],
         &deployment_id.to_string()[..8]
     )

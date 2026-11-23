@@ -32,8 +32,8 @@ pub use databases::{
 pub use deployments::{
     AppliedRuntimeResources, DeployProjectPayload, DeployProjectResult, DeploymentBuilder,
     FinalizationDeferredReason, IMAGE_REUSE_CAPABILITY, IMAGE_REUSE_SKIPPED_EVENT,
-    IMAGE_REUSED_EVENT, ImageReuseFallbackReason, LogBounds, RequestedImageReuse,
-    RequestedReplicas, RuntimeResourceLimits, RuntimeTimeoutLimits,
+    IMAGE_REUSED_EVENT, IMAGE_ROLLBACK_CAPABILITY, ImageReuseFallbackReason, LogBounds,
+    RequestedImageReuse, RequestedReplicas, RuntimeResourceLimits, RuntimeTimeoutLimits,
 };
 pub use events::{DeploymentEvent, DeploymentEventLevel};
 pub use heartbeat::{

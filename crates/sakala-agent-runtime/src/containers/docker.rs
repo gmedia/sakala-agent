@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroU32,
     path::Path,
     sync::{Arc, Mutex},
@@ -28,13 +28,15 @@ use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
     containers::{
-        ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
+        ClaimProject, ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
         ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ResourceSafetyConfig,
         RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LABELS_FORMAT,
-            IMAGE_LIST_FORMAT, InspectedImage, ListedImage, NO_SUCH_IMAGE, Retention, StaleImage,
+            IMAGE_LIST_FORMAT, InspectedImage, ListedImage, NO_SUCH_IMAGE,
+            PROJECT_CONTAINER_FORMAT, Retention, StaleImage, owned_references,
             parse_container_usage, parse_image_inspect, parse_image_labels, parse_image_list,
+            parse_project_containers, previous_image_reference, replaced_image,
             select_project_images, select_stale_images,
         },
         metrics::{
@@ -188,38 +190,42 @@ pub struct DockerContainerEngine {
 }
 
 impl DockerContainerEngine {
-    /// What image GC may remove now. See [`super::images`] for the rules.
+    /// What image GC may remove now, of every project or of one. See
+    /// [`super::images`] for the rules.
     async fn stale_images(
         &self,
+        project_id: Option<Uuid>,
         retention: ImageRetention,
     ) -> Result<Vec<StaleImage>, RuntimeError> {
-        let duration = |value: std::time::Duration| {
-            time::Duration::try_from(value).map_err(|_| {
-                RuntimeError::Configuration("image GC retention is too large".to_owned())
-            })
-        };
         let retention = Retention {
-            min_age: duration(retention.max_age)?,
-            orphaned_grace: duration(retention.orphaned_grace)?,
+            orphaned_grace: time::Duration::try_from(retention.orphaned_grace).map_err(|_| {
+                RuntimeError::Configuration("image GC retention is too large".to_owned())
+            })?,
         };
-        let Some((listed, inspected, usage)) = self.image_inventory(None).await? else {
+        let Some((listed, inspected, usage)) = self.image_inventory(project_id).await? else {
             return Ok(Vec::new());
         };
-        Ok(select_stale_images(
+        let mut stale = select_stale_images(
             &listed,
             &inspected,
             &usage,
             OffsetDateTime::now_utc(),
             retention,
-        ))
+        );
+        // The listing is already filtered by the project's label; this keeps a
+        // claim on one project from ever covering another's images.
+        if let Some(project_id) = project_id {
+            stale.retain(|image| image.project_id == project_id);
+        }
+        Ok(stale)
     }
 
-    /// Managed images, of one project or all, with what containers use.
-    /// `None` when there is no such image.
-    async fn image_inventory(
+    /// Managed images, of one project or all, with their names. A project's
+    /// listing filters on its label, so every image in it carries that label.
+    async fn image_listing(
         &self,
         project_id: Option<Uuid>,
-    ) -> Result<Option<(Vec<ListedImage>, Vec<InspectedImage>, ContainerUsage)>, RuntimeError> {
+    ) -> Result<Vec<ListedImage>, RuntimeError> {
         let mut list = CommandSpec::new("docker")
             .arg("image")
             .arg("ls")
@@ -229,10 +235,21 @@ impl DockerContainerEngine {
         if let Some(project_id) = project_id {
             list = list
                 .arg("--filter")
-                .arg(format!("label=dev.sakala.project-id={project_id}"));
+                .arg(format!("label={PROJECT_ID_LABEL}={project_id}"));
         }
         let list = list.arg("--format").arg(IMAGE_LIST_FORMAT);
-        let listed = parse_image_list(&self.read_docker(&list, "Sakala image listing").await?);
+        Ok(parse_image_list(
+            &self.read_docker(&list, "Sakala image listing").await?,
+        ))
+    }
+
+    /// Managed images, of one project or all, with what containers use.
+    /// `None` when there is no such image.
+    async fn image_inventory(
+        &self,
+        project_id: Option<Uuid>,
+    ) -> Result<Option<(Vec<ListedImage>, Vec<InspectedImage>, ContainerUsage)>, RuntimeError> {
+        let listed = self.image_listing(project_id).await?;
         if listed.is_empty() {
             return Ok(None);
         }
@@ -1395,7 +1412,7 @@ impl ContainerEngine for DockerContainerEngine {
         retention: ImageRetention,
     ) -> Result<Vec<RuntimeStaleImage>, RuntimeError> {
         Ok(self
-            .stale_images(retention)
+            .stale_images(None, retention)
             .await?
             .into_iter()
             .map(|image| RuntimeStaleImage {
@@ -1409,9 +1426,27 @@ impl ContainerEngine for DockerContainerEngine {
     async fn cleanup_stale_images(
         &self,
         retention: ImageRetention,
+        claim: &ClaimProject<'_>,
     ) -> Result<ImageCleanup, RuntimeError> {
-        let images = self.stale_images(retention).await?;
-        Ok(self.remove_images(images).await)
+        // One node-wide pass finds the projects with something to remove. Each
+        // of them is chosen again under its claim: a deployment that ran in
+        // between may have moved the previous tag or started on an image.
+        let projects = self
+            .stale_images(None, retention)
+            .await?
+            .into_iter()
+            .map(|image| image.project_id)
+            .collect::<BTreeSet<_>>();
+        let mut cleanup = ImageCleanup::default();
+        for project_id in projects {
+            let Some(_claim) = claim(project_id) else {
+                debug!(%project_id, "image GC left a project a command holds");
+                continue;
+            };
+            let images = self.stale_images(Some(project_id), retention).await?;
+            cleanup += self.remove_images(images).await;
+        }
+        Ok(cleanup)
     }
 
     async fn remove_project_images(&self, project_id: Uuid) -> Result<ImageCleanup, RuntimeError> {
@@ -1419,6 +1454,72 @@ impl ContainerEngine for DockerContainerEngine {
             return Ok(ImageCleanup::default());
         };
         let images = select_project_images(&listed, &inspected, &usage, project_id);
+        Ok(self.remove_images(images).await)
+    }
+
+    async fn mark_previous_image(
+        &self,
+        project_id: Uuid,
+        current: &[String],
+    ) -> Result<Option<String>, RuntimeError> {
+        let list = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--quiet")
+            .arg("--no-trunc")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--filter")
+            .arg(format!("label={PROJECT_ID_LABEL}={project_id}"));
+        let ids = self.read_docker(&list, "project container listing").await?;
+        if ids.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut inspect = CommandSpec::new("docker")
+            .arg("container")
+            .arg("inspect")
+            .arg("--format")
+            .arg(PROJECT_CONTAINER_FORMAT);
+        for id in ids.split_whitespace() {
+            inspect = inspect.arg(id);
+        }
+        let containers = parse_project_containers(
+            &self
+                .read_docker(&inspect, "project container inspection")
+                .await?,
+        )?;
+        let Some(image) = replaced_image(&containers, current) else {
+            return Ok(None);
+        };
+        let listed = self.image_listing(Some(project_id)).await?;
+        let Some(references) = owned_references(&listed, &image, project_id) else {
+            // Labelled for another project, or named outside this project's
+            // repository: never this project's to mark.
+            warn!(
+                %project_id,
+                image = %image,
+                "the replaced image is not provably the project's; the previous image stays"
+            );
+            return Ok(None);
+        };
+        let previous = previous_image_reference(project_id);
+        if !references.contains(&previous) {
+            let tag = CommandSpec::new("docker")
+                .arg("image")
+                .arg("tag")
+                .arg(&image)
+                .arg(&previous);
+            self.read_docker(&tag, "previous image tag").await?;
+        }
+        Ok(Some(image))
+    }
+
+    async fn prune_project_images(
+        &self,
+        project_id: Uuid,
+        retention: ImageRetention,
+    ) -> Result<ImageCleanup, RuntimeError> {
+        let images = self.stale_images(Some(project_id), retention).await?;
         Ok(self.remove_images(images).await)
     }
 
