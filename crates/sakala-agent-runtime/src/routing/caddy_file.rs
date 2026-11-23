@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -280,42 +281,64 @@ async fn remove_route(
     })
 }
 
+/// A route file Sakala owns, with what its first line says about the owner.
+struct ManagedRoute {
+    path: PathBuf,
+    project_id: Uuid,
+    owner: RouteOwner,
+}
+
+/// Every route file in `sites_dir` that Sakala owns. Other files, symlinks, and
+/// routes whose first line this Agent does not recognise are skipped.
+async fn managed_routes(sites_dir: &Path) -> Result<Vec<ManagedRoute>, RuntimeError> {
+    let mut entries = match fs::read_dir(sites_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut routes = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(project) = name.strip_suffix(".Caddyfile") else {
+            continue;
+        };
+        let Ok(project_id) = Uuid::parse_str(project) else {
+            continue;
+        };
+        let content = fs::read(&path).await?;
+        let Some(owner) = route_owner(&content, project_id) else {
+            continue;
+        };
+        routes.push(ManagedRoute {
+            path,
+            project_id,
+            owner,
+        });
+    }
+    Ok(routes)
+}
+
 #[async_trait]
 impl RouteManager for CaddyFileRouteManager {
     async fn discover_stale_routes(
         &self,
         known_routes: &KnownRoutes,
     ) -> Result<Vec<RuntimeStaleRoute>, RuntimeError> {
-        let mut entries = match fs::read_dir(&self.sites_dir).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
         let mut stale_routes = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let file_type = entry.file_type().await?;
-            if !file_type.is_file() || file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Some(project) = name.strip_suffix(".Caddyfile") else {
-                continue;
-            };
-            let Ok(project_id) = Uuid::parse_str(project) else {
-                continue;
-            };
-            let content = fs::read(&path).await?;
-            let Some(owner) = route_owner(&content, project_id) else {
-                continue;
-            };
+        for route in managed_routes(&self.sites_dir).await? {
+            let project_id = route.project_id;
             let identity = RouteIdentity {
                 project_id,
-                deployment_id: owner.deployment_id(),
+                deployment_id: route.owner.deployment_id(),
             };
-            let known = match owner {
+            let known = match route.owner {
                 RouteOwner::Legacy => known_routes
                     .serving
                     .iter()
@@ -327,12 +350,26 @@ impl RouteManager for CaddyFileRouteManager {
                 continue;
             }
             stale_routes.push(RuntimeStaleRoute {
-                path: path.display().to_string(),
+                path: route.path.display().to_string(),
                 project_id,
                 deployment_id: identity.deployment_id,
             });
         }
         Ok(stale_routes)
+    }
+
+    async fn sleeping_routes(&self) -> Result<HashSet<RouteIdentity>, RuntimeError> {
+        Ok(managed_routes(&self.sites_dir)
+            .await?
+            .into_iter()
+            .filter_map(|route| match route.owner {
+                RouteOwner::Sleeping(deployment_id) => Some(RouteIdentity {
+                    project_id: route.project_id,
+                    deployment_id: Some(deployment_id),
+                }),
+                RouteOwner::Legacy | RouteOwner::Serving(_) => None,
+            })
+            .collect())
     }
 
     async fn activate(

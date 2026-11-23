@@ -175,6 +175,12 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
                 "deployment_id": workload.deployment_id,
                 "status": workload.status,
             })),
+            "sleeping_workloads": bounded_values(&reconciliation.sleeping_workloads, |workload| json!({
+                "container_id": workload.container_id,
+                "project_id": workload.project_id,
+                "deployment_id": workload.deployment_id,
+                "status": workload.status,
+            })),
             "orphans": bounded_values(&reconciliation.orphans, |orphan| json!({
                 "container_id": orphan.container_id,
                 "project_id": orphan.project_id,
@@ -200,6 +206,7 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         "detail_counts": {
             "unhealthy_details": workloads.unhealthy_details.len(),
             "recovered_workloads": reconciliation.workloads.len(),
+            "sleeping_workloads": reconciliation.sleeping_workloads.len(),
             "orphans": reconciliation.orphans.len(),
             "stale_routes": reconciliation.stale_routes.len(),
             "stale_images": reconciliation.stale_images.len(),
@@ -708,6 +715,11 @@ mod tests {
         };
         let reconciliation = RuntimeReconciliationReport {
             workloads: vec![workload.clone()],
+            sleeping_workloads: vec![RuntimeWorkload {
+                container_id: "sleeping-00".to_owned(),
+                status: "Exited (143) 2 hours ago".to_owned(),
+                ..workload.clone()
+            }],
             orphans: vec![RuntimeOrphan {
                 container_id: "orphan-00".to_owned(),
                 project_id: Some(project_id),
@@ -750,6 +762,7 @@ mod tests {
         for key in [
             "unhealthy_details",
             "recovered_workloads",
+            "sleeping_workloads",
             "orphans",
             "stale_routes",
             "stale_images",
@@ -757,6 +770,15 @@ mod tests {
         ] {
             assert_eq!(detail_counts[key].as_u64(), Some(1), "count for {key}");
         }
+        assert_eq!(
+            heartbeat.metadata["startup_reconciliation"]["sleeping_workloads"],
+            json!([{
+                "container_id": "sleeping-00",
+                "project_id": project_id,
+                "deployment_id": deployment_id,
+                "status": "Exited (143) 2 hours ago",
+            }])
+        );
         assert_eq!(
             heartbeat.metadata["workloads"]["unhealthy_details"]
                 .as_array()

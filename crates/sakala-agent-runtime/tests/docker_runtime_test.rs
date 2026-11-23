@@ -1143,6 +1143,64 @@ async fn reconciliation_detects_stopped_or_incompletely_labeled_containers() {
     );
 }
 
+const OLDER_DEPLOYMENT: &str = "0e4a2b6c-1d3f-4a5b-8c7d-9e0f1a2b3c4d";
+const UNROUTED_PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+const UNROUTED_DEPLOYMENT: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A sleeping project's container is stopped on purpose and kept for the wake;
+/// only a stopped container no sleeping route points at is an orphan: an older
+/// deployment of the same project, or one with no route at all.
+#[tokio::test]
+async fn reconciliation_reports_sleeping_containers_as_sleeping_not_orphans() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "asleep\tExited (143) 3 days ago\t{PROJECT}\t{DEPLOYMENT}\n\
+         asleep2\tExited (137) 3 days ago\t{PROJECT}\t{DEPLOYMENT}\n\
+         older\tExited (143) 5 days ago\t{PROJECT}\t{OLDER_DEPLOYMENT}\n\
+         unrouted\tExited (0) 1 day ago\t{UNROUTED_PROJECT}\t{UNROUTED_DEPLOYMENT}\n"
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation scan should complete");
+
+    assert_eq!(report.inspected_containers, 4);
+    assert!(report.workloads.is_empty());
+    let sleeping = report
+        .sleeping_workloads
+        .iter()
+        .map(|workload| workload.container_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(sleeping, ["asleep", "asleep2"]);
+    assert_eq!(
+        report.sleeping_workloads[0].status,
+        "Exited (143) 3 days ago"
+    );
+    let orphans = report
+        .orphans
+        .iter()
+        .map(|orphan| (orphan.container_id.as_str(), orphan.reason.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        orphans,
+        [
+            ("older", "stale stopped deployment container"),
+            ("unrouted", "stale stopped deployment container"),
+        ]
+    );
+    // The sleeping route stays known, so a route cleanup would not delete it.
+    assert!(report.stale_routes.is_empty());
+
+    let capacity = RuntimeExecutor::capacity(&executor)
+        .await
+        .expect("capacity should be readable");
+    assert_eq!(capacity.active_workloads, Some(0));
+    assert_eq!(capacity.stopped_workloads, Some(4));
+}
+
 #[tokio::test]
 async fn reconciliation_discovers_valid_managed_workloads() {
     let temp = TempDir::new().expect("temp directory should be available");
@@ -1164,11 +1222,20 @@ async fn reconciliation_discovers_valid_managed_workloads() {
 #[tokio::test]
 async fn agent_restart_recovers_healthy_workload_and_orphan_visibility() {
     let temp = TempDir::new().expect("temp directory should be available");
-    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(
-        "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\ncandidate\tCreated\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\n",
-    ));
+    let asleep_project = "55555555-5555-4555-8555-555555555555";
+    let asleep_deployment = "66666666-6666-4666-8666-666666666666";
+    let config = runtime_config(&temp);
+    // A project idle sleep stopped before the restart keeps its sleeping route.
+    write_route(
+        &config,
+        asleep_project,
+        &sleeping_route(asleep_project, asleep_deployment),
+    );
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "healthy\tUp 10 minutes (healthy)\tff66ed4a-6303-4be6-8ef4-63c28b112680\t4f1f21ef-730d-42d5-a46d-d965353cb993\ncandidate\tCreated\t11111111-1111-4111-8111-111111111111\t22222222-2222-4222-8222-222222222222\nasleep\tExited (143) 2 hours ago\t{asleep_project}\t{asleep_deployment}\n",
+    )));
 
-    let recovered = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let recovered = DockerRuntimeExecutor::with_runner(config, runner.clone());
     let report = RuntimeExecutor::reconcile(&recovered)
         .await
         .expect("new agent process should reconcile existing runtime state");
@@ -1177,13 +1244,25 @@ async fn agent_restart_recovers_healthy_workload_and_orphan_visibility() {
         .expect("new agent process should recheck recovered workload health");
 
     assert_eq!(report.workloads.len(), 1);
-    assert!(
+    assert_eq!(
         report
             .orphans
             .iter()
-            .any(|orphan| orphan.container_id == "candidate")
+            .map(|orphan| orphan.container_id.as_str())
+            .collect::<Vec<_>>(),
+        ["candidate"]
     );
-    assert_eq!(health.len(), 2);
+    assert_eq!(
+        report
+            .sleeping_workloads
+            .iter()
+            .map(|workload| workload.container_id.as_str())
+            .collect::<Vec<_>>(),
+        ["asleep"]
+    );
+    assert!(report.stale_routes.is_empty());
+    // The fake runner answers every `docker ps` with the same listing.
+    assert_eq!(health.len(), 3);
     assert!(
         health
             .iter()
