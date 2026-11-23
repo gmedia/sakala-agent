@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-23
+
 ### Added
 
 - Konfigurasi opsional `SAKALA_PUBLIC_CONSOLE_URL`. Bila diisi, halaman project yang tidur dan halaman tidak tersedia menautkan pemilik project ke Console; tanpa itu kalimatnya tampil tanpa tautan. Nilai yang tidak valid membuat Agent berhenti saat start. Lihat [Configuration](docs/CONFIGURATION.md).
@@ -324,7 +326,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/gmedia/sakala-agent/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/gmedia/sakala-agent/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gmedia/sakala-agent/compare/v0.12.0...v0.13.0
