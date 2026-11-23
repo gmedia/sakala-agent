@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-11-23
+
 ### Changed
 
 - Langkah `railpack-label` kini selesai dalam sekitar satu detik, berapa pun ukuran image. Di staging dengan Agent v0.16.1, commit container yang dipakai langkah ini memakan 27,1 detik untuk image 197 MB, serta 50,5 dan 63,4 detik untuk image 526 MB; pada satu build, 50 dari 71 detik fase build habis di sini tanpa satu baris log pun. Dengan containerd image store, Docker menelusuri seluruh filesystem container saat commit walaupun tidak ada yang berubah. Kini Agent membaca digest manifest image `-unlabelled` dari `docker image inspect`, lalu menulis label lewat build yang hanya berisi `FROM <image>-unlabelled@<digest>` dengan `--label`, di builder `default` (BuildKit milik daemon, satu-satunya yang membaca image store Docker; `--builder` mengalahkan `BUILDX_BUILDER`), dengan `--pull=false`, `--network none`, dan tanpa attestation. Build ini hanya menulis config dan manifest baru di atas layer yang sama. Karena dipin ke digest, build tidak bisa memakai image lain: lookup yang meleset jatuh ke Docker Hub untuk digest persis itu, yang gagal atau mengembalikan byte yang sama. Di laptop pengembang (Docker 29.10, containerd image store, image 484 MB, 5 putaran) median langkah ini turun dari 4,38 detik (commit) ke 0,64 detik, dan build pada image 13 MB juga 0,61 detik. Label, CMD, ENTRYPOINT, ENV, WORKDIR, USER, dan EXPOSE tetap sama; `ArgsEscaped` kini juga terjaga. Node tanpa containerd image store tetap memakai commit. Log deployment kini mendapat baris `[railpack-label] Writing the Sakala labels onto the image.` saat langkah mulai dan `[railpack-label] Image labelled in N s.` saat selesai. Kegagalan tetap menggagalkan build dengan `runtime_build_failed` dan stderr Docker di log deployment. Lihat [Label image Railpack](docs/DOCKER_RUNTIME.md#label-image-railpack).
@@ -340,7 +342,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.16.2...HEAD
+[0.16.2]: https://github.com/gmedia/sakala-agent/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/gmedia/sakala-agent/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/gmedia/sakala-agent/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gmedia/sakala-agent/compare/v0.14.0...v0.15.0
