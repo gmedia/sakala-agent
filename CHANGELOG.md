@@ -4,6 +4,10 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Changed
+
+- Versi Rust minimum (`rust-version`) naik dari 1.88 ke 1.89. `uuid` 1.29.2, yang masuk `Cargo.lock` lewat update Dependabot #68 (2026-11-11) dan ikut di setiap rilis sejak v0.5.0, membutuhkan rustc 1.89.0, sehingga `cargo +1.88.0 check` gagal dengan `uuid@1.29.2 requires rustc 1.89.0` dan nilai 1.88 tidak lagi benar. CI kini punya job `msrv` yang menjalankan `cargo +<rust-version> check --workspace --all-targets --all-features --locked` dengan versi yang dibaca dari `Cargo.toml`, supaya update dependency berikutnya tidak menaikkan MSRV diam-diam. Workflow release tidak lagi meminta toolchain 1.88.0: `rust-toolchain.toml` (`stable`) selalu mengalahkan input itu, jadi binary rilis memang dibangun dengan `stable`, seperti di CI. Lihat [Development Workflow](docs/DEVELOPMENT.md#versi-rust-minimum).
+
 ### Security
 
 - Update `url` to 2.5.9 for RUSTSEC-2026-0592 (stack overflow in `Url::origin()` on nested `blob:` URLs).

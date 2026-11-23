@@ -32,6 +32,8 @@ cargo add <crate>@<version> -p <package>
 
 Setelah ditambahkan, dependency bersama dapat diubah menjadi inheritance dari `[workspace.dependencies]`.
 
+Versi Rust minimum (MSRV) adalah `rust-version` di `Cargo.toml`, saat ini 1.89, dan job CI `msrv` memeriksanya dengan `cargo +<rust-version> check`. Dependency baru atau update dependency yang butuh compiler lebih baru harus menaikkan `rust-version` di PR yang sama dan mencatatnya di `CHANGELOG.md`. Detailnya di [Development Workflow](docs/DEVELOPMENT.md#versi-rust-minimum).
+
 ## Quality Checks
 
 ```bash

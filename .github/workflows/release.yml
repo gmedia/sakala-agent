@@ -15,10 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # rust-toolchain.toml selects stable for cargo in this repository, as in
+      # CI. A `toolchain` input here would only change rustup's default, which
+      # that file overrides.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.88.0
 
       - name: Verify release candidate
         run: make check

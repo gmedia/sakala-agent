@@ -29,6 +29,8 @@ crates/sakala-agent-runtime/    Implementasi noop, inspection, Docker, Railpack,
 
 ## Quickstart
 
+Butuh Rust 1.89 atau lebih baru (`rust-version` di `Cargo.toml`).
+
 ```bash
 cargo run -p sakala-agent
 ```
