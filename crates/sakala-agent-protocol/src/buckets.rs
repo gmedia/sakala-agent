@@ -83,6 +83,10 @@ pub mod error_codes {
     pub const BUCKET_CONFLICT: &str = "bucket_conflict";
     /// The engine refused for another reason.
     pub const BUCKET_OPERATION_FAILED: &str = "bucket_operation_failed";
+    /// Setting a rotated secret failed in a way that does not prove it was not
+    /// applied, and the agent could not check which secret works. The old
+    /// secret may already be dead: send the same `RotateBucketKey` again.
+    pub const BUCKET_OUTCOME_UNKNOWN: &str = "bucket_outcome_unknown";
 }
 
 /// Code of a payload that is not an object or misses a field, shared with every

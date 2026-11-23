@@ -79,6 +79,7 @@ impl DatabaseHeartbeat {
                     failing: "managed databases could not be read; the node reports degraded until a read succeeds",
                     recovered: "managed databases are read again",
                 },
+                None,
             ),
         }
     }

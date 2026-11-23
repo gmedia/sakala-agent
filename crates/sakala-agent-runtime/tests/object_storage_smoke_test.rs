@@ -38,7 +38,8 @@ use sakala_agent_protocol::{
     AgentCommand, CommandStatus, CommandType, DeploymentEvent, DeploymentLog, buckets::error_codes,
 };
 use sakala_agent_runtime::{
-    NoopRuntimeExecutor,
+    CommandSpec, NoopRuntimeExecutor, ProcessOutput, ProcessOutputSink, ProcessRunner,
+    RuntimeError, TokioProcessRunner,
     object_storage::{RcObjectStorageAdmin, RustfsAdminConfig},
 };
 use serde_json::{Value, json};
@@ -55,6 +56,8 @@ const TOTAL_QUOTA_MB: u64 = 64;
 const MIB: u64 = 1_024 * 1_024;
 /// A bucket that predates the agent, like the staging script's `w-...` ones.
 const UNMANAGED_BUCKET: &str = "w-smoke-unlimited";
+/// Attempts of a request S3 SDKs make in their standard retry mode.
+const SDK_ATTEMPTS: u32 = 3;
 
 struct SilentReporter;
 
@@ -268,19 +271,24 @@ fn url(path: &str) -> String {
     format!("http://{S3_ADDRESS}/{path}")
 }
 
-/// A PUT, retried once on `503 SlowDown` the way S3 SDKs retry it: RustFS
+/// A PUT, retried on `503 SlowDown` with a growing pause, the way S3 SDKs
+/// retry it (three attempts in their standard mode): RustFS
 /// 1.0.6 answers the first write after every quota change with that.
 fn put(tenant: &Tenant, path: &str, arguments: &[&str], slowdowns: &Mutex<u32>) -> S3Response {
     let target = url(path);
     let mut request = vec!["-X", "PUT"];
     request.extend_from_slice(arguments);
     request.push(&target);
-    let first = s3(tenant, &request);
-    if first.status == 503 && first.body.contains("SlowDown") {
+    let mut response = s3(tenant, &request);
+    for attempt in 1..SDK_ATTEMPTS {
+        if !(response.status == 503 && response.body.contains("SlowDown")) {
+            break;
+        }
         *slowdowns.lock().expect("slowdowns") += 1;
-        return s3(tenant, &request);
+        std::thread::sleep(Duration::from_millis(200 * u64::from(attempt)));
+        response = s3(tenant, &request);
     }
-    first
+    response
 }
 
 fn header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
@@ -339,6 +347,60 @@ async fn dispatch(
         )
         .await
         .map(|CommandOutput { result }| result)
+}
+
+/// What happens to the next `rc admin user passwd` call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Passwd {
+    Answered,
+    /// It runs, but the agent never hears back, like a client timeout after
+    /// RustFS applied the change.
+    LostAfterRunning,
+    /// It never reaches the container.
+    LostBeforeRunning,
+}
+
+/// The real process runner, except that it can lose a `passwd` call.
+struct LosingRunner {
+    inner: TokioProcessRunner,
+    passwd: Mutex<Passwd>,
+}
+
+impl LosingRunner {
+    fn new() -> Self {
+        Self {
+            inner: TokioProcessRunner::default(),
+            passwd: Mutex::new(Passwd::Answered),
+        }
+    }
+
+    fn set(&self, passwd: Passwd) {
+        *self.passwd.lock().expect("passwd") = passwd;
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for LosingRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        let passwd = spec.args.iter().any(|arg| arg == "passwd");
+        let mode = *self.passwd.lock().expect("passwd");
+        let lost = || RuntimeError::Timeout {
+            operation: "docker".to_owned(),
+            seconds: 60,
+        };
+        match (passwd, mode) {
+            (true, Passwd::LostBeforeRunning) => Err(lost()),
+            (true, Passwd::LostAfterRunning) => {
+                self.inner.run(spec, sink).await?;
+                Err(lost())
+            }
+            _ => self.inner.run(spec, sink).await,
+        }
+    }
 }
 
 /// Samples the host's process list for any of `secrets` until stopped.
@@ -436,6 +498,7 @@ async fn the_object_storage_role_isolates_tenants_on_a_real_rustfs() {
         data_dir: data_dir.path().to_owned(),
         total_quota_mb: TOTAL_QUOTA_MB,
         min_free_mb: 0,
+        command_timeout: Duration::from_secs(900),
     };
     let admin = Arc::new(RcObjectStorageAdmin::new(admin_config.clone()));
     admin.check().await.expect("admin check");
@@ -803,6 +866,72 @@ async fn the_object_storage_role_isolates_tenants_on_a_real_rustfs() {
     assert_eq!(unlocked["locked"], false);
     assert_eq!(s3(&rotated_tenant, &[&url(&kept)]).status, 200);
     assert_eq!(anonymous_status(&presigned), 200);
+
+    // A rotation whose answer is lost is checked against the instance: applied
+    // means complete, not applied means fail with the old secret still alive,
+    // and a locked key is checked too.
+    let losing = Arc::new(LosingRunner::new());
+    let checked = RcObjectStorageAdmin::with_runner(
+        Arc::clone(&losing) as Arc<dyn ProcessRunner>,
+        admin_config.clone(),
+    );
+    let rotate = |secret: &str| {
+        sakala_agent_protocol::RotateBucketKeyPayload::from_value(&json!({
+            "bucket": a.bucket,
+            "access_key_id": a.key,
+            "secret_access_key": secret,
+        }))
+        .expect("payload")
+    };
+    let applied = Tenant {
+        secret: random_secret(),
+        ..a.clone()
+    };
+    let lost = random_secret();
+    let locked_applied = Tenant {
+        secret: random_secret(),
+        ..a.clone()
+    };
+    watched.lock().expect("secrets").extend([
+        applied.secret.clone(),
+        lost.clone(),
+        locked_applied.secret.clone(),
+    ]);
+    losing.set(Passwd::LostAfterRunning);
+    checked
+        .rotate_bucket_key(&rotate(&applied.secret))
+        .await
+        .expect("applied, so complete");
+    assert_eq!(s3(&applied, &[&url(&kept)]).status, 200);
+    losing.set(Passwd::LostBeforeRunning);
+    let error = checked
+        .rotate_bucket_key(&rotate(&lost))
+        .await
+        .expect_err("not applied, so fail");
+    assert_eq!(
+        error.code(),
+        error_codes::BUCKET_ADMIN_UNAVAILABLE,
+        "{error}"
+    );
+    assert_eq!(
+        s3(&applied, &[&url(&kept)]).status,
+        200,
+        "the old secret died"
+    );
+    dispatch(&dispatcher, CommandType::LockBucket, a.key_payload())
+        .await
+        .expect("lock");
+    losing.set(Passwd::LostAfterRunning);
+    checked
+        .rotate_bucket_key(&rotate(&locked_applied.secret))
+        .await
+        .expect("applied on a locked key, so complete");
+    dispatch(&dispatcher, CommandType::UnlockBucket, a.key_payload())
+        .await
+        .expect("unlock");
+    assert_eq!(s3(&locked_applied, &[&url(&kept)]).status, 200);
+    assert_eq!(s3(&applied, &[&url(&kept)]).status, 403);
+    println!("lost passwd answers were settled by a signed check: applied, not applied, locked");
 
     // Delete removes objects (incomplete uploads included), the key, the
     // policy, and the bucket; a repeat reports nothing deleted.

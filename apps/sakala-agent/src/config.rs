@@ -564,7 +564,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             .capabilities
             .push(MANAGED_POSTGRES_CAPABILITY.to_owned());
     }
-    let object_storage = object_storage_host(values)?;
+    let object_storage = object_storage_host(values, agent.command_timeout())?;
     if object_storage.is_some() {
         agent.capabilities.push(MANAGED_S3_CAPABILITY.to_owned());
     }
@@ -833,6 +833,7 @@ fn database_host(
 /// the agent instead of failing every bucket command later.
 fn object_storage_host(
     values: &HashMap<String, String>,
+    command_timeout: Duration,
 ) -> Result<Option<ObjectStorageHostConfig>, CoreError> {
     let driver: ObjectStorageDriver = get(values, OBJECT_STORAGE_DRIVER_ENV, "none")
         .trim()
@@ -895,6 +896,7 @@ fn object_storage_host(
             data_dir,
             total_quota_mb,
             min_free_mb,
+            command_timeout,
         },
         identity: ObjectStorageIdentity {
             endpoint,
@@ -1845,6 +1847,10 @@ mod tests {
         );
         assert_eq!(object_storage.admin.total_quota_mb, 5_120);
         assert_eq!(object_storage.admin.min_free_mb, 1_024);
+        assert_eq!(
+            object_storage.admin.command_timeout,
+            noop.agent.command_timeout()
+        );
 
         let docker = from_values(&object_storage_values(&[
             ("SAKALA_RUNTIME_DRIVER", "docker"),

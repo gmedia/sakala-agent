@@ -15,7 +15,7 @@ use sakala_agent_protocol::{ObjectStorageMetadata, Region};
 use serde_json::{Value, json};
 
 use super::periodic_read::{PeriodicRead, ReadMessages};
-use crate::ports::ObjectStorageAdmin;
+use crate::ports::{BUCKET_USAGE_BUSY, ObjectStorageAdmin};
 
 /// How often bucket usage is read. One read asks the engine for every
 /// bucket's quota and usage, and the control plane's usage sweep works in
@@ -84,6 +84,7 @@ impl ObjectStorageHeartbeat {
                     failing: "managed buckets could not be read; the node reports degraded until a read succeeds",
                     recovered: "managed buckets are read again",
                 },
+                Some(BUCKET_USAGE_BUSY),
             ),
         }
     }
@@ -129,6 +130,7 @@ mod tests {
     struct UsageAdmin {
         reads: AtomicUsize,
         fail: AtomicBool,
+        busy: AtomicBool,
         hang: bool,
         count: usize,
     }
@@ -138,6 +140,7 @@ mod tests {
             Arc::new(Self {
                 reads: AtomicUsize::new(0),
                 fail: AtomicBool::new(fail),
+                busy: AtomicBool::new(false),
                 hang,
                 count,
             })
@@ -150,6 +153,12 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             if self.hang {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            if self.busy.load(Ordering::SeqCst) {
+                return Err(RuntimeExecutionError::new(
+                    BUCKET_USAGE_BUSY,
+                    "a bucket command is running",
+                ));
             }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(RuntimeExecutionError::new(
@@ -289,6 +298,33 @@ mod tests {
         assert!(!heartbeat.insert(&mut metadata()).await);
         assert!(!heartbeat.insert(&mut metadata()).await);
         assert_eq!(admin.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_read_skipped_while_a_command_runs_keeps_the_node_available_and_retries() {
+        // A long DeleteBucket holds the instance, far past the 20 s read limit.
+        let admin = UsageAdmin::new(1, false, false);
+        admin.busy.store(true, Ordering::SeqCst);
+        let heartbeat = ObjectStorageHeartbeat::with_bounds(
+            admin.clone(),
+            identity(),
+            Duration::from_secs(3_600),
+            5,
+        );
+        for _ in 0..3 {
+            let mut sent = metadata();
+            assert!(heartbeat.insert(&mut sent).await, "busy is not unavailable");
+            assert_eq!(sent["object_storage"]["available"], true);
+            assert!(sent.get("buckets").is_none());
+        }
+        // A skipped read is tried again at the next heartbeat, not after the
+        // interval.
+        assert_eq!(admin.reads.load(Ordering::SeqCst), 3);
+
+        admin.busy.store(false, Ordering::SeqCst);
+        let mut after = metadata();
+        assert!(heartbeat.insert(&mut after).await);
+        assert_eq!(after["detail_counts"]["buckets"], 1);
     }
 
     #[test]

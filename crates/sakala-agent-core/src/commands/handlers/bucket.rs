@@ -360,4 +360,53 @@ mod tests {
         .expect_err("unsupported");
         assert_eq!(error.code(), "unsupported_runtime_command");
     }
+
+    #[tokio::test]
+    async fn the_failure_fixture_holds_what_the_handler_sends() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../../examples/failures/bucket-failures.json"
+        ))
+        .expect("fixture");
+        let message = |code: &str| {
+            fixture
+                .as_array()
+                .expect("list")
+                .iter()
+                .find(|entry| entry["body"]["error_code"] == code)
+                .and_then(|entry| entry["body"]["error_message"].as_str())
+                .unwrap_or_else(|| panic!("no {code} in the fixture"))
+                .to_owned()
+        };
+        let admin = RecordingAdmin::default();
+        let cases = [
+            (
+                CommandType::CreateBucket,
+                json!({ "bucket": "w-01a0d73b-uploads", "access_key_id": KEY, "secret_access_key": SECRET, "quota_mb": 1 }),
+            ),
+            (
+                CommandType::RotateBucketKey,
+                json!({ "bucket": BUCKET, "access_key_id": KEY, "secret_access_key": "too-short" }),
+            ),
+            (
+                CommandType::SetBucketQuota,
+                json!({ "bucket": BUCKET, "quota_mb": 0 }),
+            ),
+        ];
+        for (command_type, payload) in cases {
+            let error = run(&admin, command_type, payload)
+                .await
+                .expect_err("invalid");
+            assert_eq!(error.to_string(), message(error.code()), "{command_type:?}");
+        }
+        let unsupported = handle(
+            &command(
+                CommandType::LockBucket,
+                json!({ "bucket": BUCKET, "access_key_id": KEY }),
+            ),
+            None,
+        )
+        .await
+        .expect_err("unsupported");
+        assert_eq!(unsupported.to_string(), message(unsupported.code()));
+    }
 }

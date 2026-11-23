@@ -625,3 +625,44 @@ fn object_storage_host_heartbeat_fixture_matches_the_protocol_types() {
         BucketName::parse(&bucket.name).expect("managed bucket name");
     }
 }
+
+#[test]
+fn bucket_failure_fixture_covers_every_bucket_failure_code() {
+    use sakala_agent_protocol::buckets::error_codes;
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/failures/bucket-failures.json"))
+            .expect("bucket failure fixture must parse");
+    let codes: std::collections::BTreeSet<_> = fixture
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|entry| {
+            serde_json::from_value::<CommandType>(entry["type"].clone())
+                .expect("a bucket command type");
+            assert!(entry["body"]["error_message"].as_str().is_some());
+            entry["body"]["error_code"]
+                .as_str()
+                .expect("code")
+                .to_owned()
+        })
+        .collect();
+    for code in [
+        error_codes::BUCKET_NAME_INVALID,
+        error_codes::BUCKET_KEY_INVALID,
+        error_codes::BUCKET_QUOTA_INVALID,
+        error_codes::BUCKET_CAPACITY_EXCEEDED,
+        error_codes::BUCKET_ADMIN_UNAVAILABLE,
+        error_codes::BUCKET_NOT_FOUND,
+        error_codes::BUCKET_CONFLICT,
+        error_codes::BUCKET_OPERATION_FAILED,
+        error_codes::BUCKET_OUTCOME_UNKNOWN,
+        "unsupported_runtime_command",
+    ] {
+        assert!(codes.contains(code), "{code} is missing from the fixture");
+    }
+    assert_eq!(
+        error_codes::BUCKET_OUTCOME_UNKNOWN,
+        "bucket_outcome_unknown"
+    );
+}

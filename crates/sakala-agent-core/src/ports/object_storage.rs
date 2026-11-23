@@ -10,6 +10,11 @@ use sakala_agent_protocol::{
 
 use super::RuntimeExecutionError;
 
+/// Code of a [`ObjectStorageAdmin::bucket_usage`] error that means a command
+/// holds the instance and the read was skipped, not that it failed. Only the
+/// heartbeat sees it; it is never sent to the control plane.
+pub const BUCKET_USAGE_BUSY: &str = "bucket_usage_busy";
+
 fn unsupported(operation: &str) -> RuntimeExecutionError {
     RuntimeExecutionError::unsupported_command(format!(
         "object storage admin does not support {operation}"
@@ -76,7 +81,8 @@ pub trait ObjectStorageAdmin: Send + Sync {
     }
 
     /// Every managed bucket, by name, with the bytes it holds. An error means
-    /// the instance could not be read, never an empty instance.
+    /// the instance could not be read, never an empty instance; an error with
+    /// code [`BUCKET_USAGE_BUSY`] means the read was skipped.
     async fn bucket_usage(&self) -> Result<Vec<ManagedBucketUsage>, RuntimeExecutionError> {
         Err(unsupported("bucket_usage"))
     }

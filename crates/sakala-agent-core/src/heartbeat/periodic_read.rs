@@ -20,10 +20,15 @@ pub(crate) struct ReadMessages {
     pub recovered: &'static str,
 }
 
+/// The error code a read returns when it was skipped because the instance is
+/// busy, which is neither a reading nor a failure.
+pub(crate) type BusyCode = Option<&'static str>;
+
 pub(crate) struct PeriodicRead {
     interval: Duration,
     timeout: Duration,
     messages: ReadMessages,
+    busy_code: BusyCode,
     state: Mutex<ReadState>,
 }
 
@@ -34,11 +39,17 @@ struct ReadState {
 }
 
 impl PeriodicRead {
-    pub(crate) fn new(interval: Duration, timeout: Duration, messages: ReadMessages) -> Self {
+    pub(crate) fn new(
+        interval: Duration,
+        timeout: Duration,
+        messages: ReadMessages,
+        busy_code: BusyCode,
+    ) -> Self {
         Self {
             interval,
             timeout,
             messages,
+            busy_code,
             state: Mutex::new(ReadState::default()),
         }
     }
@@ -51,7 +62,8 @@ impl PeriodicRead {
 
     /// Reads when no attempt was made within the interval. A failed read waits
     /// for the next interval too, so an instance that hangs costs one timeout
-    /// per interval rather than one per heartbeat.
+    /// per interval rather than one per heartbeat. A read skipped as busy keeps
+    /// the last state and is tried again at the next heartbeat.
     pub(crate) async fn read_if_due<T, F, Fut>(&self, read: F) -> Option<T>
     where
         F: FnOnce() -> Fut,
@@ -71,6 +83,12 @@ impl PeriodicRead {
             Ok(Ok(value)) => {
                 self.set_failing(false, None);
                 return Some(value);
+            }
+            Ok(Err(error)) if self.busy_code == Some(error.code()) => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.last_attempt = None;
+                }
+                return None;
             }
             Ok(Err(error)) => error.to_string(),
             Err(_) => format!(

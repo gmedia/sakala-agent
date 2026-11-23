@@ -1641,9 +1641,9 @@ perubahan yang terlihat tenant:
 
 - `CreateBucket` membuat yang belum ada dan menyamakan lagi yang sudah ada: kuota, policy, dan secret diset ulang ke nilai payload, lalu akses anonim ditutup. `created` bernilai `false` bila bucket sudah ada. Status aktif atau nonaktif user tidak pernah diubah, jadi mengulang create (misalnya `buckets:reconcile`) tidak membuka bucket yang di-lock. Bila user sudah membawa policy lain, command gagal dengan `bucket_conflict` sebelum ada yang berubah. Kuota bucket ini sendiri dihitung sebagai sudah terpakai saat memeriksa kapasitas.
 - `DeleteBucket` menonaktifkan lalu menghapus user (key langsung berhenti), menghapus semua object termasuk upload multipart yang belum selesai, menghapus bucket, lalu menghapus policy. Bagian yang sudah tidak ada dilewati. `deleted` bernilai `false` bila bucket, user, dan policy semuanya sudah tidak ada. Bucket yang sangat besar bisa butuh waktu lama (batas 600 detik untuk langkah ini).
-- `RotateBucketKey` mengganti secret; access key ID tetap. `complete` berarti RustFS sudah menerima secret baru, dan secret lama langsung ditolak. Koneksi S3 yang sudah terbuka tidak terputus; container project memakai secret baru setelah redeploy. User yang tidak ada memberi `bucket_not_found`.
+- `RotateBucketKey` mengganti secret; access key ID tetap. `complete` berarti RustFS sudah menerima secret baru, dan secret lama langsung ditolak. `fail` dengan kode selain `bucket_outcome_unknown` berarti secret lama masih berlaku: bila `rc` gagal atau terlambat, Agent memeriksa dengan request S3 bertanda tangan secret baru sebelum melapor. Koneksi S3 yang sudah terbuka tidak terputus; container project memakai secret baru setelah redeploy. User yang tidak ada memberi `bucket_not_found`.
 - `SetBucketQuota` mengganti kuota. Hanya kenaikan yang melewati pemeriksaan kapasitas; penurunan selalu diterima, juga di bawah pemakaian saat ini. Bucket yang tidak ada memberi `bucket_not_found`.
-- `LockBucket` dan `UnlockBucket` menonaktifkan dan mengaktifkan user. Selama di-lock, key dan presigned URL yang ditandatanganinya ditolak `403`. User yang tidak ada memberi `bucket_not_found`.
+- `LockBucket` dan `UnlockBucket` menonaktifkan dan mengaktifkan user. Selama di-lock, key dan presigned URL yang ditandatanganinya ditolak `403`. User atau bucket yang tidak ada memberi `bucket_not_found`; key yang membawa policy bucket lain memberi `bucket_conflict`.
 
 Pemeriksaan kapasitas untuk `CreateBucket` dan kenaikan kuota: setiap bucket di
 instance harus punya kuota, jumlah kuota setelah perubahan tidak boleh melewati
@@ -1652,7 +1652,10 @@ penuh tidak boleh di bawah `SAKALA_OBJECT_STORAGE_MIN_FREE_MB`. Rinciannya di
 [Object Storage Host](OBJECT_STORAGE_HOST.md#pemeriksaan-kapasitas).
 
 Agent menjalankan command bucket satu per satu per node, termasuk pembacaan
-pemakaian untuk heartbeat, dengan lock yang terpisah dari command database.
+pemakaian untuk heartbeat, dengan lock yang terpisah dari command database. Setiap
+command selesai di dalam `SAKALA_COMMAND_TIMEOUT_SECONDS`, dan setiap `rc` dihentikan
+di dalam container sebelum Agent berhenti menunggu, jadi tidak ada perubahan yang
+masih berjalan setelah `complete` atau `fail`.
 
 Catatan untuk tenant, diamati di RustFS 1.0.6: tulisan pertama ke bucket setelah
 `CreateBucket` atau `SetBucketQuota` dijawab `503 SlowDown` sekali, yang di-retry
@@ -1660,7 +1663,10 @@ otomatis oleh SDK S3.
 
 ### Kode kegagalan bucket
 
-Semua kode ini sebaiknya `user_fixable: false` di API.
+Semua kode ini sebaiknya `user_fixable: false` di API. Contoh body `fail` untuk
+setiap kode ada di `examples/failures/bucket-failures.json` (`type` command dan
+`body` berisi `error_code` dan `error_message`), yang dicocokkan dengan kode oleh
+test. Kode dibandingkan sebagai string persis.
 
 | `error_code` | Arti | Tindakan API |
 | --- | --- | --- |
@@ -1670,10 +1676,11 @@ Semua kode ini sebaiknya `user_fixable: false` di API.
 | `bucket_key_invalid` | `access_key_id` atau `secret_access_key` tidak cocok dengan polanya. Pesan tidak pernah memuat nilainya. | Bug di API. |
 | `bucket_quota_invalid` | `quota_mb` bernilai 0 atau di atas 1048576. | Bug di API. |
 | `bucket_capacity_exceeded` | Total kuota node atau batas ruang disk bebas akan terlampaui, atau ada bucket tanpa kuota di instance. Tidak ada yang diubah. | Operator: naikkan kapasitas atau pindahkan. Jangan di-retry otomatis. |
-| `bucket_admin_unavailable` | `docker exec` gagal (container tidak ada atau berhenti, Docker tidak bisa dijangkau, exit 125 sampai 127), atau `rc` tidak bisa menjangkau RustFS atau root key-nya ditolak. | Retry nanti; node juga melaporkan `degraded`. |
+| `bucket_admin_unavailable` | `docker exec` gagal (container tidak ada atau berhenti, Docker tidak bisa dijangkau, exit 125 sampai 127), `rc` tidak bisa menjangkau RustFS atau root key-nya ditolak, `rc` dihentikan karena melewati batas waktunya, atau jatah waktu command habis sebelum langkah berikutnya. | Retry nanti; node juga melaporkan `degraded` bila pembacaan pemakaian ikut gagal. |
 | `bucket_not_found` | Bucket (`SetBucketQuota`) atau user key (`RotateBucketKey`, `LockBucket`, `UnlockBucket`) tidak ada. | Rekonsiliasi. |
 | `bucket_conflict` | User key membawa policy selain policy bucket ini. Tidak ada yang diubah. | Periksa manual. |
 | `bucket_operation_failed` | `rc` menolak karena alasan lain, atau output-nya tidak dipahami. Pesan berisi ujung stderr `rc` yang sudah diredaksi. | Periksa manual. |
+| `bucket_outcome_unknown` | Hanya `RotateBucketKey`: mengganti secret gagal dengan cara yang tidak membuktikan perubahan itu tidak diterapkan, dan Agent tidak bisa memeriksa secret mana yang berlaku. Secret lama mungkin sudah mati. | Kirim ulang `RotateBucketKey` yang sama (idempotent); jangan kembali ke secret lama. |
 
 ### Heartbeat object storage host
 
@@ -1703,7 +1710,7 @@ ada di `examples/heartbeat/object-storage-host.json`:
 | `object_storage.endpoint` | string | `SAKALA_OBJECT_STORAGE_PUBLIC_ENDPOINT` sebagai origin: `https://host[:port]` tanpa path, paling panjang 255 karakter (`http://` hanya untuk host loopback). Bahan `AWS_ENDPOINT_URL_S3` dan `AWS_ENDPOINT`. |
 | `object_storage.region` | string | Region tanda tangan S3, `SAKALA_OBJECT_STORAGE_REGION`, cocok dengan `^[a-z0-9]+(-[a-z0-9]+)*$` dan paling panjang 32 karakter. Bahan `AWS_DEFAULT_REGION` dan `AWS_REGION`. Bukan region penempatan, yang tetap `metadata.runtime.region`. |
 | `object_storage.capacity_mb` | integer ≥ 1 | `SAKALA_OBJECT_STORAGE_TOTAL_QUOTA_MB`: jumlah kuota bucket terbanyak di node ini. |
-| `object_storage.available` | boolean | Apakah pembacaan pemakaian terakhir berhasil. Agent ini selalu mengirimnya; key yang tidak ada berarti tersedia. Saat `false`, `status` node menjadi `degraded` dan API sebaiknya tidak menempatkan bucket baru di node ini. |
+| `object_storage.available` | boolean | Apakah pembacaan pemakaian terakhir berhasil. Agent ini selalu mengirimnya; key yang tidak ada berarti tersedia. Saat `false`, `status` node menjadi `degraded` dan API sebaiknya tidak menempatkan bucket baru di node ini. Pembacaan yang dilewati karena command bucket sedang berjalan tidak mengubah nilai ini. |
 | `buckets` | array, opsional | Setiap bucket terkelola, urut nama, paling banyak 1000 item. Hanya dikirim di heartbeat pertama setelah pembacaan baru yang berhasil, paling sering sekali per 60 detik. Heartbeat tanpa key ini tidak membawa bacaan baru, dan tidak boleh dibaca sebagai "bucket hilang" atau pemakaian nol. List kosong berarti instance tidak punya bucket terkelola. |
 | `buckets[].name` | string | Nama bucket, selalu cocok dengan `^b-[a-z0-9]{16,40}$`. Bucket lain di instance, misalnya bucket operator `w-...`, tidak pernah dilaporkan. |
 | `buckets[].size_bytes` | integer 0 sampai 1 PiB | `usage` RustFS: object yang sudah lengkap, dalam byte. Part dari upload multipart yang belum selesai tidak dihitung. |

@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::{ProcessOutputSink, RuntimeError};
+use sakala_agent_core::ports::BUCKET_USAGE_BUSY;
 
 const BUCKET: &str = "b-8k2m4q7x9z1c3v5b6n0d";
 const OTHER_BUCKET: &str = "b-q1w2e3r4t5y6u7i8o9p0";
@@ -46,6 +47,11 @@ struct Instance {
     /// The rc subcommand (first arguments joined by spaces) that fails, with
     /// its exit status and stderr.
     fail: Option<(String, i32, String)>,
+    /// The failing subcommand still takes effect, as when rc is stopped after
+    /// RustFS applied the change.
+    fail_after_applying: bool,
+    /// The subcommand whose `docker exec` the runner cannot finish.
+    runner_error: Option<String>,
 }
 
 /// One `docker exec` or `df` call as the test sees it.
@@ -63,12 +69,18 @@ impl Call {
         self.args.get(sh + 2).map(String::as_str)
     }
 
-    /// The arguments after `rc`.
+    /// The arguments after `rc` and its time limit.
     fn rc_args(&self) -> Vec<&str> {
         let Some(sh) = self.args.iter().position(|arg| arg == "sh") else {
             return Vec::new();
         };
-        self.args[sh + 4..].iter().map(String::as_str).collect()
+        self.args[sh + 5..].iter().map(String::as_str).collect()
+    }
+
+    /// The seconds after which the container stops the script's work.
+    fn server_limit(&self) -> u64 {
+        let sh = self.args.iter().position(|arg| arg == "sh").expect("sh");
+        self.args[sh + 4].parse().expect("limit")
     }
 
     /// `rc` subcommand words without flags and targets, such as `admin user add`.
@@ -78,6 +90,9 @@ impl Call {
         }
         if self.script() == Some(USAGE_SCRIPT) {
             return "usage".to_owned();
+        }
+        if self.script() == Some(VERIFY_SCRIPT) {
+            return "verify".to_owned();
         }
         let args = self.rc_args();
         let words = match args.first().copied() {
@@ -175,10 +190,30 @@ impl Instance {
                 self.free_mb * 1_024
             ));
         }
-        if let Some((summary, code, stderr)) = &self.fail
-            && call.summary() == *summary
+        if let Some((summary, code, stderr)) = self.fail.clone()
+            && call.summary() == summary
         {
-            return exit(*code, stderr.clone());
+            if self.fail_after_applying {
+                self.fail = None;
+                let _ = self.answer(call);
+                self.fail = Some((summary, code, stderr.clone()));
+            }
+            return exit(code, stderr);
+        }
+        if call.script() == Some(VERIFY_SCRIPT) {
+            let args = call.rc_args();
+            let secret = &call.secret_env[BUCKET_SECRET_ENV];
+            let body = match self.users.get(args[0]) {
+                Some(user) if user.secret == *secret && !user.disabled => {
+                    return ok("<ListBucketResult></ListBucketResult>\n200");
+                }
+                Some(user) if user.secret == *secret => {
+                    "<Error><Code>InvalidAccessKeyId</Code><Message>check key failed</Message></Error>"
+                }
+                Some(_) => "<Error><Code>SignatureDoesNotMatch</Code></Error>",
+                None => "<Error><Code>InvalidAccessKeyId</Code></Error>",
+            };
+            return ok(format!("{body}\n403"));
         }
         if call.script() == Some(USAGE_SCRIPT) {
             let listing = json!({
@@ -325,6 +360,17 @@ impl ProcessRunner for FakeRunner {
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await;
         }
+        let runner_error = self.instance().runner_error.clone();
+        if runner_error.as_deref() == Some(call.summary().as_str()) {
+            // The change lands, but the agent never hears back.
+            let _ = self.instance().answer(&call);
+            self.calls.lock().expect("calls").push(call);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            return Err(RuntimeError::Timeout {
+                operation: "docker".to_owned(),
+                seconds: 60,
+            });
+        }
         let output = self.instance().answer(&call);
         self.calls.lock().expect("calls").push(call);
         self.active.fetch_sub(1, Ordering::SeqCst);
@@ -338,6 +384,7 @@ fn config() -> RustfsAdminConfig {
         data_dir: PathBuf::from("/var/lib/sakala/object-storage"),
         total_quota_mb: 1_024,
         min_free_mb: 1_024,
+        command_timeout: Duration::from_secs(900),
     }
 }
 
@@ -1025,11 +1072,427 @@ async fn check_asks_the_instance_for_its_state() {
 }
 
 #[test]
-fn the_scripts_match_the_deployment_operator_script() {
-    assert_eq!(
-        RC_SCRIPT,
-        r#"RC_HOST_sakala="http://$(cat /run/secrets/rustfs-access-key):$(cat /run/secrets/rustfs-secret-key)@$RUSTFS_ADDRESS" exec rc --no-color --no-progress "$@""#
-    );
-    assert!(RC_POLICY_SCRIPT.starts_with(r#"printf '%s' "$SAKALA_BUCKET_POLICY" | "#));
+fn the_scripts_build_the_alias_like_the_deployment_operator_script() {
+    // `rc()` in sakala-deployment's scripts/object-storage.sh.
+    let alias = r#"RC_HOST_sakala="http://$(cat /run/secrets/rustfs-access-key):$(cat /run/secrets/rustfs-secret-key)@$RUSTFS_ADDRESS""#;
+    for script in [RC_SCRIPT, RC_POLICY_SCRIPT, USAGE_SCRIPT] {
+        assert!(script.contains(alias), "{script}");
+        assert!(script.contains("timeout \"$"), "{script}");
+    }
+    assert!(RC_SCRIPT.ends_with(r#"exec timeout "$limit" rc --no-color --no-progress "$@""#));
+    assert!(RC_POLICY_SCRIPT.contains(r#"printf '%s' "$SAKALA_BUCKET_POLICY" | "#));
     assert!(USAGE_SCRIPT.starts_with("set -e\n"));
+    assert!(VERIFY_SCRIPT.contains("--max-time"));
+    assert!(VERIFY_SCRIPT.contains("-K -"), "the key pair goes on stdin");
+}
+
+fn rotate(secret: &str) -> RotateBucketKeyPayload {
+    RotateBucketKeyPayload {
+        bucket: name(BUCKET),
+        access_key_id: key(KEY),
+        secret_access_key: SecretAccessKey::parse(secret).expect("secret"),
+    }
+}
+
+#[tokio::test]
+async fn rc_stops_inside_the_container_before_the_agent_stops_waiting() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    admin.delete_bucket(&key_payload()).await.expect("delete");
+
+    for call in runner
+        .calls()
+        .iter()
+        .filter(|call| call.program == "docker")
+    {
+        let script = call.script().expect("script");
+        assert!(script.contains("timeout"), "{}", call.summary());
+        let limit = call.server_limit();
+        let summary = call.summary();
+        let expected = if summary == "rb" { 595 } else { 55 };
+        assert_eq!(limit, expected, "{summary}");
+    }
+}
+
+#[tokio::test]
+async fn every_step_fits_the_command_timeout() {
+    // 900 s command timeout: 885 s budget, plenty for every step.
+    let runner = FakeRunner::new(roomy());
+    admin(&runner)
+        .create_bucket(&create(64))
+        .await
+        .expect("create");
+
+    // A 100 s command timeout: 85 s to spend, every step cut to fit.
+    let short = RcObjectStorageAdmin::with_runner(
+        Arc::clone(&runner) as Arc<dyn ProcessRunner>,
+        RustfsAdminConfig {
+            command_timeout: Duration::from_secs(100),
+            ..config()
+        },
+    );
+    runner.clear();
+    short.delete_bucket(&key_payload()).await.expect("delete");
+    let rb = runner
+        .calls()
+        .into_iter()
+        .find(|call| call.summary() == "rb")
+        .expect("rb");
+    // 85 s, less 20 s for the two policy calls after it, less the 5 s the
+    // container stops rc before the agent stops waiting.
+    assert!(
+        (59..=60).contains(&rb.server_limit()),
+        "{}",
+        rb.server_limit()
+    );
+    assert_eq!(
+        runner.summaries().last().map(String::as_str),
+        Some("admin policy rm")
+    );
+
+    // Too short to start anything: refused before any call.
+    let none = RcObjectStorageAdmin::with_runner(
+        Arc::clone(&runner) as Arc<dyn ProcessRunner>,
+        RustfsAdminConfig {
+            command_timeout: Duration::from_secs(20),
+            ..config()
+        },
+    );
+    runner.clear();
+    let error = none.create_bucket(&create(8)).await.expect_err("no time");
+    assert_eq!(error.code(), error_codes::BUCKET_ADMIN_UNAVAILABLE);
+    assert!(runner.calls().is_empty());
+}
+
+#[tokio::test]
+async fn a_rotation_that_rc_reports_failed_but_took_effect_completes() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    {
+        let mut instance = runner.instance();
+        instance.fail = Some(("admin user passwd".to_owned(), TIMEOUT_EXIT, String::new()));
+        instance.fail_after_applying = true;
+    }
+    runner.clear();
+
+    admin
+        .rotate_bucket_key(&rotate(ROTATED))
+        .await
+        .expect("rotated");
+
+    assert_eq!(
+        runner.summaries(),
+        ["admin user info", "admin user passwd", "verify"]
+    );
+    let verify = runner
+        .calls()
+        .into_iter()
+        .find(|call| call.summary() == "verify")
+        .expect("verify");
+    assert_eq!(&verify.args[..3], ["exec", "-e", BUCKET_SECRET_ENV]);
+    assert!(!verify.args.join(" ").contains(ROTATED));
+    assert_eq!(verify.secret_env[BUCKET_SECRET_ENV], ROTATED);
+    assert_eq!(runner.instance().users[KEY].secret, ROTATED);
+}
+
+#[tokio::test]
+async fn a_rotation_of_a_locked_key_is_checked_too() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    admin.lock_bucket(&key_payload()).await.expect("lock");
+    {
+        let mut instance = runner.instance();
+        instance.runner_error = Some("admin user passwd".to_owned());
+    }
+
+    admin
+        .rotate_bucket_key(&rotate(ROTATED))
+        .await
+        .expect("rotated");
+    assert!(runner.instance().users[KEY].disabled, "still locked");
+}
+
+#[tokio::test]
+async fn a_rotation_that_did_not_take_effect_fails_with_the_old_secret_alive() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    runner.instance().fail = Some(("admin user passwd".to_owned(), TIMEOUT_EXIT, String::new()));
+
+    let error = admin
+        .rotate_bucket_key(&rotate(ROTATED))
+        .await
+        .expect_err("not applied");
+
+    assert_eq!(error.code(), error_codes::BUCKET_ADMIN_UNAVAILABLE);
+    assert_eq!(runner.instance().users[KEY].secret, SECRET);
+}
+
+#[tokio::test]
+async fn a_rotation_whose_outcome_cannot_be_checked_asks_for_the_same_command_again() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    {
+        let mut instance = runner.instance();
+        instance.runner_error = Some("admin user passwd".to_owned());
+    }
+    // The check cannot reach the instance either.
+    runner.instance().fail = Some((
+        "verify".to_owned(),
+        1,
+        "Error response from daemon: container is not running".to_owned(),
+    ));
+
+    let error = admin
+        .rotate_bucket_key(&rotate(ROTATED))
+        .await
+        .expect_err("unknown");
+
+    assert_eq!(error.code(), error_codes::BUCKET_OUTCOME_UNKNOWN);
+    assert!(
+        error
+            .to_string()
+            .contains("send the same RotateBucketKey again")
+    );
+    assert!(!error.to_string().contains(ROTATED));
+}
+
+#[test]
+fn signed_request_answers_tell_which_secret_works() {
+    assert_eq!(
+        secret_check("<ListBucketResult/>\n200\n", false),
+        SecretCheck::InEffect
+    );
+    assert_eq!(
+        secret_check(
+            "<Error><Code>SignatureDoesNotMatch</Code></Error>\n403",
+            true
+        ),
+        SecretCheck::NotInEffect
+    );
+    assert_eq!(
+        secret_check("<Error><Code>InvalidAccessKeyId</Code></Error>\n403", true),
+        SecretCheck::InEffect
+    );
+    for (stdout, disabled) in [
+        ("<Error><Code>InvalidAccessKeyId</Code></Error>\n403", false),
+        ("<Error><Code>InternalError</Code></Error>\n500", false),
+        ("", false),
+    ] {
+        assert!(
+            matches!(secret_check(stdout, disabled), SecretCheck::Unknown(_)),
+            "{stdout:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn admin_commands_that_cannot_reach_the_instance_are_unavailable() {
+    // `rc admin ...` exits 1, not 3, when the instance is unreachable.
+    let stderr = r#"{
+  "error": "Failed to get user info: Network error: Request failed: error sending request",
+  "details": { "type": "network_error", "retryable": true }
+}"#;
+    let mut instance = roomy();
+    instance.fail = Some(("admin user info".to_owned(), 1, stderr.to_owned()));
+    let runner = FakeRunner::new(instance);
+    let admin = admin(&runner);
+
+    for error in [
+        admin
+            .create_bucket(&create(8))
+            .await
+            .map(drop)
+            .expect_err("create"),
+        admin
+            .lock_bucket(&key_payload())
+            .await
+            .map(drop)
+            .expect_err("lock"),
+        admin
+            .rotate_bucket_key(&rotate(ROTATED))
+            .await
+            .map(drop)
+            .expect_err("rotate"),
+    ] {
+        assert_eq!(
+            error.code(),
+            error_codes::BUCKET_ADMIN_UNAVAILABLE,
+            "{error}"
+        );
+    }
+
+    let mut instance = roomy();
+    instance.fail = Some(("admin info cluster".to_owned(), 1, stderr.to_owned()));
+    let error = super::RcObjectStorageAdmin::with_runner(
+        FakeRunner::new(instance) as Arc<dyn ProcessRunner>,
+        config(),
+    )
+    .check()
+    .await
+    .expect_err("check");
+    assert_eq!(error.code(), error_codes::BUCKET_ADMIN_UNAVAILABLE);
+
+    let mut instance = roomy();
+    instance.fail = Some(("mb".to_owned(), TIMEOUT_EXIT, String::new()));
+    let error = admin_for(instance)
+        .create_bucket(&create(8))
+        .await
+        .expect_err("late");
+    assert_eq!(error.code(), error_codes::BUCKET_ADMIN_UNAVAILABLE);
+    assert!(error.to_string().contains("did not finish in time"));
+}
+
+fn admin_for(instance: Instance) -> RcObjectStorageAdmin {
+    RcObjectStorageAdmin::with_runner(
+        FakeRunner::new(instance) as Arc<dyn ProcessRunner>,
+        config(),
+    )
+}
+
+#[tokio::test]
+async fn a_runner_error_is_unavailable() {
+    let mut instance = roomy();
+    instance.runner_error = Some("usage".to_owned());
+    let error = admin_for(instance)
+        .bucket_usage()
+        .await
+        .expect_err("timeout");
+    assert_eq!(error.code(), error_codes::BUCKET_ADMIN_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn lock_and_unlock_refuse_another_buckets_key_and_a_missing_bucket() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+
+    let other = BucketKeyPayload {
+        bucket: name(OTHER_BUCKET),
+        access_key_id: key(KEY),
+    };
+    for error in [
+        admin.lock_bucket(&other).await.expect_err("lock"),
+        admin.unlock_bucket(&other).await.expect_err("unlock"),
+    ] {
+        assert_eq!(error.code(), error_codes::BUCKET_CONFLICT, "{error}");
+    }
+    assert!(!runner.instance().users[KEY].disabled);
+
+    runner.instance().buckets.remove(BUCKET);
+    let error = admin
+        .lock_bucket(&key_payload())
+        .await
+        .expect_err("missing");
+    assert_eq!(error.code(), error_codes::BUCKET_NOT_FOUND);
+    assert!(!runner.instance().users[KEY].disabled);
+}
+
+#[tokio::test]
+async fn a_usage_read_while_a_command_holds_the_instance_is_skipped_not_failed() {
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    // A long DeleteBucket holds the lock for as long as it runs, up to minutes.
+    let held = admin.operations.lock().await;
+
+    let started = std::time::Instant::now();
+    let error = admin.bucket_usage().await.expect_err("busy");
+    assert_eq!(error.code(), BUCKET_USAGE_BUSY);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited too long"
+    );
+    assert!(runner.calls().is_empty());
+
+    drop(held);
+    admin.bucket_usage().await.expect("read after the command");
+}
+
+/// `examples/failures/bucket-failures.json`: the `fail` bodies the control
+/// plane copies, by code.
+fn fixture_message(code: &str) -> String {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../../examples/failures/bucket-failures.json"
+    ))
+    .expect("fixture");
+    fixture
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|entry| entry["body"]["error_code"] == code)
+        .and_then(|entry| entry["body"]["error_message"].as_str())
+        .unwrap_or_else(|| panic!("no {code} in the fixture"))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn the_failure_fixture_holds_what_the_adapter_sends() {
+    const STOPPED: &str = "Error response from daemon: container 3f2a is not running";
+
+    let runner = FakeRunner::new(roomy());
+    let admin = admin(&runner);
+    admin.create_bucket(&create(64)).await.expect("create");
+    runner.instance().runner_error = Some("admin user passwd".to_owned());
+    runner.instance().fail = Some(("verify".to_owned(), 1, STOPPED.to_owned()));
+    let unknown = admin
+        .rotate_bucket_key(&rotate(ROTATED))
+        .await
+        .expect_err("unknown");
+
+    let mut full = roomy();
+    existing_bucket(&mut full, OTHER_BUCKET, 1_000, 0);
+    let capacity = admin_for(full)
+        .create_bucket(&create(64))
+        .await
+        .expect_err("capacity");
+
+    let mut foreign = roomy();
+    foreign.users.insert(
+        KEY.to_owned(),
+        User {
+            disabled: false,
+            policies: vec![OTHER_BUCKET.to_owned()],
+            secret: String::new(),
+        },
+    );
+    let conflict = admin_for(foreign)
+        .create_bucket(&create(64))
+        .await
+        .expect_err("conflict");
+
+    let missing = admin_for(roomy())
+        .lock_bucket(&key_payload())
+        .await
+        .expect_err("missing");
+
+    let mut stopped = roomy();
+    stopped.fail = Some(("usage".to_owned(), 1, STOPPED.to_owned()));
+    let unavailable = admin_for(stopped)
+        .create_bucket(&create(64))
+        .await
+        .expect_err("stopped");
+
+    let mut refused = roomy();
+    refused.fail = Some((
+        "mb".to_owned(),
+        1,
+        "✗ Failed to create bucket: Access Denied".to_owned(),
+    ));
+    let operation = admin_for(refused)
+        .create_bucket(&create(64))
+        .await
+        .expect_err("refused");
+
+    for error in [unknown, capacity, conflict, missing, unavailable, operation] {
+        assert_eq!(
+            error.to_string(),
+            fixture_message(error.code()),
+            "{}",
+            error.code()
+        );
+    }
 }
