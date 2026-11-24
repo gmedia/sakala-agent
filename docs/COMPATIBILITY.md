@@ -402,6 +402,50 @@ New configuration: `SAKALA_OBJECT_STORAGE_DRIVER`, `SAKALA_OBJECT_STORAGE_CONTAI
 [Object Storage Host](OBJECT_STORAGE_HOST.md). None of them holds a credential: the
 RustFS root key stays in the RustFS container.
 
+## Revision 4 additions for worker processes and scheduled jobs
+
+Still revision 4 (ADR-022), but this release adds one command type, `RunJob`. An older
+Agent fails to deserialize a poll response that holds it, so the API must only assign
+`RunJob` to a node that advertises `scheduled-jobs`, and must not raise
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS` for it. `processes` is an optional payload
+field: an older Agent ignores it and runs the web process only, so the API must only send
+it, and place a deployment with workers, on a node that advertises `worker-processes`.
+A new Agent against an older API changes nothing: that API never sends `processes` or
+`RunJob`, so no worker or job container exists and none of the new keys below is sent.
+Deploy either side first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capabilities `worker-processes` and `scheduled-jobs` | Advertised by the `docker` driver only, after `image-rollback`. | Neither is advertised by `noop`. |
+| `DeployProject` payload field `processes` | Honoured. | Optional list of at most 5 `{ name, command, replicas, resources }`. Absent, `null`, or `[]` deploys the web process only, exactly as before. A value that is not a list of definitions never fails the payload: the web process deploys and event `deployment.processes.ignored` (level `warning`) says why. A readable list that breaks a rule fails with `invalid_runtime_command`, and `replicas` above the node limit with `runtime_replicas_exceeded`, both before checkout. Example in `examples/commands/deploy-project-processes.json`; semantics in [Sakala Agent API](AGENT_API.md#proses-worker). |
+| `error_code` value `worker_start_failed` | Sent on `fail` of `DeployProject`. | Additive and user-fixable: a worker exited or was restarted, with any exit code, before the route switched. Nothing of the new deployment stays; the previous one keeps serving with its own workers. |
+| Command type `RunJob` | Handled by the `docker` driver, appended last to `CommandType`. | `project_id` and `deployment_id` (the live deployment) are required. Payload `{ command, timeout_seconds, commit_sha, reuse_image_from_deployment_id, container_port, environment, resources, log_bounds }`; `timeout_seconds` defaults to 300 and must be 1 to 600. `complete` result `{ exit_code, duration_ms, oom_killed }`. Example in `examples/commands/run-job.json`; semantics in [Sakala Agent API](AGENT_API.md#job-runjob). |
+| `error_code` values `job_failed`, `job_timeout`, `job_image_missing` | Sent on `fail` of `RunJob`. | Additive. `runtime_capacity_exceeded`, `runtime_cancelled`, `invalid_runtime_command`, and `runtime_port_conflict` keep their meaning. Example bodies in `examples/failures/job-failures.json`. |
+| Events `job.started` and `job.finished` | Sent for every `RunJob` that started a container. | `job.finished` carries `exit_code` (`null` after a timeout), `duration_ms`, `oom_killed`, and `timed_out`, also when the command then fails. |
+| Events `deployment.container.started`, `deployment.runtime.ready`, `deployment.health.started` | Add `processes` (and `worker_startup_seconds`) only for a deployment with workers. | A deployment without workers sends the events every earlier Agent sent. |
+| Log item field `process` | Sent on lines of worker containers (the worker name) and of `RunJob` (`job`). | Absent on build, release, and web lines, as before. Each worker's lines go through a reporter of their own with their own `max_total_bytes` budget and stopped state. The current API ignores unknown log keys; an API that enforces the budget per command should count it per `process`. |
+| `process` on `metadata.workloads.crashed_details[]`, `metrics[]`, and `unhealthy_details[]` | Sent only for worker containers. | Absent means the web process, so earlier shapes are unchanged. Crashes are grouped per process: a crashing worker never marks the web process crashed, and a worker that ends with code 0 is never a crash. `workloads.replicas` counts web replicas only. Example in `examples/heartbeat/worker-processes.json`. |
+
+Capacity: every worker container counts against `SAKALA_MAX_ACTIVE_CONTAINERS` like a
+replica, on deploy, wake, and restart of a crashed deployment, and in
+`metadata.workloads.active`. A running job counts as one container for every admission,
+its own project's deploy included, because a deploy never replaces a job. Jobs run in
+their own pool, `SAKALA_MAX_CONCURRENT_JOBS` (default 2), outside the per-project queue.
+
+Lifecycle: `RestartProject`, `SleepProject`, `WakeProject`, and `StopProject` handle web
+and worker containers together; `HealthCheck`, `RefreshRoute`, and route restore look at
+web replicas only. `StopProject` also cancels the project's running jobs; `SleepProject`
+does not, and a job never wakes a project. A rollback runs the `processes` recorded in the
+target's payload.
+
+New configuration: `SAKALA_MAX_CONCURRENT_JOBS`, `SAKALA_WORKER_STARTUP_SECONDS`,
+`SAKALA_WORKER_STOP_GRACE_SECONDS`, see [Configuration](CONFIGURATION.md).
+
+Rolling the Agent back: an Agent without `worker-processes` reads a worker container as
+a web replica and routes to it. Before downgrading, redeploy the projects that have
+workers without `processes`, or stop them, and check that
+`docker ps -a --filter label=dev.sakala.workload-kind=worker` is empty.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.
