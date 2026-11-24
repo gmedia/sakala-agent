@@ -647,9 +647,12 @@ Cara Agent menjalankan job:
 
 - Container `sakala-job-<project8>-<command-id>` dari image itu, dengan network project,
   runtime container (`runsc` bila dikonfigurasi), opsi keamanan, filter egress, dan batas
-  resource yang sama dengan web, `--pull never`, tanpa restart policy, tanpa route, dan
-  tanpa label `dev.sakala.managed`. Label: `dev.sakala.role=job`, `dev.sakala.project-id`,
-  `dev.sakala.deployment-id`, `dev.sakala.command-id`, `dev.sakala.agent-id`.
+  resource yang sama dengan web, `--pull never`, tanpa restart policy, dan tanpa route.
+  Label: `dev.sakala.role=job`, `dev.sakala.project-id`, `dev.sakala.deployment-id`,
+  `dev.sakala.command-id`, `dev.sakala.agent-id`. Agent tidak memasang
+  `dev.sakala.managed`, tetapi container mewarisinya dari image; semua listing workload
+  melewati container ber-label `dev.sakala.role`, jadi job tidak pernah dianggap replika
+  atau worker.
 - Job berjalan di pool sendiri, `SAKALA_MAX_CONCURRENT_JOBS` (default 2), di luar
   `SAKALA_MAX_CONCURRENT_COMMANDS` dan di luar antrean per project: job tidak menunggu
   deploy, restart, atau sleep project yang sama, dan tidak menahannya. Job tidak pernah
@@ -663,8 +666,12 @@ Cara Agent menjalankan job:
   command, dan scheduler Agent tidak memulai ID command yang sedang berjalan. `idempotency_key`
   per slot tetap tanggung jawab API pada record command.
 - Container selalu dihapus setelah job selesai, gagal, melewati batas waktu, atau
-  dibatalkan. Saat Agent start, container job yang tertinggal milik Agent ini dihapus
-  bersama container release; command-nya sendiri berakhir lewat lease API.
+  dibatalkan, juga bila pembatalan datang saat Docker masih membuat container-nya:
+  penghapusan menunggu `docker run` selesai. Container job dan release milik Agent ini
+  yang command-nya sudah tidak berjalan dihapus saat Agent start, sebelum setiap job,
+  dan setiap 60 detik; command-nya sendiri berakhir lewat lease API. `StopProject`
+  menghapus semua container job dan release project itu dalam status apa pun, dan
+  container seperti itu tidak pernah menggagalkan lifecycle command project-nya.
 - Output container dikirim lewat endpoint logs command ini dengan awalan `[job]` dan
   `process: "job"`, melewati redaksi yang sama.
 
@@ -1613,9 +1620,9 @@ Cara membaca list ini:
 - **Container yang berhenti atau dihapus di tengah sampel dilewati**, karena Docker
   tidak lagi punya angka untuknya. Container yang sedang `restarting` juga dilewati;
   crash-nya terlihat di `crashed_details`.
-- **Container release tidak masuk list.** Container itu tidak membawa label
-  `dev.sakala.managed`, dan listing metrik juga membuang container apa pun yang punya
-  label `dev.sakala.role`. Router dan container lain di node juga tidak masuk.
+- **Container release tidak masuk list.** Container itu mewarisi label
+  `dev.sakala.managed` dari image, tetapi listing metrik membuang container apa pun yang
+  punya label `dev.sakala.role`. Router dan container lain di node juga tidak masuk.
 
 Satu sampel memakai tiga panggilan Docker: `docker ps` untuk container berlabel
 `dev.sakala.managed=true`, satu `docker stats --no-stream --format '{{json .}}'`, dan

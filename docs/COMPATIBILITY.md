@@ -434,8 +434,10 @@ their own pool, `SAKALA_MAX_CONCURRENT_JOBS` (default 2), outside the per-projec
 
 Lifecycle: `RestartProject`, `SleepProject`, `WakeProject`, and `StopProject` handle web
 and worker containers together; `HealthCheck`, `RefreshRoute`, and route restore look at
-web replicas only. `StopProject` also cancels the project's running jobs; `SleepProject`
-does not, and a job never wakes a project. A rollback runs the `processes` recorded in the
+web replicas only. `StopProject` also cancels the project's running jobs and removes the
+project's job and release containers in any state; `SleepProject` does not, and a job
+never wakes a project. A job or release container never makes a lifecycle command of its
+project fail. A rollback runs the `processes` recorded in the
 target's payload.
 
 New configuration: `SAKALA_MAX_CONCURRENT_JOBS`, `SAKALA_WORKER_STARTUP_SECONDS`,

@@ -5,7 +5,10 @@
 //! keeps serving, a worker that ends with code 0 is not a crash, restart,
 //! sleep, wake, and stop handle web and workers together, and a job runs once
 //! in a container of the live image, also while the project sleeps, without
-//! waking it, and is removed after success, failure, timeout, or cancellation.
+//! waking it, and is removed after success, failure, timeout, or cancellation,
+//! also when it is cancelled while Docker creates its container. A one-off
+//! container left behind is removed by the periodic reconcile, and never
+//! keeps its project from stopping.
 //!
 //! No checkout and no build: the image is a labelled copy of `busybox:1.37`
 //! that every deployment reuses. Opt-in, because it needs a daemon plus
@@ -37,7 +40,8 @@ use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, SleepingPage};
 use sakala_agent_runtime::{
     DockerRuntimeConfig, DockerRuntimeExecutor, TokioProcessRunner,
     containers::{
-        ReplicaSlot, container_name, image_name, project_network_name, worker_container_name,
+        ReplicaSlot, container_name, image_name, job_container_name, project_network_name,
+        worker_container_name,
     },
 };
 use serde_json::{Value, json};
@@ -60,6 +64,14 @@ const QUEUE_COMMAND: &str = "trap 'exit 0' TERM; while true; do echo tick; sleep
 /// Shorter than the defaults, so the test spends seconds, not minutes.
 const WORKER_STARTUP: Duration = Duration::from_secs(2);
 const WORKER_STOP_GRACE: Duration = Duration::from_secs(3);
+/// How long after a cancelled job ended a container Docker was still
+/// creating would show up. Staging saw it about a second after the cancel.
+const LATE_CONTAINER_WINDOW: Duration = Duration::from_secs(2);
+/// After the job is requested, when it is cancelled: from before its
+/// container exists to while Docker creates or starts it.
+const CANCEL_DELAYS_MS: [u64; 6] = [0, 25, 50, 100, 200, 400];
+/// The agent ID of `DockerRuntimeConfig::default()`.
+const AGENT_ID: &str = "local-agent-01";
 
 const ROUTER_CADDYFILE: &str = "{
 \tadmin localhost:2019
@@ -301,6 +313,39 @@ impl Node {
             .into_iter()
             .filter(|name| name.starts_with("sakala-job-"))
             .collect()
+    }
+
+    /// A job container whose command is gone, in `created` state on the
+    /// project's network, as staging found one on 2026-11-24: it inherits
+    /// `dev.sakala.managed=true` from the image and has no domain label.
+    fn leftover_job(&self, deployment_id: Uuid, agent_id: &str) -> String {
+        let name = job_container_name(self.project_id, Uuid::new_v4());
+        must(&[
+            "create",
+            "--name",
+            &name,
+            "--pull=never",
+            "--network",
+            &project_network_name(self.project_id),
+            "--label",
+            "dev.sakala.role=job",
+            "--label",
+            &format!("dev.sakala.project-id={}", self.project_id),
+            "--label",
+            &format!("dev.sakala.deployment-id={deployment_id}"),
+            "--label",
+            &format!("dev.sakala.command-id={}", Uuid::new_v4()),
+            "--label",
+            &format!("dev.sakala.agent-id={agent_id}"),
+            "--entrypoint",
+            "sh",
+            &image_name(self.project_id, self.image_deployment, COMMIT),
+            "-c",
+            "sleep 60",
+        ]);
+        assert_eq!(status_of(&name).as_deref(), Some("created"));
+        assert_eq!(label_of(&name, "dev.sakala.managed"), "true");
+        name
     }
 }
 
@@ -592,14 +637,93 @@ async fn real_docker_runs_workers_beside_the_web_process_and_jobs_from_the_live_
     assert!(node.jobs_left().is_empty(), "{:?}", node.jobs_left());
     println!("--- failed, timed out, and cancelled jobs left nothing behind");
 
-    // Stop removes web and workers.
+    // A job cancelled right after it was requested, while Docker may still
+    // be creating its container, leaves nothing behind, also once Docker
+    // would have finished creating it.
+    for delay_ms in CANCEL_DELAYS_MS {
+        let job = node.job(live, "sleep 60", 60);
+        let token = job.cancellation.clone();
+        let executor = Arc::clone(&node.executor);
+        let running = tokio::spawn(async move {
+            executor
+                .run_job(job, Arc::new(RecordingReporter::default()))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        token.cancel();
+        let error = running.await.expect("task").expect_err("cancelled");
+        assert_eq!(error.code(), "runtime_cancelled", "{delay_ms} ms: {error}");
+        tokio::time::sleep(LATE_CONTAINER_WINDOW).await;
+        assert!(
+            node.jobs_left().is_empty(),
+            "cancelled after {delay_ms} ms: {:?}",
+            node.jobs_left()
+        );
+    }
+    // And cancelled the moment its container first shows up.
+    let job = node.job(live, "sleep 60", 60);
+    let name = job_container_name(node.project_id, job.command_id);
+    let token = job.cancellation.clone();
+    let executor = Arc::clone(&node.executor);
+    let running = tokio::spawn(async move {
+        executor
+            .run_job(job, Arc::new(RecordingReporter::default()))
+            .await
+    });
+    let appeared = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(status) = status_of(&name) {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the job container appears");
+    token.cancel();
+    let error = running.await.expect("task").expect_err("cancelled");
+    assert_eq!(error.code(), "runtime_cancelled");
+    tokio::time::sleep(LATE_CONTAINER_WINDOW).await;
+    assert!(node.jobs_left().is_empty(), "{:?}", node.jobs_left());
+    println!(
+        "--- jobs cancelled after {CANCEL_DELAYS_MS:?} ms and once its container was {appeared} left nothing behind"
+    );
+
+    // The periodic reconcile removes a job container of this Agent whose
+    // command is gone, and lifecycle commands never mistake it for a replica.
+    let leftover = node.leftover_job(live, AGENT_ID);
+    node.executor
+        .health_check(node.lifecycle(live), Arc::new(RecordingReporter::default()))
+        .await
+        .expect("health check beside a leftover job container");
+    node.executor
+        .reconcile_networks(false)
+        .await
+        .expect("periodic reconcile");
+    assert_eq!(status_of(&leftover), None, "the sweep removed it");
+    println!("--- the periodic reconcile removed a leftover job container");
+
+    // Stop removes web and workers, and a leftover job container of any
+    // Agent, so the project network and the route go too.
+    let leftover = node.leftover_job(live, "another-agent");
     node.executor
         .stop_project(node.lifecycle(live), Arc::new(RecordingReporter::default()))
         .await
-        .expect("stop");
+        .expect("stop with a leftover job container");
     assert!(
         containers_of(node.project_id).is_empty(),
         "{:?}",
         containers_of(node.project_id)
     );
+    assert_eq!(status_of(&leftover), None);
+    let (network_left, _) = docker(&["network", "inspect", &project_network_name(node.project_id)]);
+    assert!(!network_left, "the project network is removed");
+    assert!(
+        !node
+            .sites
+            .join(format!("{}.Caddyfile", node.project_id))
+            .exists(),
+        "the route is removed"
+    );
+    println!("--- stop removed a leftover job container, the network, and the route");
 }

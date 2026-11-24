@@ -28,9 +28,9 @@ use crate::{
     CommandSpec, NullOutputSink, ProcessRunner, RuntimeError, RuntimeReporter,
     containers::limits::docker_cpu_value,
     containers::{
-        ClaimProject, ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
-        ManagedWorkload, OneOffContainerRequest, OneOffExit, OneOffRole, ResourceSafetyConfig,
-        RoutedWorkload, RunContainerRequest,
+        ClaimProject, ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, IsActiveOneOff,
+        ListedReplica, ManagedWorkload, OneOffContainerRequest, OneOffExit, OneOffRole,
+        ResourceSafetyConfig, RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LABELS_FORMAT,
             IMAGE_LIST_FORMAT, InspectedImage, ListedImage, NO_SUCH_IMAGE,
@@ -63,9 +63,14 @@ const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
 const PROJECT_ID_LABEL: &str = "dev.sakala.project-id";
 const DEPLOYMENT_ID_LABEL: &str = "dev.sakala.deployment-id";
 /// Marks a one-off container, `dev.sakala.role=<role>` with the role of
-/// [`OneOffRole::as_str`]: `release` or `job`. It never carries
-/// `MANAGED_LABEL`, so nothing that lists workloads sees it.
+/// [`OneOffRole::as_str`]: `release` or `job`. The Agent never sets
+/// `MANAGED_LABEL` on it, but Docker copies the image's labels to the
+/// container and every Sakala image carries `MANAGED_LABEL`. So every listing
+/// filtered on `MANAGED_LABEL` also prints this label and skips a container
+/// that has it (see [`OneOffRole::is_labelled`]).
 const ROLE_LABEL_KEY: &str = "dev.sakala.role";
+/// `docker ps` of one-off containers by name, for their removal.
+const ONE_OFF_NAME_FORMAT: &str = "{{.Names}}";
 /// Why a stopped container no sleeping route points at is an orphan.
 const STALE_STOPPED_REASON: &str = "stale stopped deployment container";
 /// Restart policy of a workload, web or worker. A one-off container keeps
@@ -105,9 +110,9 @@ const METRICS_INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Set by the image or by Sakala itself, and common in ordinary log text.
 const NON_SECRET_ENVIRONMENT_KEYS: [&str; 3] = ["PATH", "HOME", "PORT"];
 /// `docker inspect` of a container the new deployment replaces: whether it
-/// runs, its name, and the worker process it runs, empty for a web replica.
-const PREVIOUS_CONTAINER_FORMAT: &str =
-    "{{.State.Running}}\t{{.Name}}\t{{index .Config.Labels \"dev.sakala.process\"}}";
+/// runs, its name, the worker process it runs, empty for a web replica, and
+/// its one-off role, empty for a workload.
+const PREVIOUS_CONTAINER_FORMAT: &str = "{{.State.Running}}\t{{.Name}}\t{{index .Config.Labels \"dev.sakala.process\"}}\t{{index .Config.Labels \"dev.sakala.role\"}}";
 const CRASH_STATE_FORMAT: &str = "{{.Id}}\t{{.State.Status}}\t{{.RestartCount}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}";
 const EXIT_EVENTS_FORMAT: &str = "{{.Actor.ID}}\t{{.Action}}\t{{.Actor.Attributes.exitCode}}";
 /// Exit code of a SIGKILL, which is what the kernel OOM killer sends.
@@ -423,6 +428,18 @@ impl DockerContainerEngine {
         self
     }
 
+    /// The names of the one-off containers, running or not, that match every
+    /// `docker ps` filter in `filters`.
+    async fn one_off_names(&self, filters: &[String]) -> Result<Vec<String>, RuntimeError> {
+        let mut list = CommandSpec::new("docker").arg("ps").arg("--all");
+        for filter in filters {
+            list = list.arg("--filter").arg(filter);
+        }
+        let list = list.arg("--format").arg(ONE_OFF_NAME_FORMAT);
+        let listed = self.read_docker(&list, "docker one-off listing").await?;
+        Ok(non_empty_lines(&listed).map(str::to_owned).collect())
+    }
+
     /// Running containers that count against the node's maximum, by project:
     /// managed workloads, then one-off containers with their role.
     async fn running_containers(&self) -> Result<RunningContainers, RuntimeError> {
@@ -431,7 +448,9 @@ impl DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
-            .arg(format!("{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}"));
+            .arg(format!(
+                "{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
+            ));
         let workloads = self
             .read_docker(&workloads, "docker capacity inspection")
             .await?;
@@ -449,8 +468,13 @@ impl DockerContainerEngine {
             .read_docker(&one_offs, "docker one-off capacity inspection")
             .await?;
         Ok(RunningContainers {
+            // A one-off container inherits the managed label from its image;
+            // it is counted once, with the one-off containers below.
             workloads: non_empty_lines(&workloads)
-                .map(|project| project.to_owned())
+                .filter_map(|line| {
+                    let (project, role) = line.split_once('\t').unwrap_or((line, ""));
+                    (!OneOffRole::is_labelled(Some(role))).then(|| project.trim().to_owned())
+                })
                 .collect(),
             one_offs: non_empty_lines(&one_offs)
                 .map(|line| {
@@ -458,6 +482,98 @@ impl DockerContainerEngine {
                     (project.trim().to_owned(), role.trim().to_owned())
                 })
                 .collect(),
+        })
+    }
+
+    /// Every managed workload container, running or not, as orphan detection
+    /// sorts it, and how many one-off containers run. A one-off container
+    /// carries the managed label it inherits from its image, but it is never
+    /// a workload or an orphan: the sweep of one-off containers removes it
+    /// once its command ended.
+    async fn managed_containers(
+        &self,
+        sleeping_routes: &HashSet<RouteIdentity>,
+    ) -> Result<ManagedContainers, RuntimeError> {
+        let command = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--all")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(format!("{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{DEPLOYMENT_ID_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"));
+        let output = self.runner.run(&command, &NullOutputSink).await?;
+        if !output.success {
+            return Err(RuntimeError::Container(format!(
+                "docker orphan inspection failed with {}",
+                crate::error::describe_exit(output.code)
+            )));
+        }
+
+        let mut report = RuntimeReconciliationReport::default();
+        let mut running_one_offs = 0;
+        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            let status = fields.get(1).copied().unwrap_or_default();
+            if OneOffRole::is_labelled(fields.get(4).copied()) {
+                if status.starts_with("Up") {
+                    running_one_offs += 1;
+                }
+                continue;
+            }
+            report.inspected_containers += 1;
+            let container_id = fields.first().copied().unwrap_or_default().to_owned();
+            let project_id = fields.get(2).and_then(|value| Uuid::parse_str(value).ok());
+            let deployment_id = fields.get(3).and_then(|value| Uuid::parse_str(value).ok());
+            let stopped = status.starts_with("Exited") || status.starts_with("Dead");
+            // Idle sleep stops the active deployment's containers and keeps
+            // them for the wake; its sleeping route is the local record of that.
+            if let (true, Some(project_id), Some(deployment_id)) =
+                (stopped, project_id, deployment_id)
+                && sleeping_routes.contains(&RouteIdentity {
+                    project_id,
+                    deployment_id: Some(deployment_id),
+                })
+            {
+                report.sleeping_workloads.push(RuntimeWorkload {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    status: status.to_owned(),
+                });
+                continue;
+            }
+            let reason = if project_id.is_none() {
+                Some("managed container has an unknown project identity")
+            } else if deployment_id.is_none() {
+                Some("managed container has incomplete deployment identity labels")
+            } else if status.starts_with("Created") {
+                Some("dangling candidate container was never started")
+            } else if stopped {
+                Some(STALE_STOPPED_REASON)
+            } else {
+                None
+            };
+
+            if let Some(reason) = reason {
+                report.orphans.push(RuntimeOrphan {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    reason: reason.to_owned(),
+                });
+            } else if let (Some(project_id), Some(deployment_id)) = (project_id, deployment_id) {
+                report.workloads.push(RuntimeWorkload {
+                    container_id,
+                    project_id,
+                    deployment_id,
+                    status: status.to_owned(),
+                });
+            }
+        }
+
+        Ok(ManagedContainers {
+            report,
+            running_one_offs,
         })
     }
 
@@ -610,90 +726,23 @@ impl ContainerEngine for DockerContainerEngine {
         &self,
         sleeping_routes: &HashSet<RouteIdentity>,
     ) -> Result<RuntimeReconciliationReport, RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("ps")
-            .arg("--all")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}");
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "docker orphan inspection failed with {}",
-                crate::error::describe_exit(output.code)
-            )));
-        }
-
-        let mut report = RuntimeReconciliationReport::default();
-        for line in output.stdout.lines().filter(|line| !line.trim().is_empty()) {
-            report.inspected_containers += 1;
-            let fields = line.split('\t').collect::<Vec<_>>();
-            let container_id = fields.first().copied().unwrap_or_default().to_owned();
-            let status = fields.get(1).copied().unwrap_or_default();
-            let project_id = fields.get(2).and_then(|value| Uuid::parse_str(value).ok());
-            let deployment_id = fields.get(3).and_then(|value| Uuid::parse_str(value).ok());
-            let stopped = status.starts_with("Exited") || status.starts_with("Dead");
-            // Idle sleep stops the active deployment's containers and keeps
-            // them for the wake; its sleeping route is the local record of that.
-            if let (true, Some(project_id), Some(deployment_id)) =
-                (stopped, project_id, deployment_id)
-                && sleeping_routes.contains(&RouteIdentity {
-                    project_id,
-                    deployment_id: Some(deployment_id),
-                })
-            {
-                report.sleeping_workloads.push(RuntimeWorkload {
-                    container_id,
-                    project_id,
-                    deployment_id,
-                    status: status.to_owned(),
-                });
-                continue;
-            }
-            let reason = if project_id.is_none() {
-                Some("managed container has an unknown project identity")
-            } else if deployment_id.is_none() {
-                Some("managed container has incomplete deployment identity labels")
-            } else if status.starts_with("Created") {
-                Some("dangling candidate container was never started")
-            } else if stopped {
-                Some(STALE_STOPPED_REASON)
-            } else {
-                None
-            };
-
-            if let Some(reason) = reason {
-                report.orphans.push(RuntimeOrphan {
-                    container_id,
-                    project_id,
-                    deployment_id,
-                    reason: reason.to_owned(),
-                });
-            } else if let (Some(project_id), Some(deployment_id)) = (project_id, deployment_id) {
-                report.workloads.push(RuntimeWorkload {
-                    container_id,
-                    project_id,
-                    deployment_id,
-                    status: status.to_owned(),
-                });
-            }
-        }
-
-        Ok(report)
+        Ok(self.managed_containers(sleeping_routes).await?.report)
     }
 
     async fn capacity(&self) -> Result<RuntimeCapacity, RuntimeError> {
         // A sleeping container is still a stopped one, so which of them sleep
         // does not change the count and the route files are not read here.
-        let report = self.detect_orphans(&HashSet::new()).await?;
+        let listing = self.managed_containers(&HashSet::new()).await?;
+        let report = listing.report;
         let stale_stopped = report
             .orphans
             .iter()
             .filter(|orphan| orphan.reason == STALE_STOPPED_REASON)
             .count();
         Ok(RuntimeCapacity {
-            active_workloads: Some(report.workloads.len()),
+            // A running one-off container takes a slot like a workload, as in
+            // the capacity guard.
+            active_workloads: Some(report.workloads.len() + listing.running_one_offs),
             stopped_workloads: Some(report.sleeping_workloads.len() + stale_stopped),
             maximum_active_workloads: Some(self.max_active_containers as usize),
             active_builds: None,
@@ -708,7 +757,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
-            .arg(format!("{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"));
+            .arg(format!("{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
@@ -721,8 +770,11 @@ impl ContainerEngine for DockerContainerEngine {
             .lines()
             .filter_map(|line| {
                 let fields = line.split('\t').collect::<Vec<_>>();
-                // A worker has no route, so the router serves nothing for it.
-                if process_from_labels(fields.get(5).copied(), fields.get(6).copied()).is_some() {
+                // A worker has no route, so the router serves nothing for it,
+                // and neither does a one-off container.
+                if process_from_labels(fields.get(5).copied(), fields.get(6).copied()).is_some()
+                    || OneOffRole::is_labelled(fields.get(7).copied())
+                {
                     return None;
                 }
                 Some(RoutedWorkload {
@@ -937,7 +989,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
             .arg("--format")
             .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"dev.sakala.port\"}}}}\t{{{{.Label \"dev.sakala.command-id\"}}}}\t{{{{.Label \"dev.sakala.log-max-line-length\"}}}}\t{{{{.Label \"dev.sakala.log-max-batch-lines\"}}}}\t{{{{.Label \"dev.sakala.log-max-total-bytes\"}}}}\t{{{{.Names}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"dev.sakala.port\"}}}}\t{{{{.Label \"dev.sakala.command-id\"}}}}\t{{{{.Label \"dev.sakala.log-max-line-length\"}}}}\t{{{{.Label \"dev.sakala.log-max-batch-lines\"}}}}\t{{{{.Label \"dev.sakala.log-max-total-bytes\"}}}}\t{{{{.Names}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
             ));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
@@ -949,7 +1001,7 @@ impl ContainerEngine for DockerContainerEngine {
         let mut workloads = output
             .stdout
             .lines()
-            .filter(|line| !line.trim().is_empty())
+            .filter(|line| !line.trim().is_empty() && !is_one_off_lookup(line))
             .map(|line| parse_workload(line, project_id, deployment_id))
             .collect::<Result<Vec<_>, _>>()?;
         // Web replicas first, then each worker process by name.
@@ -1257,25 +1309,38 @@ impl ContainerEngine for DockerContainerEngine {
         }
     }
 
-    async fn remove_stale_one_offs(&self) -> Result<usize, RuntimeError> {
+    async fn remove_stale_one_offs(
+        &self,
+        is_active: &IsActiveOneOff<'_>,
+    ) -> Result<usize, RuntimeError> {
         let mut removed = 0;
         for role in OneOffRole::ALL {
-            let list = CommandSpec::new("docker")
-                .arg("ps")
-                .arg("--all")
-                .arg("--quiet")
-                .arg("--no-trunc")
-                .arg("--filter")
-                .arg(format!("label={ROLE_LABEL_KEY}={}", role.as_str()))
-                .arg("--filter")
-                .arg(format!("label={AGENT_ID_LABEL}={}", self.agent_id));
-            let listed = self.read_docker(&list, "docker one-off listing").await?;
-            for container in listed.split_whitespace() {
-                self.remove_one_off(container).await?;
+            let names = self
+                .one_off_names(&[
+                    format!("label={ROLE_LABEL_KEY}={}", role.as_str()),
+                    format!("label={AGENT_ID_LABEL}={}", self.agent_id),
+                ])
+                .await?;
+            for name in names.iter().filter(|name| !is_active(name)) {
+                self.remove_one_off(name).await?;
                 removed += 1;
             }
         }
         Ok(removed)
+    }
+
+    async fn remove_project_one_offs(&self, project_id: Uuid) -> Result<usize, RuntimeError> {
+        // Any Agent's: the project is gone, whoever started its containers.
+        let names = self
+            .one_off_names(&[
+                format!("label={ROLE_LABEL_KEY}"),
+                format!("label={PROJECT_ID_LABEL}={project_id}"),
+            ])
+            .await?;
+        for name in &names {
+            self.remove_one_off(name).await?;
+        }
+        Ok(names.len())
     }
 
     async fn attach_router(&self, project_id: Uuid) -> Result<(), RuntimeError> {
@@ -1449,6 +1514,11 @@ impl ContainerEngine for DockerContainerEngine {
             let worker = fields
                 .next()
                 .is_some_and(|process| !process.trim().is_empty());
+            // A job of the project keeps running through its deploy, and a
+            // release container is removed by the deployment that ran it.
+            if OneOffRole::is_labelled(fields.next()) {
+                continue;
+            }
             previous.push((container_id, running, worker));
         }
 
@@ -1638,11 +1708,16 @@ impl ContainerEngine for DockerContainerEngine {
         for id in ids.split_whitespace() {
             inspect = inspect.arg(id);
         }
+        // A one-off container runs the image it was given, which says
+        // nothing about which image the deployment replaced.
         let containers = parse_project_containers(
             &self
                 .read_docker(&inspect, "project container inspection")
                 .await?,
-        )?;
+        )?
+        .into_iter()
+        .filter(|container| !container.one_off)
+        .collect::<Vec<_>>();
         let Some(image) = replaced_image(&containers, current) else {
             return Ok(None);
         };
@@ -1698,6 +1773,9 @@ fn parse_listed_replica(line: &str) -> Option<ListedReplica> {
         return None;
     }
     let fields = line.split('\t').collect::<Vec<_>>();
+    if OneOffRole::is_labelled(fields.get(8).copied()) {
+        return None;
+    }
     Some(ListedReplica {
         container_id: fields.first().copied().unwrap_or_default().to_owned(),
         status: fields.get(1).copied().unwrap_or_default().to_owned(),
@@ -1706,6 +1784,12 @@ fn parse_listed_replica(line: &str) -> Option<ListedReplica> {
         replica: ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied()),
         process: process_from_labels(fields.get(6).copied(), fields.get(7).copied()),
     })
+}
+
+/// Whether a line of the workload lookup is a one-off container, whose role
+/// comes after the process.
+fn is_one_off_lookup(line: &str) -> bool {
+    OneOffRole::is_labelled(line.split('\t').nth(13))
 }
 
 /// One line of the workload lookup. The name and the replica labels come last,
@@ -1800,6 +1884,12 @@ fn whole_deployments<'a>(
                 .max_by_key(|(_, state)| state.finished_at)
         })
         .collect()
+}
+
+/// What [`DockerContainerEngine::managed_containers`] found.
+struct ManagedContainers {
+    report: RuntimeReconciliationReport,
+    running_one_offs: usize,
 }
 
 /// What [`DockerContainerEngine::running_containers`] found.
@@ -1917,7 +2007,8 @@ impl CrashState {
 impl DockerContainerEngine {
     /// Managed containers with their identity and replica labels, in one
     /// `docker ps`. `all` includes the stopped ones. A container without a
-    /// readable project or deployment ID is left out.
+    /// readable project or deployment ID is left out, and so is a one-off
+    /// container.
     async fn list_replicas(
         &self,
         all: bool,
@@ -1932,7 +2023,7 @@ impl DockerContainerEngine {
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
             .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
             ));
         let stdout = self.read_docker(&command, what).await?;
         Ok(stdout.lines().filter_map(parse_listed_replica).collect())

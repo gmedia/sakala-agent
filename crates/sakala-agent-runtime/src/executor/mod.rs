@@ -1,6 +1,7 @@
 mod docker;
 mod image_reuse;
 mod noop;
+mod one_off;
 mod project_locks;
 mod replica_restore;
 mod shell_command;

@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use super::{
     image_reuse::ImagePlan,
+    one_off::{ActiveOneOffs, OneOffContainer},
     project_locks::ProjectLocks,
     replica_restore::{ReplicaRestorer, RestorePolicy, RestoreTarget},
     shell_command::{
@@ -108,6 +109,8 @@ pub struct DockerRuntimeExecutor {
     restorer: std::sync::Mutex<ReplicaRestorer>,
     /// The jobs running now, so stopping a project can stop its jobs too.
     jobs: RunningJobs,
+    /// The release and job containers whose command runs now.
+    one_offs: Arc<ActiveOneOffs>,
 }
 
 pub(crate) struct DockerPreflight {
@@ -312,6 +315,7 @@ impl DockerRuntimeExecutor {
             project_locks: ProjectLocks::default(),
             restorer: std::sync::Mutex::new(ReplicaRestorer::new(restore_policy)),
             jobs: RunningJobs::default(),
+            one_offs: Arc::default(),
         }
     }
 
@@ -486,6 +490,7 @@ impl DockerRuntimeExecutor {
             .collect::<Vec<_>>();
         let release = OneOffContainer::new(
             Arc::clone(&self.containers),
+            &self.one_offs,
             release_container_name(project_id, deployment_id),
         );
         let route_activated = AtomicBool::new(false);
@@ -731,7 +736,7 @@ impl DockerRuntimeExecutor {
                 },
                 containers_needed,
                 progress.release,
-                reporter_ref,
+                &reporter,
             )
             .await?;
         }
@@ -1107,10 +1112,10 @@ impl DockerRuntimeExecutor {
         request: &OneOffContainerRequest,
         replicas: NonZeroU32,
         release: &OneOffContainer,
-        reporter: &dyn RuntimeReporter,
+        reporter: &Arc<dyn RuntimeReporter>,
     ) -> Result<(), RuntimeError> {
         emit_event(
-            reporter,
+            reporter.as_ref(),
             "deployment.release.started",
             "Running the release command before the new version starts.",
             json!({
@@ -1139,7 +1144,7 @@ impl DockerRuntimeExecutor {
             });
         }
         emit_event(
-            reporter,
+            reporter.as_ref(),
             "deployment.release.completed",
             "Release command finished; starting the new version.",
             json!({ "duration_ms": started.elapsed().as_millis() }),
@@ -1158,21 +1163,18 @@ impl DockerRuntimeExecutor {
         request: &OneOffContainerRequest,
         replicas: NonZeroU32,
         release: &OneOffContainer,
-        reporter: &dyn RuntimeReporter,
+        reporter: &Arc<dyn RuntimeReporter>,
     ) -> Result<OneOffExit, RuntimeError> {
         let admission = self.container_admission.lock().await;
         self.containers
             .ensure_capacity(request.project_id, replicas)
             .await?;
-        // Before `docker run`, which can leave a created container behind
-        // even when it fails.
-        release.arm();
-        self.containers.start_one_off(request, reporter).await?;
+        release.start(request, Arc::clone(reporter)).await?;
         drop(admission);
         tokio::time::timeout(
             self.release_command_timeout,
             self.containers
-                .wait_one_off(&request.name, request.role, reporter),
+                .wait_one_off(&request.name, request.role, reporter.as_ref()),
         )
         .await
         .map_err(|_| RuntimeError::ReleaseCommandTimeout {
@@ -1212,8 +1214,13 @@ impl DockerRuntimeExecutor {
         let workspace = self.workspace.empty(command_id).await?;
         let container = OneOffContainer::new(
             Arc::clone(&self.containers),
+            &self.one_offs,
             job_container_name(project_id, command_id),
         );
+        // Every job first removes the one-off containers whose command
+        // ended, such as one Docker created after its command was cancelled.
+        // Its own container is registered as active already, so it stays.
+        self.sweep_one_offs().await;
         let container_request = OneOffContainerRequest {
             role: OneOffRole::Job,
             command_id,
@@ -1229,7 +1236,7 @@ impl DockerRuntimeExecutor {
         };
         let outcome = tokio::select! {
             biased;
-            outcome = self.execute_job(&container_request, job.timeout, &container, reporter.as_ref()) => outcome,
+            outcome = self.execute_job(&container_request, job.timeout, &container, &reporter) => outcome,
             () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
         };
         if let Err(error) = container.remove().await {
@@ -1307,15 +1314,13 @@ impl DockerRuntimeExecutor {
         request: &OneOffContainerRequest,
         timeout: std::time::Duration,
         container: &OneOffContainer,
-        reporter: &dyn RuntimeReporter,
+        reporter: &Arc<dyn RuntimeReporter>,
     ) -> Result<(OneOffExit, u64), RuntimeError> {
         let admission = self.container_admission.lock().await;
         self.containers.ensure_job_capacity().await?;
-        // Before `docker run`, which can leave a created container behind
-        // even when it fails.
-        container.arm();
-        self.containers.start_one_off(request, reporter).await?;
+        container.start(request, Arc::clone(reporter)).await?;
         drop(admission);
+        let reporter = reporter.as_ref();
         let started = Instant::now();
         emit_event(
             reporter,
@@ -1466,6 +1471,26 @@ impl DockerRuntimeExecutor {
                     "log follower cannot redact environment values for this workload"
                 );
                 ValueRedactor::default()
+            }
+        }
+    }
+
+    /// Removes this Agent's release and job containers whose command no
+    /// longer runs, such as one Docker finished creating after its command
+    /// was cancelled. Best effort: the next sweep tries again, and the
+    /// operator log says why.
+    async fn sweep_one_offs(&self) {
+        let is_active = |name: &str| self.one_offs.contains(name);
+        match self.containers.remove_stale_one_offs(&is_active).await {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::info!(
+                    removed,
+                    "release and job containers of ended commands removed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%error, "release and job containers of ended commands could not be removed");
             }
         }
     }
@@ -1656,6 +1681,20 @@ impl DockerRuntimeExecutor {
                     cancelled,
                     "jobs of a stopped project cancelled"
                 );
+            }
+            // Before the network goes, which no container may still use. A
+            // one-off container left behind must not keep the project from
+            // stopping, so a failure here is only a warning.
+            if let Err(error) = self
+                .containers
+                .remove_project_one_offs(request.project_id)
+                .await
+            {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "release and job container cleanup warning: {error}"
+                    )))
+                    .await;
             }
         }
         let workloads = self
@@ -2348,16 +2387,7 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         let mut report = self.reconcile().await?;
         // A release or job container belongs to a command, and none of those
         // survived the restart. Removed first, so its network can go too.
-        match self.containers.remove_stale_one_offs().await {
-            Ok(0) => {}
-            Ok(removed) => tracing::info!(
-                removed,
-                "release and job containers of interrupted commands removed"
-            ),
-            Err(error) => {
-                tracing::warn!(%error, "release and job containers of interrupted commands could not be removed")
-            }
-        }
+        self.sweep_one_offs().await;
         // Unlike containers, a network holds no state, so one without containers
         // is removed here instead of only reported.
         if let Err(error) = self.containers.reconcile_networks(true).await {
@@ -2421,10 +2451,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         Ok(report)
     }
 
+    /// Also removes the one-off containers whose command ended, first, so
+    /// their networks can go in the same run.
     async fn reconcile_networks(
         &self,
         remove_unused: bool,
     ) -> Result<RuntimeNetworkReconciliation, RuntimeExecutionError> {
+        self.sweep_one_offs().await;
         self.containers
             .reconcile_networks(remove_unused)
             .await
@@ -2821,61 +2854,6 @@ struct DeploymentProgress<'a> {
     /// The first replica that failed readiness, whose output explains why.
     failed_replica: &'a OnceLock<String>,
     release: &'a OneOffContainer,
-}
-
-/// The one-off container of a release command or a job, removed on every
-/// path: by the step that ran it once the command ended or timed out, by the
-/// command's cleanup after a cancellation, and in the background when the
-/// command is dropped before either could run, such as after the shutdown
-/// grace.
-struct OneOffContainer {
-    containers: Arc<dyn ContainerEngine>,
-    name: String,
-    /// Set from just before `docker run` until a removal succeeded.
-    started: AtomicBool,
-}
-
-impl OneOffContainer {
-    fn new(containers: Arc<dyn ContainerEngine>, name: String) -> Self {
-        Self {
-            containers,
-            name,
-            started: AtomicBool::new(false),
-        }
-    }
-
-    fn arm(&self) {
-        self.started.store(true, Ordering::Release);
-    }
-
-    /// Does nothing when no container was started, or it is gone.
-    async fn remove(&self) -> Result<(), RuntimeError> {
-        if !self.started.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.containers.remove_one_off(&self.name).await?;
-        self.started.store(false, Ordering::Release);
-        Ok(())
-    }
-}
-
-impl Drop for OneOffContainer {
-    fn drop(&mut self) {
-        if !self.started.load(Ordering::Acquire) {
-            return;
-        }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(container = %self.name, "one-off container left behind; the next start removes it");
-            return;
-        };
-        let containers = Arc::clone(&self.containers);
-        let name = std::mem::take(&mut self.name);
-        runtime.spawn(async move {
-            if let Err(error) = containers.remove_one_off(&name).await {
-                tracing::warn!(container = %name, %error, "one-off container could not be removed; the next start removes it");
-            }
-        });
-    }
 }
 
 /// Best effort: the deployment already succeeded, and the operator log has

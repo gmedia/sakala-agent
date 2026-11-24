@@ -88,6 +88,14 @@ impl OneOffRole {
             Self::Job => Some(sakala_agent_protocol::JOB_PROCESS),
         }
     }
+
+    /// Whether the `dev.sakala.role` label a listing printed for a container
+    /// marks a one-off container. Any value does, so a role a newer Agent
+    /// adds is never mistaken for a workload either.
+    #[must_use]
+    pub fn is_labelled(role: Option<&str>) -> bool {
+        role.is_some_and(|role| !role.trim().is_empty())
+    }
 }
 
 /// The one container that runs a deployment's release command, or one job.
@@ -95,8 +103,11 @@ impl OneOffRole {
 /// It runs from a deployment's image with the same environment, resources,
 /// runtime, and security options as a replica, on the project's network, but
 /// it serves nothing: it has no route, no domain or port label, and no restart
-/// policy. It is not a managed workload either, so listings, health checks,
-/// replica restore, and orphan detection never see it.
+/// policy. It is not a managed workload either, although it inherits
+/// `dev.sakala.managed=true` from the image: every listing of workloads skips
+/// a container with a role (see [`OneOffRole::is_labelled`]), so lifecycle
+/// commands, health checks, replica restore, metrics, and orphan detection
+/// never see it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OneOffContainerRequest {
     pub role: OneOffRole,
@@ -306,10 +317,20 @@ pub trait ContainerEngine: Send + Sync {
     /// anonymous volumes. A container that is already gone is not an error.
     async fn remove_one_off(&self, name: &str) -> Result<(), RuntimeError>;
 
-    /// Removes every one-off container this Agent left behind, running or
-    /// not. Called at startup: a one-off container only lives as long as the
-    /// command that started it. Returns how many were removed.
-    async fn remove_stale_one_offs(&self) -> Result<usize, RuntimeError>;
+    /// Removes every one-off container of this Agent, running or not, that
+    /// `is_active` does not claim: a one-off container only lives as long as
+    /// the command that started it, so one without a running command was
+    /// left behind. `is_active` is asked after the listing, so a command that
+    /// started its container since is always seen. Returns how many were
+    /// removed.
+    async fn remove_stale_one_offs(
+        &self,
+        is_active: &IsActiveOneOff<'_>,
+    ) -> Result<usize, RuntimeError>;
+
+    /// Removes every one-off container of the project, in any state, for a
+    /// project that stops for good. Returns how many were removed.
+    async fn remove_project_one_offs(&self, project_id: Uuid) -> Result<usize, RuntimeError>;
 
     /// Connects the router to the project's network again, when the project has
     /// one. A workload started by an older Agent lives on the shared network.
@@ -447,6 +468,10 @@ pub struct ImageRetention {
     /// counted from when the image was built.
     pub orphaned_grace: std::time::Duration,
 }
+
+/// Tells the sweep of one-off containers, by container name, whether the
+/// command that started it still runs.
+pub type IsActiveOneOff<'a> = dyn Fn(&str) -> bool + Send + Sync + 'a;
 
 /// A project held away from its commands while image GC removes its images.
 pub type ProjectClaim = tokio::sync::OwnedMutexGuard<()>;
