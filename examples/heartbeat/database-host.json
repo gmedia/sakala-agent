@@ -4,7 +4,7 @@
   "runtime_network": "sakala-runtime",
   "capabilities": ["noop-runtime", "managed-postgres"],
   "metadata": {
-    "version": "0.17.0",
+    "version": "0.18.0",
     "protocol_version": 4,
     "runtime_driver": "noop",
     "runtime": {
