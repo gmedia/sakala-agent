@@ -450,6 +450,45 @@ mod tests {
     }
 
     #[test]
+    fn a_job_runs_under_its_own_timeout_plus_the_time_to_report_it() {
+        let deadline = |payload: Value| {
+            job_policy(&command(CommandType::RunJob, payload))
+                .map(|(timeout, _, _)| timeout.as_secs())
+        };
+        let base = json!({
+            "command": "php artisan report:daily",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        });
+        assert_eq!(deadline(base.clone()).expect("default"), 330);
+        let mut short = base.clone();
+        short["timeout_seconds"] = json!(60);
+        assert_eq!(deadline(short).expect("requested"), 90);
+        let mut long = base;
+        long["timeout_seconds"] = json!(86_400);
+        assert_eq!(deadline(long).expect("capped; the runtime refuses it"), 630);
+        let error = deadline(json!({ "command": "x" })).expect_err("no commit");
+        assert_eq!(error.code(), "invalid_runtime_command");
+    }
+
+    #[test]
+    fn a_job_hides_its_environment_values_from_its_failure_message() {
+        let (_, _, redactor) = job_policy(&command(
+            CommandType::RunJob,
+            json!({
+                "command": "x",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "environment": { "DB_PASSWORD": PASSWORD },
+            }),
+        ))
+        .expect("policy");
+        assert!(
+            !redactor
+                .redact(&format!("refused {PASSWORD}"))
+                .contains(PASSWORD)
+        );
+    }
+
+    #[test]
     fn a_database_password_is_redacted_from_the_failure_message() {
         for command_type in [
             CommandType::CreateDatabase,

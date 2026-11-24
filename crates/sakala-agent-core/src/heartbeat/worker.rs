@@ -1208,6 +1208,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_containers_are_not_replicas_and_name_their_process_when_unhealthy() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let (project, deployment) = (Uuid::new_v4(), Uuid::new_v4());
+        let worker = |ready| {
+            let mut snapshot = RuntimeHealthSnapshot {
+                process: Some("queue".to_owned()),
+                ..replica(project, deployment, 2, ready)
+            };
+            if !ready {
+                // `Restarting` reads as starting, which is never listed.
+                "Up 1 minute (unhealthy)".clone_into(&mut snapshot.workload.status);
+            }
+            snapshot
+        };
+        let runtime = ReplicaRuntime {
+            snapshots: vec![
+                replica(project, deployment, 1, true),
+                worker(true),
+                worker(false),
+            ],
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        assert!(
+            heartbeat.metadata["workloads"].get("replicas").is_none(),
+            "one web replica: {}",
+            heartbeat.metadata["workloads"]
+        );
+        let unhealthy = heartbeat.metadata["workloads"]["unhealthy_details"]
+            .as_array()
+            .expect("unhealthy details");
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0]["process"], "queue");
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_web_replica_has_no_process_key() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let mut unhealthy = replica(Uuid::new_v4(), Uuid::new_v4(), 1, false);
+        "Up 1 minute (unhealthy)".clone_into(&mut unhealthy.workload.status);
+        let runtime = ReplicaRuntime {
+            snapshots: vec![unhealthy],
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        let unhealthy = &heartbeat.metadata["workloads"]["unhealthy_details"][0];
+        assert!(unhealthy.get("process").is_none(), "{unhealthy}");
+    }
+
+    #[tokio::test]
     async fn heartbeat_reports_ready_replicas_of_deployments_with_several() {
         let config = AgentConfig::from_values(&HashMap::new()).expect("config");
         let (balanced, balanced_deployment) = (Uuid::new_v4(), Uuid::new_v4());

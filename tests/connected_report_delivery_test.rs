@@ -1217,3 +1217,60 @@ async fn an_event_rejected_for_its_content_is_dropped_without_retry() {
         .expect("a rejected event does not fail the deployment");
     assert_eq!(reporter.undelivered_events(), 1);
 }
+
+/// A worker's lines carry its process and have their own budget and stopped
+/// state, so a chatty worker never ends the deployment's own lines (ADR-022).
+#[tokio::test]
+async fn a_worker_reporter_marks_its_lines_and_keeps_its_own_log_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(logs_path()))
+        .respond_with(AcceptWholeBatch)
+        .mount(&server)
+        .await;
+    let bounds = LogBounds {
+        max_total_bytes: Some(10),
+        ..LogBounds::default()
+    };
+    let deployment = reporter(&server, bounds);
+
+    deployment
+        .log(log("0123456789"))
+        .await
+        .expect("web line queues");
+    let worker = deployment
+        .for_process("queue")
+        .expect("an API reporter makes one per process");
+    worker
+        .log(log("queue line"))
+        .await
+        .expect("the worker has a budget of its own");
+    deployment
+        .log(log("over the web budget"))
+        .await
+        .expect("dropped quietly");
+    deployment.flush().await.expect("web lines delivered");
+    worker.flush().await.expect("worker lines delivered");
+
+    let sent = log_requests(&server)
+        .await
+        .iter()
+        .flat_map(|request| {
+            request.body_json::<serde_json::Value>().expect("json body")["logs"]
+                .as_array()
+                .expect("batch logs array")
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let web = sent
+        .iter()
+        .find(|line| line["message"] == "0123456789")
+        .expect("web line");
+    assert!(web.get("process").is_none(), "{web}");
+    let queue = sent
+        .iter()
+        .find(|line| line["message"] == "queue line")
+        .expect("worker line");
+    assert_eq!(queue["process"], "queue");
+}

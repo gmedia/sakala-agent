@@ -335,10 +335,20 @@ mod tests {
     struct RecordingRuntime {
         stops: Mutex<Vec<bool>>,
         sleeps: Mutex<Vec<(bool, SleepingPage)>>,
+        jobs: Mutex<Vec<crate::ports::RunJobRequest>>,
     }
 
     #[async_trait]
     impl RuntimeExecutor for RecordingRuntime {
+        async fn run_job(
+            &self,
+            request: crate::ports::RunJobRequest,
+            _reporter: Arc<dyn RuntimeReporter>,
+        ) -> Result<CommandOutput, RuntimeExecutionError> {
+            self.jobs.lock().expect("lock").push(request);
+            Ok(CommandOutput::empty())
+        }
+
         async fn stop_project(
             &self,
             request: WorkloadLifecycleRequest,
@@ -397,6 +407,73 @@ mod tests {
                 CancellationToken::new(),
             )
             .await
+    }
+
+    #[tokio::test]
+    async fn a_job_reaches_the_runtime_with_its_payload_and_identity() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let dispatcher = CommandDispatcher::new(Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>);
+        let job = command(
+            CommandType::RunJob,
+            json!({
+                "command": "php artisan report:daily",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "timeout_seconds": 120,
+            }),
+        );
+
+        dispatcher
+            .dispatch(&job, Arc::new(SilentReporter), CancellationToken::new())
+            .await
+            .expect("job");
+
+        let jobs = runtime.jobs.lock().expect("lock");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].command_id, job.id);
+        assert_eq!(Some(jobs[0].project_id), job.project_id);
+        assert_eq!(Some(jobs[0].deployment_id), job.deployment_id);
+        assert_eq!(jobs[0].payload.timeout_seconds, Some(120));
+    }
+
+    #[tokio::test]
+    async fn a_job_without_its_identity_or_payload_is_refused() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let dispatcher = CommandDispatcher::new(Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>);
+        let mut without_deployment = command(
+            CommandType::RunJob,
+            json!({ "command": "x", "commit_sha": "0123456789abcdef0123456789abcdef01234567" }),
+        );
+        without_deployment.deployment_id = None;
+        for job in [
+            without_deployment,
+            command(CommandType::RunJob, json!({ "command": "x" })),
+            command(CommandType::RunJob, Value::Null),
+        ] {
+            let error = dispatcher
+                .dispatch(&job, Arc::new(SilentReporter), CancellationToken::new())
+                .await
+                .expect_err("refused");
+            assert_eq!(error.code(), "invalid_runtime_command");
+        }
+        assert!(runtime.jobs.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_jobs_refuses_them_explicitly() {
+        struct NoJobs;
+        impl RuntimeExecutor for NoJobs {}
+        let error = CommandDispatcher::new(Arc::new(NoJobs))
+            .dispatch(
+                &command(
+                    CommandType::RunJob,
+                    json!({ "command": "x", "commit_sha": "0123456789abcdef0123456789abcdef01234567" }),
+                ),
+                Arc::new(SilentReporter),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unsupported");
+        assert_eq!(error.code(), "unsupported_runtime_command");
     }
 
     #[tokio::test]

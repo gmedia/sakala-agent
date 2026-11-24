@@ -597,6 +597,83 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn jobs_use_their_own_pool_and_never_hold_or_wait_for_their_project() {
+        let project = Uuid::new_v4();
+        let mut executions = CommandExecutions::new(1, 2, Arc::new(SchedulerMetrics::default()));
+        let (release_deploy, wait_deploy) = oneshot::channel();
+        let (release_jobs, wait_jobs) = tokio::sync::watch::channel(false);
+        let job = |wait: tokio::sync::watch::Receiver<bool>| async move {
+            let mut wait = wait;
+            let _ = wait.wait_for(|released| *released).await;
+        };
+
+        assert!(executions.try_start(
+            command(Some(project)),
+            CancellationToken::new(),
+            async move {
+                let _ = wait_deploy.await;
+            }
+        ));
+        // The deploy holds the only command slot and the project.
+        assert!(!executions.try_start(
+            command(Some(Uuid::new_v4())),
+            CancellationToken::new(),
+            async {}
+        ));
+        for _ in 0..2 {
+            assert!(
+                executions.try_start(
+                    command_with_type(Some(project), CommandType::RunJob),
+                    CancellationToken::new(),
+                    job(wait_jobs.clone())
+                ),
+                "a job of the busy project still starts"
+            );
+        }
+        assert!(
+            !executions.try_start(
+                command_with_type(Some(Uuid::new_v4()), CommandType::RunJob),
+                CancellationToken::new(),
+                async {}
+            ),
+            "the job pool is full"
+        );
+        assert_eq!(executions.active_jobs, 2);
+        assert_eq!(executions.active_heavy, 1);
+
+        release_deploy.send(()).expect("the deploy still runs");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        executions.reap_completed();
+        assert!(
+            executions.try_start(command(Some(project)), CancellationToken::new(), async {}),
+            "running jobs never hold their project"
+        );
+        release_jobs.send(true).expect("the jobs still run");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        executions.reap_completed();
+        assert_eq!(executions.active_jobs, 0);
+        assert!(executions.active_projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_command_offered_again_while_it_runs_is_not_started_twice() {
+        let mut executions = CommandExecutions::new(2, 2, Arc::new(SchedulerMetrics::default()));
+        let job = command_with_type(Some(Uuid::new_v4()), CommandType::RunJob);
+        let token = CancellationToken::new();
+        let running = token.clone();
+
+        assert!(
+            executions.try_start(job.clone(), token.clone(), async move {
+                running.cancelled().await;
+            })
+        );
+        assert!(!executions.try_start(job, CancellationToken::new(), async {}));
+        assert_eq!(executions.len(), 1);
+        token.cancel();
+        executions.wait_for_tasks().await;
+    }
+
     async fn tracked(
         release: oneshot::Receiver<()>,
         active: Arc<AtomicUsize>,

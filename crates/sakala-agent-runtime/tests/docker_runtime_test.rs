@@ -6043,6 +6043,16 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
             host: "portfolio.sakala.app".to_owned(),
             check: HostCheck::Django,
         },
+        RuntimeError::WorkerStartFailed {
+            process: "queue".to_owned(),
+            exit_code: Some(1),
+            out_of_memory_limit_mb: None,
+        },
+        RuntimeError::WorkerStartFailed {
+            process: "queue".to_owned(),
+            exit_code: Some(137),
+            out_of_memory_limit_mb: Some(192),
+        },
     ];
     let expected = fixture.as_array().expect("fixture is a list");
     assert_eq!(expected.len(), errors.len());
@@ -6053,6 +6063,36 @@ fn failure_fixture_documents_the_exact_messages_the_runtime_sends() {
             error.to_string().chars().count() <= 1_000,
             "fits the fail body"
         );
+    }
+}
+
+#[test]
+fn job_failure_fixture_documents_the_exact_messages_the_runtime_sends() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../examples/failures/job-failures.json"))
+            .expect("failure fixture should be JSON");
+    let errors = [
+        RuntimeError::JobFailed {
+            exit_code: 3,
+            out_of_memory_limit_mb: None,
+        },
+        RuntimeError::JobFailed {
+            exit_code: 137,
+            out_of_memory_limit_mb: Some(256),
+        },
+        RuntimeError::JobTimeout { seconds: 300 },
+        RuntimeError::JobImageMissing {
+            reason: "this node has no image of the live deployment",
+        },
+        RuntimeError::JobImageMissing {
+            reason: "the image under the live deployment's name is not the project's",
+        },
+    ];
+    let expected = fixture.as_array().expect("fixture is a list");
+    assert_eq!(expected.len(), errors.len());
+    for (error, expected) in errors.iter().zip(expected) {
+        assert_eq!(expected["error_code"], error.code());
+        assert_eq!(expected["error_message"], error.to_string());
     }
 }
 
@@ -7100,6 +7140,7 @@ fn runtime_config(temp: &TempDir) -> DockerRuntimeConfig {
         caddy_sites_dir: temp.path().join("sites"),
         health_attempts: 1,
         health_interval: Duration::ZERO,
+        worker_startup_window: Duration::ZERO,
         ..DockerRuntimeConfig::default()
     }
 }
@@ -7337,6 +7378,9 @@ struct FakeRunner {
     active_builds: AtomicUsize,
     max_concurrent_builds: AtomicUsize,
     inspect_states: Mutex<VecDeque<String>>,
+    /// The state `docker inspect` reports for one container by name, before
+    /// the scripted `inspect_states`.
+    container_states: HashMap<String, String>,
     probe_results: Mutex<VecDeque<(i32, String)>>,
     app_stdout: Vec<String>,
     app_stderr: Vec<String>,
@@ -7618,6 +7662,7 @@ impl FakeRunner {
             active_builds: AtomicUsize::new(0),
             max_concurrent_builds: AtomicUsize::new(0),
             inspect_states: Mutex::new(VecDeque::new()),
+            container_states: HashMap::new(),
             probe_results: Mutex::new(VecDeque::new()),
             app_stdout: vec!["application listening".to_owned()],
             app_stderr: Vec::new(),
@@ -7724,6 +7769,18 @@ impl FakeRunner {
     }
 
     /// Container states `docker inspect` reports, in order. The last one repeats.
+    /// The state `docker inspect` reports for `container` every time.
+    fn with_container_state(mut self, container: &str, state: &str) -> Self {
+        self.container_states
+            .insert(container.to_owned(), state.to_owned());
+        self
+    }
+
+    fn with_job_ps(mut self, stdout: impl Into<String>) -> Self {
+        self.job_ps_stdout = stdout.into();
+        self
+    }
+
     fn with_inspect_states(self, states: &[&str]) -> Self {
         *self.inspect_states.lock().expect("state lock") =
             states.iter().map(|state| (*state).to_owned()).collect();
@@ -8330,6 +8387,11 @@ impl ProcessRunner for FakeRunner {
                 .any(|argument| argument.to_string_lossy().contains("{{.Id}}"))
             {
                 &self.crash_inspect_stdout
+            } else if let Some(state) = spec.args.last().and_then(|container| {
+                self.container_states
+                    .get(container.to_string_lossy().as_ref())
+            }) {
+                state
             } else {
                 let mut states = self.inspect_states.lock().expect("state lock");
                 scripted_state = if states.len() > 1 {
@@ -10307,4 +10369,1156 @@ async fn image_gc_leaves_alone_a_project_whose_command_runs() {
         .await
         .expect("deployment task")
         .expect("deployment should succeed");
+}
+
+// Worker processes and job runs (ADR-022).
+
+const QUEUE_WORKER: &str = "sakala-worker-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993-queue-r0";
+const JOB_COMMAND_ID: &str = "8a6c1e57-2f4b-4b3d-9e0a-5c7d1f2e3a4b";
+const JOB_CONTAINER: &str = "sakala-job-ff66ed4a-8a6c1e57-2f4b-4b3d-9e0a-5c7d1f2e3a4b";
+/// The image the live deployment of `job_command` built.
+const LIVE_IMAGE: &str =
+    "sakala/project-ff66ed4a-6303-4be6-8ef4-63c28b112680:0123456789ab-4f1f21ef";
+
+fn deploy_with_workers(processes: serde_json::Value) -> AgentCommand {
+    deploy_with_config("auto", json!({ "processes": processes }))
+}
+
+fn queue_worker() -> serde_json::Value {
+    json!([
+        { "name": "queue", "command": "php artisan queue:work --tries=3", "replicas": 1,
+          "resources": { "memory_mb": 384 } },
+        { "name": "mailer", "command": "npm run mailer", "replicas": 0 },
+    ])
+}
+
+fn is_worker_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument == "dev.sakala.workload-kind=worker")
+}
+
+fn is_web_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument == "dev.sakala.workload-kind=web")
+}
+
+fn is_job_run(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && spec.args.first().is_some_and(|argument| argument == "run")
+        && spec
+            .args
+            .iter()
+            .any(|argument| argument == "dev.sakala.role=job")
+}
+
+fn is_job_removal(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && string_arguments(spec) == ["rm", "--force", "--volumes", JOB_CONTAINER]
+}
+
+/// One row of the workload lookup for a container of `DEPLOYMENT`: web when
+/// `process` is `None`.
+fn lookup_row(id: &str, status: &str, name: &str, process: Option<&str>) -> String {
+    let (kind, process) = match process {
+        Some(process) => ("worker", process),
+        None => ("web", ""),
+    };
+    format!(
+        "{id}\t{status}\tportfolio.run.sakala.localhost\t3000\tb3c8cb55-3bc8-4725-a004-e69d9917d40b\t\t\t\t{name}\t0\t1\t{kind}\t{process}\n"
+    )
+}
+
+fn web_and_worker_lookup(status: &str) -> String {
+    format!(
+        "{}{}",
+        lookup_row(
+            "webcontainer",
+            status,
+            "sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993",
+            None
+        ),
+        lookup_row("workercontainer", status, QUEUE_WORKER, Some("queue")),
+    )
+}
+
+fn docker_commands(runner: &FakeRunner, verb: &str) -> Vec<Vec<String>> {
+    runner
+        .commands
+        .lock()
+        .expect("command lock")
+        .iter()
+        .filter(|spec| spec.program == "docker" && spec.args.first().is_some_and(|a| a == verb))
+        .map(string_arguments)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_deployment_without_processes_starts_only_its_web_replica_as_before() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("auto"),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("deploy");
+
+    assert_eq!(runner.count_commands(is_worker_run), 0);
+    let web = string_arguments(&find_command(&runner, is_web_run));
+    assert!(
+        !web.iter()
+            .any(|argument| argument.starts_with("dev.sakala.process="))
+    );
+    assert!(
+        event_of(&reporter, "deployment.runtime.ready")
+            .metadata
+            .get("processes")
+            .is_none()
+    );
+    assert!(
+        reporter
+            .logs
+            .lock()
+            .expect("log lock")
+            .iter()
+            .all(|log| log.process.is_none())
+    );
+}
+
+#[tokio::test]
+async fn each_worker_starts_beside_the_web_replica_from_the_same_image_without_a_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_with_workers(queue_worker()),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("deploy with a worker");
+
+    // `mailer` has zero replicas: its definition is kept, nothing runs.
+    assert_eq!(runner.count_commands(is_worker_run), 1);
+    let worker = string_arguments(&find_command(&runner, is_worker_run));
+    let web = string_arguments(&find_command(&runner, is_web_run));
+    for label in [
+        "dev.sakala.workload-kind=worker",
+        "dev.sakala.process=queue",
+    ] {
+        assert!(
+            worker.iter().any(|argument| argument == label),
+            "{worker:?}"
+        );
+    }
+    assert!(
+        worker
+            .windows(2)
+            .any(|pair| pair == ["--name", QUEUE_WORKER])
+    );
+    assert!(
+        worker
+            .windows(2)
+            .any(|pair| pair == ["--restart", "unless-stopped"])
+    );
+    assert!(worker.windows(2).any(|pair| pair == ["--memory", "384m"]));
+    assert!(worker.windows(2).any(|pair| pair == ["--entrypoint", "sh"]));
+    assert_eq!(
+        &worker[worker.len() - 3..],
+        [BUILT_IMAGE, "-c", "php artisan queue:work --tries=3"]
+    );
+    // Same isolation as the web replica: everything up to the name, image,
+    // limits, and labels that differ on purpose.
+    for flag in [
+        "--network",
+        "--security-opt",
+        "--cap-drop",
+        "--pids-limit",
+        "--env-file",
+    ] {
+        assert_eq!(
+            worker.iter().filter(|argument| *argument == flag).count(),
+            web.iter().filter(|argument| *argument == flag).count(),
+            "{flag}"
+        );
+    }
+
+    let route = fs::read_to_string(route_file(&config)).expect("route");
+    assert!(route.contains("sakala-app-ff66ed4a"), "{route}");
+    assert!(
+        !route.contains("sakala-worker"),
+        "a worker has no route: {route}"
+    );
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .filter(|spec| is_probe(spec))
+            .any(|spec| string_arguments(spec)
+                .iter()
+                .any(|a| a.contains("sakala-worker"))),
+        "a worker gets no HTTP check"
+    );
+
+    let expected = json!([{ "process": "queue", "container": QUEUE_WORKER }]);
+    assert_eq!(
+        event_of(&reporter, "deployment.container.started").metadata["processes"],
+        expected
+    );
+    assert_eq!(
+        event_of(&reporter, "deployment.runtime.ready").metadata["processes"],
+        expected
+    );
+    assert_eq!(
+        event_of(&reporter, "deployment.health.started").metadata["worker_startup_seconds"],
+        0
+    );
+
+    runner.wait_for_followers(2).await;
+    let followed = docker_commands(&runner, "logs")
+        .into_iter()
+        .filter(|args| args.iter().any(|a| a == "--follow"))
+        .filter_map(|args| args.last().cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        followed.iter().any(|name| name == QUEUE_WORKER),
+        "{followed:?}"
+    );
+    let logs = reporter.logs.lock().expect("log lock");
+    assert!(
+        logs.iter()
+            .any(|log| log.process.as_deref() == Some("queue")
+                && log.message == "[runtime] application listening"),
+        "the worker's startup output is marked with its process"
+    );
+    assert!(
+        logs.iter()
+            .filter(|log| log.message == "[runtime] application listening")
+            .any(|log| log.process.is_none()),
+        "the web replica's output stays unmarked"
+    );
+}
+
+#[tokio::test]
+async fn workers_count_against_the_node_maximum_like_replicas() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 2;
+    let other_project = "11111111-1111-4111-8111-111111111111\n";
+
+    // One container of another project, the web replica, and the worker: 3 > 2.
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(other_project));
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner);
+    let error = dispatch(
+        executor,
+        &deploy_with_workers(queue_worker()),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("no room for the worker");
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert!(
+        error.to_string().contains("this project needs 2"),
+        "{error}"
+    );
+
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(other_project));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner);
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("the web replica alone fits");
+}
+
+#[tokio::test]
+async fn a_worker_that_ends_before_the_route_switches_fails_the_deployment_and_keeps_the_previous_one()
+ {
+    for (state, expected) in [
+        (
+            "restarting\t1\t1\tfalse\tnone\t268435456\n",
+            "worker queue exited during start with exit code 1",
+        ),
+        // Code 0 too: a worker that is done before the route switches has not started.
+        (
+            "running\t1\t0\tfalse\tnone\t268435456\n",
+            "worker queue exited during start",
+        ),
+        (
+            "restarting\t1\t137\ttrue\tnone\t402653184\n",
+            "worker queue ran out of memory (limit 384 MB)",
+        ),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(
+            FakeRunner::new(true)
+                .with_previous_containers(&[("previous-container", true, "sakala-app-previous")])
+                .with_container_state(QUEUE_WORKER, state),
+        );
+        let reporter = Arc::new(RecordingReporter::default());
+        let config = runtime_config(&temp);
+        let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+        let error = dispatch(
+            executor,
+            &deploy_with_workers(queue_worker()),
+            Arc::clone(&reporter),
+        )
+        .await
+        .expect_err("the worker did not start");
+
+        assert_eq!(error.code(), "worker_start_failed", "{state}");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!route_file(&config).exists(), "the route never switched");
+        assert!(
+            !docker_commands(&runner, "stop")
+                .iter()
+                .any(|args| args.iter().any(|a| a == "previous-container")),
+            "the previous version keeps running"
+        );
+        let removal = find_command(&runner, is_candidate_removal);
+        let removal = string_arguments(&removal);
+        assert!(removal.iter().any(|a| a == QUEUE_WORKER), "{removal:?}");
+        assert!(
+            removal
+                .iter()
+                .any(|a| a == "sakala-app-ff66ed4a-4f1f21ef-730d-42d5-a46d-d965353cb993"),
+            "{removal:?}"
+        );
+        assert!(
+            reporter.logs.lock().expect("log lock").iter().any(|log| {
+                log.process.as_deref() == Some("queue")
+                    && log.message == "Last application output before the failed start was removed:"
+            }),
+            "the failed worker's own output explains the failure"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_processes_value_runs_the_web_process_and_says_so() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let reporter = Arc::new(RecordingReporter::default());
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_with_workers(json!({ "queue": "php artisan queue:work" })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("the web process still deploys");
+
+    assert_eq!(runner.count_commands(is_worker_run), 0);
+    let ignored = event_of(&reporter, "deployment.processes.ignored");
+    assert_eq!(ignored.level, DeploymentEventLevel::Warning);
+}
+
+#[tokio::test]
+async fn an_invalid_worker_definition_fails_before_checkout() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+
+    let error = deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_with_workers(json!([{ "name": "job", "command": "x" }])),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("a reserved name");
+
+    assert_eq!(error.code(), "invalid_runtime_command");
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(|spec| spec.program == "git")
+    );
+}
+
+#[tokio::test]
+async fn a_rollback_runs_the_workers_the_target_recorded_on_its_image() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_reuse_image_labels(source_labels("dockerfile", None)));
+    let mut command = reuse_command(json!({}));
+    command.payload["processes"] = queue_worker();
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &command,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("rollback with a worker");
+
+    let worker = string_arguments(&find_command(&runner, is_worker_run));
+    assert_eq!(
+        &worker[worker.len() - 3..],
+        [REUSED_IMAGE, "-c", "php artisan queue:work --tries=3"]
+    );
+    assert!(
+        !runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .any(is_buildx_build)
+    );
+}
+
+#[tokio::test]
+async fn a_redeploy_stops_the_previous_workers_with_their_own_grace() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_previous_containers(&[
+        ("previous-web", true, "sakala-app-previous"),
+        ("previous-worker", true, "sakala-worker-previous-queue-r0"),
+    ]));
+    let mut previous = runner.previous_containers.clone();
+    previous.insert(
+        "previous-worker".to_owned(),
+        "true\t/sakala-worker-previous-queue-r0\tqueue\n".to_owned(),
+    );
+    let runner = Arc::new(FakeRunner {
+        previous_containers: previous,
+        ..Arc::into_inner(runner).expect("only reference")
+    });
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_with_workers(queue_worker()),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("redeploy");
+
+    let stops = docker_commands(&runner, "stop");
+    assert!(
+        stops.contains(&vec![
+            "stop".into(),
+            "--time".into(),
+            "10".into(),
+            "previous-web".into()
+        ]),
+        "{stops:?}"
+    );
+    assert!(
+        stops.contains(&vec![
+            "stop".into(),
+            "--time".into(),
+            "30".into(),
+            "previous-worker".into()
+        ]),
+        "{stops:?}"
+    );
+    let removed = docker_commands(&runner, "rm");
+    for container in ["previous-web", "previous-worker"] {
+        assert!(
+            removed.iter().any(|args| args == &["rm", container]),
+            "{removed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn restart_restarts_the_workers_and_routes_only_the_web_replica() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(web_and_worker_lookup("Up 2 minutes")));
+    let config = runtime_config(&temp);
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+
+    RuntimeExecutor::restart_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("restart");
+
+    let restarts = docker_commands(&runner, "restart");
+    assert!(
+        restarts.contains(&vec![
+            "restart".into(),
+            "--time".into(),
+            "10".into(),
+            "webcontainer".into()
+        ]),
+        "{restarts:?}"
+    );
+    assert!(
+        restarts.contains(&vec![
+            "restart".into(),
+            "--time".into(),
+            "30".into(),
+            "workercontainer".into()
+        ]),
+        "{restarts:?}"
+    );
+    let route = fs::read_to_string(route_file(&config)).expect("route");
+    assert!(route.contains("sakala-app-ff66ed4a"), "{route}");
+    assert!(!route.contains("sakala-worker"), "{route}");
+}
+
+#[tokio::test]
+async fn sleep_stops_web_and_workers_with_their_own_grace_and_wake_starts_both() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(web_and_worker_lookup("Up 2 minutes")));
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+    RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep");
+    let stops = docker_commands(&runner, "stop");
+    assert!(
+        stops.contains(&vec![
+            "stop".into(),
+            "--time".into(),
+            "10".into(),
+            "webcontainer".into()
+        ]),
+        "{stops:?}"
+    );
+    assert!(
+        stops.contains(&vec![
+            "stop".into(),
+            "--time".into(),
+            "30".into(),
+            "workercontainer".into()
+        ]),
+        "{stops:?}"
+    );
+    let sleeping = fs::read_to_string(route_file(&config)).expect("sleeping route");
+    assert!(sleeping.contains("(sleeping)"), "{sleeping}");
+
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(web_and_worker_lookup("Exited (0) 1 minute ago")),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+    RuntimeExecutor::wake_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake");
+    let started = docker_commands(&runner, "start");
+    for container in ["webcontainer", "workercontainer"] {
+        assert!(
+            started.iter().any(|args| args == &["start", container]),
+            "{started:?}"
+        );
+    }
+    let route = fs::read_to_string(route_file(&config)).expect("route");
+    assert!(!route.contains("(sleeping)"), "{route}");
+    assert!(!route.contains("sakala-worker"), "{route}");
+}
+
+#[tokio::test]
+async fn stop_removes_web_and_workers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(web_and_worker_lookup("Up 2 minutes")));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("stop");
+
+    let removed = docker_commands(&runner, "rm");
+    for container in ["webcontainer", "workercontainer"] {
+        assert!(
+            removed.iter().any(|args| args == &["rm", container]),
+            "{removed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn health_check_reports_the_web_replica_only() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_workload_lookup(web_and_worker_lookup("Up 2 minutes")));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    let output = RuntimeExecutor::health_check(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("health check");
+
+    assert_eq!(output.result["container_id"], "webcontainer");
+    assert!(output.result.get("replicas").is_none(), "{}", output.result);
+}
+
+/// A `docker ps` row of the health snapshot for a worker container.
+fn listed_worker(id: &str, status: &str, process: &str) -> String {
+    format!("{id}\t{status}\t{CRASHED_PROJECT}\t{DEPLOYMENT}\t0\t1\tworker\t{process}\n")
+}
+
+#[tokio::test]
+async fn a_worker_ending_with_code_0_is_not_a_crash() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(listed_worker(
+                "worker123",
+                "Restarting (0) 1 second ago",
+                "queue",
+            ))
+            .with_crash_inspect(crash_state("worker123", "restarting", 4, 0, false, 10)),
+    );
+
+    assert!(crashes_reported(runner, &temp).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_crashing_worker_is_reported_on_its_process_apart_from_the_web_process() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_docker_ps(format!(
+                "{}{}",
+                listed_in("web123", "Up 2 minutes", DEPLOYMENT, 1),
+                listed_worker("worker123", "Restarting (1) 1 second ago", "queue"),
+            ))
+            .with_crash_inspect(format!(
+                "{}{}",
+                crash_state("web123", "running", 0, 0, false, 120),
+                crash_state("worker123", "restarting", 3, 1, false, 10),
+            )),
+    );
+
+    let crashed = crashes_reported(runner, &temp).await;
+
+    assert_eq!(crashed.len(), 1, "{crashed:?}");
+    assert_eq!(crashed[0].process.as_deref(), Some("queue"));
+    assert_eq!(crashed[0].exit_code, Some(1));
+    assert_eq!(
+        serde_json::to_value(&crashed[0]).expect("serialize")["process"],
+        "queue"
+    );
+}
+
+fn job_command(payload: serde_json::Value) -> AgentCommand {
+    let mut base = json!({
+        "command": "php artisan report:daily",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "container_port": 3000,
+        "environment": { "APP_ENV": "production" },
+        "resources": { "memory_mb": 256 },
+    });
+    for (key, value) in payload.as_object().expect("payload object") {
+        base[key] = value.clone();
+    }
+    AgentCommand {
+        id: Uuid::parse_str(JOB_COMMAND_ID).expect("command UUID"),
+        command_type: CommandType::RunJob,
+        status: CommandStatus::Pending,
+        project_id: Some(Uuid::parse_str(PROJECT).expect("project UUID")),
+        deployment_id: Some(Uuid::parse_str(DEPLOYMENT).expect("deployment UUID")),
+        payload: base,
+    }
+}
+
+/// The labels a build of `DEPLOYMENT` in `PROJECT` writes.
+fn live_image_labels() -> serde_json::Value {
+    json!({
+        "dev.sakala.managed": "true",
+        "dev.sakala.project-id": PROJECT,
+        "dev.sakala.deployment-id": DEPLOYMENT,
+        "dev.sakala.builder": "dockerfile",
+    })
+}
+
+async fn run_job(
+    runner: Arc<FakeRunner>,
+    config: DockerRuntimeConfig,
+    command: &AgentCommand,
+    reporter: Arc<RecordingReporter>,
+) -> Result<CommandOutput, RuntimeExecutionError> {
+    dispatch(
+        DockerRuntimeExecutor::with_runner(config, runner),
+        command,
+        reporter,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_job_runs_once_in_a_container_of_the_live_image_and_reports_its_exit() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_lines(&["report sent"]),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+    let config = runtime_config(&temp);
+
+    let output = run_job(
+        runner.clone(),
+        config.clone(),
+        &job_command(json!({})),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("job");
+
+    assert_eq!(output.result["exit_code"], 0);
+    assert_eq!(output.result["oom_killed"], false);
+    assert!(output.result["duration_ms"].is_u64(), "{}", output.result);
+
+    let run = string_arguments(&find_command(&runner, is_job_run));
+    assert!(
+        run.windows(2).any(|pair| pair == ["--name", JOB_CONTAINER]),
+        "{run:?}"
+    );
+    assert!(
+        run.windows(2).any(|pair| pair == ["--pull", "never"]),
+        "{run:?}"
+    );
+    assert!(
+        !run.iter().any(|argument| argument == "--restart"),
+        "a job runs once"
+    );
+    assert!(
+        !run.iter()
+            .any(|argument| argument == "dev.sakala.managed=true"),
+        "not a workload"
+    );
+    for label in [
+        format!("dev.sakala.project-id={PROJECT}"),
+        format!("dev.sakala.deployment-id={DEPLOYMENT}"),
+        format!("dev.sakala.command-id={JOB_COMMAND_ID}"),
+    ] {
+        assert!(run.contains(&label), "{label}: {run:?}");
+    }
+    for flag in [
+        "--security-opt",
+        "--cap-drop",
+        "--memory",
+        "--pids-limit",
+        "--network",
+        "--env-file",
+    ] {
+        assert!(
+            run.iter().any(|argument| argument == flag),
+            "{flag}: {run:?}"
+        );
+    }
+    assert_eq!(
+        &run[run.len() - 3..],
+        [LIVE_IMAGE, "-c", "php artisan report:daily"]
+    );
+    assert_eq!(
+        runner.count_commands(is_job_removal),
+        1,
+        "the container is removed"
+    );
+
+    // A job never touches the project's web or worker containers or its route.
+    for verb in ["stop", "start", "restart"] {
+        assert!(docker_commands(&runner, verb).is_empty(), "{verb}");
+    }
+    assert!(!route_file(&config).exists());
+
+    let logs = reporter.logs.lock().expect("log lock");
+    assert!(
+        logs.iter()
+            .any(|log| log.message == "[job] report sent" && log.process.as_deref() == Some("job"))
+    );
+    drop(logs);
+    let started = event_of(&reporter, "job.started");
+    assert_eq!(started.metadata["container"], JOB_CONTAINER);
+    assert_eq!(started.metadata["timeout_seconds"], 300);
+    let finished = event_of(&reporter, "job.finished");
+    assert_eq!(finished.metadata["exit_code"], 0);
+    assert_eq!(finished.metadata["timed_out"], false);
+}
+
+#[tokio::test]
+async fn a_job_that_exits_non_zero_or_out_of_memory_fails_with_its_exit_code() {
+    for (exit_code, oom, expected) in [
+        (3, false, "the job exited with exit code 3"),
+        (137, true, "the job ran out of memory (limit 256 MB)"),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(
+            FakeRunner::new(true)
+                .with_reuse_image_labels(live_image_labels())
+                .with_release_exit(exit_code, oom),
+        );
+        let reporter = Arc::new(RecordingReporter::default());
+
+        let error = run_job(
+            runner.clone(),
+            runtime_config(&temp),
+            &job_command(json!({})),
+            Arc::clone(&reporter),
+        )
+        .await
+        .expect_err("job failed");
+
+        assert_eq!(error.code(), "job_failed");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(runner.count_commands(is_job_removal), 1);
+        let finished = event_of(&reporter, "job.finished");
+        assert_eq!(finished.metadata["exit_code"], exit_code);
+        assert_eq!(finished.metadata["oom_killed"], oom);
+    }
+}
+
+#[tokio::test]
+async fn a_job_past_its_timeout_is_stopped_and_removed() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30)),
+    );
+    let reporter = Arc::new(RecordingReporter::default());
+
+    let started = std::time::Instant::now();
+    let error = run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({ "timeout_seconds": 1 })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("timeout");
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(error.code(), "job_timeout");
+    assert!(error.to_string().contains("within 1 seconds"), "{error}");
+    assert_eq!(runner.count_commands(is_job_removal), 1);
+    let finished = event_of(&reporter, "job.finished");
+    assert_eq!(finished.metadata["timed_out"], true);
+    assert!(finished.metadata["exit_code"].is_null());
+}
+
+#[tokio::test]
+async fn a_cancelled_job_removes_its_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30)),
+    );
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let cancellation = CancellationToken::new();
+    let job = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &job_command(json!({})),
+                    Arc::new(RecordingReporter::default()),
+                    cancellation,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(FOLLOWER_START_TIMEOUT, async {
+        while runner.count_commands(is_log_follower) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the job is running");
+
+    cancellation.cancel();
+    let error = job.await.expect("task").expect_err("cancelled");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert_eq!(runner.count_commands(is_job_removal), 1);
+}
+
+#[tokio::test]
+async fn stopping_a_project_cancels_its_running_jobs() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30))
+            .with_workload_lookup(web_and_worker_lookup("Up 2 minutes")),
+    );
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let job = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &job_command(json!({})),
+                    Arc::new(RecordingReporter::default()),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(FOLLOWER_START_TIMEOUT, async {
+        while runner.count_commands(is_log_follower) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the job is running");
+
+    executor
+        .stop_project(lifecycle_request(), Arc::new(RecordingReporter::default()))
+        .await
+        .expect("stop");
+    let error = tokio::time::timeout(Duration::from_secs(10), job)
+        .await
+        .expect("the job ends with the stop")
+        .expect("task")
+        .expect_err("cancelled");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    assert_eq!(runner.count_commands(is_job_removal), 1);
+}
+
+#[tokio::test]
+async fn a_job_runs_while_a_deploy_of_the_same_project_holds_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_build_delay(Duration::from_secs(5)),
+    );
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let deploy = tokio::spawn({
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &deploy_command("auto"),
+                    Arc::new(RecordingReporter::default()),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runner.count_commands(is_buildx_build) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the deploy is building");
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(4),
+        CommandDispatcher::new(Arc::clone(&executor)).dispatch(
+            &job_command(json!({})),
+            Arc::new(RecordingReporter::default()),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("the job does not wait for the deploy")
+    .expect("job");
+
+    assert_eq!(output.result["exit_code"], 0);
+    assert!(!deploy.is_finished(), "the deploy was still building");
+    deploy.await.expect("task").expect("deploy");
+}
+
+#[tokio::test]
+async fn a_job_without_its_image_or_with_a_bad_payload_never_starts_a_container() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let error = run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({})),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("no image");
+    assert_eq!(error.code(), "job_image_missing");
+    assert!(
+        error.to_string().contains("deploy the project again"),
+        "{error}"
+    );
+
+    let foreign = Arc::new(FakeRunner::new(true).with_reuse_image_labels(json!({
+        "dev.sakala.project-id": "11111111-1111-4111-8111-111111111111",
+        "dev.sakala.deployment-id": DEPLOYMENT,
+        "dev.sakala.builder": "dockerfile",
+    })));
+    let error = run_job(
+        foreign.clone(),
+        runtime_config(&temp),
+        &job_command(json!({})),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("not the project's image");
+    assert_eq!(error.code(), "job_image_missing");
+
+    for payload in [
+        json!({ "timeout_seconds": 601 }),
+        json!({ "timeout_seconds": 0 }),
+        json!({ "command": "  " }),
+        json!({ "command": "report\nrm -rf /" }),
+        json!({ "commit_sha": "0123" }),
+        json!({ "environment": { "PORT": "8080" } }),
+        json!({ "reuse_image_from_deployment_id": "not-a-uuid" }),
+    ] {
+        let runner = Arc::new(FakeRunner::new(true).with_reuse_image_labels(live_image_labels()));
+        let error = run_job(
+            runner.clone(),
+            runtime_config(&temp),
+            &job_command(payload.clone()),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err(&payload.to_string());
+        assert!(
+            ["invalid_runtime_command", "runtime_port_conflict"].contains(&error.code()),
+            "{payload}: {}",
+            error.code()
+        );
+        assert_eq!(runner.count_commands(is_job_run), 0, "{payload}");
+    }
+    assert_eq!(runner.count_commands(is_job_run), 0);
+    assert_eq!(foreign.count_commands(is_job_run), 0);
+}
+
+#[tokio::test]
+async fn a_job_reuses_the_image_the_live_deployment_reused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true).with_reuse_image_labels(source_labels("railpack", Some("apps/web"))),
+    );
+
+    run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({ "reuse_image_from_deployment_id": REUSE_SOURCE })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("job");
+
+    let run = string_arguments(&find_command(&runner, is_job_run));
+    assert_eq!(run[run.len() - 3], REUSED_IMAGE);
+    assert_eq!(
+        run.last().map(String::as_str),
+        Some("cd 'apps/web' && php artisan report:daily"),
+        "in the package, like the release command"
+    );
+}
+
+#[tokio::test]
+async fn a_full_node_refuses_a_job_and_counts_running_jobs_for_deploys() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let mut config = runtime_config(&temp);
+    config.max_active_containers = 2;
+    // Two workloads already run, one of them the job's own project.
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_docker_ps(format!("{PROJECT}\n11111111-1111-4111-8111-111111111111\n")),
+    );
+    let error = run_job(
+        runner.clone(),
+        config.clone(),
+        &job_command(json!({})),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("full");
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+    assert_eq!(runner.count_commands(is_job_run), 0);
+
+    // A job of the same project keeps its slot during that project's deploy.
+    let runner = Arc::new(FakeRunner::new(true).with_release_ps(format!(
+        "{PROJECT}\tjob\n11111111-1111-4111-8111-111111111111\tjob\n"
+    )));
+    let error = dispatch(
+        DockerRuntimeExecutor::with_runner(config, runner),
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("two jobs and the new replica do not fit in 2");
+    assert_eq!(error.code(), "runtime_capacity_exceeded");
+}
+
+#[tokio::test]
+async fn startup_removes_job_containers_an_interrupted_agent_left() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_job_ps("9a8b7c6d5e4f\n"));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::recover(&executor, None)
+        .await
+        .expect("recovery runs");
+
+    let listing = string_arguments(&find_command(&runner, |spec| {
+        string_arguments(spec)
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.role=job")
+    }));
+    assert!(
+        listing
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.agent-id=local-agent-01")
+    );
+    assert!(
+        docker_commands(&runner, "rm")
+            .iter()
+            .any(|args| args == &["rm", "--force", "--volumes", "9a8b7c6d5e4f"])
+    );
 }

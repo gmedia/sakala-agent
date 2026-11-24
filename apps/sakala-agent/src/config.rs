@@ -1363,6 +1363,75 @@ mod tests {
     }
 
     #[test]
+    fn workers_and_jobs_are_advertised_only_by_the_docker_runtime() {
+        let docker = HashMap::from([("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned())]);
+        let docker = from_values(&docker).expect("Docker app config should load");
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+        for capability in ["worker-processes", "scheduled-jobs"] {
+            assert!(
+                docker.agent.capabilities.contains(&capability.to_owned()),
+                "{capability}"
+            );
+            assert!(
+                !noop.agent.capabilities.contains(&capability.to_owned()),
+                "{capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_and_job_settings_have_the_adr_starting_values() {
+        let config = from_values(&HashMap::new()).expect("default app config should load");
+        assert_eq!(config.agent.max_concurrent_jobs, 2);
+        assert_eq!(
+            config.docker_runtime.worker_startup_window,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.docker_runtime.worker_stop_grace,
+            Duration::from_secs(30)
+        );
+
+        let config = from_values(&HashMap::from([
+            ("SAKALA_MAX_CONCURRENT_JOBS".to_owned(), "5".to_owned()),
+            ("SAKALA_WORKER_STARTUP_SECONDS".to_owned(), "3".to_owned()),
+            (
+                "SAKALA_WORKER_STOP_GRACE_SECONDS".to_owned(),
+                "60".to_owned(),
+            ),
+        ]))
+        .expect("custom values load");
+        assert_eq!(config.agent.max_concurrent_jobs, 5);
+        assert_eq!(config.agent.max_concurrent_commands, 4, "independent");
+        assert_eq!(
+            config.docker_runtime.worker_startup_window,
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            config.docker_runtime.worker_stop_grace,
+            Duration::from_secs(60)
+        );
+
+        for (key, value, expected) in [
+            ("SAKALA_MAX_CONCURRENT_JOBS", "0", "greater than zero"),
+            ("SAKALA_WORKER_STARTUP_SECONDS", "0", "greater than zero"),
+            ("SAKALA_WORKER_STARTUP_SECONDS", "900", "must be shorter"),
+            (
+                "SAKALA_WORKER_STOP_GRACE_SECONDS",
+                "1000",
+                "must be shorter",
+            ),
+        ] {
+            let error =
+                from_values(&HashMap::from([(key.to_owned(), value.to_owned())])).expect_err(key);
+            assert!(
+                error.to_string().contains(expected),
+                "{key}={value}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn replicas_are_advertised_only_by_the_docker_runtime() {
         let noop = from_values(&HashMap::new()).expect("default app config should load");
         assert!(!noop.agent.capabilities.contains(&"replicas".to_owned()));
