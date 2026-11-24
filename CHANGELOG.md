@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-24
+
 ### Fixed
 
 - Job yang melewati `timeout_seconds`-nya kembali dilaporkan sebagai `job_timeout`, bukan `runtime_timeout`. Di staging 2026-11-24 (Agent 0.18.1, `runsc`, 2 vCPU sibuk) job dengan timeout 8 detik butuh 20 detik sampai container-nya berjalan, timeout 8 detiknya tepat, lalu `docker rm --force` container yang masih berjalan memakan sekitar 11 detik sampai batas command (`timeout_seconds` + 30 detik, dihitung sejak claim) memotongnya dan melaporkan `runtime_timeout`. Kini hasil job tidak menunggu penghapusan lebih dari 5 detik: penghapusan yang lebih lama berlanjut di background dan sweep menangani kegagalannya. Start container dibatasi 45 detik sejak job mulai diproses (gagal dengan `runtime_timeout` yang menyebut `job container start`), dan batas command `RunJob` menjadi `timeout_seconds` + 60 detik (45 detik start, 15 detik penutupan), masih 30 detik di bawah lease API `timeout_seconds` + 90 detik.
@@ -384,7 +386,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.2...HEAD
+[0.18.2]: https://github.com/gmedia/sakala-agent/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gmedia/sakala-agent/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/gmedia/sakala-agent/compare/v0.16.2...v0.17.0
