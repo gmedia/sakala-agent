@@ -1646,6 +1646,18 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
         remove: bool,
     ) -> Result<CommandOutput, RuntimeError> {
+        if remove {
+            // A stopped or deleted project runs nothing, jobs included. A
+            // sleeping one keeps running its jobs: they need only the image.
+            let cancelled = self.jobs.cancel_project(request.project_id);
+            if cancelled > 0 {
+                tracing::info!(
+                    project_id = %request.project_id,
+                    cancelled,
+                    "jobs of a stopped project cancelled"
+                );
+            }
+        }
         let workloads = self
             .containers
             .workloads(request.project_id, request.deployment_id)
@@ -1676,18 +1688,6 @@ impl DockerRuntimeExecutor {
             .iter()
             .find(|workload| workload.is_web())
             .unwrap_or(workload);
-        if remove {
-            // A stopped or deleted project runs nothing, jobs included. A
-            // sleeping one keeps running its jobs: they need only the image.
-            let cancelled = self.jobs.cancel_project(workload.project_id);
-            if cancelled > 0 {
-                tracing::info!(
-                    project_id = %workload.project_id,
-                    cancelled,
-                    "jobs of a stopped project cancelled"
-                );
-            }
-        }
         self.containers.stop(&workloads).await?;
         if remove {
             self.deactivate_route(workload, reporter.as_ref()).await?;
