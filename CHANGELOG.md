@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-24
+
 ### Fixed
 
 - Container job atau release yang tertinggal tidak lagi menggagalkan lifecycle command project-nya. Agent tidak memasang `dev.sakala.managed=true` pada container sekali jalan, tetapi Docker menyalin label image ke container dan setiap image Sakala membawa label itu, jadi listing workload ikut menemukan container job atau release dan menolaknya karena tidak punya label domain. Di staging 2026-11-24 (Agent 0.18.0), satu container job berstatus `created` membuat `StopProject` gagal dengan `managed workload is missing its domain label`, sehingga container web dan worker, network project, dan file route tertinggal. Hal yang sama berlaku untuk job yang sedang berjalan: `SleepProject`, `RestartProject`, `WakeProject`, `HealthCheck`, dan `RefreshRoute` gagal, health snapshot menghitungnya sebagai replika, rekonsiliasi melaporkannya sebagai workload atau orphan, dan redeploy menghentikan serta menghapus job yang sedang berjalan sebagai container lama. Kini setiap listing workload membaca label `dev.sakala.role` dan melewati container yang punya label itu, termasuk listing route, pemulihan replika, metrik, deteksi orphan, penanda image sebelumnya, dan pembersihan container lama. Guard kapasitas tetap menghitung container sekali jalan yang berjalan, kini satu kali (sebelumnya dua kali), dan `metadata.workloads.active` ikut menghitungnya. `StopProject` kini juga menghapus semua container job dan release project itu dalam status apa pun sebelum network dilepas; kegagalannya hanya menjadi peringatan di log command.
@@ -376,7 +378,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gmedia/sakala-agent/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/gmedia/sakala-agent/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/gmedia/sakala-agent/compare/v0.16.1...v0.16.2
