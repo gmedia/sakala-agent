@@ -695,9 +695,16 @@ Hasil:
 | Payload tidak valid | `fail` `invalid_runtime_command` atau `runtime_port_conflict` | Sebelum container apa pun. |
 
 Batas waktu command `RunJob` di Agent adalah `timeout_seconds` (paling lama 600) ditambah
-30 detik untuk menghentikan, menghapus, dan melaporkan container, bukan
-`SAKALA_COMMAND_TIMEOUT_SECONDS`. API perlu memberi lease setidaknya sepanjang itu
-ditambah grace lease-nya. Contoh body `fail` ada di `examples/failures/job-failures.json`.
+60 detik, bukan `SAKALA_COMMAND_TIMEOUT_SECONDS`, dihitung sejak claim: paling lama 45
+detik sampai container berjalan (lookup image, antre admission, `docker run`), lalu
+`timeout_seconds` milik job, lalu paling lama 15 detik untuk membaca cara container
+berakhir dan menunggu penghapusannya sebentar. Penghapusan yang lebih lama berlanjut di
+background, jadi hasil job (`complete`, `job_failed`, `job_timeout`, `runtime_cancelled`)
+tidak pernah tergantikan `runtime_timeout` karena container lambat dihapus. Container yang
+tidak berjalan dalam 45 detik gagal dengan `runtime_timeout` yang menyebut
+`job container start`. API perlu memberi lease setidaknya sepanjang itu ditambah waktu
+untuk flush log dan report terakhir; lease API saat ini, `timeout_seconds` + 30 + 60
+detik grace, menyisakan 30 detik. Contoh body `fail` ada di `examples/failures/job-failures.json`.
 
 ## Pembatalan command
 

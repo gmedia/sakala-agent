@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use sakala_agent_protocol::{
@@ -31,6 +31,19 @@ pub struct DeployProjectRequest {
     pub repository_credential: Option<RepositoryCredential>,
     pub cancellation: CancellationToken,
 }
+
+/// How long a `RunJob` has from the start of its execution until its
+/// container runs: the image lookup, the wait for admission, and
+/// `docker run`. The job's own `timeout_seconds` only starts once the
+/// container runs. On staging (gVisor, two loaded vCPUs) this took 13 to 20
+/// seconds on 2026-11-24.
+pub const JOB_START_BUDGET: Duration = Duration::from_secs(45);
+
+/// How long a `RunJob` has once its container ended or its timeout passed:
+/// reading how it ended, a short wait for the removal of its container, and
+/// returning the outcome. A removal that takes longer goes on in the
+/// background, so it never replaces the job's own outcome.
+pub const JOB_END_BUDGET: Duration = Duration::from_secs(15);
 
 /// One run of a project command in a container of its live image.
 #[derive(Clone, Debug)]

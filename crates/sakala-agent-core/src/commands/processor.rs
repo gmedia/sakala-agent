@@ -15,7 +15,10 @@ use crate::{
     api::ApiClient,
     commands::CommandDispatcher,
     logs::redactor::ValueRedactor,
-    ports::{CommandOutput, DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor, RuntimeReporter},
+    ports::{
+        CommandOutput, DatabaseAdmin, JOB_END_BUDGET, JOB_START_BUDGET, ObjectStorageAdmin,
+        RuntimeExecutor, RuntimeReporter,
+    },
     reporting::{
         ApiRuntimeReporter, ApiRuntimeReporterFactory, EventDelivery, EventDeliveryPolicy,
     },
@@ -32,10 +35,15 @@ const FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(120);
 /// for the terminal report.
 const MIN_FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(10);
 
-/// Time a job run keeps after its own timeout to stop its container, remove
-/// it, and report `job_timeout`, before the command deadline would cut it
-/// short with `runtime_timeout`.
-const JOB_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
+/// Time a job run has besides its own timeout: to start its container and,
+/// after it ended or timed out, to report `complete`, `job_failed`, or
+/// `job_timeout` before the command deadline would cut it short with
+/// `runtime_timeout`. The API leases a RunJob for its timeout plus 30
+/// seconds plus 60 seconds of lease grace, so this deadline of the timeout
+/// plus 60 seconds still leaves 30 seconds for the final log flush and the
+/// terminal report.
+const JOB_FINALIZATION_GRACE: Duration =
+    Duration::from_secs(JOB_START_BUDGET.as_secs() + JOB_END_BUDGET.as_secs());
 
 /// Payload field of `CreateDatabase` and `RotateDatabasePassword`.
 const DATABASE_PASSWORD_FIELD: &str = "password";
@@ -459,13 +467,15 @@ mod tests {
             "command": "php artisan report:daily",
             "commit_sha": "0123456789abcdef0123456789abcdef01234567",
         });
-        assert_eq!(deadline(base.clone()).expect("default"), 330);
+        // Its timeout, plus 45 s to start its container and 15 s to end:
+        // below the API lease of the timeout + 90 s.
+        assert_eq!(deadline(base.clone()).expect("default"), 360);
         let mut short = base.clone();
-        short["timeout_seconds"] = json!(60);
-        assert_eq!(deadline(short).expect("requested"), 90);
+        short["timeout_seconds"] = json!(8);
+        assert_eq!(deadline(short).expect("requested"), 68);
         let mut long = base;
         long["timeout_seconds"] = json!(86_400);
-        assert_eq!(deadline(long).expect("capped; the runtime refuses it"), 630);
+        assert_eq!(deadline(long).expect("capped; the runtime refuses it"), 660);
         let error = deadline(json!({ "command": "x" })).expect_err("no commit");
         assert_eq!(error.code(), "invalid_runtime_command");
     }

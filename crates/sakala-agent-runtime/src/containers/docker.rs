@@ -88,7 +88,20 @@ pub const DEFAULT_WORKER_STOP_GRACE: Duration = Duration::from_secs(30);
 /// What `docker run` exits with when it cannot invoke the command (126) or
 /// cannot find it (127), such as `sh` missing from the image.
 const COMMAND_NOT_RUNNABLE_EXIT_CODES: [i32; 2] = [126, 127];
-const ONE_OFF_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// What Docker says, in lower case, about a container that is gone: `No such
+/// container` from `docker rm`, `no such object` from `docker inspect`.
+const NO_SUCH_MESSAGE: &str = "no such";
+/// What `docker rm` says, in lower case, while another removal of the
+/// container runs.
+const REMOVAL_IN_PROGRESS_MESSAGE: &str = "is already in progress";
+/// How long a removal of a one-off container that Docker already runs is
+/// awaited. Docker waits about ten seconds for a killed container to exit,
+/// and gVisor on a loaded node can take that long.
+const ONE_OFF_REMOVAL_IN_PROGRESS_WAIT: Duration = Duration::from_secs(30);
+/// How often that removal is checked.
+const ONE_OFF_REMOVAL_POLL: Duration = Duration::from_millis(500);
+/// `docker inspect` of how a one-off container ended.
+pub(crate) const ONE_OFF_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_LOG_TAIL_LINES: u64 = 100;
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const CRASH_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1298,15 +1311,27 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--volumes")
             .arg(name);
         let output = self.runner.run(&remove, &NullOutputSink).await?;
-        if output.success || output.stderr.contains("No such container") {
-            Ok(())
-        } else {
-            Err(RuntimeError::failed_process(
-                "docker-remove-one-off",
-                output.code,
-                &output.stderr,
-            ))
+        let stderr = output.stderr.to_ascii_lowercase();
+        if output.success || stderr.contains(NO_SUCH_MESSAGE) {
+            return Ok(());
         }
+        // Docker still removes it for an earlier `docker rm` whose client
+        // went away, such as one cut off while it waited for the container
+        // to exit. Asking again fails at once, so its end is awaited instead.
+        if stderr.contains(REMOVAL_IN_PROGRESS_MESSAGE) {
+            return self.wait_until_removed(name).await;
+        }
+        warn!(
+            container = name,
+            status = %crate::error::describe_exit(output.code),
+            detail = output.stderr.lines().next().unwrap_or_default(),
+            "Docker did not remove a one-off container"
+        );
+        Err(RuntimeError::failed_process(
+            "docker-remove-one-off",
+            output.code,
+            &output.stderr,
+        ))
     }
 
     async fn remove_stale_one_offs(
@@ -2005,6 +2030,31 @@ impl CrashState {
 }
 
 impl DockerContainerEngine {
+    /// Waits until Docker no longer knows the container, polling at
+    /// [`ONE_OFF_REMOVAL_POLL`] for at most [`ONE_OFF_REMOVAL_IN_PROGRESS_WAIT`].
+    async fn wait_until_removed(&self, name: &str) -> Result<(), RuntimeError> {
+        let inspect = CommandSpec::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{.Id}}")
+            .arg(name)
+            .timeout(ONE_OFF_INSPECT_TIMEOUT);
+        let deadline = tokio::time::Instant::now() + ONE_OFF_REMOVAL_IN_PROGRESS_WAIT;
+        loop {
+            let output = self.runner.run(&inspect, &NullOutputSink).await?;
+            if !output.success && output.stderr.to_ascii_lowercase().contains(NO_SUCH_MESSAGE) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() + ONE_OFF_REMOVAL_POLL > deadline {
+                return Err(RuntimeError::Container(format!(
+                    "the removal of one-off container {name} already in progress did not finish within {}s",
+                    ONE_OFF_REMOVAL_IN_PROGRESS_WAIT.as_secs()
+                )));
+            }
+            tokio::time::sleep(ONE_OFF_REMOVAL_POLL).await;
+        }
+    }
+
     /// Managed containers with their identity and replica labels, in one
     /// `docker ps`. `all` includes the stopped ones. A container without a
     /// readable project or deployment ID is left out, and so is a one-off

@@ -601,11 +601,16 @@ membunuhnya di tengah jalan. Penghapusan menunggu `docker run` itu selesai, pali
 30 detik, baru menjalankan `docker rm --force --volumes`; setelah 30 detik `docker run`
 dimatikan. Tanpa itu, deploy atau job yang dibatalkan saat Docker masih membuat atau
 menyalakan container bisa meninggalkan container `Created` yang muncul setelah
-penghapusan. `docker rm` yang gagal dicoba sampai 3 kali dengan jeda 1 detik.
+penghapusan. Bila Docker menjawab bahwa penghapusan container itu sudah berjalan
+(misalnya `docker rm` sebelumnya terputus saat Docker masih menunggu container keluar),
+Agent menunggu sampai container hilang, paling lama 30 detik, alih-alih meminta lagi.
+`docker rm` yang gagal karena alasan lain dicoba sampai 5 kali dengan jeda 3 detik, dan
+stderr Docker-nya masuk log operator.
 
 Container release dan job milik Agent ini yang command-nya sudah tidak berjalan, misalnya
 setelah Agent mati mendadak atau penghapusan yang tetap gagal, dihapus saat Agent start,
-sebelum setiap job, dan di setiap putaran rekonsiliasi network berkala (setiap 60 detik).
+di samping setiap job (tanpa menunda start-nya), dan di setiap putaran rekonsiliasi
+network berkala (setiap 60 detik).
 Container milik command yang masih berjalan tidak pernah disentuh. Setelah kegagalan,
 image candidate dan network project yang tidak dipakai lagi dibersihkan seperti
 kegagalan deploy lainnya.
@@ -667,6 +672,16 @@ supaya image yang hilang tidak pernah dicari di registry. Output-nya diikuti
 container selalu dihapus dengan `docker rm --force --volumes`, juga setelah timeout dan
 pembatalan, termasuk pembatalan saat Docker masih membuat container-nya. Sisa container
 job dihapus dengan cara yang sama dengan sisa container release.
+
+Hasil job tidak menunggu penghapusan yang lambat. Setelah container berakhir, timeout
+job lewat, atau job dibatalkan, Agent menunggu penghapusan paling lama 5 detik, lalu
+melaporkan hasil job itu sendiri (`complete`, `job_failed`, `job_timeout`, atau
+`runtime_cancelled`) sementara penghapusan berlanjut di background. Di gVisor pada node
+yang sibuk, `docker rm --force` container yang masih berjalan bisa memakan lebih dari 10
+detik. Start container juga dibatasi: bila container belum berjalan 45 detik setelah
+Agent mulai memproses job (lookup image, antre admission, `docker run`), job gagal dengan
+`runtime_timeout` yang menyebut `job container start`, dan container yang mungkin masih
+dibuat Docker dihapus seperti job yang dibatalkan.
 
 Job tidak memegang lock project dan berjalan di pool `SAKALA_MAX_CONCURRENT_JOBS`, jadi
 job bisa berjalan bersamaan dengan deploy, restart, atau sleep project yang sama, dan

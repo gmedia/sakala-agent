@@ -70,6 +70,8 @@ const LATE_CONTAINER_WINDOW: Duration = Duration::from_secs(2);
 /// After the job is requested, when it is cancelled: from before its
 /// container exists to while Docker creates or starts it.
 const CANCEL_DELAYS_MS: [u64; 6] = [0, 25, 50, 100, 200, 400];
+/// How long the removal of a job container may go on after its outcome.
+const REMOVAL_WINDOW: Duration = Duration::from_secs(30);
 /// The agent ID of `DockerRuntimeConfig::default()`.
 const AGENT_ID: &str = "local-agent-01";
 
@@ -560,6 +562,7 @@ async fn real_docker_runs_workers_beside_the_web_process_and_jobs_from_the_live_
 
     // A job runs while the project sleeps, from the live image, without waking it.
     let reporter = Arc::new(RecordingReporter::default());
+    let requested = time::OffsetDateTime::now_utc();
     let output = node
         .executor
         .run_job(
@@ -569,6 +572,18 @@ async fn real_docker_runs_workers_beside_the_web_process_and_jobs_from_the_live_
         .await
         .expect("job while asleep");
     assert_eq!(output.result["exit_code"], 0);
+    let started_at = reporter
+        .events
+        .lock()
+        .expect("lock")
+        .iter()
+        .find(|event| event.event_type == "job.started")
+        .map(|event| event.occurred_at)
+        .expect("job.started");
+    println!(
+        "--- the job container ran {} ms after the job was requested",
+        (started_at - requested).whole_milliseconds()
+    );
     assert!(
         reporter.logs.lock().expect("lock").iter().any(|log| {
             log.message == "[job] job says [REDACTED]" || log.message == "[job] job says hello"
@@ -619,6 +634,18 @@ async fn real_docker_runs_workers_beside_the_web_process_and_jobs_from_the_live_
     assert!(
         timed.elapsed() < Duration::from_secs(20),
         "{:?}",
+        timed.elapsed()
+    );
+    // Its removal may go on after the outcome, but it does end.
+    tokio::time::timeout(REMOVAL_WINDOW, async {
+        while !node.jobs_left().is_empty() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the timed-out job container is removed");
+    println!(
+        "--- a job past its timeout reported job_timeout after {:?}",
         timed.elapsed()
     );
     let cancelled = node.job(live, "sleep 60", 60);

@@ -11909,7 +11909,7 @@ async fn the_periodic_reconcile_removes_one_off_containers_whose_command_ended()
 }
 
 #[tokio::test]
-async fn a_job_start_first_removes_one_off_containers_whose_command_ended() {
+async fn a_job_start_also_removes_one_off_containers_whose_command_ended() {
     let leftover = "sakala-job-ff66ed4a-0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001";
     let temp = TempDir::new().expect("temp directory should be available");
     let runner = Arc::new(
@@ -11927,11 +11927,19 @@ async fn a_job_start_first_removes_one_off_containers_whose_command_ended() {
     .await
     .expect("job");
 
-    let removal = runner
-        .command_position(|spec| string_arguments(spec) == ["rm", "--force", "--volumes", leftover])
-        .expect("the leftover is removed");
-    let run = runner.command_position(is_job_run).expect("the job runs");
-    assert!(removal < run, "removed before the job starts");
+    // Beside the job's own start, not before it, so it may still be busy.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runner
+            .command_position(|spec| {
+                string_arguments(spec) == ["rm", "--force", "--volumes", leftover]
+            })
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the leftover is removed");
 }
 
 #[tokio::test]
@@ -11976,4 +11984,178 @@ async fn the_periodic_reconcile_never_removes_the_container_of_a_running_job() {
     cancellation.cancel();
     let _ = job.await.expect("task");
     assert_eq!(runner.count_commands(is_job_removal), 1);
+}
+
+/// A job's Docker the way gVisor on a loaded node behaves: the `docker run`
+/// of the job container and its `docker rm --force` can take long, and
+/// `docker rm` can answer that another removal is already in progress.
+struct SlowJobDocker {
+    inner: FakeRunner,
+    run_delay: Duration,
+    removal_delay: Duration,
+    removal_in_progress: bool,
+}
+
+impl SlowJobDocker {
+    fn new(inner: FakeRunner) -> Self {
+        Self {
+            inner,
+            run_delay: Duration::ZERO,
+            removal_delay: Duration::ZERO,
+            removal_in_progress: false,
+        }
+    }
+
+    fn is_container_lookup(spec: &CommandSpec) -> bool {
+        spec.program == "docker"
+            && string_arguments(spec) == ["inspect", "--format", "{{.Id}}", JOB_CONTAINER]
+    }
+
+    fn record(&self, spec: &CommandSpec) {
+        self.inner
+            .commands
+            .lock()
+            .expect("command lock")
+            .push(spec.clone());
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for SlowJobDocker {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if is_job_run(spec) {
+            tokio::time::sleep(self.run_delay).await;
+        }
+        if is_job_removal(spec) {
+            self.record(spec);
+            tokio::time::sleep(self.removal_delay).await;
+            return Ok(if self.removal_in_progress {
+                ProcessOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Error response from daemon: removal of container {JOB_CONTAINER} is already in progress\n"
+                    ),
+                }
+            } else {
+                ProcessOutput {
+                    success: true,
+                    code: Some(0),
+                    stdout: format!("{JOB_CONTAINER}\n"),
+                    stderr: String::new(),
+                }
+            });
+        }
+        if Self::is_container_lookup(spec) {
+            self.record(spec);
+            // The removal in progress has finished by now.
+            return Ok(ProcessOutput {
+                success: false,
+                code: Some(1),
+                stdout: "[]\n".to_owned(),
+                stderr: format!("error: no such object: {JOB_CONTAINER}\n"),
+            });
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_job_past_its_timeout_reports_job_timeout_without_waiting_for_a_slow_removal() {
+    // Staging, 2026-11-24: a job that ran into its 8 s timeout was reported
+    // as `runtime_timeout`, because removing its gVisor container outlasted
+    // the command deadline.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowJobDocker {
+        removal_delay: Duration::from_secs(60),
+        ..SlowJobDocker::new(
+            FakeRunner::new(true)
+                .with_reuse_image_labels(live_image_labels())
+                .with_follow_delay(Duration::from_secs(30)),
+        )
+    });
+    let reporter = Arc::new(RecordingReporter::default());
+
+    let started = std::time::Instant::now();
+    let error = dispatch(
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone()),
+        &job_command(json!({ "timeout_seconds": 1 })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect_err("timeout");
+
+    assert_eq!(error.code(), "job_timeout", "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the outcome does not wait for the removal: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(runner.inner.count_commands(is_job_removal), 1, "under way");
+    assert_eq!(
+        event_of(&reporter, "job.finished").metadata["timed_out"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn a_removal_already_in_progress_is_awaited_instead_of_failing() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowJobDocker {
+        removal_in_progress: true,
+        ..SlowJobDocker::new(FakeRunner::new(true).with_reuse_image_labels(live_image_labels()))
+    });
+    let reporter = Arc::new(RecordingReporter::default());
+
+    dispatch(
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone()),
+        &job_command(json!({})),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("job");
+
+    assert_eq!(
+        runner.inner.count_commands(is_job_removal),
+        1,
+        "not asked again while Docker removes it"
+    );
+    assert!(
+        runner
+            .inner
+            .count_commands(SlowJobDocker::is_container_lookup)
+            >= 1
+    );
+    let logs = reporter.logs.lock().expect("log lock");
+    assert!(
+        !logs
+            .iter()
+            .any(|log| log.message.contains("cleanup warning")),
+        "{logs:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_whose_container_does_not_start_in_time_fails_before_the_command_deadline() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowJobDocker {
+        run_delay: Duration::from_secs(600),
+        ..SlowJobDocker::new(FakeRunner::new(true).with_reuse_image_labels(live_image_labels()))
+    });
+
+    let error = dispatch(
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone()),
+        &job_command(json!({ "timeout_seconds": 8 })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("never started");
+
+    assert_eq!(error.code(), "runtime_timeout", "{error}");
+    assert!(error.to_string().contains("job container start"), "{error}");
 }

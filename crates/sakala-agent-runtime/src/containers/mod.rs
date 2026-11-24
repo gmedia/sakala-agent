@@ -26,6 +26,7 @@ pub(crate) mod network;
 pub(crate) mod replicas;
 pub(crate) mod workers;
 
+pub(crate) use docker::ONE_OFF_INSPECT_TIMEOUT;
 pub use docker::{
     ContainerDns, DEFAULT_WEB_STOP_GRACE, DEFAULT_WORKER_STOP_GRACE, DockerContainerEngine,
     StopGrace, WorkloadIsolation,
