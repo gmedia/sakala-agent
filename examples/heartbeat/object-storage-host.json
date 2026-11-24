@@ -4,7 +4,7 @@
   "runtime_network": "sakala-runtime",
   "capabilities": ["docker-runtime", "project-inspection", "managed-s3"],
   "metadata": {
-    "version": "0.16.2",
+    "version": "0.17.0",
     "protocol_version": 4,
     "runtime_driver": "docker",
     "runtime": {

@@ -16,7 +16,7 @@ globset = "0.4.21"
 nix = { version = "0.32.0", features = ["signal", "process"] }
 oci-spec = { version = "0.10.0", default-features = false, features = ["distribution"] }
 postgres-protocol = "0.6.12"
-sakala-agent-core = { version = "0.16.2", path = "../sakala-agent-core" }
+sakala-agent-core = { version = "0.17.0", path = "../sakala-agent-core" }
 sakala-agent-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
