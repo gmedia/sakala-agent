@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use sakala_agent_protocol::{
     AgentCommand, CommandType, CompleteCommandPayload, DeploymentEvent, DeploymentEventLevel,
-    FinalizationDeferredReason, LogBounds,
+    FinalizationDeferredReason, LogBounds, MAX_JOB_TIMEOUT_SECONDS,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -31,6 +31,11 @@ const FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(120);
 /// `SAKALA_AGENT_LEASE_GRACE_SECONDS` (default 60), so this still leaves room
 /// for the terminal report.
 const MIN_FINAL_LOG_FLUSH_GRACE: Duration = Duration::from_secs(10);
+
+/// Time a job run keeps after its own timeout to stop its container, remove
+/// it, and report `job_timeout`, before the command deadline would cut it
+/// short with `runtime_timeout`.
+const JOB_FINALIZATION_GRACE: Duration = Duration::from_secs(30);
 
 /// Payload field of `CreateDatabase` and `RotateDatabasePassword`.
 const DATABASE_PASSWORD_FIELD: &str = "password";
@@ -334,6 +339,9 @@ impl CommandProcessor {
         &self,
         command: &AgentCommand,
     ) -> Result<(Duration, LogBounds, ValueRedactor), crate::ports::RuntimeExecutionError> {
+        if command.command_type == CommandType::RunJob {
+            return job_policy(command);
+        }
         if command.command_type != CommandType::DeployProject {
             return Ok((
                 self.command_timeout,
@@ -364,6 +372,27 @@ impl CommandProcessor {
             ValueRedactor::new(payload.environment.into_values()),
         ))
     }
+}
+
+/// A job runs under its own timeout, not the node's command timeout, plus the
+/// time to stop and report it. A timeout above the maximum is refused by the
+/// runtime with `invalid_runtime_command`, so it is only capped here.
+fn job_policy(
+    command: &AgentCommand,
+) -> Result<(Duration, LogBounds, ValueRedactor), crate::ports::RuntimeExecutionError> {
+    let payload = command.run_job_payload().map_err(|error| {
+        crate::ports::RuntimeExecutionError::invalid_command(format!(
+            "invalid RunJob payload: {error}"
+        ))
+    })?;
+    let job_seconds = payload
+        .timeout_seconds_or_default()
+        .min(MAX_JOB_TIMEOUT_SECONDS);
+    Ok((
+        Duration::from_secs(job_seconds) + JOB_FINALIZATION_GRACE,
+        payload.log_bounds,
+        ValueRedactor::new(payload.environment.into_values()),
+    ))
 }
 
 /// The tenant credential a database or bucket command carries, hidden from its
@@ -418,6 +447,45 @@ mod tests {
             deployment_id: None,
             payload,
         }
+    }
+
+    #[test]
+    fn a_job_runs_under_its_own_timeout_plus_the_time_to_report_it() {
+        let deadline = |payload: Value| {
+            job_policy(&command(CommandType::RunJob, payload))
+                .map(|(timeout, _, _)| timeout.as_secs())
+        };
+        let base = json!({
+            "command": "php artisan report:daily",
+            "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        });
+        assert_eq!(deadline(base.clone()).expect("default"), 330);
+        let mut short = base.clone();
+        short["timeout_seconds"] = json!(60);
+        assert_eq!(deadline(short).expect("requested"), 90);
+        let mut long = base;
+        long["timeout_seconds"] = json!(86_400);
+        assert_eq!(deadline(long).expect("capped; the runtime refuses it"), 630);
+        let error = deadline(json!({ "command": "x" })).expect_err("no commit");
+        assert_eq!(error.code(), "invalid_runtime_command");
+    }
+
+    #[test]
+    fn a_job_hides_its_environment_values_from_its_failure_message() {
+        let (_, _, redactor) = job_policy(&command(
+            CommandType::RunJob,
+            json!({
+                "command": "x",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "environment": { "DB_PASSWORD": PASSWORD },
+            }),
+        ))
+        .expect("policy");
+        assert!(
+            !redactor
+                .redact(&format!("refused {PASSWORD}"))
+                .contains(PASSWORD)
+        );
     }
 
     #[test]

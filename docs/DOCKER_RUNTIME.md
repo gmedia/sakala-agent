@@ -12,8 +12,9 @@ validate command
 -> docker buildx build --load
 -> buat network project bila belum ada, sambungkan container Caddy ke sana
 -> bila ada release_command: jalankan satu container release, tunggu exit, hapus
--> docker run candidate pada network project
--> deployment.health.started: tunggu state Docker, lalu probe HTTP dari dalam container Caddy
+-> docker run candidate pada network project, lalu setiap worker dari `processes`
+-> deployment.health.started: tunggu state Docker, lalu probe HTTP dari dalam container Caddy;
+   bersamaan, tunggu setiap worker tetap berjalan SAKALA_WORKER_STARTUP_SECONDS
 -> deployment.route.started
 -> tulis route Caddy secara atomik
 -> validate dan reload Caddy
@@ -597,12 +598,69 @@ dihapus saat Agent start berikutnya. Setelah kegagalan, image candidate dan netw
 project yang tidak dipakai lagi dibersihkan seperti kegagalan deploy lainnya.
 
 Kapasitas: container release diterima lewat pengecekan yang sama dengan replika, di
-bawah lock admission yang sama, dan meminta jumlah replika deployment itu. Node yang
+bawah lock admission yang sama, dan meminta jumlah replika deployment itu ditambah
+container worker-nya. Node yang
 tidak muat untuk versi baru menolak sebelum release command mengubah apa pun. Selama
 berjalan, container release adalah satu container tambahan project itu, seperti replika
 lama selama deploy bergulir: tidak dihitung untuk project-nya sendiri, tetapi dihitung
 satu slot oleh project lain. Lock admission dilepas begitu container release berjalan,
 jadi deploy dan wake project lain tidak menunggu migrasi selesai.
+
+## Proses worker
+
+Worker (ADR-022) adalah container tambahan dari deployment yang sama: image, env file,
+network project, `--runtime`, mount DNS, opsi keamanan, allowlist capability, dan
+`--restart unless-stopped` sama dengan replika web, lewat builder `docker run` yang sama.
+Perintahnya `--entrypoint sh <image> -c <command>`, seperti `start_command` pada
+Dockerfile dan release command, dan pada image Railpack dari workspace JavaScript
+dijalankan di direktori package. Batas resource-nya milik proses itu sendiri, dengan
+`resources` deployment sebagai fallback per field.
+
+| Hal | Replika web | Worker |
+| --- | --- | --- |
+| Nama | `sakala-app-<project8>-<deployment-id>[-r<i>]` | `sakala-worker-<project8>-<deployment-id>-<name>-r<i>` |
+| Label `dev.sakala.workload-kind` | `web` | `worker` |
+| Label `dev.sakala.process` | tidak ada | nama proses |
+| `dev.sakala.replica` / `dev.sakala.replicas` | indeks dan jumlah replika web | indeks dan jumlah container proses itu |
+| Route, probe HTTP, traffic | ya | tidak |
+| Siap saat deploy | menjawab HTTP | masih berjalan tanpa restart `SAKALA_WORKER_STARTUP_SECONDS` setelah start |
+| Grace stop | 10 detik | `SAKALA_WORKER_STOP_GRACE_SECONDS` (default 30) |
+| Pemulihan replika | ya | tidak; Docker sudah menyalakan ulang worker yang keluar sendiri |
+| Dihitung ke `SAKALA_MAX_ACTIVE_CONTAINERS` | ya | ya |
+
+Label `dev.sakala.domain`, `dev.sakala.port`, `dev.sakala.command-id`, dan batas log
+juga dipasang pada worker, supaya lookup workload, pemulihan follower log setelah Agent
+restart, dan deteksi orphan memperlakukannya seperti container deployment lain. Semua
+yang membaca workload untuk route, readiness, traffic, `HealthCheck`, dan pemulihan
+replika menyaring `dev.sakala.workload-kind`, dan container tanpa label `worker`
+dianggap replika web, termasuk container dari Agent lama.
+
+Rollback Agent ke versi tanpa capability `worker-processes` tidak aman selama ada
+container worker di node: Agent lama menganggapnya replika web dan memasukkannya ke
+route. Sebelum menurunkan Agent, deploy ulang project yang punya worker tanpa
+`processes` atau stop project itu, lalu pastikan
+`docker ps -a --filter label=dev.sakala.workload-kind=worker` kosong.
+
+## Job
+
+`RunJob` memakai jalur container sekali jalan yang sama dengan release command, dengan
+role `job`: label `dev.sakala.role=job` (tanpa `dev.sakala.managed`), nama
+`sakala-job-<project8>-<command-id>`, image deployment live yang dicari dari nama yang
+dihitung Agent dan diperiksa labelnya, env file, network project, runtime, opsi
+keamanan, dan batas resource yang sama, tanpa `--restart`, dan dengan `--pull never`
+supaya image yang hilang tidak pernah dicari di registry. Output-nya diikuti
+`docker logs --follow` dengan awalan `[job]`, exit code dibaca `docker wait`, dan
+container selalu dihapus dengan `docker rm --force --volumes`, juga setelah timeout,
+pembatalan, dan saat Agent start berikutnya.
+
+Job tidak memegang lock project dan berjalan di pool `SAKALA_MAX_CONCURRENT_JOBS`, jadi
+job bisa berjalan bersamaan dengan deploy, restart, atau sleep project yang sama, dan
+tidak pernah menyalakan atau menghentikan container web atau worker. Penerimaannya
+memakai lock admission yang sama dengan deploy dan wake, dan menghitung semua container
+yang berjalan ditambah satu. Image GC tetap aman: image yang dipakai container mana pun,
+termasuk container job, tidak dihapus. `StopProject` membatalkan job project itu yang
+sedang berjalan; `SleepProject` tidak. Kontraknya ada di
+[Sakala Agent API](AGENT_API.md#job-runjob).
 
 ## Memakai ulang image
 

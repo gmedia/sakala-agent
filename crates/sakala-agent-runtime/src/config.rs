@@ -14,6 +14,13 @@ pub const DEFAULT_RELEASE_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// Default of `SAKALA_MAX_REPLICAS_PER_PROJECT`.
 pub const DEFAULT_MAX_REPLICAS_PER_PROJECT: u32 = 4;
 
+/// Default of `SAKALA_WORKER_STARTUP_SECONDS`: how long a worker must keep
+/// running after it started before a deployment counts it as started
+/// (ADR-022).
+pub const DEFAULT_WORKER_STARTUP_WINDOW: Duration = Duration::from_secs(10);
+
+pub use crate::containers::DEFAULT_WORKER_STOP_GRACE;
+
 /// Node-level deadline ceilings. Product policy comes from the command payload;
 /// these values protect the runtime node from excessive requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +142,10 @@ pub struct DockerRuntimeConfig {
     pub crash_stable_window: Duration,
     /// See [`DEFAULT_RELEASE_COMMAND_TIMEOUT`].
     pub release_command_timeout: Duration,
+    /// See [`DEFAULT_WORKER_STARTUP_WINDOW`].
+    pub worker_startup_window: Duration,
+    /// See [`DEFAULT_WORKER_STOP_GRACE`].
+    pub worker_stop_grace: Duration,
     /// `SAKALA_PUBLIC_API_URL`, or `SAKALA_API_URL` when unset: the control
     /// plane as visitors' browsers reach it. A sleeping project's page sends
     /// them to the public wake endpoint under it. Used for nothing else.
@@ -171,6 +182,8 @@ impl Default for DockerRuntimeConfig {
             health_interval: Duration::from_secs(1),
             crash_stable_window: DEFAULT_CRASH_STABLE_WINDOW,
             release_command_timeout: DEFAULT_RELEASE_COMMAND_TIMEOUT,
+            worker_startup_window: DEFAULT_WORKER_STARTUP_WINDOW,
+            worker_stop_grace: DEFAULT_WORKER_STOP_GRACE,
             public_api_url: "http://localhost:8000".to_owned(),
             public_console_url: None,
         }

@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::{
     CommandSpec, NullOutputSink, ProcessOutput, ProcessRunner, RuntimeError,
     health::{
-        HealthChecker, ReadinessRequest,
+        HealthChecker, ReadinessRequest, StabilityRequest,
         host_check::{self, HOST_CHECK_STATUSES},
     },
 };
@@ -157,27 +157,46 @@ impl DockerHealthChecker {
         request: &ReadinessRequest,
         state: &ContainerState,
     ) -> RuntimeError {
-        let mut exit_code = (state.status != "running").then_some(state.exit_code);
-        let mut oom_killed = state.oom_killed;
-        if exit_code.is_none() || (exit_code == Some(SIGKILL_EXIT_CODE) && !oom_killed) {
-            let history = self.exit_history(request).await;
-            exit_code = history.exit_code.or(exit_code);
-            oom_killed |= history.oom_killed;
-        }
-        if oom_killed {
+        let exit = self
+            .last_exit(&request.container, request.started_at, state)
+            .await;
+        if exit.oom_killed {
             RuntimeError::AppOutOfMemory {
                 memory_limit_mb: state.memory_limit_mb(),
             }
         } else {
-            RuntimeError::AppCrashed { exit_code }
+            RuntimeError::AppCrashed {
+                exit_code: exit.exit_code,
+            }
         }
     }
 
-    async fn exit_history(&self, request: &ReadinessRequest) -> ExitHistory {
+    /// How the container last ended, from its state when Docker still holds
+    /// it and from its history otherwise.
+    async fn last_exit(
+        &self,
+        container: &str,
+        started_at: Instant,
+        state: &ContainerState,
+    ) -> ExitHistory {
+        let mut exit_code = (state.status != "running").then_some(state.exit_code);
+        let mut oom_killed = state.oom_killed;
+        if exit_code.is_none() || (exit_code == Some(SIGKILL_EXIT_CODE) && !oom_killed) {
+            let history = self.exit_history(container, started_at).await;
+            exit_code = history.exit_code.or(exit_code);
+            oom_killed |= history.oom_killed;
+        }
+        ExitHistory {
+            exit_code,
+            oom_killed,
+        }
+    }
+
+    async fn exit_history(&self, container: &str, started_at: Instant) -> ExitHistory {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let since = now.saturating_sub(request.started_at.elapsed().as_secs());
+        let since = now.saturating_sub(started_at.elapsed().as_secs());
         let command = CommandSpec::new("docker")
             .arg("events")
             .arg("--since")
@@ -187,7 +206,7 @@ impl DockerHealthChecker {
             .arg("--until")
             .arg((now + 1).to_string())
             .arg("--filter")
-            .arg(format!("container={}", request.container))
+            .arg(format!("container={container}"))
             .arg("--filter")
             .arg("event=die")
             .arg("--filter")
@@ -270,6 +289,39 @@ impl HealthChecker for DockerHealthChecker {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(progress.verdict(request, &self.router_container));
+            }
+            sleep(self.interval.max(MIN_POLL_INTERVAL).min(remaining)).await;
+        }
+    }
+
+    async fn wait_until_stable(&self, request: &StabilityRequest) -> Result<(), RuntimeError> {
+        let until = request.started_at + request.window;
+        loop {
+            let remaining = until.saturating_duration_since(Instant::now());
+            let inspected = self.inspect(&request.container, remaining).await;
+            match &inspected {
+                // Any end counts, code 0 included: a worker that is done
+                // before the route switches has not started.
+                Ok(state) if state.has_exited() || state.restart_count > 0 => {
+                    let exit = self
+                        .last_exit(&request.container, request.started_at, state)
+                        .await;
+                    return Err(RuntimeError::WorkerStartFailed {
+                        process: request.process.clone(),
+                        exit_code: exit.exit_code,
+                        out_of_memory_limit_mb: exit
+                            .oom_killed
+                            .then(|| state.memory_limit_mb())
+                            .flatten(),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => debug!(%error, "worker state is not available yet"),
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // The last look decides: one that failed proves nothing.
+                return inspected.map(|_| ());
             }
             sleep(self.interval.max(MIN_POLL_INTERVAL).min(remaining)).await;
         }

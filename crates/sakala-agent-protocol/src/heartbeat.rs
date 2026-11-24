@@ -38,6 +38,10 @@ pub struct CrashedWorkloadDetail {
     pub restart_count: u32,
     /// Whether a process is running at this moment, between two crashes.
     pub running: bool,
+    /// The worker process the crashed containers run. Absent for the web
+    /// process: a crashed worker does not mean the project is down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
 }
 
 /// One entry of `metadata.workloads.traffic`: when the router last served a
@@ -100,4 +104,8 @@ pub struct WorkloadMetrics {
     /// container since it was last started on purpose. `docker start` and
     /// `docker restart`, which a wake or `RestartProject` use, reset it to 0.
     pub restart_count: u32,
+    /// The worker process this container runs; `replica` then counts among
+    /// the containers of that process. Absent for the web process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
 }

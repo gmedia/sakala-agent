@@ -2,8 +2,9 @@ use sakala_agent_protocol::{
     AgentCommand, BucketName, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
     DatabaseExtension, DeployProjectResult, FinalizationDeferredReason, HeartbeatPayload,
     MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, ManagedBucketUsage, ManagedDatabaseSize,
-    ManagedName, NodePlacement, ObjectStorageMetadata, RequestedImageReuse, RequestedReplicas,
-    SleepingPage, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
+    ManagedName, NodePlacement, ObjectStorageMetadata, RequestedImageReuse, RequestedProcesses,
+    RequestedReplicas, SCHEDULED_JOBS_CAPABILITY, SleepingPage, WORKER_PROCESSES_CAPABILITY,
+    WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
 };
 
 #[test]
@@ -664,5 +665,114 @@ fn bucket_failure_fixture_covers_every_bucket_failure_code() {
     assert_eq!(
         error_codes::BUCKET_OUTCOME_UNKNOWN,
         "bucket_outcome_unknown"
+    );
+}
+
+#[test]
+fn deploy_payload_processes_fixture_matches_the_contract() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-processes.json"
+    ))
+    .expect("DeployProject fixture with processes must deserialize");
+    let payload = command.deploy_payload().expect("payload");
+
+    let workers = payload.processes.workers();
+    assert_eq!(workers.len(), 2);
+    assert_eq!(workers[0].name, "queue");
+    assert_eq!(workers[0].replicas, 1);
+    assert_eq!(workers[0].resources.memory_mb, Some(192));
+    assert_eq!(workers[0].resources.pids_limit, None);
+    assert_eq!(
+        workers[1].replicas, 0,
+        "a definition kept without containers"
+    );
+
+    // A round trip keeps the exact list the API sent, `null` limits included.
+    assert_eq!(
+        serde_json::to_value(&payload).expect("serialize")["processes"],
+        command.payload["processes"]
+    );
+}
+
+#[test]
+fn a_deploy_payload_without_processes_stays_unchanged_on_the_wire() {
+    let command: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("fixture");
+    let payload = command.deploy_payload().expect("payload");
+
+    assert_eq!(payload.processes, RequestedProcesses::Absent);
+    assert!(
+        serde_json::to_value(&payload)
+            .expect("serialize")
+            .get("processes")
+            .is_none()
+    );
+}
+
+#[test]
+fn run_job_fixture_matches_the_contract() {
+    let poll: CommandPoll = serde_json::from_str(include_str!("../examples/commands/run-job.json"))
+        .expect("poll response with RunJob must deserialize");
+    let command = &poll.data[0];
+
+    assert_eq!(command.command_type, CommandType::RunJob);
+    assert!(command.project_id.is_some());
+    assert!(command.deployment_id.is_some());
+    let payload = command.run_job_payload().expect("RunJob payload");
+    assert_eq!(payload.command, "php artisan schedule:run");
+    assert_eq!(payload.timeout_seconds, Some(300));
+    assert!(matches!(
+        payload.reuse_image_from_deployment_id,
+        RequestedImageReuse::Deployment(_)
+    ));
+    assert_eq!(payload.container_port, 8000);
+    assert_eq!(payload.log_bounds.max_total_bytes, Some(10_485_760));
+    assert_eq!(
+        serde_json::to_value(&payload).expect("serialize"),
+        command.payload
+    );
+}
+
+#[test]
+fn run_job_is_the_last_command_type_and_keeps_its_wire_name() {
+    assert_eq!(
+        serde_json::to_value(CommandType::RunJob).expect("serialize"),
+        "RunJob"
+    );
+    assert_eq!(WORKER_PROCESSES_CAPABILITY, "worker-processes");
+    assert_eq!(SCHEDULED_JOBS_CAPABILITY, "scheduled-jobs");
+}
+
+#[test]
+fn worker_heartbeat_fixture_matches_the_heartbeat_contract() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/worker-processes.json"))
+            .expect("heartbeat fixture must deserialize");
+    for capability in [WORKER_PROCESSES_CAPABILITY, SCHEDULED_JOBS_CAPABILITY] {
+        assert!(heartbeat.node.capabilities.iter().any(|c| c == capability));
+    }
+    let crashed: Vec<CrashedWorkloadDetail> =
+        serde_json::from_value(heartbeat.metadata["workloads"]["crashed_details"].clone())
+            .expect("crashed details");
+    assert_eq!(crashed[0].process.as_deref(), Some("queue"));
+    let metrics: Vec<WorkloadMetrics> =
+        serde_json::from_value(heartbeat.metadata["workloads"]["metrics"].clone())
+            .expect("metrics");
+    assert_eq!(metrics[0].process, None, "the web replica");
+    assert_eq!(metrics[1].process.as_deref(), Some("queue"));
+    assert_eq!(
+        heartbeat.metadata["workloads"]["unhealthy_details"][0]["process"],
+        "queue"
+    );
+
+    // A round trip keeps the wire shape: no `process` key for the web replica.
+    assert_eq!(
+        serde_json::to_value(&metrics).expect("serialize"),
+        heartbeat.metadata["workloads"]["metrics"]
+    );
+    assert_eq!(
+        serde_json::to_value(&crashed).expect("serialize"),
+        heartbeat.metadata["workloads"]["crashed_details"]
     );
 }

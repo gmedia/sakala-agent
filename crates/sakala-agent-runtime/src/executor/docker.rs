@@ -11,17 +11,19 @@ use async_trait::async_trait;
 use sakala_agent_core::logs::redactor::ValueRedactor;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
-    NodeTelemetry, ReconcileWorkloadRequest, RuntimeCapacity, RuntimeCompatibilityIssue,
-    RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot, RuntimeImageCleanup,
-    RuntimeNetworkReconciliation, RuntimePreflightCheck, RuntimePreflightReport,
-    RuntimeReconciliationReport, RuntimeReplicaRestoration, RuntimeReporter,
-    RuntimeReporterFactory, WorkloadLifecycleRequest,
+    NodeTelemetry, ReconcileWorkloadRequest, RunJobRequest, RuntimeCapacity,
+    RuntimeCompatibilityIssue, RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot,
+    RuntimeImageCleanup, RuntimeNetworkReconciliation, RuntimePreflightCheck,
+    RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReplicaRestoration,
+    RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest, process_reporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
-    DeploymentBuilder, DeploymentEventLevel, DeploymentLog, InspectProjectPayload, LogBounds,
-    LogStream, ReconcileWorkloadAction, RuntimeCleanupTarget, SleepingPage, WorkloadMetrics,
-    WorkloadTraffic,
+    DeploymentBuilder, DeploymentEventLevel, DeploymentLog, ImageReuseFallbackReason,
+    InspectProjectPayload, JOB_FINISHED_EVENT, JOB_STARTED_EVENT, LogBounds, LogStream,
+    MAX_JOB_TIMEOUT_SECONDS, PROCESSES_IGNORED_EVENT, ReconcileWorkloadAction, RequestedImageReuse,
+    RequestedProcesses, RunJobPayload, RunJobResult, RuntimeCleanupTarget, SleepingPage,
+    WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -30,6 +32,7 @@ use tokio::{
     task::JoinSet,
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -37,16 +40,21 @@ use super::{
     image_reuse::ImagePlan,
     project_locks::ProjectLocks,
     replica_restore::{ReplicaRestorer, RestorePolicy, RestoreTarget},
+    shell_command::{
+        command_field, required_shell_command, validate_command_field, validate_shell_command,
+    },
+    workers::{WorkerCandidate, resolve_workers, worker_candidates},
 };
 use crate::{
     CommandSpec, DockerRuntimeConfig, ProcessRunner, RuntimeError, TokioProcessRunner,
-    builders::{BuildOutput, BuildRequest, ImageBuildService, ImageBuilder},
+    builders::{BuildOutput, BuildRequest, ImageBuildService, ImageBuilder, reusable_build},
     containers::{
-        ContainerEngine, DockerContainerEngine, FailureOutput, ImageCleanup, ImageRetention,
-        ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ReplicaSlot, RunContainerRequest,
+        ContainerEngine, DEFAULT_WEB_STOP_GRACE, DockerContainerEngine, FailureOutput,
+        ImageCleanup, ImageRetention, ManagedWorkload, OneOffContainerRequest, OneOffExit,
+        OneOffRole, ReplicaSlot, RunContainerRequest, StopGrace, image_name, job_container_name,
         release_container_name, replicas::resolve_replicas,
     },
-    health::{DockerHealthChecker, HealthChecker, ReadinessRequest},
+    health::{DockerHealthChecker, HealthChecker, ReadinessRequest, StabilityRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
     logs::{emit_event, emit_event_at},
     railpack::{RailpackSandbox, is_pinned_image},
@@ -76,6 +84,8 @@ pub struct DockerRuntimeExecutor {
     timeout_safety: crate::TimeoutSafetyConfig,
     health_check_window: std::time::Duration,
     release_command_timeout: std::time::Duration,
+    /// See [`crate::DEFAULT_WORKER_STARTUP_WINDOW`].
+    worker_startup_window: std::time::Duration,
     build_permits: Arc<Semaphore>,
     container_admission: Arc<Mutex<()>>,
     max_concurrent_builds: usize,
@@ -96,6 +106,8 @@ pub struct DockerRuntimeExecutor {
     /// Held by every project command, and tried by replica restore.
     project_locks: ProjectLocks,
     restorer: std::sync::Mutex<ReplicaRestorer>,
+    /// The jobs running now, so stopping a project can stop its jobs too.
+    jobs: RunningJobs,
 }
 
 pub(crate) struct DockerPreflight {
@@ -154,6 +166,11 @@ impl DockerRuntimeExecutor {
         let min_workspace_free_bytes = config.min_workspace_free_bytes;
         let health_check_window = config.health_interval * config.health_attempts;
         let release_command_timeout = config.release_command_timeout;
+        let worker_startup_window = config.worker_startup_window;
+        let stop_grace = StopGrace {
+            web: DEFAULT_WEB_STOP_GRACE,
+            worker: config.worker_stop_grace,
+        };
         let restore_policy = RestorePolicy::new(config.crash_stable_window);
         let router_container = config.caddy_container.clone();
         let public_api_url = config.public_api_url.clone();
@@ -184,18 +201,21 @@ impl DockerRuntimeExecutor {
                     config.railpack_network,
                 ),
             )),
-            Arc::new(DockerContainerEngine::new(
-                Arc::clone(&runner),
-                router_container.clone(),
-                config.resource_safety,
-                config.max_active_containers,
-                agent_id,
-                config.crash_stable_window,
-                crate::containers::WorkloadIsolation {
-                    container_runtime: config.container_runtime,
-                    container_dns,
-                },
-            )),
+            Arc::new(
+                DockerContainerEngine::new(
+                    Arc::clone(&runner),
+                    router_container.clone(),
+                    config.resource_safety,
+                    config.max_active_containers,
+                    agent_id,
+                    config.crash_stable_window,
+                    crate::containers::WorkloadIsolation {
+                        container_runtime: config.container_runtime,
+                        container_dns,
+                    },
+                )
+                .with_stop_grace(stop_grace),
+            ),
             Arc::new(DockerHealthChecker::new(
                 Arc::clone(&runner),
                 router_container,
@@ -205,6 +225,7 @@ impl DockerRuntimeExecutor {
             config.timeout_safety,
             health_check_window,
             release_command_timeout,
+            worker_startup_window,
             max_concurrent_builds,
             max_replicas_per_project,
             workspace_gc_max_age,
@@ -229,6 +250,7 @@ impl DockerRuntimeExecutor {
         timeout_safety: crate::TimeoutSafetyConfig,
         health_check_window: std::time::Duration,
         release_command_timeout: std::time::Duration,
+        worker_startup_window: std::time::Duration,
         max_concurrent_builds: usize,
         max_replicas_per_project: u32,
         workspace_gc_max_age: std::time::Duration,
@@ -271,6 +293,7 @@ impl DockerRuntimeExecutor {
             timeout_safety,
             health_check_window,
             release_command_timeout,
+            worker_startup_window,
             build_permits: Arc::new(Semaphore::new(max_concurrent_builds)),
             container_admission: Arc::new(Mutex::new(())),
             max_concurrent_builds,
@@ -288,6 +311,7 @@ impl DockerRuntimeExecutor {
             traffic_unreadable: AtomicBool::new(false),
             project_locks: ProjectLocks::default(),
             restorer: std::sync::Mutex::new(ReplicaRestorer::new(restore_policy)),
+            jobs: RunningJobs::default(),
         }
     }
 
@@ -366,6 +390,11 @@ impl DockerRuntimeExecutor {
         let payload = request.payload;
         validate_payload(&payload, &self.project_domains)?;
         let replicas = resolve_replicas(payload.replicas, self.max_replicas_per_project)?;
+        let workers = resolve_workers(&payload, self.max_replicas_per_project, |limits| {
+            self.containers.resolve_resources(limits)
+        })?;
+        let workers = worker_candidates(&workers, project_id, deployment_id);
+        let containers_needed = containers_needed(replicas, workers.len());
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
         let source = deployment_source(&payload, request.repository_credential)?;
@@ -381,8 +410,19 @@ impl DockerRuntimeExecutor {
             self.ensure_workspace_capacity().await?;
         }
         self.containers
-            .ensure_capacity(project_id, replicas)
+            .ensure_capacity(project_id, containers_needed)
             .await?;
+
+        if payload.processes == RequestedProcesses::Unreadable {
+            emit_event_at(
+                reporter.as_ref(),
+                DeploymentEventLevel::Warning,
+                PROCESSES_IGNORED_EVENT,
+                "The worker processes of this deployment could not be read; only the web process runs.",
+                json!({}),
+            )
+            .await?;
+        }
 
         emit_event(
             reporter.as_ref(),
@@ -438,7 +478,13 @@ impl DockerRuntimeExecutor {
             .iter()
             .map(|(_, name)| name.clone())
             .collect::<Vec<_>>();
-        let release = ReleaseContainer::new(
+        // Web replicas first, so the first one explains a failure by default.
+        let all_containers = containers
+            .iter()
+            .cloned()
+            .chain(workers.iter().map(|worker| worker.name.clone()))
+            .collect::<Vec<_>>();
+        let release = OneOffContainer::new(
             Arc::clone(&self.containers),
             release_container_name(project_id, deployment_id),
         );
@@ -455,6 +501,7 @@ impl DockerRuntimeExecutor {
             &workspace,
             &plan,
             &candidates,
+            &workers,
             applied_resources,
             applied_timeouts,
             DeploymentProgress {
@@ -502,24 +549,28 @@ impl DockerRuntimeExecutor {
             && candidate_started.load(Ordering::Acquire)
             && !matches!(result, Err(RuntimeError::Cancelled))
         {
-            // The replica that failed explains the failure; before readiness,
-            // that is the first one.
+            // The container that failed explains the failure; before
+            // readiness, that is the first web replica.
             let failed = failed_replica.get().unwrap_or(&containers[0]);
+            let failed_process = workers
+                .iter()
+                .find(|worker| worker.name == *failed)
+                .map(|worker| worker.process.as_str());
             let output = self
-                .report_candidate_output(failed, payload.log_bounds, reporter.as_ref())
+                .report_candidate_output(failed, failed_process, payload.log_bounds, &reporter)
                 .await;
             result = result.map_err(|error| error.refine_crash(output.exec_denied));
         }
         if failed_before_cutover {
             if let Err(error) = self
                 .containers
-                .cleanup_candidate(&containers, plan.candidate_image())
+                .cleanup_candidate(&all_containers, plan.candidate_image())
                 .await
             {
                 let _ = reporter
                     .log(system_log(format!(
                         "candidate cleanup warning for {}: {error}",
-                        containers.join(", ")
+                        all_containers.join(", ")
                     )))
                     .await;
             }
@@ -555,13 +606,20 @@ impl DockerRuntimeExecutor {
     }
 
     /// Best effort by design: nothing here may replace the deployment's own error,
-    /// though what the output shows may refine it.
+    /// though what the output shows may refine it. A worker's output is marked
+    /// with its process.
     async fn report_candidate_output(
         &self,
         container: &str,
+        process: Option<&str>,
         log_bounds: LogBounds,
-        reporter: &dyn RuntimeReporter,
+        reporter: &Arc<dyn RuntimeReporter>,
     ) -> FailureOutput {
+        let reporter = match process {
+            Some(process) => process_reporter(reporter, process),
+            None => Arc::clone(reporter),
+        };
+        let reporter = reporter.as_ref();
         let _ = reporter
             .log(system_log(
                 "Last application output before the failed start was removed:".to_owned(),
@@ -618,6 +676,7 @@ impl DockerRuntimeExecutor {
         workspace: &DeploymentWorkspace,
         plan: &ImagePlan,
         candidates: &[(ReplicaSlot, String)],
+        workers: &[WorkerCandidate],
         applied_resources: AppliedRuntimeResources,
         applied_timeouts: crate::config::AppliedRuntimeTimeouts,
         progress: DeploymentProgress<'_>,
@@ -628,7 +687,12 @@ impl DockerRuntimeExecutor {
             .iter()
             .map(|(_, name)| name.clone())
             .collect::<Vec<_>>();
-        let replicas = replica_count(candidates.len());
+        let all_containers = containers
+            .iter()
+            .cloned()
+            .chain(workers.iter().map(|worker| worker.name.clone()))
+            .collect::<Vec<_>>();
+        let containers_needed = containers_needed(replica_count(candidates.len()), workers.len());
         let image = plan.image();
         // A reused image was built the way its labels say, so everything after
         // the build behaves exactly as it did for the deployment that built it.
@@ -652,7 +716,8 @@ impl DockerRuntimeExecutor {
         // the route moves, the previous deployment keeps serving.
         if let Some(command) = command_field(payload.release_command.as_deref()) {
             self.run_release_command(
-                &ReleaseContainerRequest {
+                &OneOffContainerRequest {
+                    role: OneOffRole::Release,
                     command_id,
                     project_id,
                     deployment_id,
@@ -664,7 +729,7 @@ impl DockerRuntimeExecutor {
                     port: payload.container_port,
                     command: build.in_package(command),
                 },
-                replicas,
+                containers_needed,
                 progress.release,
                 reporter_ref,
             )
@@ -674,14 +739,17 @@ impl DockerRuntimeExecutor {
         emit_event(
             reporter_ref,
             "deployment.container.started",
-            if containers.len() > 1 {
+            if all_containers.len() > 1 {
                 "Starting candidate application containers."
             } else {
                 "Starting candidate application container."
             },
-            with_replicas(
-                json!({ "container": containers[0], "image": image }),
-                &containers,
+            with_workers(
+                with_replicas(
+                    json!({ "container": containers[0], "image": image }),
+                    &containers,
+                ),
+                workers,
             ),
         )
         .await?;
@@ -691,7 +759,7 @@ impl DockerRuntimeExecutor {
             // serialized re-check is authoritative and closes concurrent admission races.
             let admission = self.container_admission.lock().await;
             self.containers
-                .ensure_capacity(project_id, replicas)
+                .ensure_capacity(project_id, containers_needed)
                 .await?;
             for (replica, name) in candidates {
                 self.containers
@@ -712,6 +780,32 @@ impl DockerRuntimeExecutor {
                             // A Railpack image already starts with this command.
                             start_command: command_field(payload.start_command.as_deref())
                                 .filter(|_| build.builder == DeploymentBuilder::Dockerfile),
+                            process: None,
+                        },
+                        reporter_ref,
+                    )
+                    .await?;
+            }
+            // Same image, variables, and port as the web replicas; each runs
+            // its own command where the release command would run.
+            for worker in workers {
+                self.containers
+                    .start(
+                        &RunContainerRequest {
+                            command_id,
+                            project_id,
+                            deployment_id,
+                            name: worker.name.clone(),
+                            replica: worker.slot,
+                            image: image.to_owned(),
+                            workspace: workspace.root().to_owned(),
+                            environment: payload.environment.clone(),
+                            resources: worker.resources,
+                            domain: payload.domain.clone(),
+                            port: payload.container_port,
+                            log_bounds: payload.log_bounds,
+                            start_command: Some(build.in_package(worker.command.clone())),
+                            process: Some(worker.process.clone()),
                         },
                         reporter_ref,
                     )
@@ -725,37 +819,49 @@ impl DockerRuntimeExecutor {
             operation: "deployment-start".to_owned(),
             seconds: applied_timeouts.start.as_secs(),
         })??;
+        let workers_started = Instant::now();
         progress.candidate_started.store(true, Ordering::Release);
+        let mut health_details = json!({
+            "port": payload.container_port,
+            "timeout_seconds": applied_timeouts.start.as_secs(),
+        });
+        if !workers.is_empty() {
+            health_details["worker_startup_seconds"] = json!(self.worker_startup_window.as_secs());
+        }
         emit_event(
             reporter_ref,
             "deployment.health.started",
             "Waiting for the application to answer on its port.",
-            json!({
-                "port": payload.container_port,
-                "timeout_seconds": applied_timeouts.start.as_secs(),
-            }),
+            health_details,
         )
         .await?;
-        // Every replica must answer before the route moves, under one deadline:
-        // the old deployment keeps serving until the whole new set is ready.
-        for name in &containers {
-            if let Err(error) = self
-                .health
-                .wait_until_ready(&ReadinessRequest {
-                    container: name.clone(),
-                    port: payload.container_port,
-                    started_at: start_began,
-                    timeout: applied_timeouts.start,
-                    expected_restarts: Some(0),
-                    operation: "deployment-start",
-                    host: Some(payload.domain.clone()),
-                })
-                .await
-            {
-                let _ = progress.failed_replica.set(name.clone());
-                return Err(error);
+        // Every replica must answer, and every worker must stay up, before the
+        // route moves: the old deployment keeps serving until the whole new
+        // set is ready. Web replicas share one deadline.
+        let web_ready = async {
+            for name in &containers {
+                if let Err(error) = self
+                    .health
+                    .wait_until_ready(&ReadinessRequest {
+                        container: name.clone(),
+                        port: payload.container_port,
+                        started_at: start_began,
+                        timeout: applied_timeouts.start,
+                        expected_restarts: Some(0),
+                        operation: "deployment-start",
+                        host: Some(payload.domain.clone()),
+                    })
+                    .await
+                {
+                    let _ = progress.failed_replica.set(name.clone());
+                    return Err(error);
+                }
             }
-        }
+            Ok(())
+        };
+        let workers_ready =
+            self.wait_for_workers(workers, workers_started, progress.failed_replica);
+        tokio::try_join!(web_ready, workers_ready)?;
         emit_event(
             reporter_ref,
             "deployment.route.started",
@@ -803,11 +909,30 @@ impl DockerRuntimeExecutor {
                     .await;
             }
         }
+        // Each worker's lines go under its process, with a budget of its own.
+        let worker_reporters = workers
+            .iter()
+            .map(|worker| process_reporter(&reporter, &worker.process))
+            .collect::<Vec<_>>();
+        for (worker, worker_reporter) in workers.iter().zip(&worker_reporters) {
+            if let Err(error) = self
+                .containers
+                .report_startup_logs(&worker.name, worker_reporter.as_ref())
+                .await
+            {
+                let _ = reporter
+                    .log(system_log(format!(
+                        "startup log collection warning for {}: {error}",
+                        worker.name
+                    )))
+                    .await;
+            }
+        }
         // Before the replaced containers go, so their image is still known.
-        let previous_marked = self.mark_previous_image(project_id, &containers).await;
+        let previous_marked = self.mark_previous_image(project_id, &all_containers).await;
         let finalization_error = match self
             .containers
-            .cleanup_previous(project_id, &containers, reporter_ref)
+            .cleanup_previous(project_id, &all_containers, reporter_ref)
             .await
         {
             Ok(()) => None,
@@ -825,15 +950,18 @@ impl DockerRuntimeExecutor {
             reporter_ref,
             "deployment.runtime.ready",
             "Application container and route are ready.",
-            with_replicas(
-                json!({
-                    "builder": build.builder,
-                    "container": containers[0],
-                    "domain": payload.domain,
-                    "image": image,
-                    "resources": applied_resources,
-                }),
-                &containers,
+            with_workers(
+                with_replicas(
+                    json!({
+                        "builder": build.builder,
+                        "container": containers[0],
+                        "domain": payload.domain,
+                        "image": image,
+                        "resources": applied_resources,
+                    }),
+                    &containers,
+                ),
+                workers,
             ),
         )
         .await
@@ -849,6 +977,11 @@ impl DockerRuntimeExecutor {
             let _ = self
                 .containers
                 .start_log_follower(name, Arc::clone(&reporter));
+        }
+        for (worker, worker_reporter) in workers.iter().zip(worker_reporters) {
+            let _ = self
+                .containers
+                .start_log_follower(&worker.name, worker_reporter);
         }
         if let Some(error) = finalization_error {
             return Err(error);
@@ -971,9 +1104,9 @@ impl DockerRuntimeExecutor {
     /// the deployment go on to start its replicas.
     async fn run_release_command(
         &self,
-        request: &ReleaseContainerRequest,
+        request: &OneOffContainerRequest,
         replicas: NonZeroU32,
-        release: &ReleaseContainer,
+        release: &OneOffContainer,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         emit_event(
@@ -1022,11 +1155,11 @@ impl DockerRuntimeExecutor {
     /// are during a rolling deploy, and other projects count it as one slot.
     async fn execute_release(
         &self,
-        request: &ReleaseContainerRequest,
+        request: &OneOffContainerRequest,
         replicas: NonZeroU32,
-        release: &ReleaseContainer,
+        release: &OneOffContainer,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<ReleaseExit, RuntimeError> {
+    ) -> Result<OneOffExit, RuntimeError> {
         let admission = self.container_admission.lock().await;
         self.containers
             .ensure_capacity(request.project_id, replicas)
@@ -1034,11 +1167,12 @@ impl DockerRuntimeExecutor {
         // Before `docker run`, which can leave a created container behind
         // even when it fails.
         release.arm();
-        self.containers.start_release(request, reporter).await?;
+        self.containers.start_one_off(request, reporter).await?;
         drop(admission);
         tokio::time::timeout(
             self.release_command_timeout,
-            self.containers.wait_release(&request.name, reporter),
+            self.containers
+                .wait_one_off(&request.name, request.role, reporter),
         )
         .await
         .map_err(|_| RuntimeError::ReleaseCommandTimeout {
@@ -1046,7 +1180,233 @@ impl DockerRuntimeExecutor {
         })?
     }
 
-    /// Every replica of the request's deployment, in replica order.
+    /// Runs one job: one container of the live image, under the node's
+    /// capacity guard, until it exits, its timeout passes, or it is cancelled,
+    /// and removes the container on every path. Holds no project lock, so a
+    /// deploy, restart, or sleep of the project runs next to it, and touches
+    /// none of the project's web or worker containers.
+    async fn run_job_container(
+        &self,
+        request: RunJobRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeError> {
+        let RunJobRequest {
+            command_id,
+            project_id,
+            deployment_id,
+            payload,
+            cancellation,
+        } = request;
+        let job = validate_job(&payload, deployment_id)?;
+        let resources = self.containers.resolve_resources(payload.resources)?;
+        let (image, command) = self
+            .job_image(project_id, &job, &payload.commit_sha)
+            .await?;
+        let _tracked = self
+            .jobs
+            .track(command_id, project_id, cancellation.clone());
+        if cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
+        // Only for the env file of the job container.
+        let workspace = self.workspace.empty(command_id).await?;
+        let container = OneOffContainer::new(
+            Arc::clone(&self.containers),
+            job_container_name(project_id, command_id),
+        );
+        let container_request = OneOffContainerRequest {
+            role: OneOffRole::Job,
+            command_id,
+            project_id,
+            deployment_id,
+            name: container.name.clone(),
+            image,
+            workspace: workspace.root().to_owned(),
+            environment: payload.environment,
+            resources,
+            port: payload.container_port,
+            command,
+        };
+        let outcome = tokio::select! {
+            biased;
+            outcome = self.execute_job(&container_request, job.timeout, &container, reporter.as_ref()) => outcome,
+            () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
+        };
+        if let Err(error) = container.remove().await {
+            let _ = reporter
+                .log(system_log(format!(
+                    "job container cleanup warning for {}: {error}",
+                    container.name
+                )))
+                .await;
+        }
+        if let Err(error) = self.workspace.cleanup(&workspace).await {
+            tracing::warn!(
+                workspace = %workspace.root().display(),
+                %error,
+                "job workspace cleanup failed"
+            );
+        }
+        let (exit, duration_ms) = outcome?;
+        if !exit.succeeded() {
+            return Err(RuntimeError::JobFailed {
+                exit_code: exit.exit_code,
+                out_of_memory_limit_mb: exit.oom_killed.then_some(resources.memory_mb),
+            });
+        }
+        let result = serde_json::to_value(RunJobResult {
+            exit_code: exit.exit_code,
+            duration_ms,
+            oom_killed: exit.oom_killed,
+        })
+        .map_err(|error| {
+            RuntimeError::Execution(format!("failed to serialize job result: {error}"))
+        })?;
+        Ok(CommandOutput::with_result(result))
+    }
+
+    /// The image of the deployment that built the live image, looked up under
+    /// the reference the Agent computes from the job's project, so a job can
+    /// only ever reach images of its own project, and the command to run in
+    /// it: in the package directory when the image was built from a
+    /// JavaScript workspace, like the release command.
+    async fn job_image(
+        &self,
+        project_id: Uuid,
+        job: &JobSpec,
+        commit_sha: &str,
+    ) -> Result<(String, String), RuntimeError> {
+        let image = image_name(project_id, job.image_deployment_id, commit_sha);
+        let labels = self.containers.image_labels(&image).await?;
+        let command = match reusable_build(labels.as_ref(), project_id, job.image_deployment_id) {
+            Ok(build) => build.in_package(job.command.clone()),
+            // Built by an Agent from before image metadata, which never built
+            // a workspace package: the command runs where the image starts.
+            Err(ImageReuseFallbackReason::ImageMetadataMissing) => job.command.clone(),
+            Err(ImageReuseFallbackReason::ImageNotOwned) => {
+                return Err(RuntimeError::JobImageMissing {
+                    reason: "the image under the live deployment's name is not the project's",
+                });
+            }
+            Err(
+                ImageReuseFallbackReason::ImageMissing | ImageReuseFallbackReason::InvalidReference,
+            ) => {
+                return Err(RuntimeError::JobImageMissing {
+                    reason: "this node has no image of the live deployment",
+                });
+            }
+        };
+        Ok((image, command))
+    }
+
+    /// A job counts as one container under the same serialized admission as
+    /// a deploy or a wake, so the two never race past the node's maximum.
+    /// Returns how the container ended and how long it ran.
+    async fn execute_job(
+        &self,
+        request: &OneOffContainerRequest,
+        timeout: std::time::Duration,
+        container: &OneOffContainer,
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(OneOffExit, u64), RuntimeError> {
+        let admission = self.container_admission.lock().await;
+        self.containers.ensure_job_capacity().await?;
+        // Before `docker run`, which can leave a created container behind
+        // even when it fails.
+        container.arm();
+        self.containers.start_one_off(request, reporter).await?;
+        drop(admission);
+        let started = Instant::now();
+        emit_event(
+            reporter,
+            JOB_STARTED_EVENT,
+            "Job container started.",
+            json!({
+                "container": request.name,
+                "image": request.image,
+                "timeout_seconds": timeout.as_secs(),
+            }),
+        )
+        .await?;
+        let exit = tokio::time::timeout(
+            timeout,
+            self.containers
+                .wait_one_off(&request.name, OneOffRole::Job, reporter),
+        )
+        .await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (exit, finished) = match exit {
+            Ok(exit) => {
+                let exit = exit?;
+                (
+                    Ok((exit, duration_ms)),
+                    json!({
+                        "exit_code": exit.exit_code,
+                        "duration_ms": duration_ms,
+                        "oom_killed": exit.oom_killed,
+                        "timed_out": false,
+                    }),
+                )
+            }
+            Err(_) => (
+                Err(RuntimeError::JobTimeout {
+                    seconds: timeout.as_secs(),
+                }),
+                json!({
+                    "exit_code": null,
+                    "duration_ms": duration_ms,
+                    "oom_killed": false,
+                    "timed_out": true,
+                }),
+            ),
+        };
+        // Telemetry: the outcome is what the command reports.
+        let _ = emit_event(
+            reporter,
+            JOB_FINISHED_EVENT,
+            "Job container ended.",
+            finished,
+        )
+        .await;
+        exit
+    }
+
+    /// Waits until every worker kept running for the startup window, side by
+    /// side, and records the first one that did not, whose output explains
+    /// the failure.
+    async fn wait_for_workers(
+        &self,
+        workers: &[WorkerCandidate],
+        started_at: Instant,
+        failed: &OnceLock<String>,
+    ) -> Result<(), RuntimeError> {
+        let mut checks = JoinSet::new();
+        for worker in workers {
+            let health = Arc::clone(&self.health);
+            let request = StabilityRequest {
+                container: worker.name.clone(),
+                process: worker.process.clone(),
+                started_at,
+                window: self.worker_startup_window,
+            };
+            checks.spawn(async move {
+                let result = health.wait_until_stable(&request).await;
+                (request.container, result)
+            });
+        }
+        // Dropping the set on the first failure cancels the checks still waiting.
+        while let Some(joined) = checks.join_next().await {
+            let (container, result) = joined.map_err(readiness_task_failed)?;
+            if let Err(error) = result {
+                let _ = failed.set(container);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Every container of the request's deployment, web replicas first in
+    /// replica order, then each worker process.
     async fn workloads(
         &self,
         request: &WorkloadLifecycleRequest,
@@ -1059,6 +1419,19 @@ impl DockerRuntimeExecutor {
             return Err(RuntimeError::WorkloadNotFound);
         }
         Ok(workloads)
+    }
+
+    /// The web replicas of the request's deployment, in replica order: what
+    /// the route, the readiness probe, and `HealthCheck` are about.
+    async fn web_workloads(
+        &self,
+        request: &WorkloadLifecycleRequest,
+    ) -> Result<Vec<ManagedWorkload>, RuntimeError> {
+        let web = web_only(&self.workloads(request).await?);
+        if web.is_empty() {
+            return Err(RuntimeError::WorkloadNotFound);
+        }
+        Ok(web)
     }
 
     /// A lifecycle command has no start deadline of its own in its payload.
@@ -1216,15 +1589,19 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let workloads = self.workloads(&request).await?;
-        // A running deployment gets every replica back, including one that
-        // stopped on its own. A crashed one, where no replica runs because
-        // they exited or Docker is between two restarts of a crash loop, is
-        // started like a wake. A sleeping one stays asleep: its sleeping route
-        // is the local record of the sleep, the same one orphan detection
-        // reads, and the only thing that tells it apart from a crash.
-        if workloads.iter().any(ManagedWorkload::is_running) {
+        let web = web_only(&workloads);
+        if web.is_empty() {
+            return Err(RuntimeError::WorkloadNotFound);
+        }
+        // A running deployment gets every replica and worker back, including
+        // one that stopped on its own. A crashed one, where no web replica runs
+        // because they exited or Docker is between two restarts of a crash
+        // loop, is started like a wake. A sleeping one stays asleep: its
+        // sleeping route is the local record of the sleep, the same one orphan
+        // detection reads, and the only thing that tells it apart from a crash.
+        if web.iter().any(ManagedWorkload::is_running) {
             for workload in &workloads {
-                self.containers.restart(workload, 10).await?;
+                self.containers.restart(workload).await?;
             }
         } else {
             let identity = RouteIdentity {
@@ -1239,11 +1616,11 @@ impl DockerRuntimeExecutor {
                 .ensure_capacity(request.project_id, replica_count(workloads.len()))
                 .await?;
             for workload in &workloads {
-                self.containers.restart(workload, 10).await?;
+                self.containers.restart(workload).await?;
             }
             drop(admission);
         }
-        let restarted = workloads
+        let restarted = web
             .iter()
             .map(|workload| ManagedWorkload {
                 status: RESTARTED_STATUS.to_owned(),
@@ -1252,7 +1629,7 @@ impl DockerRuntimeExecutor {
             .collect::<Vec<_>>();
         self.activate_workload(&restarted, reporter.as_ref())
             .await?;
-        let workload = &workloads[0];
+        let workload = &web[0];
         emit_event(
             reporter.as_ref(),
             "workload.restart.completed",
@@ -1269,6 +1646,18 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
         remove: bool,
     ) -> Result<CommandOutput, RuntimeError> {
+        if remove {
+            // A stopped or deleted project runs nothing, jobs included. A
+            // sleeping one keeps running its jobs: they need only the image.
+            let cancelled = self.jobs.cancel_project(request.project_id);
+            if cancelled > 0 {
+                tracing::info!(
+                    project_id = %request.project_id,
+                    cancelled,
+                    "jobs of a stopped project cancelled"
+                );
+            }
+        }
         let workloads = self
             .containers
             .workloads(request.project_id, request.deployment_id)
@@ -1294,7 +1683,12 @@ impl DockerRuntimeExecutor {
             }
             return Err(RuntimeError::WorkloadNotFound);
         };
-        self.containers.stop(&workloads, 10).await?;
+        // The route and the sleeping page belong to the web process.
+        let workload = workloads
+            .iter()
+            .find(|workload| workload.is_web())
+            .unwrap_or(workload);
+        self.containers.stop(&workloads).await?;
         if remove {
             self.deactivate_route(workload, reporter.as_ref()).await?;
             for replica in &workloads {
@@ -1441,7 +1835,7 @@ impl DockerRuntimeExecutor {
                 ..workload.clone()
             })
             .collect::<Vec<_>>();
-        if let Err(error) = self.containers.stop(&started, 10).await {
+        if let Err(error) = self.containers.stop(&started).await {
             tracing::warn!(
                 project_id = %first.project_id,
                 deployment_id = %first.deployment_id,
@@ -1462,9 +1856,12 @@ impl DockerRuntimeExecutor {
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
         let workloads = self.workloads(&request).await?;
-        let workload = &workloads[0];
+        let web = web_only(&workloads);
+        let Some(workload) = web.first() else {
+            return Err(RuntimeError::WorkloadNotFound);
+        };
         // Same admission as a deployment: a full node refuses the wake, and the
-        // sleeping page stays until there is room for every replica.
+        // sleeping page stays until there is room for every replica and worker.
         let admission = self.container_admission.lock().await;
         self.containers
             .ensure_capacity(workload.project_id, replica_count(workloads.len()))
@@ -1482,7 +1879,7 @@ impl DockerRuntimeExecutor {
             started.push(replica.clone());
         }
         drop(admission);
-        let woken = workloads
+        let woken = web
             .iter()
             .map(|replica| ManagedWorkload {
                 status: RESTARTED_STATUS.to_owned(),
@@ -1512,7 +1909,7 @@ impl DockerRuntimeExecutor {
         &self,
         request: WorkloadLifecycleRequest,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workloads = self.workloads(&request).await?;
+        let workloads = self.web_workloads(&request).await?;
         let results = self
             .readiness_of_each(&workloads, self.health_check_window)
             .await?;
@@ -1547,7 +1944,7 @@ impl DockerRuntimeExecutor {
         request: WorkloadLifecycleRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
-        let workloads = self.workloads(&request).await?;
+        let workloads = self.web_workloads(&request).await?;
         if !workloads.iter().any(ManagedWorkload::is_running) {
             return Err(RuntimeError::WorkloadNotRunning);
         }
@@ -1560,7 +1957,10 @@ impl DockerRuntimeExecutor {
     /// replicas qualify. The route is left as it is: it already lists every
     /// replica, and the router sends requests to one again once it answers.
     async fn run_restore_replicas(&self) -> Result<RuntimeReplicaRestoration, RuntimeError> {
-        let listing = self.containers.replica_listing().await?;
+        // A worker is not a replica of the web process, and an exited worker
+        // was stopped on purpose: Docker restarts one that exits on its own.
+        let mut listing = self.containers.replica_listing().await?;
+        listing.retain(|listed| listed.process.is_none());
         let targets = self.restorer.lock().expect("replica restorer lock").plan(
             &listing,
             Instant::now(),
@@ -1609,6 +2009,7 @@ impl DockerRuntimeExecutor {
                 return Err(error);
             }
         };
+        let workloads = web_only(&workloads);
         let Some(replica) = workloads
             .iter()
             .find(|workload| workload.container_id == target.container_id)
@@ -1945,16 +2346,16 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
         reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     ) -> Result<RuntimeReconciliationReport, RuntimeExecutionError> {
         let mut report = self.reconcile().await?;
-        // A release container belongs to a deployment command, and none of
-        // those survived the restart. Removed first, so its network can go too.
-        match self.containers.remove_stale_releases().await {
+        // A release or job container belongs to a command, and none of those
+        // survived the restart. Removed first, so its network can go too.
+        match self.containers.remove_stale_one_offs().await {
             Ok(0) => {}
             Ok(removed) => tracing::info!(
                 removed,
-                "release containers of interrupted deployments removed"
+                "release and job containers of interrupted commands removed"
             ),
             Err(error) => {
-                tracing::warn!(%error, "release containers of interrupted deployments could not be removed")
+                tracing::warn!(%error, "release and job containers of interrupted commands could not be removed")
             }
         }
         // Unlike containers, a network holds no state, so one without containers
@@ -2006,7 +2407,10 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 continue;
             };
             let redactor = self.follower_redactor(&workload.container_id).await;
-            let reporter = factory.reporter(command_id, workload.log_bounds, redactor);
+            let mut reporter = factory.reporter(command_id, workload.log_bounds, redactor);
+            if let Some(process) = &workload.process {
+                reporter = process_reporter(&reporter, process);
+            }
             if self
                 .containers
                 .start_log_follower(&workload.container_id, reporter)
@@ -2123,9 +2527,12 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .containers
             .workloads(request.project_id, request.deployment_id)
             .await?;
-        let actual_state = if workloads.is_empty() {
+        // The state of a deployment is the state of its web process: that is
+        // what serves, and what `desired_state` is about.
+        let web = web_only(&workloads);
+        let actual_state = if web.is_empty() {
             "missing"
-        } else if workloads.iter().any(ManagedWorkload::is_running) {
+        } else if web.iter().any(ManagedWorkload::is_running) {
             "running"
         } else {
             "stopped"
@@ -2172,10 +2579,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                         factory.reporter(command_id, workload.log_bounds, redactor);
                     let mut started = false;
                     for replica in running {
-                        started |= self.containers.start_log_follower(
-                            &replica.container_id,
-                            Arc::clone(&follower_reporter),
-                        );
+                        let reporter = match &replica.process {
+                            Some(process) => process_reporter(&follower_reporter, process),
+                            None => Arc::clone(&follower_reporter),
+                        };
+                        started |= self
+                            .containers
+                            .start_log_follower(&replica.container_id, reporter);
                     }
                     actions_applied.push(json!({
                         "action": "restart_log_follower",
@@ -2208,14 +2618,13 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     }));
                 }
                 ReconcileWorkloadAction::RestoreRoute => {
-                    if workloads.is_empty() {
+                    if web.is_empty() {
                         return Err(RuntimeError::WorkloadNotFound.into());
                     }
-                    if !workloads.iter().any(ManagedWorkload::is_running) {
+                    if !web.iter().any(ManagedWorkload::is_running) {
                         return Err(RuntimeError::WorkloadNotRunning.into());
                     }
-                    self.activate_workload(&workloads, reporter.as_ref())
-                        .await?;
+                    self.activate_workload(&web, reporter.as_ref()).await?;
                     actions_applied.push(json!({ "action": "restore_route" }));
                 }
             }
@@ -2386,6 +2795,17 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
             .await
             .map_err(Into::into)
     }
+
+    /// Deliberately without the project lock: see [`Self::run_job_container`].
+    async fn run_job(
+        &self,
+        request: RunJobRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        self.run_job_container(request, reporter)
+            .await
+            .map_err(Into::into)
+    }
 }
 
 /// The status a container listed as stopped has once a command started it
@@ -2400,21 +2820,22 @@ struct DeploymentProgress<'a> {
     cutover_started: &'a AtomicBool,
     /// The first replica that failed readiness, whose output explains why.
     failed_replica: &'a OnceLock<String>,
-    release: &'a ReleaseContainer,
+    release: &'a OneOffContainer,
 }
 
-/// The release container of one deployment, removed on every path: by the
-/// release step once the command ended or timed out, by the deployment's
-/// cleanup after a cancellation, and in the background when the command is
-/// dropped before either could run, such as after the shutdown grace.
-struct ReleaseContainer {
+/// The one-off container of a release command or a job, removed on every
+/// path: by the step that ran it once the command ended or timed out, by the
+/// command's cleanup after a cancellation, and in the background when the
+/// command is dropped before either could run, such as after the shutdown
+/// grace.
+struct OneOffContainer {
     containers: Arc<dyn ContainerEngine>,
     name: String,
     /// Set from just before `docker run` until a removal succeeded.
     started: AtomicBool,
 }
 
-impl ReleaseContainer {
+impl OneOffContainer {
     fn new(containers: Arc<dyn ContainerEngine>, name: String) -> Self {
         Self {
             containers,
@@ -2427,31 +2848,31 @@ impl ReleaseContainer {
         self.started.store(true, Ordering::Release);
     }
 
-    /// Does nothing when no release container was started, or it is gone.
+    /// Does nothing when no container was started, or it is gone.
     async fn remove(&self) -> Result<(), RuntimeError> {
         if !self.started.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.containers.remove_release(&self.name).await?;
+        self.containers.remove_one_off(&self.name).await?;
         self.started.store(false, Ordering::Release);
         Ok(())
     }
 }
 
-impl Drop for ReleaseContainer {
+impl Drop for OneOffContainer {
     fn drop(&mut self) {
         if !self.started.load(Ordering::Acquire) {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(container = %self.name, "release container left behind; the next start removes it");
+            tracing::warn!(container = %self.name, "one-off container left behind; the next start removes it");
             return;
         };
         let containers = Arc::clone(&self.containers);
         let name = std::mem::take(&mut self.name);
         runtime.spawn(async move {
-            if let Err(error) = containers.remove_release(&name).await {
-                tracing::warn!(container = %name, %error, "release container could not be removed; the next start removes it");
+            if let Err(error) = containers.remove_one_off(&name).await {
+                tracing::warn!(container = %name, %error, "one-off container could not be removed; the next start removes it");
             }
         });
     }
@@ -2478,6 +2899,92 @@ fn with_replicas(mut details: serde_json::Value, containers: &[String]) -> serde
         details["containers"] = json!(containers);
     }
     details
+}
+
+/// Adds the worker containers to an event of a deployment that has any. A
+/// deployment without workers keeps the event every earlier Agent sent.
+fn with_workers(mut details: serde_json::Value, workers: &[WorkerCandidate]) -> serde_json::Value {
+    if workers.is_empty() {
+        return details;
+    }
+    details["processes"] = json!(
+        workers
+            .iter()
+            .map(|worker| json!({ "process": worker.process, "container": worker.name }))
+            .collect::<Vec<_>>()
+    );
+    details
+}
+
+/// Every container a deployment runs: its web replicas and its workers.
+fn containers_needed(replicas: NonZeroU32, workers: usize) -> NonZeroU32 {
+    u32::try_from(workers)
+        .ok()
+        .and_then(|workers| replicas.checked_add(workers))
+        .unwrap_or(NonZeroU32::MAX)
+}
+
+/// The web replicas among a deployment's containers.
+fn web_only(workloads: &[ManagedWorkload]) -> Vec<ManagedWorkload> {
+    workloads
+        .iter()
+        .filter(|workload| workload.is_web())
+        .cloned()
+        .collect()
+}
+
+/// The cancellation of each job running now, by command, with its project.
+#[derive(Default)]
+struct RunningJobs {
+    jobs: std::sync::Mutex<std::collections::HashMap<Uuid, (Uuid, CancellationToken)>>,
+}
+
+impl RunningJobs {
+    /// Registers a job until the returned guard is dropped.
+    fn track(
+        &self,
+        command_id: Uuid,
+        project_id: Uuid,
+        cancellation: CancellationToken,
+    ) -> TrackedJob<'_> {
+        self.lock().insert(command_id, (project_id, cancellation));
+        TrackedJob {
+            jobs: self,
+            command_id,
+        }
+    }
+
+    /// Cancels every job of the project and returns how many there were.
+    fn cancel_project(&self, project_id: Uuid) -> usize {
+        let jobs = self.lock();
+        let mut cancelled = 0;
+        for (project, cancellation) in jobs.values() {
+            if *project == project_id {
+                cancellation.cancel();
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<Uuid, (Uuid, CancellationToken)>> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct TrackedJob<'a> {
+    jobs: &'a RunningJobs,
+    command_id: Uuid,
+}
+
+impl Drop for TrackedJob<'_> {
+    fn drop(&mut self) {
+        self.jobs.lock().remove(&self.command_id);
+    }
 }
 
 /// The replica count of a non-empty set of `len` containers.
@@ -2510,42 +3017,11 @@ fn build_environment(
         .collect()
 }
 
-const MAX_COMMAND_CHARS: usize = 1_000;
-
-/// An empty command means the project did not set one.
-fn command_field(command: Option<&str>) -> Option<String> {
-    command
-        .map(str::trim)
-        .filter(|command| !command.is_empty())
-        .map(str::to_owned)
-}
-
-fn validate_command_field(name: &str, command: Option<&str>) -> Result<(), RuntimeError> {
-    let Some(command) = command else {
-        return Ok(());
-    };
-    if command.chars().count() > MAX_COMMAND_CHARS || command.contains(['\n', '\r', '\0']) {
-        return Err(RuntimeError::InvalidCommand(format!(
-            "{name} must be one line of at most {MAX_COMMAND_CHARS} characters"
-        )));
-    }
-    Ok(())
-}
-
-/// Stricter than the other command fields, like the control plane: no ASCII
-/// control character at all, so the line shown in the deployment log is the
-/// line that runs.
+/// The release command's rule, `release_command` being optional.
 fn validate_release_command(command: Option<&str>) -> Result<(), RuntimeError> {
-    let Some(command) = command else {
-        return Ok(());
-    };
-    if command.chars().count() > MAX_COMMAND_CHARS || command.chars().any(|c| c.is_ascii_control())
-    {
-        return Err(RuntimeError::InvalidCommand(format!(
-            "release_command must be one line of at most {MAX_COMMAND_CHARS} characters without control characters"
-        )));
-    }
-    Ok(())
+    command.map_or(Ok(()), |command| {
+        validate_shell_command("release_command", command)
+    })
 }
 
 fn validate_payload(
@@ -2559,18 +3035,26 @@ fn validate_payload(
     validate_command_field("build_command", payload.build_command.as_deref())?;
     validate_command_field("start_command", payload.start_command.as_deref())?;
     validate_release_command(payload.release_command.as_deref())?;
-    if payload.container_port == 0 {
-        return Err(RuntimeError::InvalidCommand(
-            "container_port must be greater than zero".to_owned(),
-        ));
-    }
     if !project_domains.accepts(&payload.domain) {
         return Err(RuntimeError::InvalidCommand(format!(
             "domain must be one lowercase DNS label under an allowed suffix ({project_domains}), such as portfolio.{}",
             project_domains.as_slice()[0]
         )));
     }
-    for (key, value) in &payload.environment {
+    validate_environment(&payload.environment, payload.container_port)
+}
+
+/// The variables and port every container of a project gets, a job's too.
+fn validate_environment(
+    environment: &std::collections::BTreeMap<String, String>,
+    container_port: u16,
+) -> Result<(), RuntimeError> {
+    if container_port == 0 {
+        return Err(RuntimeError::InvalidCommand(
+            "container_port must be greater than zero".to_owned(),
+        ));
+    }
+    for (key, value) in environment {
         if !valid_env_key(key) || value.contains(['\n', '\r', '\0']) {
             return Err(RuntimeError::InvalidCommand(format!(
                 "environment entry {key:?} is not safe for a Docker env file"
@@ -2580,16 +3064,50 @@ fn validate_payload(
     // The agent exports PORT so the workload listens where the generated route
     // points. A deployment environment that disagrees would serve on one port
     // and be routed on another, so reject it rather than pick a winner.
-    if let Some(port) = payload.environment.get("PORT") {
+    if let Some(port) = environment.get("PORT") {
         let environment_port = port.parse::<u16>().ok();
-        if environment_port != Some(payload.container_port) {
+        if environment_port != Some(container_port) {
             return Err(RuntimeError::PortConflict {
                 environment_port,
-                container_port: payload.container_port,
+                container_port,
             });
         }
     }
     Ok(())
+}
+
+/// What a job runs and for how long, once its payload passed the rules.
+struct JobSpec {
+    command: String,
+    timeout: std::time::Duration,
+    /// The deployment that built the live image.
+    image_deployment_id: Uuid,
+}
+
+fn validate_job(payload: &RunJobPayload, deployment_id: Uuid) -> Result<JobSpec, RuntimeError> {
+    let command = required_shell_command("command", &payload.command)?;
+    let timeout_seconds = payload.timeout_seconds_or_default();
+    if !(1..=MAX_JOB_TIMEOUT_SECONDS).contains(&timeout_seconds) {
+        return Err(RuntimeError::InvalidCommand(format!(
+            "timeout_seconds must be between 1 and {MAX_JOB_TIMEOUT_SECONDS}"
+        )));
+    }
+    validate_commit_sha(&payload.commit_sha)?;
+    validate_environment(&payload.environment, payload.container_port)?;
+    let image_deployment_id = match payload.reuse_image_from_deployment_id {
+        RequestedImageReuse::Absent => deployment_id,
+        RequestedImageReuse::Deployment(source) => source,
+        RequestedImageReuse::Invalid => {
+            return Err(RuntimeError::InvalidCommand(
+                "reuse_image_from_deployment_id must be a deployment UUID".to_owned(),
+            ));
+        }
+    };
+    Ok(JobSpec {
+        command,
+        timeout: std::time::Duration::from_secs(timeout_seconds),
+        image_deployment_id,
+    })
 }
 
 fn inspection_source(
@@ -2647,7 +3165,15 @@ fn validate_repository_source(repository_url: &str, commit_sha: &str) -> Result<
             "MVP repository URL must identify one GitHub owner and repository".to_owned(),
         ));
     }
-    if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    validate_commit_sha(commit_sha)
+}
+
+const COMMIT_SHA_LENGTH: usize = 40;
+
+fn validate_commit_sha(commit_sha: &str) -> Result<(), RuntimeError> {
+    if commit_sha.len() != COMMIT_SHA_LENGTH
+        || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err(RuntimeError::InvalidCommand(
             "commit_sha must be a complete 40-character Git SHA".to_owned(),
         ));
@@ -2668,6 +3194,7 @@ fn system_log(message: String) -> DeploymentLog {
         stream: LogStream::System,
         message,
         recorded_at: OffsetDateTime::now_utc(),
+        process: None,
     }
 }
 

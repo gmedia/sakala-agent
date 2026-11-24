@@ -390,6 +390,89 @@ berkala merapikannya kemudian. Agent yang tidak mengiklankan `image-rollback` te
 menerima rollback lewat `reuse_image_from_deployment_id`, tetapi image-nya diatur aturan
 GC lama, jadi API sebaiknya tidak menjanjikan "tanpa build".
 
+### Proses worker
+
+Payload `DeployProject` boleh membawa `processes`, yaitu daftar proses worker yang berjalan
+di samping proses web (ADR-022), misalnya `php artisan queue:work`. Contohnya ada di
+`examples/commands/deploy-project-processes.json`. API hanya boleh mengirim field ini ke
+node yang mengiklankan capability `worker-processes`. Agent lama mengabaikannya dan hanya
+menjalankan proses web.
+
+```json
+"processes": [
+  {
+    "name": "queue",
+    "command": "php artisan queue:work --sleep=3 --tries=3 --max-time=3600",
+    "replicas": 1,
+    "resources": { "memory_mb": 192, "cpu_millis": 250, "pids_limit": null }
+  }
+]
+```
+
+| Field | Tipe | Wajib | Arti |
+| --- | --- | --- | --- |
+| `processes` | array atau `null` | tidak | Definisi worker, paling banyak 5. Tidak ada atau `null` berarti hanya proses web, persis seperti sebelum field ini ada. Array kosong juga berarti tanpa worker. |
+| `processes[].name` | string | ya | Huruf kecil, angka, dan `-`, diawali huruf, paling panjang 30 karakter, unik di dalam daftar. `web`, `release`, dan `job` dicadangkan. |
+| `processes[].command` | string | ya | 1 sampai 1000 karakter tanpa control character ASCII, aturan yang sama dengan `release_command`. Spasi di awal dan akhir dibuang; string kosong ditolak. Dijalankan sebagai `sh -c <command>` di dalam container. |
+| `processes[].replicas` | integer 0 sampai `metadata.workloads.maximum_replicas_per_project` | tidak, default 1 | Jumlah container proses ini. `0` menyimpan definisi tanpa menjalankan apa pun. |
+| `processes[].resources` | object `{ memory_mb, cpu_millis, pids_limit }`, setiap field integer atau `null` | tidak | Batas per container. Field yang tidak ada atau `null` memakai nilai `resources` deployment, lalu default node bila itu juga kosong. Nilai di atas batas node gagal seperti `resources` deployment. |
+
+Membaca field ini dibuat longgar seperti `replicas`: nilai yang bukan array definisi
+(misalnya object, string, atau item tanpa `name`/`command`, `replicas` negatif atau
+berupa string) tidak menggagalkan deploy. Proses web tetap dideploy tanpa worker, Agent
+mengirim event `deployment.processes.ignored` (level `warning`, metadata `{}`), dan
+mencatat peringatan di log operator. Daftar yang terbaca tetapi melanggar aturan di atas
+(nama dicadangkan atau dobel, lebih dari 5 definisi, perintah kosong atau multi-baris)
+gagal sebelum checkout dengan `invalid_runtime_command`. `replicas` di atas batas node
+gagal dengan `runtime_replicas_exceeded`, sama seperti replika web.
+
+Setiap worker memakai image, variabel (termasuk `PORT`), network project, runtime
+container, opsi keamanan, dan filter egress yang sama dengan replika web, plus
+`--restart unless-stopped`. Bedanya, worker tidak punya route, tidak diprobe HTTP, tidak
+masuk traffic, dan tidak dipulihkan oleh pemulihan replika. Container-nya bernama
+`sakala-worker-<project8>-<deployment-id>-<name>-r<indeks>` dan membawa label
+`dev.sakala.workload-kind=worker` serta `dev.sakala.process=<name>` (replika web tetap
+`dev.sakala.workload-kind=web`). Label `dev.sakala.replica` dan `dev.sakala.replicas`
+menghitung container proses itu sendiri. Untuk image Railpack dari workspace JavaScript,
+perintah dijalankan di direktori package, sama seperti release command.
+
+Urutan di dalam satu `DeployProject`: build atau reuse, release command satu kali, lalu
+replika web dan worker dinyalakan di bawah satu pemeriksaan kapasitas. Setiap container
+worker dihitung terhadap `SAKALA_MAX_ACTIVE_CONTAINERS` seperti replika. Replika web
+harus lolos cek HTTP seperti biasa; worker dianggap siap bila masih berjalan, tanpa
+restart, `SAKALA_WORKER_STARTUP_SECONDS` (default 10) setelah dinyalakan. Keduanya
+ditunggu bersamaan. Worker yang keluar sebelum titik itu, apa pun exit code-nya termasuk
+0, menggagalkan deploy dengan `worker_start_failed`: semua container baru dihapus,
+output worker yang gagal dikirim sebagai log dengan `process` worker itu, route tidak
+berpindah, dan versi lama tetap melayani bersama worker-nya. Setelah route berpindah,
+container lama dihentikan: replika web dengan grace 10 detik, worker dengan
+`SAKALA_WORKER_STOP_GRACE_SECONDS` (default 30), keduanya bersamaan. Selama beberapa
+detik dua versi worker bisa sama-sama mengambil job antrean, jadi job harus kompatibel
+dengan versi sebelumnya, seperti migrasi release command.
+
+Event deployment yang menyebut container menambah `processes` bila deployment punya
+worker: `deployment.container.started` dan `deployment.runtime.ready` mendapat
+`processes: [{ "process": "queue", "container": "<nama>" }]` (satu item per container), dan
+`deployment.health.started` mendapat `worker_startup_seconds`. Deployment tanpa worker
+mengirim event yang sama persis seperti sebelumnya.
+
+Setelah deploy, worker diperlakukan sebagai bagian dari deployment:
+
+| Command | Perilaku untuk worker |
+| --- | --- |
+| `RestartProject` | Semua replika web dan worker di-restart; route dibangun ulang dari replika web saja. Pemeriksaan "ada yang berjalan" dan halaman tidur memakai replika web. |
+| `SleepProject` | Web dan worker dihentikan bersama, masing-masing dengan grace-nya. Container dan image disimpan. |
+| `WakeProject` | Web dan worker dinyalakan setelah pemeriksaan kapasitas untuk semuanya. Route ditulis untuk replika web. |
+| `StopProject` | Web dan worker dihentikan lalu dihapus. Job project itu yang sedang berjalan di node ini juga dibatalkan (`runtime_cancelled`). |
+| `HealthCheck`, `RefreshRoute`, `ReconcileWorkload.restore_route` | Hanya replika web. `ReconcileWorkload.actual_state` juga dihitung dari replika web. |
+| `ReconcileWorkload.restart_log_follower` | Follower untuk semua container yang berjalan; baris worker ditandai `process`. |
+| Rollback | `DeployProject` biasa dengan `processes` rekaman deployment tujuan. Worker yang ditambahkan setelah deployment tujuan tidak ikut berjalan. |
+
+Worker yang keluar dengan code 0 setelah deploy (misalnya `--max-time` Laravel) dinyalakan
+lagi oleh Docker dan tidak dilaporkan sebagai crash. Exit lain mengikuti aturan crash loop
+yang sama dengan web, tetapi dilaporkan di `crashed_details` dengan `process`, terpisah dari
+proses web; lihat [Heartbeat Payload](#heartbeat-payload).
+
 ### Workload Lifecycle Commands
 
 Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
@@ -510,6 +593,104 @@ snapshot kapasitas lokal. Completion result menyertakan
 `available_workload_slots`; nilai `null` berarti driver tidak dapat menentukan
 nilai tersebut dengan aman. API harus memperlakukannya sebagai telemetry, bukan
 izin untuk melewati safety limit node.
+
+## Job (`RunJob`)
+
+`RunJob` menjalankan satu perintah project satu kali di container dari image deployment
+yang sedang live (ADR-022). API adalah satu-satunya penjadwal: setiap slot jadwal dan
+setiap "Run now" menjadi satu command `RunJob` yang dipin ke node yang melayani project.
+Agent lama gagal membaca respons poll yang berisi tipe command yang tidak dikenal, jadi
+API hanya boleh memberikan `RunJob` ke node yang mengiklankan capability `scheduled-jobs`.
+Contoh lengkap ada di `examples/commands/run-job.json`.
+
+```json
+{
+  "id": "8a6c1e57-2f4b-4b3d-9e0a-5c7d1f2e3a4b",
+  "type": "RunJob",
+  "status": "Pending",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": {
+    "command": "php artisan schedule:run",
+    "timeout_seconds": 300,
+    "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+    "reuse_image_from_deployment_id": "0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b",
+    "container_port": 8000,
+    "environment": { "APP_ENV": "production" },
+    "resources": { "memory_mb": 256, "cpu_millis": 500, "pids_limit": 128 },
+    "log_bounds": { "max_line_length": 4096, "max_batch_lines": 500, "max_total_bytes": 10485760 }
+  }
+}
+```
+
+`project_id` dan `deployment_id` wajib; `deployment_id` adalah deployment live project.
+Semua field selain `command`, `timeout_seconds`, dan `commit_sha` disalin API dari payload
+`DeployProject` deployment live itu, sehingga job memakai persis apa yang dipakai versi live.
+
+| Field | Tipe | Wajib | Arti |
+| --- | --- | --- | --- |
+| `command` | string | ya | 1 sampai 1000 karakter tanpa control character ASCII; spasi di awal dan akhir dibuang, string kosong ditolak. Dijalankan sebagai `sh -c <command>`. |
+| `timeout_seconds` | integer 1 sampai 600 atau `null` | tidak, default 300 | Batas waktu job, dalam detik, dihitung sejak container dinyalakan. |
+| `commit_sha` | string, 40 karakter heksadesimal | ya | Commit deployment live. |
+| `reuse_image_from_deployment_id` | UUID string atau `null` | tidak | Deployment yang membangun image live, bila deployment live memakai ulang image (redeploy konfigurasi atau rollback). Tidak ada berarti `deployment_id` sendiri yang membangunnya. Nilai yang bukan UUID ditolak dengan `invalid_runtime_command`. |
+| `container_port` | integer 1 sampai 65535 | tidak, default 3000 | Diekspor sebagai `PORT`, seperti untuk web. Tidak ada yang listen di sana. |
+| `environment` | object string ke string | tidak | Variabel deployment live, aturan dan redaksi sama dengan `DeployProject`. `PORT` yang berbeda dari `container_port` gagal dengan `runtime_port_conflict`. |
+| `resources` | object `{ memory_mb, cpu_millis, pids_limit }` | tidak | Batas container job; kosong memakai default node, di atas batas node ditolak. |
+| `log_bounds` | object | tidak | Batas log command ini, seperti pada `DeployProject`. |
+
+Agent mencari image di bawah nama yang dihitung sendiri dari project job,
+`sakala/project-<project_id>:<commit12>-<deployment8>` dengan deployment pembangun image,
+lalu memeriksa labelnya seperti reuse image. Jadi job hanya pernah bisa menjalankan image
+project-nya sendiri.
+
+Cara Agent menjalankan job:
+
+- Container `sakala-job-<project8>-<command-id>` dari image itu, dengan network project,
+  runtime container (`runsc` bila dikonfigurasi), opsi keamanan, filter egress, dan batas
+  resource yang sama dengan web, `--pull never`, tanpa restart policy, tanpa route, dan
+  tanpa label `dev.sakala.managed`. Label: `dev.sakala.role=job`, `dev.sakala.project-id`,
+  `dev.sakala.deployment-id`, `dev.sakala.command-id`, `dev.sakala.agent-id`.
+- Job berjalan di pool sendiri, `SAKALA_MAX_CONCURRENT_JOBS` (default 2), di luar
+  `SAKALA_MAX_CONCURRENT_COMMANDS` dan di luar antrean per project: job tidak menunggu
+  deploy, restart, atau sleep project yang sama, dan tidak menahannya. Job tidak pernah
+  menyalakan, menghentikan, atau me-route container web atau worker, jadi project yang
+  tidur tetap tidur dan job tidak dihitung sebagai traffic.
+- Job diterima di bawah pemeriksaan kapasitas node yang sama dengan deploy dan wake,
+  sebagai satu container. Semua container yang berjalan dihitung, termasuk milik project
+  job itu. Selama berjalan, job juga dihitung oleh deploy project lain dan oleh deploy
+  project-nya sendiri, karena deploy tidak menggantikan job.
+- Satu command tidak pernah menjalankan dua container: nama container diturunkan dari ID
+  command, dan scheduler Agent tidak memulai ID command yang sedang berjalan. `idempotency_key`
+  per slot tetap tanggung jawab API pada record command.
+- Container selalu dihapus setelah job selesai, gagal, melewati batas waktu, atau
+  dibatalkan. Saat Agent start, container job yang tertinggal milik Agent ini dihapus
+  bersama container release; command-nya sendiri berakhir lewat lease API.
+- Output container dikirim lewat endpoint logs command ini dengan awalan `[job]` dan
+  `process: "job"`, melewati redaksi yang sama.
+
+Event job:
+
+| Event | Kapan | Metadata |
+| --- | --- | --- |
+| `job.started` | Container job sudah dinyalakan. | `container` (string), `image` (string), `timeout_seconds` (integer). |
+| `job.finished` | Container berakhir dengan cara apa pun selain pembatalan, sebelum `complete`/`fail`. | `exit_code` (integer, `null` setelah timeout), `duration_ms` (integer), `oom_killed` (boolean), `timed_out` (boolean). |
+
+Hasil:
+
+| Hasil | Report | Isi |
+| --- | --- | --- |
+| Exit code 0 | `complete` | `result`: `{ "exit_code": 0, "duration_ms": 1570, "oom_killed": false }`. `duration_ms` dihitung sejak container dinyalakan sampai keluar. |
+| Exit code lain, atau `sh` tidak bisa dijalankan (126/127) | `fail` `job_failed` | Pesan menyebut exit code, dan batas memori bila Docker melaporkan OOM. Exit code terstruktur ada di `job.finished`. |
+| Melewati `timeout_seconds` | `fail` `job_timeout` | Container dimatikan dan dihapus. |
+| Image tidak ada di node, atau label image tidak menyebut project dan deployment itu | `fail` `job_image_missing` | Tidak ada container yang dibuat. Pesan menyarankan deploy ulang. |
+| Node penuh | `fail` `runtime_capacity_exceeded` | Tidak ada container yang dibuat. |
+| `cancel_requested`, `StopProject` project itu, atau Agent dimatikan | `fail` `runtime_cancelled` | Container dihapus. |
+| Payload tidak valid | `fail` `invalid_runtime_command` atau `runtime_port_conflict` | Sebelum container apa pun. |
+
+Batas waktu command `RunJob` di Agent adalah `timeout_seconds` (paling lama 600) ditambah
+30 detik untuk menghentikan, menghapus, dan melaporkan container, bukan
+`SAKALA_COMMAND_TIMEOUT_SECONDS`. API perlu memberi lease setidaknya sepanjang itu
+ditambah grace lease-nya. Contoh body `fail` ada di `examples/failures/job-failures.json`.
 
 ## Pembatalan command
 
@@ -1163,7 +1344,9 @@ project yang tidur sebagai orphan.
 `project_id`/`deployment_id` bernilai `null` bila label tidak dapat dibaca;
 `stale_routes.deployment_id` juga `null` untuk route generasi legacy tanpa
 deployment marker. `workloads.unhealthy_details` memakai bentuk
-`{ container_id, project_id, deployment_id, status, reason }`.
+`{ container_id, project_id, deployment_id, status, reason }`, ditambah `process`
+(string, nama worker) hanya untuk container worker. Item tanpa `process` adalah replika
+web. Worker yang tidak sehat tidak berarti project-nya mati.
 
 `workloads.crashed_details` melaporkan workload managed yang sedang tidak berjalan
 karena process-nya keluar sendiri, atau yang crash berulang.
@@ -1191,6 +1374,7 @@ Field ini opsional bagi API, bersifat aditif pada revision 4, dan contohnya ada 
 | `finished_at` | RFC 3339 atau `null` | Waktu run terakhir berakhir, tanpa pecahan detik. |
 | `restart_count` | integer | Jumlah restart oleh Docker sejak terakhir di-start dengan sengaja. |
 | `running` | boolean | Apakah ada process yang berjalan saat ini. `false` berarti aplikasi sedang tidak berjalan. `true` berarti ia sedang hidup di antara dua crash, jadi UI sebaiknya menyebutnya crash berulang, bukan mati. |
+| `process` | string, hanya ada untuk worker | Nama proses worker yang crash. Tidak ada berarti proses web. Worker yang crash tidak menandai project sebagai crash dan tidak menyentuh route; tampilkan di proses itu. Contoh di `examples/heartbeat/worker-processes.json`. |
 
 Sebuah workload masuk list bila salah satu kondisi ini terpenuhi:
 
@@ -1229,6 +1413,12 @@ Cara membaca list ini:
   Selama satu replika masih melayani, deployment itu tidak dianggap crash; replika
   yang crash terlihat sebagai `ready` yang lebih kecil dari `desired` di
   [`workloads.replicas`](#replika-workload).
+- **Setiap proses dinilai sendiri.** Replika web dan setiap worker dikelompokkan
+  terpisah per deployment, jadi worker yang crash muncul sebagai item dengan `process`
+  walaupun web masih melayani, dan sebaliknya. Worker yang keluar dengan code 0 tidak
+  pernah masuk list, karena itu akhir yang disengaja (misalnya `queue:work --max-time`)
+  dan Docker langsung menyalakannya lagi. Bila exit terakhirnya tidak diketahui, worker
+  tetap dinilai dengan aturan crash biasa.
 - Workload berstatus `restarting` juga muncul di `unhealthy_details`, karena
   keduanya menjawab pertanyaan berbeda. Jangan menjumlahkan keduanya. Workload
   crash berulang yang sedang `running` hanya muncul di `crashed_details`.
@@ -1401,6 +1591,7 @@ opsional, aditif pada revision 4, dan contoh heartbeat lengkapnya ada di
 | `memory_bytes` | integer ≥ 0, wajib | Memori yang dipakai cgroup container menurut `docker stats`, dalam byte. Docker mencetaknya dengan empat angka penting (misalnya `35.8MiB`), jadi nilainya bisa meleset sampai sekitar 0,05%. |
 | `memory_limit_bytes` | integer > 0 atau `null`, wajib | Batas memori yang diberikan ke Docker (`HostConfig.Memory`), dalam byte dan tepat. `null` berarti container berjalan tanpa batas memori. |
 | `restart_count` | integer ≥ 0, wajib | `RestartCount` Docker: berapa kali restart policy Docker menyalakan ulang container sejak terakhir di-start dengan sengaja. Docker mengembalikannya ke 0 pada `docker start` dan `docker restart`, yang dipakai wake, `RestartProject`, dan pemulihan replika. Deployment baru selalu mulai dari 0 karena container-nya baru. |
+| `process` | string, hanya ada untuk worker | Nama proses worker yang dijalankan container ini; `replica` lalu menghitung di antara container proses itu. Tidak ada berarti replika web, sama seperti sebelum worker ada. |
 
 Cara membaca list ini:
 
@@ -1435,7 +1626,11 @@ bila diberi satu ID yang sudah hilang, ia gagal seluruhnya tanpa mencetak apa pu
 menghitung CPU. Sampel dibatasi 12 detik dan berjalan bersamaan dengan probe kesehatan
 heartbeat, bukan setelahnya.
 
-List diurutkan menurut `project_id`, `deployment_id`, lalu `replica`, dan dibatasi
+Container job tidak masuk list, sama seperti container release, karena membawa label
+`dev.sakala.role`.
+
+List diurutkan menurut `project_id`, `deployment_id`, proses (web dulu, lalu worker
+menurut nama), lalu `replica`, dan dibatasi
 `SAKALA_MAX_ACTIVE_CONTAINERS` × `SAKALA_MAX_REPLICAS_PER_PROJECT` item (default 20 × 4,
 yaitu 80 item, sekitar 25 KiB). `detail_counts.metrics` menyimpan jumlah asli.
 
@@ -1810,6 +2005,18 @@ Idempotency-Key: 8b4a0d3e-6f7c-4a3e-9c3f-3f2f1c1c0a11
 }
 ```
 
+Satu item log boleh membawa `process` (string, opsional). Agent mengisinya dengan nama
+worker untuk output container worker, termasuk output startup, output kegagalan, dan
+follower setelah cutover, dan dengan `job` untuk output `RunJob`. Baris milik deployment
+sendiri (build, release command dengan awalan `[release]`, dan replika web dengan awalan
+`[runtime]`) tetap tanpa `process`, persis seperti sebelumnya. Baris setiap worker
+dikirim lewat reporter sendiri dengan budget `max_total_bytes` sendiri dan status
+berhenti sendiri, jadi worker yang ramai log tidak menghabiskan budget proses web, dan
+`422` untuk baris worker hanya menghentikan baris worker itu. API yang menegakkan
+`max_total_bytes` per command perlu menghitungnya per `process` supaya pemisahan ini
+juga berlaku di sisi API. API sekarang mengabaikan key yang tidak dikenal di item log,
+jadi field ini aman untuk API lama.
+
 Tahap `DeployProject` dikirim sebagai event, tepat saat tahap itu dimulai, dalam
 urutan berikut. API yang belum mengenal suatu `type` tetap menyimpannya di timeline
 dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
@@ -1826,6 +2033,7 @@ dan tidak mengubah status deployment, sehingga event baru aman untuk API lama.
 | `deployment.health.started` | Container sudah jalan, probe readiness dimulai. | `health_checking` |
 | `deployment.route.started` | Aplikasi sudah menjawab, route akan diaktifkan. | `routing` |
 | `deployment.runtime.ready` | Route aktif dan cleanup selesai. Bukan penanda routing. | tidak ada; `succeeded` hanya dari `complete` |
+| `deployment.processes.ignored` | Hanya bila `processes` ada tetapi tidak terbaca, sebelum checkout. Level `warning`, metadata `{}`. Deploy berlanjut dengan proses web saja. Lihat [Proses worker](#proses-worker). | tidak ada |
 | `deployment.images.retained` | Hanya bila deployment sudah melayani tetapi image lama project-nya tidak bisa ditandai atau dihapus sesudahnya. Level `warning`, metadata `project_id`. Datang setelah `deployment.runtime.ready`; deployment tetap sukses dan image GC berkala merapikannya. | tidak ada |
 
 Health check selalu terjadi sebelum routing. Route tidak boleh aktif sebelum
@@ -1922,6 +2130,12 @@ di `examples/failures/deploy-failures.json`, yang dicocokkan dengan kode oleh te
 | `runtime_root_directory_invalid` | `root_directory` tidak aman atau tidak menunjuk direktori di dalam repository. | Alasannya, tanpa mengulang path. |
 | `release_command_failed` | Release command keluar dengan exit code selain 0, termasuk 126 atau 127 saat Docker tidak bisa menjalankan `sh` di image. Tidak ada replika yang dinyalakan. | Exit code. Bila Docker melaporkan container dibunuh karena kehabisan memory, juga batas memory yang diterapkan. |
 | `release_command_timeout` | Release command belum selesai sampai `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS`. Container dibunuh dan dihapus, dan tidak ada replika yang dinyalakan. | Batas waktu dalam detik. |
+| `worker_start_failed` | Sebuah worker keluar atau di-restart Docker sebelum route berpindah, apa pun exit code-nya termasuk 0, atau tidak masih berjalan `SAKALA_WORKER_STARTUP_SECONDS` setelah dinyalakan. Semua container baru dihapus, versi lama tetap melayani bersama worker-nya. | Nama worker dan exit code, atau batas memory bila Docker melaporkan OOM. |
+
+`worker_start_failed` juga bisa diperbaiki user: perintah worker atau memorinya. Saran
+pemetaan di API: kategori start, dengan hint membaca log yang `process`-nya worker itu.
+Kode kegagalan `RunJob` (`job_failed`, `job_timeout`, `job_image_missing`) ada di
+[Job (`RunJob`)](#job-runjob).
 
 Kedua code release bisa diperbaiki user: perintahnya, migrasinya, atau batas waktunya.
 Saran pemetaan di API: kategori tersendiri sebelum start, dengan hint untuk membaca log

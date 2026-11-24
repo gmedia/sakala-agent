@@ -137,7 +137,7 @@ Follower memakai reporter deployment yang sama dan seluruh baris tetap melewati 
 
 ## Capacity Guard
 
-`SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard admission guard untuk project aktif pada steady state. Agent melakukan pemeriksaan awal dan pemeriksaan authoritative yang di-serialize tepat sebelum `docker run`, sehingga deployment project baru yang concurrent tidak dapat melewati batas. Redeploy project aktif mengizinkan satu candidate surge sementara untuk cutover sehat, lalu container lama dihentikan dan dihapus. Container [release command](DOCKER_RUNTIME.md#release-command) diterima dengan pemeriksaan yang sama sebelum replika, dan selama berjalan dihitung satu slot oleh project lain.
+`SAKALA_MAX_ACTIVE_CONTAINERS` adalah hard admission guard untuk project aktif pada steady state. Agent melakukan pemeriksaan awal dan pemeriksaan authoritative yang di-serialize tepat sebelum `docker run`, sehingga deployment project baru yang concurrent tidak dapat melewati batas. Redeploy project aktif mengizinkan satu candidate surge sementara untuk cutover sehat, lalu container lama dihentikan dan dihapus. Container [release command](DOCKER_RUNTIME.md#release-command) diterima dengan pemeriksaan yang sama sebelum replika, dan selama berjalan dihitung satu slot oleh project lain. Container [worker](DOCKER_RUNTIME.md#proses-worker) dihitung seperti replika, dan container [job](DOCKER_RUNTIME.md#job) diterima sebagai satu container tambahan yang dihitung oleh semua project, termasuk project-nya sendiri.
 
 Route activation adalah commit point. Sebelum titik ini cancellation/error
 mempertahankan deployment lama dan membersihkan candidate. Setelah titik ini,

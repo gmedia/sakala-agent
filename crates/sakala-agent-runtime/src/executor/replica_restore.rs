@@ -303,6 +303,7 @@ mod tests {
                 count: NonZeroU32::new(count).expect("non-zero"),
             },
             status: status.to_owned(),
+            process: None,
         }
     }
 

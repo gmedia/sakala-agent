@@ -145,13 +145,7 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
             "unhealthy": workloads.unhealthy,
             "stopped": workloads.stopped,
             "maximum_replicas_per_project": workloads.maximum_replicas_per_project,
-            "unhealthy_details": bounded_values(&workloads.unhealthy_details, |snapshot| json!({
-                "container_id": snapshot.workload.container_id,
-                "project_id": snapshot.workload.project_id,
-                "deployment_id": snapshot.workload.deployment_id,
-                "status": snapshot.workload.status,
-                "reason": snapshot.reason,
-            })),
+            "unhealthy_details": bounded_values(&workloads.unhealthy_details, unhealthy_detail),
         },
         "execution": {
             "active_commands": context.scheduler_metrics.active_commands(),
@@ -339,11 +333,32 @@ fn insert_placement(metadata: &mut Value, placement: &NodePlacement) {
     }
 }
 
-/// Groups the snapshot of running containers by deployment. A deployment of
-/// one replica is left out: its single container already speaks for it.
+/// One entry of `workloads.unhealthy_details`. A worker's entry names its
+/// process, so it is never read as the web process being down.
+fn unhealthy_detail(snapshot: &crate::ports::RuntimeHealthSnapshot) -> Value {
+    let mut detail = json!({
+        "container_id": snapshot.workload.container_id,
+        "project_id": snapshot.workload.project_id,
+        "deployment_id": snapshot.workload.deployment_id,
+        "status": snapshot.workload.status,
+        "reason": snapshot.reason,
+    });
+    if let Some(process) = &snapshot.process {
+        detail["process"] = json!(process);
+    }
+    detail
+}
+
+/// Groups the snapshot of running web containers by deployment. A deployment
+/// of one replica is left out: its single container already speaks for it.
+/// Worker containers are not replicas of the deployment, so they are not
+/// counted.
 fn deployment_replicas(snapshots: &[crate::ports::RuntimeHealthSnapshot]) -> Vec<WorkloadReplicas> {
     let mut deployments = BTreeMap::<(Uuid, Uuid), WorkloadReplicas>::new();
-    for snapshot in snapshots {
+    for snapshot in snapshots
+        .iter()
+        .filter(|snapshot| snapshot.process.is_none())
+    {
         let workload = &snapshot.workload;
         let entry = deployments
             .entry((workload.project_id, workload.deployment_id))
@@ -611,6 +626,7 @@ mod tests {
             finished_at: Some(OffsetDateTime::UNIX_EPOCH),
             restart_count: 4,
             running: true,
+            process: None,
         }
     }
 
@@ -761,6 +777,7 @@ mod tests {
                 ready: false,
                 reason: Some("health check failed".to_owned()),
                 desired_replicas: NonZeroU32::MIN,
+                process: None,
             }],
         };
         let heartbeat = payload(
@@ -856,6 +873,7 @@ mod tests {
                 ready: false,
                 reason: Some("health check failed".to_owned()),
                 desired_replicas: NonZeroU32::MIN,
+                process: None,
             })
             .collect();
         let reconciliation = RuntimeReconciliationReport {
@@ -1185,7 +1203,66 @@ mod tests {
             ready,
             reason: None,
             desired_replicas: NonZeroU32::new(desired).expect("non-zero"),
+            process: None,
         }
+    }
+
+    #[tokio::test]
+    async fn worker_containers_are_not_replicas_and_name_their_process_when_unhealthy() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let (project, deployment) = (Uuid::new_v4(), Uuid::new_v4());
+        let worker = |ready| {
+            let mut snapshot = RuntimeHealthSnapshot {
+                process: Some("queue".to_owned()),
+                ..replica(project, deployment, 2, ready)
+            };
+            if !ready {
+                // `Restarting` reads as starting, which is never listed.
+                "Up 1 minute (unhealthy)".clone_into(&mut snapshot.workload.status);
+            }
+            snapshot
+        };
+        let runtime = ReplicaRuntime {
+            snapshots: vec![
+                replica(project, deployment, 1, true),
+                worker(true),
+                worker(false),
+            ],
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        assert!(
+            heartbeat.metadata["workloads"].get("replicas").is_none(),
+            "one web replica: {}",
+            heartbeat.metadata["workloads"]
+        );
+        let unhealthy = heartbeat.metadata["workloads"]["unhealthy_details"]
+            .as_array()
+            .expect("unhealthy details");
+        assert_eq!(unhealthy.len(), 1);
+        assert_eq!(unhealthy[0]["process"], "queue");
+    }
+
+    #[tokio::test]
+    async fn an_unhealthy_web_replica_has_no_process_key() {
+        let config = AgentConfig::from_values(&HashMap::new()).expect("config");
+        let mut unhealthy = replica(Uuid::new_v4(), Uuid::new_v4(), 1, false);
+        "Up 1 minute (unhealthy)".clone_into(&mut unhealthy.workload.status);
+        let runtime = ReplicaRuntime {
+            snapshots: vec![unhealthy],
+        };
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(Arc::new(runtime), RuntimeReconciliationReport::default()),
+        )
+        .await;
+
+        let unhealthy = &heartbeat.metadata["workloads"]["unhealthy_details"][0];
+        assert!(unhealthy.get("process").is_none(), "{unhealthy}");
     }
 
     #[tokio::test]
@@ -1467,6 +1544,7 @@ mod tests {
                     memory_bytes: 37_538_611,
                     memory_limit_bytes: Some(268_435_456),
                     restart_count: 2,
+                    process: None,
                 }]),
             }),
             RuntimeReconciliationReport::default(),

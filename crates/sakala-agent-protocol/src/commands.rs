@@ -6,7 +6,7 @@ use crate::{
     BucketKeyPayload, BucketPayloadError, CommandStatus, CreateBucketPayload,
     CreateDatabasePayload, DatabasePayloadError, DatabaseTargetPayload, DeployProjectPayload,
     DropDatabasePayload, InspectProjectPayload, InstallDatabaseExtensionPayload,
-    RotateBucketKeyPayload, RotateDatabasePasswordPayload, SetBucketQuotaPayload,
+    RotateBucketKeyPayload, RotateDatabasePasswordPayload, RunJobPayload, SetBucketQuotaPayload,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,6 +106,9 @@ pub enum CommandType {
     SetBucketQuota,
     LockBucket,
     UnlockBucket,
+    /// One run of a project command in a container of the live image, only on
+    /// nodes that advertise `scheduled-jobs`.
+    RunJob,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -123,6 +126,10 @@ pub struct AgentCommand {
 
 impl AgentCommand {
     pub fn deploy_payload(&self) -> Result<DeployProjectPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
+    }
+
+    pub fn run_job_payload(&self) -> Result<RunJobPayload, serde_json::Error> {
         serde_json::from_value(self.payload.clone())
     }
 

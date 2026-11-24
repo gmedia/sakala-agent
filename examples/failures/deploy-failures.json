@@ -54,5 +54,13 @@
   {
     "error_code": "runtime_app_host_blocked",
     "error_message": "Django refuses requests for portfolio.sakala.app (DisallowedHost), so every visitor would get HTTP 400; add it to ALLOWED_HOSTS in settings.py, and turn DEBUG off for production"
+  },
+  {
+    "error_code": "worker_start_failed",
+    "error_message": "worker queue exited during start with exit code 1, so this deployment was not started; the previous version keeps running"
+  },
+  {
+    "error_code": "worker_start_failed",
+    "error_message": "worker queue ran out of memory (limit 192 MB) during start, so this deployment was not started; the previous version keeps running"
   }
 ]
