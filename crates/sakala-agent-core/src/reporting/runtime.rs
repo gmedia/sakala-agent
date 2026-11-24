@@ -151,6 +151,9 @@ struct ReporterInner {
     client: ApiClient,
     command_id: Uuid,
     log_bounds: LogBounds,
+    /// Marks every line this reporter queues, for the reporter of one worker
+    /// process. `None` leaves the lines as the runtime wrote them.
+    process: Option<String>,
     batch_max_lines: usize,
     policy: LogDeliveryPolicy,
     state: StdMutex<LogState>,
@@ -224,6 +227,16 @@ impl ApiRuntimeReporter {
         log_bounds: LogBounds,
         policy: LogDeliveryPolicy,
     ) -> Self {
+        Self::for_lines_of(client, command_id, log_bounds, policy, None)
+    }
+
+    fn for_lines_of(
+        client: ApiClient,
+        command_id: Uuid,
+        log_bounds: LogBounds,
+        policy: LogDeliveryPolicy,
+        process: Option<String>,
+    ) -> Self {
         let batch_max_lines = log_bounds
             .max_batch_lines
             .and_then(|lines| usize::try_from(lines).ok())
@@ -239,6 +252,7 @@ impl ApiRuntimeReporter {
                 client,
                 command_id,
                 log_bounds,
+                process,
                 batch_max_lines,
                 policy,
                 state: StdMutex::new(LogState::default()),
@@ -427,6 +441,7 @@ impl ReporterInner {
                     "{missing} log lines are missing here: the Sakala Agent could not reach the control plane in time and dropped them."
                 ),
                 recorded_at: OffsetDateTime::now_utc(),
+                process: self.process.clone(),
             },
             self.log_bounds,
             state.budget_used,
@@ -591,7 +606,10 @@ impl RuntimeReporter for ApiRuntimeReporter {
         self.events.send(&event).await
     }
 
-    async fn log(&self, log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+    async fn log(&self, mut log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+        if let Some(process) = &self.inner.process {
+            log.process.get_or_insert_with(|| process.clone());
+        }
         let spawn = {
             let mut state = self.inner.lock_state();
             if let Some(reason) = &state.delivery_stopped {
@@ -653,6 +671,22 @@ impl RuntimeReporter for ApiRuntimeReporter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// A reporter of its own, with its own queue, `max_total_bytes` budget,
+    /// and stopped state, so a worker whose lines the control plane refuses
+    /// does not stop the deployment's own lines.
+    fn for_process(&self, process: &str) -> Option<Arc<dyn RuntimeReporter>> {
+        Some(Arc::new(
+            Self::for_lines_of(
+                self.inner.client.clone(),
+                self.inner.command_id,
+                self.inner.log_bounds,
+                self.inner.policy,
+                Some(process.to_owned()),
+            )
+            .with_redactor(self.redactor.clone()),
+        ))
     }
 }
 
@@ -775,6 +809,7 @@ mod tests {
             stream: LogStream::Stdout,
             message: message.to_owned(),
             recorded_at: OffsetDateTime::now_utc(),
+            process: None,
         }
     }
 

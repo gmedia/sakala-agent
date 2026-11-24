@@ -51,8 +51,11 @@ pub async fn run(
         }
         Arc::new(processor)
     });
-    let mut executions =
-        CommandExecutions::new(config.max_concurrent_commands, Arc::clone(&metrics));
+    let mut executions = CommandExecutions::new(
+        config.max_concurrent_commands,
+        config.max_concurrent_jobs,
+        Arc::clone(&metrics),
+    );
 
     'polling: loop {
         let panicked = executions.reap_completed();
@@ -156,36 +159,81 @@ pub async fn run(
 
 /// Bounds active command work without creating queued tasks. Commands that cannot
 /// start remain pending in the control plane and will be considered again on a
-/// later poll. A project may own at most one active command at a time.
+/// later poll. A project may own at most one active command at a time, except
+/// for job runs, which have a pool of their own and never hold the project.
 struct CommandExecutions {
     heavy_limit: usize,
     lightweight_limit: usize,
+    job_limit: usize,
     active_heavy: usize,
     active_lightweight: usize,
+    active_jobs: usize,
     active_projects: HashSet<Uuid>,
     metrics: Arc<SchedulerMetrics>,
     task_metadata: HashMap<tokio::task::Id, TaskMetadata>,
     tasks: JoinSet<(Uuid, Option<Uuid>)>,
 }
 
+/// The slots a command takes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pool {
+    /// Builds, deploys, and lifecycle commands: `SAKALA_MAX_CONCURRENT_COMMANDS`.
+    Heavy,
+    /// Short checks that must not wait behind a build: one slot.
+    Lightweight,
+    /// `RunJob`: `SAKALA_MAX_CONCURRENT_JOBS`, outside the project's queue.
+    Job,
+}
+
+impl Pool {
+    fn of(command_type: CommandType) -> Self {
+        if command_type == CommandType::RunJob {
+            Self::Job
+        } else if is_lightweight(command_type) {
+            Self::Lightweight
+        } else {
+            Self::Heavy
+        }
+    }
+}
+
 struct TaskMetadata {
     command_id: Uuid,
+    /// The project this command holds while it runs; `None` for a job.
     project_id: Option<Uuid>,
     cancellation: CancellationToken,
-    lightweight: bool,
+    pool: Pool,
 }
 
 impl CommandExecutions {
-    fn new(limit: usize, metrics: Arc<SchedulerMetrics>) -> Self {
+    fn new(limit: usize, job_limit: usize, metrics: Arc<SchedulerMetrics>) -> Self {
         Self {
             heavy_limit: limit,
             lightweight_limit: 1,
+            job_limit,
             active_heavy: 0,
             active_lightweight: 0,
+            active_jobs: 0,
             active_projects: HashSet::new(),
             metrics,
             task_metadata: HashMap::new(),
             tasks: JoinSet::new(),
+        }
+    }
+
+    fn active_in(&mut self, pool: Pool) -> &mut usize {
+        match pool {
+            Pool::Heavy => &mut self.active_heavy,
+            Pool::Lightweight => &mut self.active_lightweight,
+            Pool::Job => &mut self.active_jobs,
+        }
+    }
+
+    const fn limit_of(&self, pool: Pool) -> usize {
+        match pool {
+            Pool::Heavy => self.heavy_limit,
+            Pool::Lightweight => self.lightweight_limit,
+            Pool::Job => self.job_limit,
         }
     }
 
@@ -203,10 +251,18 @@ impl CommandExecutions {
         F: Future<Output = ()> + Send + 'static,
     {
         let command_id = command.id;
-        let project_id = command.project_id;
-        let lightweight = is_lightweight(command.command_type);
-        if (lightweight && self.active_lightweight >= self.lightweight_limit)
-            || (!lightweight && self.active_heavy >= self.heavy_limit)
+        let pool = Pool::of(command.command_type);
+        // A job runs next to the project's own commands, so it holds no project.
+        let project_id = command.project_id.filter(|_| pool != Pool::Job);
+        let limit = self.limit_of(pool);
+        // The same command is offered again until its claim lands, and a
+        // command must never run twice at once.
+        let already_running = self
+            .task_metadata
+            .values()
+            .any(|task| task.command_id == command_id);
+        if already_running
+            || *self.active_in(pool) >= limit
             || project_id.is_some_and(|project_id| self.active_projects.contains(&project_id))
         {
             return false;
@@ -215,11 +271,7 @@ impl CommandExecutions {
         if let Some(project_id) = project_id {
             self.active_projects.insert(project_id);
         }
-        if lightweight {
-            self.active_lightweight += 1;
-        } else {
-            self.active_heavy += 1;
-        }
+        *self.active_in(pool) += 1;
         self.metrics.command_started();
         let task = self.tasks.spawn(async move {
             work.await;
@@ -231,7 +283,7 @@ impl CommandExecutions {
                 command_id,
                 project_id,
                 cancellation,
-                lightweight,
+                pool,
             },
         );
         true
@@ -288,11 +340,8 @@ impl CommandExecutions {
         if let Some(project_id) = task.project_id {
             self.active_projects.remove(&project_id);
         }
-        if task.lightweight {
-            self.active_lightweight = self.active_lightweight.saturating_sub(1);
-        } else {
-            self.active_heavy = self.active_heavy.saturating_sub(1);
-        }
+        let active = self.active_in(task.pool);
+        *active = active.saturating_sub(1);
         self.metrics.command_finished();
     }
 
@@ -383,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn lightweight_work_uses_a_slot_separate_from_heavy_build_work() {
-        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
+        let mut executions = CommandExecutions::new(1, 1, Arc::new(SchedulerMetrics::default()));
         let (release_build, wait_build) = oneshot::channel();
         let (release_health, wait_health) = oneshot::channel();
 
@@ -415,7 +464,7 @@ mod tests {
     async fn bounds_global_work_and_serializes_each_project() {
         let project_a = Uuid::new_v4();
         let project_b = Uuid::new_v4();
-        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
+        let mut executions = CommandExecutions::new(2, 1, Arc::new(SchedulerMetrics::default()));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let (release_a, wait_a) = oneshot::channel();
@@ -449,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn graceful_shutdown_cancels_multiple_in_flight_commands() {
-        let mut executions = CommandExecutions::new(2, Arc::new(SchedulerMetrics::default()));
+        let mut executions = CommandExecutions::new(2, 1, Arc::new(SchedulerMetrics::default()));
         let first_cancellation = CancellationToken::new();
         let second_cancellation = CancellationToken::new();
 
@@ -473,6 +522,7 @@ mod tests {
     #[tokio::test]
     async fn a_panicked_task_is_returned_so_its_command_can_be_failed() {
         let mut executions = CommandExecutions::new(
+            1,
             1,
             Arc::new(crate::scheduler::metrics::SchedulerMetrics::default()),
         );
@@ -501,6 +551,7 @@ mod tests {
     async fn cancel_requested_only_touches_the_listed_running_command() {
         let mut executions = CommandExecutions::new(
             2,
+            1,
             Arc::new(crate::scheduler::metrics::SchedulerMetrics::default()),
         );
         let listed = command(Some(Uuid::new_v4()));
@@ -529,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn failed_task_releases_its_project_and_capacity() {
         let project_id = Uuid::new_v4();
-        let mut executions = CommandExecutions::new(1, Arc::new(SchedulerMetrics::default()));
+        let mut executions = CommandExecutions::new(1, 1, Arc::new(SchedulerMetrics::default()));
 
         assert!(
             executions.try_start(command(Some(project_id)), CancellationToken::new(), async {

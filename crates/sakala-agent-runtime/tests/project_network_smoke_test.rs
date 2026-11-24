@@ -272,6 +272,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
                     port: PORT,
                     log_bounds: LogBounds::default(),
                     start_command: Some(format!("caddy respond --listen :{PORT} {}", project.body)),
+                    process: None,
                 },
                 &NullReporter,
             )

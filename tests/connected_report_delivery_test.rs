@@ -79,6 +79,7 @@ fn log(message: &str) -> DeploymentLog {
         stream: LogStream::Stdout,
         message: message.to_owned(),
         recorded_at: OffsetDateTime::now_utc(),
+        process: None,
     }
 }
 

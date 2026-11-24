@@ -203,6 +203,7 @@ mod tests {
             memory_bytes: 1_024,
             memory_limit_bytes: None,
             restart_count: 0,
+            process: None,
         }
     }
 

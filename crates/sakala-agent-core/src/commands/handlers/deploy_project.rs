@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sakala_agent_protocol::{AgentCommand, RequestedReplicas};
+use sakala_agent_protocol::{AgentCommand, RequestedProcesses, RequestedReplicas};
 use tokio_util::sync::CancellationToken;
 
 use crate::ports::{
@@ -31,6 +31,15 @@ pub async fn handle(
             command_id = %command.id,
             %project_id,
             "DeployProject replicas is not a positive integer; running one replica"
+        );
+    }
+    // Same reasoning: the web process still gets its new release, and the
+    // runtime tells the deployment's timeline that no worker runs.
+    if payload.processes == RequestedProcesses::Unreadable {
+        tracing::warn!(
+            command_id = %command.id,
+            %project_id,
+            "DeployProject processes is not a list of worker definitions; running the web process only"
         );
     }
     let repository_credential = repository_credentials

@@ -7224,6 +7224,11 @@ fn is_workload_run(spec: &CommandSpec) -> bool {
         && !is_release_run(spec)
 }
 
+/// A `docker ps` filter on one-off containers: any role, or one of them.
+fn is_one_off_filter(argument: &str) -> bool {
+    argument == "label=dev.sakala.role" || argument.starts_with("label=dev.sakala.role=")
+}
+
 fn is_release_run(spec: &CommandSpec) -> bool {
     spec.program == "docker"
         && spec.args.first().is_some_and(|argument| argument == "run")
@@ -7355,8 +7360,11 @@ struct FakeRunner {
     router_networks_stdout: String,
     address_pools_stdout: String,
     network_create_stderr: Option<String>,
-    /// `docker ps` of release containers, for capacity and startup cleanup.
+    /// `docker ps` of one-off containers, for capacity, and of release
+    /// containers, for startup cleanup.
     release_ps_stdout: String,
+    /// `docker ps` of job containers, for startup cleanup.
+    job_ps_stdout: String,
     /// What `docker wait` prints for the release container.
     release_exit_stdout: String,
     release_oom_killed: bool,
@@ -7459,7 +7467,7 @@ impl ProcessRunner for AdmissionRunner {
             && !spec
                 .args
                 .iter()
-                .any(|argument| argument == "label=dev.sakala.role=release")
+                .any(|argument| is_one_off_filter(&argument.to_string_lossy()))
             && spec
                 .args
                 .iter()
@@ -7632,6 +7640,7 @@ impl FakeRunner {
             address_pools_stdout: r#"[{"Base":"172.16.0.0/12","Size":24}]"#.to_owned(),
             network_create_stderr: None,
             release_ps_stdout: String::new(),
+            job_ps_stdout: String::new(),
             release_exit_stdout: "0\n".to_owned(),
             release_oom_killed: false,
             release_run_failure: None,
@@ -7680,11 +7689,10 @@ impl FakeRunner {
             stderr: stderr.to_owned(),
         };
         match args.first().map(String::as_str) {
-            Some("ps")
-                if args
-                    .iter()
-                    .any(|arg| arg == "label=dev.sakala.role=release") =>
-            {
+            Some("ps") if args.iter().any(|arg| arg == "label=dev.sakala.role=job") => {
+                Some(output(true, 0, &self.job_ps_stdout, ""))
+            }
+            Some("ps") if args.iter().any(|arg| is_one_off_filter(arg)) => {
                 Some(output(true, 0, &self.release_ps_stdout, ""))
             }
             Some("wait") => Some(output(true, 0, &self.release_exit_stdout, "")),
@@ -8286,10 +8294,11 @@ impl ProcessRunner for FakeRunner {
         } else if live_caddy_probe {
             "true\n"
         } else if spec.program == "docker"
-            && spec
-                .args
-                .iter()
-                .any(|argument| argument == "{{.State.Running}}\t{{.Name}}")
+            && spec.args.iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .starts_with("{{.State.Running}}\t{{.Name}}")
+            })
         {
             spec.args
                 .last()
@@ -9279,14 +9288,8 @@ impl ProcessRunner for ReplicaRestoreRunner {
         }
         let statuses = self.statuses.lock().expect("status lock").clone();
         match args.first().map(String::as_str) {
-            // No release container runs during a restore.
-            Some("ps")
-                if args
-                    .iter()
-                    .any(|arg| arg == "label=dev.sakala.role=release") =>
-            {
-                success(String::new())
-            }
+            // No release or job container runs during a restore.
+            Some("ps") if args.iter().any(|arg| is_one_off_filter(arg)) => success(String::new()),
             Some("ps")
                 if args
                     .iter()

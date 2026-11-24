@@ -11,6 +11,12 @@ pub const REGION_ENV: &str = "SAKALA_AGENT_REGION";
 /// `metadata.runtime.edge_address`.
 pub const EDGE_ADDRESS_ENV: &str = "SAKALA_AGENT_EDGE_ADDRESS";
 
+/// How many `RunJob` commands the node runs at once, in a pool of their own.
+pub const MAX_CONCURRENT_JOBS_ENV: &str = "SAKALA_MAX_CONCURRENT_JOBS";
+
+/// Default of [`MAX_CONCURRENT_JOBS_ENV`] (ADR-022).
+pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 2;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AgentMode {
     #[default]
@@ -51,6 +57,9 @@ pub struct AgentConfig {
     pub heartbeat_interval_seconds: u64,
     pub command_timeout_seconds: u64,
     pub max_concurrent_commands: usize,
+    /// Slots of `RunJob`, apart from `max_concurrent_commands`, so a long job
+    /// never holds back a deploy.
+    pub max_concurrent_jobs: usize,
     pub shutdown_grace_seconds: u64,
     pub runtime_network: String,
     pub capabilities: Vec<String>,
@@ -100,6 +109,11 @@ impl AgentConfig {
                 900,
             )?,
             max_concurrent_commands: positive_usize(values, "SAKALA_MAX_CONCURRENT_COMMANDS", 4)?,
+            max_concurrent_jobs: positive_usize(
+                values,
+                MAX_CONCURRENT_JOBS_ENV,
+                DEFAULT_MAX_CONCURRENT_JOBS,
+            )?,
             shutdown_grace_seconds: positive_number(values, "SAKALA_SHUTDOWN_GRACE_SECONDS", 30)?,
             runtime_network: get(values, "SAKALA_RUNTIME_NETWORK", "sakala-runtime"),
             capabilities: vec!["noop-runtime".to_owned()],

@@ -29,7 +29,7 @@ use crate::{
     containers::limits::docker_cpu_value,
     containers::{
         ClaimProject, ContainerEngine, FailureOutput, ImageCleanup, ImageRetention, ListedReplica,
-        ManagedWorkload, ReleaseContainerRequest, ReleaseExit, ResourceSafetyConfig,
+        ManagedWorkload, OneOffContainerRequest, OneOffExit, OneOffRole, ResourceSafetyConfig,
         RoutedWorkload, RunContainerRequest,
         images::{
             CONTAINER_IMAGE_FORMAT, ContainerUsage, IMAGE_INSPECT_FORMAT, IMAGE_LABELS_FORMAT,
@@ -45,6 +45,7 @@ use crate::{
         },
         network::ProjectNetworks,
         replicas::{REPLICA_LABEL, REPLICAS_LABEL, ReplicaSlot},
+        workers::{PROCESS_LABEL, WORKLOAD_KIND_LABEL_KEY, process_from_labels, process_labels},
     },
     logs::ReporterOutputSink,
     process::run_checked,
@@ -53,7 +54,6 @@ use crate::{
 
 const MANAGED_LABEL: &str = "dev.sakala.managed=true";
 const AGENT_ID_LABEL: &str = "dev.sakala.agent-id";
-const WORKLOAD_KIND_LABEL: &str = "dev.sakala.workload-kind=web";
 const DOMAIN_LABEL: &str = "dev.sakala.domain";
 const PORT_LABEL: &str = "dev.sakala.port";
 const COMMAND_ID_LABEL: &str = "dev.sakala.command-id";
@@ -62,23 +62,28 @@ const LOG_MAX_BATCH_LABEL: &str = "dev.sakala.log-max-batch-lines";
 const LOG_MAX_TOTAL_LABEL: &str = "dev.sakala.log-max-total-bytes";
 const PROJECT_ID_LABEL: &str = "dev.sakala.project-id";
 const DEPLOYMENT_ID_LABEL: &str = "dev.sakala.deployment-id";
-/// Marks the container of a release command. It never carries
+/// Marks a one-off container, `dev.sakala.role=<role>` with the role of
+/// [`OneOffRole::as_str`]: `release` or `job`. It never carries
 /// `MANAGED_LABEL`, so nothing that lists workloads sees it.
-const RELEASE_ROLE_LABEL: &str = "dev.sakala.role=release";
-/// Key of [`RELEASE_ROLE_LABEL`], read back by listings that must skip it.
 const ROLE_LABEL_KEY: &str = "dev.sakala.role";
 /// Why a stopped container no sleeping route points at is an orphan.
 const STALE_STOPPED_REASON: &str = "stale stopped deployment container";
-/// Prefix of the release container's output in the deployment log, next to
-/// `build` and `runtime`.
-const RELEASE_LOG_PHASE: &str = "release";
-/// Restart policy of a workload. A release container keeps Docker's default,
-/// which never restarts: it runs once.
+/// Restart policy of a workload, web or worker. A one-off container keeps
+/// Docker's default, which never restarts: it runs once.
 const WORKLOAD_RESTART_POLICY: &str = "unless-stopped";
+/// Keeps a job from ever reaching a registry: its image is local or missing.
+const JOB_PULL_POLICY: &str = "never";
+/// What Docker says when `--pull never` finds no local image.
+const NO_SUCH_IMAGE_MESSAGE: &str = "no such image";
+/// How long a web replica gets between `SIGTERM` and `SIGKILL`.
+pub const DEFAULT_WEB_STOP_GRACE: Duration = Duration::from_secs(10);
+/// Default of `SAKALA_WORKER_STOP_GRACE_SECONDS`: how long a worker gets
+/// between `SIGTERM` and `SIGKILL`, to finish the job in hand (ADR-022).
+pub const DEFAULT_WORKER_STOP_GRACE: Duration = Duration::from_secs(30);
 /// What `docker run` exits with when it cannot invoke the command (126) or
 /// cannot find it (127), such as `sh` missing from the image.
 const COMMAND_NOT_RUNNABLE_EXIT_CODES: [i32; 2] = [126, 127];
-const RELEASE_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ONE_OFF_INSPECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_LOG_TAIL_LINES: u64 = 100;
 const FAILURE_LOG_TIMEOUT: Duration = Duration::from_secs(10);
 const CRASH_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -99,10 +104,16 @@ const METRICS_STATS_TIMEOUT: Duration = Duration::from_secs(8);
 const METRICS_INSPECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Set by the image or by Sakala itself, and common in ordinary log text.
 const NON_SECRET_ENVIRONMENT_KEYS: [&str; 3] = ["PATH", "HOME", "PORT"];
+/// `docker inspect` of a container the new deployment replaces: whether it
+/// runs, its name, and the worker process it runs, empty for a web replica.
+const PREVIOUS_CONTAINER_FORMAT: &str =
+    "{{.State.Running}}\t{{.Name}}\t{{index .Config.Labels \"dev.sakala.process\"}}";
 const CRASH_STATE_FORMAT: &str = "{{.Id}}\t{{.State.Status}}\t{{.RestartCount}}\t{{.State.ExitCode}}\t{{.State.OOMKilled}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}";
 const EXIT_EVENTS_FORMAT: &str = "{{.Actor.ID}}\t{{.Action}}\t{{.Actor.Attributes.exitCode}}";
 /// Exit code of a SIGKILL, which is what the kernel OOM killer sends.
 const SIGKILL_EXIT_CODE: i32 = 137;
+/// The exit of a worker that ended on purpose, which is never a crash.
+const EXPECTED_WORKER_EXIT_CODE: i32 = 0;
 /// The only Linux capabilities a workload keeps after `--cap-drop ALL`.
 ///
 /// Most images start as root and then switch to an unprivileged user: the
@@ -168,6 +179,34 @@ impl ContainerDns {
     }
 }
 
+/// How long each kind of workload gets between `SIGTERM` and `SIGKILL` when
+/// the Agent stops or restarts it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StopGrace {
+    pub web: Duration,
+    pub worker: Duration,
+}
+
+impl Default for StopGrace {
+    fn default() -> Self {
+        Self {
+            web: DEFAULT_WEB_STOP_GRACE,
+            worker: DEFAULT_WORKER_STOP_GRACE,
+        }
+    }
+}
+
+impl StopGrace {
+    /// The grace of the process a container runs, in whole seconds for
+    /// `docker stop --time`.
+    fn seconds_for(self, process: Option<&str>) -> u64 {
+        match process {
+            None => self.web.as_secs(),
+            Some(_) => self.worker.as_secs(),
+        }
+    }
+}
+
 /// What a node adds to every workload it starts, as opposed to what a command asks for.
 #[derive(Default)]
 pub struct WorkloadIsolation {
@@ -184,6 +223,7 @@ pub struct DockerContainerEngine {
     crash_stable_window: Duration,
     container_runtime: Option<String>,
     container_dns: Option<ContainerDns>,
+    stop_grace: StopGrace,
     /// Restarts already written to the operator log, by container.
     logged_restarts: Mutex<HashMap<String, u32>>,
     log_followers: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -370,9 +410,55 @@ impl DockerContainerEngine {
             crash_stable_window,
             container_runtime: isolation.container_runtime,
             container_dns: isolation.container_dns,
+            stop_grace: StopGrace::default(),
             logged_restarts: Mutex::new(HashMap::new()),
             log_followers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Replaces the default [`StopGrace`].
+    #[must_use]
+    pub fn with_stop_grace(mut self, stop_grace: StopGrace) -> Self {
+        self.stop_grace = stop_grace;
+        self
+    }
+
+    /// Running containers that count against the node's maximum, by project:
+    /// managed workloads, then one-off containers with their role.
+    async fn running_containers(&self) -> Result<RunningContainers, RuntimeError> {
+        let workloads = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={MANAGED_LABEL}"))
+            .arg("--format")
+            .arg(format!("{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}"));
+        let workloads = self
+            .read_docker(&workloads, "docker capacity inspection")
+            .await?;
+        // A one-off container is not a managed workload, but it runs on the
+        // node like one until its command exits.
+        let one_offs = CommandSpec::new("docker")
+            .arg("ps")
+            .arg("--filter")
+            .arg(format!("label={ROLE_LABEL_KEY}"))
+            .arg("--format")
+            .arg(format!(
+                "{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
+            ));
+        let one_offs = self
+            .read_docker(&one_offs, "docker one-off capacity inspection")
+            .await?;
+        Ok(RunningContainers {
+            workloads: non_empty_lines(&workloads)
+                .map(|project| project.to_owned())
+                .collect(),
+            one_offs: non_empty_lines(&one_offs)
+                .map(|line| {
+                    let (project, role) = line.split_once('\t').unwrap_or((line, ""));
+                    (project.trim().to_owned(), role.trim().to_owned())
+                })
+                .collect(),
+        })
     }
 
     /// Railpack images serve on `$PORT` (its Caddyfile listens on
@@ -482,40 +568,20 @@ impl ContainerEngine for DockerContainerEngine {
         project_id: Uuid,
         replicas: NonZeroU32,
     ) -> Result<(), RuntimeError> {
-        let command = CommandSpec::new("docker")
-            .arg("ps")
-            .arg("--filter")
-            .arg(format!("label={MANAGED_LABEL}"))
-            .arg("--format")
-            .arg("{{.Label \"dev.sakala.project-id\"}}");
-        let output = self.runner.run(&command, &NullOutputSink).await?;
-        if !output.success {
-            return Err(RuntimeError::Container(format!(
-                "docker capacity inspection failed with {}",
-                crate::error::describe_exit(output.code)
-            )));
-        }
-
-        // A release container is not a managed workload, but it runs on the
-        // node like one until its command exits, so other projects count it.
-        let releases = CommandSpec::new("docker")
-            .arg("ps")
-            .arg("--filter")
-            .arg(format!("label={RELEASE_ROLE_LABEL}"))
-            .arg("--format")
-            .arg(format!("{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}"));
-        let releases = self
-            .read_docker(&releases, "docker release capacity inspection")
-            .await?;
-
+        let running = self.running_containers().await?;
         let project_id = project_id.to_string();
-        let other_projects = output
-            .stdout
-            .lines()
-            .chain(releases.lines())
-            .map(str::trim)
-            .filter(|value| !value.is_empty() && *value != project_id)
-            .count();
+        let other_projects = running
+            .workloads
+            .iter()
+            .filter(|project| **project != project_id)
+            .count()
+            + running
+                .one_offs
+                .iter()
+                .filter(|(project, role)| {
+                    *project != project_id || role == OneOffRole::Job.as_str()
+                })
+                .count();
         let needed = other_projects.saturating_add(replicas.get() as usize);
 
         if needed > self.max_active_containers as usize {
@@ -525,6 +591,18 @@ impl ContainerEngine for DockerContainerEngine {
             )));
         }
 
+        Ok(())
+    }
+
+    async fn ensure_job_capacity(&self) -> Result<(), RuntimeError> {
+        let running = self.running_containers().await?;
+        let running = running.workloads.len() + running.one_offs.len();
+        if running >= self.max_active_containers as usize {
+            return Err(RuntimeError::Capacity(format!(
+                "node already runs {running} managed containers and this job needs one more; configured maximum is {}",
+                self.max_active_containers
+            )));
+        }
         Ok(())
     }
 
@@ -630,7 +708,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--filter")
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
-            .arg("{{.ID}}\t{{.Status}}\t{{.Label \"dev.sakala.project-id\"}}\t{{.Label \"dev.sakala.deployment-id\"}}\t{{.Label \"dev.sakala.domain\"}}");
+            .arg(format!("{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
             return Err(RuntimeError::Container(format!(
@@ -643,6 +721,10 @@ impl ContainerEngine for DockerContainerEngine {
             .lines()
             .filter_map(|line| {
                 let fields = line.split('\t').collect::<Vec<_>>();
+                // A worker has no route, so the router serves nothing for it.
+                if process_from_labels(fields.get(5).copied(), fields.get(6).copied()).is_some() {
+                    return None;
+                }
                 Some(RoutedWorkload {
                     project_id: Uuid::parse_str(fields.get(2)?).ok()?,
                     deployment_id: Uuid::parse_str(fields.get(3)?).ok()?,
@@ -674,6 +756,7 @@ impl ContainerEngine for DockerContainerEngine {
                     ready,
                     reason,
                     desired_replicas: listed.replica.count,
+                    process: listed.process,
                 }
             })
             .collect())
@@ -686,7 +769,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
             .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{DEPLOYMENT_ID_LABEL}\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}"
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"{PROJECT_ID_LABEL}\"}}}}\t{{{{.Label \"{DEPLOYMENT_ID_LABEL}\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{ROLE_LABEL_KEY}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"
             ))
             .timeout(METRICS_LISTING_TIMEOUT);
         let targets = self
@@ -808,8 +891,17 @@ impl ContainerEngine for DockerContainerEngine {
             .into_iter()
             .filter(|(_, state)| state.is_crashed(now, self.crash_stable_window))
             .collect::<Vec<_>>();
-        let crashed = whole_deployments(&listed, crashed);
         let last_exits = self.last_exits(&crashed).await;
+        // A worker that ends with code 0 does so on purpose, like Laravel's
+        // `queue:work --max-time`, and Docker starts it again: not a crash.
+        let crashed = crashed
+            .into_iter()
+            .filter(|(snapshot, state)| {
+                snapshot.process.is_none()
+                    || state.exit_code(last_exits.get(&state.id)) != Some(EXPECTED_WORKER_EXIT_CODE)
+            })
+            .collect::<Vec<_>>();
+        let crashed = whole_deployments(&listed, crashed);
 
         Ok(crashed
             .iter()
@@ -823,6 +915,7 @@ impl ContainerEngine for DockerContainerEngine {
                     finished_at: state.finished_at,
                     restart_count: state.restart_count,
                     running: state.running,
+                    process: snapshot.process.clone(),
                 }
             })
             .collect())
@@ -844,7 +937,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(format!("label=dev.sakala.deployment-id={deployment_id}"))
             .arg("--format")
             .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"dev.sakala.port\"}}}}\t{{{{.Label \"dev.sakala.command-id\"}}}}\t{{{{.Label \"dev.sakala.log-max-line-length\"}}}}\t{{{{.Label \"dev.sakala.log-max-batch-lines\"}}}}\t{{{{.Label \"dev.sakala.log-max-total-bytes\"}}}}\t{{{{.Names}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.domain\"}}}}\t{{{{.Label \"dev.sakala.port\"}}}}\t{{{{.Label \"dev.sakala.command-id\"}}}}\t{{{{.Label \"dev.sakala.log-max-line-length\"}}}}\t{{{{.Label \"dev.sakala.log-max-batch-lines\"}}}}\t{{{{.Label \"dev.sakala.log-max-total-bytes\"}}}}\t{{{{.Names}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"
             ));
         let output = self.runner.run(&command, &NullOutputSink).await?;
         if !output.success {
@@ -859,47 +952,54 @@ impl ContainerEngine for DockerContainerEngine {
             .filter(|line| !line.trim().is_empty())
             .map(|line| parse_workload(line, project_id, deployment_id))
             .collect::<Result<Vec<_>, _>>()?;
-        workloads.sort_by_key(|workload| workload.replica.index);
+        // Web replicas first, then each worker process by name.
+        workloads.sort_by(|left, right| {
+            (&left.process, left.replica.index).cmp(&(&right.process, right.replica.index))
+        });
         Ok(workloads)
     }
 
-    async fn restart(
-        &self,
-        workload: &ManagedWorkload,
-        grace_seconds: u64,
-    ) -> Result<(), RuntimeError> {
+    async fn restart(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
         run_container_command(
             self.runner.as_ref(),
             CommandSpec::new("docker")
                 .arg("restart")
                 .arg("--time")
-                .arg(grace_seconds.to_string())
+                .arg(
+                    self.stop_grace
+                        .seconds_for(workload.process.as_deref())
+                        .to_string(),
+                )
                 .arg(&workload.container_id),
             "docker-restart",
         )
         .await
     }
 
-    async fn stop(
-        &self,
-        workloads: &[ManagedWorkload],
-        grace_seconds: u64,
-    ) -> Result<(), RuntimeError> {
-        let running = workloads
-            .iter()
-            .filter(|workload| workload.is_running())
-            .collect::<Vec<_>>();
-        if running.is_empty() {
-            return Ok(());
-        }
-        let mut command = CommandSpec::new("docker")
-            .arg("stop")
-            .arg("--time")
-            .arg(grace_seconds.to_string());
-        for workload in running {
-            command = command.arg(&workload.container_id);
-        }
-        run_container_command(self.runner.as_ref(), command, "docker-stop").await
+    async fn stop(&self, workloads: &[ManagedWorkload]) -> Result<(), RuntimeError> {
+        let stop = |web: bool| {
+            let running = workloads
+                .iter()
+                .filter(|workload| workload.is_running() && workload.is_web() == web)
+                .map(|workload| workload.container_id.as_str())
+                .collect::<Vec<_>>();
+            let grace = if web {
+                self.stop_grace.web
+            } else {
+                self.stop_grace.worker
+            };
+            async move {
+                match stop_command(&running, grace) {
+                    Some(command) => {
+                        run_container_command(self.runner.as_ref(), command, "docker-stop").await
+                    }
+                    None => Ok(()),
+                }
+            }
+        };
+        // Side by side, so the web replicas do not wait out the workers' grace.
+        let (web, workers) = tokio::join!(stop(true), stop(false));
+        web.and(workers)
     }
 
     async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError> {
@@ -958,9 +1058,11 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--label")
             .arg(format!("{PORT_LABEL}={}", request.port))
             .arg("--label")
-            .arg(format!("{COMMAND_ID_LABEL}={}", request.command_id))
-            .arg("--label")
-            .arg(WORKLOAD_KIND_LABEL)
+            .arg(format!("{COMMAND_ID_LABEL}={}", request.command_id));
+        for label in process_labels(request.process.as_deref()) {
+            command = command.arg("--label").arg(label);
+        }
+        command = command
             .arg("--label")
             .arg(format!("{AGENT_ID_LABEL}={}", self.agent_id));
         for label in request.replica.labels() {
@@ -998,9 +1100,9 @@ impl ContainerEngine for DockerContainerEngine {
         result.map(|_| ())
     }
 
-    async fn start_release(
+    async fn start_one_off(
         &self,
-        request: &ReleaseContainerRequest,
+        request: &OneOffContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         let _start = self.networks.start_guard().await;
@@ -1011,13 +1113,18 @@ impl ContainerEngine for DockerContainerEngine {
             .isolated_run(&request.name, &network, request.resources, None)
             .await?;
         for label in [
-            RELEASE_ROLE_LABEL.to_owned(),
+            format!("{ROLE_LABEL_KEY}={}", request.role.as_str()),
             format!("{PROJECT_ID_LABEL}={}", request.project_id),
             format!("{DEPLOYMENT_ID_LABEL}={}", request.deployment_id),
             format!("{COMMAND_ID_LABEL}={}", request.command_id),
             format!("{AGENT_ID_LABEL}={}", self.agent_id),
         ] {
             command = command.arg("--label").arg(label);
+        }
+        if request.role == OneOffRole::Job {
+            // The image was checked before; one that went since must fail
+            // here, not be looked up in a registry under the project's name.
+            command = command.arg("--pull").arg(JOB_PULL_POLICY);
         }
         if let Some(env_file) = &env_file {
             command = command.arg("--env-file").arg(env_file.as_os_str());
@@ -1042,26 +1149,45 @@ impl ContainerEngine for DockerContainerEngine {
         if output.success {
             return Ok(());
         }
-        match output.code {
-            Some(code) if COMMAND_NOT_RUNNABLE_EXIT_CODES.contains(&code) => {
+        if request.role == OneOffRole::Job
+            && output
+                .stderr
+                .to_ascii_lowercase()
+                .contains(NO_SUCH_IMAGE_MESSAGE)
+        {
+            return Err(RuntimeError::JobImageMissing {
+                reason: "the image was removed before the job started",
+            });
+        }
+        match (output.code, request.role) {
+            (Some(code), OneOffRole::Release)
+                if COMMAND_NOT_RUNNABLE_EXIT_CODES.contains(&code) =>
+            {
                 Err(RuntimeError::ReleaseCommandFailed {
                     exit_code: code,
                     out_of_memory_limit_mb: None,
                 })
             }
-            code => Err(RuntimeError::failed_process(
-                "docker-run-release",
+            (Some(code), OneOffRole::Job) if COMMAND_NOT_RUNNABLE_EXIT_CODES.contains(&code) => {
+                Err(RuntimeError::JobFailed {
+                    exit_code: code,
+                    out_of_memory_limit_mb: None,
+                })
+            }
+            (code, role) => Err(RuntimeError::failed_process(
+                &format!("docker-run-{}", role.as_str()),
                 code,
                 &output.stderr,
             )),
         }
     }
 
-    async fn wait_release(
+    async fn wait_one_off(
         &self,
         name: &str,
+        role: OneOffRole,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<ReleaseExit, RuntimeError> {
+    ) -> Result<OneOffExit, RuntimeError> {
         // Ends when the container exits. A follower that fails early loses
         // output, not the result, which `docker wait` reads on its own.
         let follow = CommandSpec::new("docker")
@@ -1069,18 +1195,21 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--follow")
             .arg(name)
             .without_timeout();
-        let sink = ReporterOutputSink::new(reporter, RELEASE_LOG_PHASE);
+        let sink =
+            ReporterOutputSink::new(reporter, role.as_str()).with_process(role.log_process());
         match self.runner.run(&follow, &sink).await {
             Ok(output) if output.success => {}
             Ok(output) => warn!(
                 container = name,
+                role = role.as_str(),
                 status = %crate::error::describe_exit(output.code),
-                "release container output could not be followed"
+                "one-off container output could not be followed"
             ),
             Err(error) => warn!(
                 container = name,
+                role = role.as_str(),
                 %error,
-                "release container output could not be followed"
+                "one-off container output could not be followed"
             ),
         }
         let wait = CommandSpec::new("docker")
@@ -1088,7 +1217,7 @@ impl ContainerEngine for DockerContainerEngine {
             .arg(name)
             .without_timeout();
         let exit_code = self
-            .read_docker(&wait, "docker release wait")
+            .read_docker(&wait, "docker one-off wait")
             .await?
             .trim()
             .parse::<i32>()
@@ -1099,18 +1228,18 @@ impl ContainerEngine for DockerContainerEngine {
             .arg("--format")
             .arg("{{.State.OOMKilled}}")
             .arg(name)
-            .timeout(RELEASE_INSPECT_TIMEOUT);
+            .timeout(ONE_OFF_INSPECT_TIMEOUT);
         let oom_killed = match self.runner.run(&inspect, &NullOutputSink).await {
             Ok(output) if output.success => output.stdout.trim() == "true",
             _ => false,
         };
-        Ok(ReleaseExit {
+        Ok(OneOffExit {
             exit_code,
             oom_killed,
         })
     }
 
-    async fn remove_release(&self, name: &str) -> Result<(), RuntimeError> {
+    async fn remove_one_off(&self, name: &str) -> Result<(), RuntimeError> {
         let remove = CommandSpec::new("docker")
             .arg("rm")
             .arg("--force")
@@ -1121,28 +1250,30 @@ impl ContainerEngine for DockerContainerEngine {
             Ok(())
         } else {
             Err(RuntimeError::failed_process(
-                "docker-remove-release",
+                "docker-remove-one-off",
                 output.code,
                 &output.stderr,
             ))
         }
     }
 
-    async fn remove_stale_releases(&self) -> Result<usize, RuntimeError> {
-        let list = CommandSpec::new("docker")
-            .arg("ps")
-            .arg("--all")
-            .arg("--quiet")
-            .arg("--no-trunc")
-            .arg("--filter")
-            .arg(format!("label={RELEASE_ROLE_LABEL}"))
-            .arg("--filter")
-            .arg(format!("label={AGENT_ID_LABEL}={}", self.agent_id));
-        let listed = self.read_docker(&list, "docker release listing").await?;
+    async fn remove_stale_one_offs(&self) -> Result<usize, RuntimeError> {
         let mut removed = 0;
-        for container in listed.split_whitespace() {
-            self.remove_release(container).await?;
-            removed += 1;
+        for role in OneOffRole::ALL {
+            let list = CommandSpec::new("docker")
+                .arg("ps")
+                .arg("--all")
+                .arg("--quiet")
+                .arg("--no-trunc")
+                .arg("--filter")
+                .arg(format!("label={ROLE_LABEL_KEY}={}", role.as_str()))
+                .arg("--filter")
+                .arg(format!("label={AGENT_ID_LABEL}={}", self.agent_id));
+            let listed = self.read_docker(&list, "docker one-off listing").await?;
+            for container in listed.split_whitespace() {
+                self.remove_one_off(container).await?;
+                removed += 1;
+            }
         }
         Ok(removed)
     }
@@ -1298,7 +1429,7 @@ impl ContainerEngine for DockerContainerEngine {
             let inspect = CommandSpec::new("docker")
                 .arg("inspect")
                 .arg("--format")
-                .arg("{{.State.Running}}\t{{.Name}}")
+                .arg(PREVIOUS_CONTAINER_FORMAT)
                 .arg(container_id);
             let inspected_name = self.runner.run(&inspect, &NullOutputSink).await?;
             if !inspected_name.success {
@@ -1313,33 +1444,45 @@ impl ContainerEngine for DockerContainerEngine {
             if current.iter().any(|current| current == name) {
                 continue;
             }
-            previous.push((container_id, running));
+            // The kind label is not read: only an Agent with workers writes
+            // a process label, and only on a worker.
+            let worker = fields
+                .next()
+                .is_some_and(|process| !process.trim().is_empty());
+            previous.push((container_id, running, worker));
         }
 
-        // One call stops every old replica side by side, so they share one
-        // grace period instead of waiting it out one after another.
-        let running = previous
-            .iter()
-            .filter(|(_, running)| *running)
-            .map(|(container_id, _)| *container_id)
-            .collect::<Vec<_>>();
-        if !running.is_empty() {
-            let mut stop = CommandSpec::new("docker")
-                .arg("stop")
-                .arg("--time")
-                .arg("10");
-            for container_id in running {
-                stop = stop.arg(container_id);
+        // One call per process kind stops the old containers side by side, so
+        // they share one grace period instead of waiting it out one after
+        // another, and the web replicas do not wait out the workers' grace.
+        let stop = |worker: bool| {
+            let running = previous
+                .iter()
+                .filter(|(_, running, is_worker)| *running && *is_worker == worker)
+                .map(|(container_id, _, _)| *container_id)
+                .collect::<Vec<_>>();
+            let grace = if worker {
+                self.stop_grace.worker
+            } else {
+                self.stop_grace.web
+            };
+            async move {
+                match stop_command(&running, grace) {
+                    Some(command) => run_checked(
+                        self.runner.as_ref(),
+                        &command,
+                        "docker-stop-previous",
+                        reporter,
+                    )
+                    .await
+                    .map(|_| ()),
+                    None => Ok(()),
+                }
             }
-            run_checked(
-                self.runner.as_ref(),
-                &stop,
-                "docker-stop-previous",
-                reporter,
-            )
-            .await?;
-        }
-        for (container_id, _) in previous {
+        };
+        let (web, workers) = tokio::join!(stop(false), stop(true));
+        web.and(workers)?;
+        for (container_id, _, _) in previous {
             let remove = CommandSpec::new("docker").arg("rm").arg(container_id);
             run_checked(
                 self.runner.as_ref(),
@@ -1561,6 +1704,7 @@ fn parse_listed_replica(line: &str) -> Option<ListedReplica> {
         project_id: Uuid::parse_str(fields.get(2)?).ok()?,
         deployment_id: Uuid::parse_str(fields.get(3)?).ok()?,
         replica: ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied()),
+        process: process_from_labels(fields.get(6).copied(), fields.get(7).copied()),
     })
 }
 
@@ -1610,13 +1754,16 @@ fn parse_workload(
             max_batch_lines: parse_optional_label(fields.get(6).copied()),
             max_total_bytes: parse_optional_label(fields.get(7).copied()),
         },
+        process: process_from_labels(fields.get(11).copied(), fields.get(12).copied()),
     })
 }
 
-/// Keeps the crashed containers of deployments whose every listed container
-/// crashed, one per deployment: the one that ended last, as the freshest
-/// account of the crash. A deployment with a replica still up is serving, and
-/// its crashed replicas show up as `ready` below `desired` instead.
+/// Keeps the crashed containers of processes whose every listed container
+/// crashed, one per process of a deployment: the one that ended last, as the
+/// freshest account of the crash. A web process with a replica still up is
+/// serving, and its crashed replicas show up as `ready` below `desired`
+/// instead. A worker process is judged on its own containers, so a crashing
+/// worker never reads as the web process crashing, and the other way round.
 fn whole_deployments<'a>(
     listed: &[&RuntimeHealthSnapshot],
     crashed: Vec<(&'a RuntimeHealthSnapshot, CrashState)>,
@@ -1625,16 +1772,19 @@ fn whole_deployments<'a>(
         (
             snapshot.workload.project_id,
             snapshot.workload.deployment_id,
+            snapshot.process.clone(),
         )
     };
-    let mut listed_per_deployment = HashMap::<(Uuid, Uuid), usize>::new();
+    let mut listed_per_deployment = HashMap::<(Uuid, Uuid, Option<String>), usize>::new();
     for snapshot in listed {
         *listed_per_deployment
             .entry(deployment(snapshot))
             .or_default() += 1;
     }
-    let mut per_deployment =
-        BTreeMap::<(Uuid, Uuid), Vec<(&'a RuntimeHealthSnapshot, CrashState)>>::new();
+    let mut per_deployment = BTreeMap::<
+        (Uuid, Uuid, Option<String>),
+        Vec<(&'a RuntimeHealthSnapshot, CrashState)>,
+    >::new();
     for entry in crashed {
         per_deployment
             .entry(deployment(entry.0))
@@ -1652,10 +1802,41 @@ fn whole_deployments<'a>(
         .collect()
 }
 
+/// What [`DockerContainerEngine::running_containers`] found.
+struct RunningContainers {
+    /// The project label of each running managed workload, web or worker.
+    workloads: Vec<String>,
+    /// The project and role labels of each running one-off container.
+    one_offs: Vec<(String, String)>,
+}
+
+fn non_empty_lines(stdout: &str) -> impl Iterator<Item = &str> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+}
+
 fn parse_optional_label(value: Option<&str>) -> Option<u64> {
     value
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse().ok())
+}
+
+/// `docker stop` of `containers` in one call, which stops them side by side
+/// so they share one grace period. `None` when there is nothing to stop.
+fn stop_command(containers: &[&str], grace: Duration) -> Option<CommandSpec> {
+    if containers.is_empty() {
+        return None;
+    }
+    let mut command = CommandSpec::new("docker")
+        .arg("stop")
+        .arg("--time")
+        .arg(grace.as_secs().to_string());
+    for container in containers {
+        command = command.arg(container);
+    }
+    Some(command)
 }
 
 async fn run_container_command(
@@ -1751,7 +1932,7 @@ impl DockerContainerEngine {
             .arg(format!("label={MANAGED_LABEL}"))
             .arg("--format")
             .arg(format!(
-                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}"
+                "{{{{.ID}}}}\t{{{{.Status}}}}\t{{{{.Label \"dev.sakala.project-id\"}}}}\t{{{{.Label \"dev.sakala.deployment-id\"}}}}\t{{{{.Label \"{REPLICA_LABEL}\"}}}}\t{{{{.Label \"{REPLICAS_LABEL}\"}}}}\t{{{{.Label \"{WORKLOAD_KIND_LABEL_KEY}\"}}}}\t{{{{.Label \"{PROCESS_LABEL}\"}}}}"
             ));
         let stdout = self.read_docker(&command, what).await?;
         Ok(stdout.lines().filter_map(parse_listed_replica).collect())
@@ -1774,6 +1955,7 @@ impl DockerContainerEngine {
                 deployment_id = %snapshot.workload.deployment_id,
                 restart_count = state.restart_count,
                 running = state.running,
+                process = snapshot.process.as_deref().unwrap_or(sakala_agent_protocol::WEB_PROCESS),
                 "Docker restarted a managed workload after it exited on its own"
             );
         }

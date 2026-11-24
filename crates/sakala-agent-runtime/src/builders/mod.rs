@@ -246,6 +246,7 @@ impl ImageBuilder for ImageBuildService {
                             message: "build_command was not used: a Dockerfile defines its own build steps."
                                 .to_owned(),
                             recorded_at: OffsetDateTime::now_utc(),
+                            process: None,
                         })
                         .await;
                 }

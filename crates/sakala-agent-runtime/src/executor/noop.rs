@@ -61,6 +61,7 @@ async fn execute_noop(
             message: "Foundation mode: no Docker, Caddy, or Railpack operation executed."
                 .to_owned(),
             recorded_at: now,
+            process: None,
         })
         .await?;
 

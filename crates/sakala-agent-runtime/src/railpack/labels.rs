@@ -182,6 +182,7 @@ async fn report(reporter: &dyn RuntimeReporter, message: String) {
             stream: LogStream::System,
             message: format!("[{LABEL_PHASE}] {message}"),
             recorded_at: OffsetDateTime::now_utc(),
+            process: None,
         })
         .await;
 }

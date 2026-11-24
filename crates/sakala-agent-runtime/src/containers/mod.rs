@@ -24,12 +24,17 @@ pub(crate) mod limits;
 pub(crate) mod metrics;
 pub(crate) mod network;
 pub(crate) mod replicas;
+pub(crate) mod workers;
 
-pub use docker::{ContainerDns, DockerContainerEngine, WorkloadIsolation};
+pub use docker::{
+    ContainerDns, DEFAULT_WEB_STOP_GRACE, DEFAULT_WORKER_STOP_GRACE, DockerContainerEngine,
+    StopGrace, WorkloadIsolation,
+};
 pub use images::{PREVIOUS_IMAGE_TAG, previous_image_reference, project_repository};
 pub use limits::ResourceSafetyConfig;
 pub use network::project_network_name;
 pub use replicas::{MAX_REPLICAS_PER_PROJECT_CEILING, ReplicaSlot};
+pub use workers::worker_container_name;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunContainerRequest {
@@ -46,19 +51,55 @@ pub struct RunContainerRequest {
     pub port: u16,
     pub log_bounds: LogBounds,
     /// Replaces the image's entrypoint and command, for images that have no way
-    /// to take it at build time.
+    /// to take it at build time. Always set for a worker, which runs its own.
     pub start_command: Option<String>,
+    /// The worker process this container runs, `None` for a web replica.
+    pub process: Option<String>,
 }
 
-/// The one container that runs a deployment's release command.
+/// What a one-off container runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OneOffRole {
+    /// A deployment's release command, before its replicas start.
+    Release,
+    /// A `RunJob` command, from the live image.
+    Job,
+}
+
+impl OneOffRole {
+    /// Every role, for listings that must find any one-off container.
+    pub const ALL: [Self; 2] = [Self::Release, Self::Job];
+
+    /// The value of the `dev.sakala.role` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => sakala_agent_protocol::RELEASE_PROCESS,
+            Self::Job => sakala_agent_protocol::JOB_PROCESS,
+        }
+    }
+
+    /// The `process` of the log lines it writes. A release command's lines
+    /// stay without one, as before worker processes.
+    #[must_use]
+    pub const fn log_process(self) -> Option<&'static str> {
+        match self {
+            Self::Release => None,
+            Self::Job => Some(sakala_agent_protocol::JOB_PROCESS),
+        }
+    }
+}
+
+/// The one container that runs a deployment's release command, or one job.
 ///
-/// It runs from the deployment's new image with the same environment,
-/// resources, runtime, and security options as a replica, on the project's
-/// network, but it serves nothing: it has no route, no domain or port label,
-/// and no restart policy. It is not a managed workload either, so listings,
-/// health checks, replica restore, and orphan detection never see it.
+/// It runs from a deployment's image with the same environment, resources,
+/// runtime, and security options as a replica, on the project's network, but
+/// it serves nothing: it has no route, no domain or port label, and no restart
+/// policy. It is not a managed workload either, so listings, health checks,
+/// replica restore, and orphan detection never see it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReleaseContainerRequest {
+pub struct OneOffContainerRequest {
+    pub role: OneOffRole,
     pub command_id: Uuid,
     pub project_id: Uuid,
     pub deployment_id: Uuid,
@@ -74,15 +115,15 @@ pub struct ReleaseContainerRequest {
     pub command: String,
 }
 
-/// How a release container ended.
+/// How a one-off container ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReleaseExit {
+pub struct OneOffExit {
     pub exit_code: i32,
     /// Docker killed the container for exceeding its memory limit.
     pub oom_killed: bool,
 }
 
-impl ReleaseExit {
+impl OneOffExit {
     #[must_use]
     pub fn succeeded(self) -> bool {
         self.exit_code == 0
@@ -103,12 +144,20 @@ pub struct ManagedWorkload {
     pub port: u16,
     pub command_id: Option<Uuid>,
     pub log_bounds: LogBounds,
+    /// The worker process this container runs, `None` for a web replica.
+    pub process: Option<String>,
 }
 
 impl ManagedWorkload {
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.status.to_ascii_lowercase().starts_with("up")
+    }
+
+    /// A container behind the route, as opposed to a worker's.
+    #[must_use]
+    pub fn is_web(&self) -> bool {
+        self.process.is_none()
     }
 }
 
@@ -121,6 +170,8 @@ pub struct ListedReplica {
     pub replica: ReplicaSlot,
     /// Docker's status column, such as `Up 3 minutes` or `Exited (137) 1 minute ago`.
     pub status: String,
+    /// The worker process the container runs, `None` for a web replica.
+    pub process: Option<String>,
 }
 
 impl ListedReplica {
@@ -153,16 +204,23 @@ pub trait ContainerEngine: Send + Sync {
     ) -> Result<AppliedRuntimeResources, RuntimeError>;
 
     /// Refuses `replicas` more running containers for `project_id` when the
-    /// node would then run more than its maximum. The project's own running
-    /// containers are not counted: a new deployment replaces them, and the
-    /// overlap while it starts is the same one a single container always had.
-    /// A running release container of another project counts as one, for as
-    /// long as its command runs.
+    /// node would then run more than its maximum. `replicas` counts every
+    /// container of the deployment, its workers included. The project's own
+    /// running workloads are not counted: a new deployment replaces them, and
+    /// the overlap while it starts is the same one a single container always
+    /// had. A running one-off container counts as one for as long as its
+    /// command runs: a release container of another project, and a job of
+    /// any project, because a deployment never replaces a job.
     async fn ensure_capacity(
         &self,
         project_id: Uuid,
         replicas: NonZeroU32,
     ) -> Result<(), RuntimeError>;
+
+    /// Refuses one more container, for a job, when the node would then run
+    /// more than its maximum. Every running container counts, the job's own
+    /// project included: a job runs next to it.
+    async fn ensure_job_capacity(&self) -> Result<(), RuntimeError>;
 
     /// Sorts every managed container into running workloads, sleeping
     /// workloads, and orphans. A stopped container is sleeping when
@@ -202,19 +260,13 @@ pub trait ContainerEngine: Send + Sync {
         deployment_id: Uuid,
     ) -> Result<Vec<ManagedWorkload>, RuntimeError>;
 
-    async fn restart(
-        &self,
-        workload: &ManagedWorkload,
-        grace_seconds: u64,
-    ) -> Result<(), RuntimeError>;
+    /// Restarts one container with the stop grace of its process.
+    async fn restart(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
 
-    /// Stops the running ones among `workloads` in one Docker call, which
-    /// stops them side by side, so replicas share one grace period.
-    async fn stop(
-        &self,
-        workloads: &[ManagedWorkload],
-        grace_seconds: u64,
-    ) -> Result<(), RuntimeError>;
+    /// Stops the running ones among `workloads` side by side, so the
+    /// containers of one process share one grace period: web replicas get
+    /// the web grace, workers the worker grace (see [`StopGrace`]).
+    async fn stop(&self, workloads: &[ManagedWorkload]) -> Result<(), RuntimeError>;
 
     async fn start_existing(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
 
@@ -229,32 +281,35 @@ pub trait ContainerEngine: Send + Sync {
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    /// Creates and starts the release container, detached, on the project's
+    /// Creates and starts a one-off container, detached, on the project's
     /// network. A command Docker cannot start at all, such as one in an image
-    /// without `sh`, is a [`RuntimeError::ReleaseCommandFailed`]; the container
-    /// may then exist in `Created` state and still needs [`Self::remove_release`].
-    async fn start_release(
+    /// without `sh`, is a [`RuntimeError::ReleaseCommandFailed`] for a release
+    /// and a [`RuntimeError::JobFailed`] for a job; a job image that is gone is
+    /// a [`RuntimeError::JobImageMissing`]. The container may then exist in
+    /// `Created` state and still needs [`Self::remove_one_off`].
+    async fn start_one_off(
         &self,
-        request: &ReleaseContainerRequest,
+        request: &OneOffContainerRequest,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError>;
 
-    /// Reports the release container's output as it is written, until the
+    /// Reports a one-off container's output as it is written, until the
     /// container exits, and returns how it ended. Has no deadline of its own.
-    async fn wait_release(
+    async fn wait_one_off(
         &self,
         name: &str,
+        role: OneOffRole,
         reporter: &dyn RuntimeReporter,
-    ) -> Result<ReleaseExit, RuntimeError>;
+    ) -> Result<OneOffExit, RuntimeError>;
 
-    /// Kills the release container when it still runs and removes it with its
+    /// Kills a one-off container when it still runs and removes it with its
     /// anonymous volumes. A container that is already gone is not an error.
-    async fn remove_release(&self, name: &str) -> Result<(), RuntimeError>;
+    async fn remove_one_off(&self, name: &str) -> Result<(), RuntimeError>;
 
-    /// Removes every release container this Agent left behind, running or
-    /// not. Called at startup: a release container only lives as long as the
-    /// deployment command that started it. Returns how many were removed.
-    async fn remove_stale_releases(&self) -> Result<usize, RuntimeError>;
+    /// Removes every one-off container this Agent left behind, running or
+    /// not. Called at startup: a one-off container only lives as long as the
+    /// command that started it. Returns how many were removed.
+    async fn remove_stale_one_offs(&self) -> Result<usize, RuntimeError>;
 
     /// Connects the router to the project's network again, when the project has
     /// one. A workload started by an older Agent lives on the shared network.
@@ -297,7 +352,8 @@ pub trait ContainerEngine: Send + Sync {
     fn start_log_follower(&self, container: &str, reporter: Arc<dyn RuntimeReporter>) -> bool;
 
     /// Stops and removes every container of the project except `current`, the
-    /// replicas of the deployment that just went live.
+    /// web replicas and workers of the deployment that just went live. Each
+    /// gets the stop grace of its process.
     async fn cleanup_previous(
         &self,
         project_id: Uuid,
@@ -453,6 +509,15 @@ pub fn container_name(project_id: Uuid, deployment_id: Uuid) -> String {
 pub fn release_container_name(project_id: Uuid, deployment_id: Uuid) -> String {
     let project = project_id.to_string();
     format!("sakala-release-{}-{deployment_id}", &project[..8])
+}
+
+/// Names the container of one `RunJob` command. The command ID keeps one
+/// command from ever running two containers: Docker refuses a second
+/// container under the same name.
+#[must_use]
+pub fn job_container_name(project_id: Uuid, command_id: Uuid) -> String {
+    let project = project_id.to_string();
+    format!("sakala-job-{}-{command_id}", &project[..8])
 }
 
 #[cfg(test)]

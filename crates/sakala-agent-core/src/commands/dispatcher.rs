@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NodeLifecycle, NodeLifecycleState,
-    commands::handlers::{bucket, database, deploy_project, inspect_project},
+    commands::handlers::{bucket, database, deploy_project, inspect_project, run_job},
     ports::{
         CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ObjectStorageAdmin,
         ReconcileWorkloadRequest, RepositoryCredentialProvider, RuntimeExecutionError,
@@ -275,6 +275,9 @@ impl CommandDispatcher {
             | CommandType::LockBucket
             | CommandType::UnlockBucket => {
                 bucket::handle(command, self.object_storage_admin.as_deref()).await
+            }
+            CommandType::RunJob => {
+                run_job::handle(command, self.runtime.as_ref(), reporter, cancellation).await
             }
         }
     }

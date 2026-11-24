@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::RepositoryAccess;
+use crate::{RepositoryAccess, RequestedProcesses};
 
 /// Capability of a node that reads `DeployProject.reuse_image_from_deployment_id`.
 /// The control plane sends the field only to a node that advertises it.
@@ -137,6 +137,10 @@ pub struct DeployProjectPayload {
     /// The deployment whose image this one starts from instead of building.
     #[serde(default, skip_serializing_if = "RequestedImageReuse::is_absent")]
     pub reuse_image_from_deployment_id: RequestedImageReuse,
+    /// Worker processes that run next to the web process, from the same image
+    /// and variables, without a route. Absent means the web process only.
+    #[serde(default, skip_serializing_if = "RequestedProcesses::is_absent")]
+    pub processes: RequestedProcesses,
 }
 
 /// The `reuse_image_from_deployment_id` field of a `DeployProject` payload: the
@@ -253,7 +257,7 @@ impl Serialize for RequestedReplicas {
     }
 }
 
-const fn default_container_port() -> u16 {
+pub(crate) const fn default_container_port() -> u16 {
     3000
 }
 

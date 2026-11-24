@@ -3,7 +3,7 @@ use std::{num::NonZeroU32, sync::Arc};
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
-    DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
+    DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction, RunJobPayload,
     RuntimeCleanupTarget, SleepingPage, WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::Value;
@@ -29,6 +29,17 @@ pub struct DeployProjectRequest {
     pub deployment_id: Uuid,
     pub payload: DeployProjectPayload,
     pub repository_credential: Option<RepositoryCredential>,
+    pub cancellation: CancellationToken,
+}
+
+/// One run of a project command in a container of its live image.
+#[derive(Clone, Debug)]
+pub struct RunJobRequest {
+    pub command_id: Uuid,
+    pub project_id: Uuid,
+    /// The live deployment, whose image and settings the job runs with.
+    pub deployment_id: Uuid,
+    pub payload: RunJobPayload,
     pub cancellation: CancellationToken,
 }
 
@@ -161,8 +172,11 @@ pub struct RuntimeHealthSnapshot {
     pub ready: bool,
     pub reason: Option<String>,
     /// How many replicas the workload's deployment was started with. One for a
-    /// deployment without replicas, and for a workload of an older Agent.
+    /// deployment without replicas, and for a workload of an older Agent. For a
+    /// worker, the replicas of its process.
     pub desired_replicas: NonZeroU32,
+    /// The worker process the container runs, `None` for the web process.
+    pub process: Option<String>,
 }
 
 /// What one pass over the replicas of running deployments changed.
@@ -337,6 +351,53 @@ pub trait RuntimeReporter: Send + Sync {
     #[must_use]
     fn committed_output(&self) -> Option<CommandOutput> {
         None
+    }
+
+    /// A reporter of the same command for the output of one worker process,
+    /// with a log byte budget of its own, so a chatty worker cannot use up the
+    /// budget the deployment's own lines need. It marks every line with
+    /// `process`. `None` when this reporter has no such thing; use
+    /// [`process_reporter`], which then marks the lines of this one.
+    fn for_process(&self, _process: &str) -> Option<Arc<dyn RuntimeReporter>> {
+        None
+    }
+}
+
+/// The reporter for the output of worker `process`: the reporter's own
+/// [`RuntimeReporter::for_process`], or one that marks the lines with
+/// `process` and passes them on, sharing the budget.
+#[must_use]
+pub fn process_reporter(
+    reporter: &Arc<dyn RuntimeReporter>,
+    process: &str,
+) -> Arc<dyn RuntimeReporter> {
+    reporter.for_process(process).unwrap_or_else(|| {
+        Arc::new(ProcessLogReporter {
+            inner: Arc::clone(reporter),
+            process: process.to_owned(),
+        })
+    })
+}
+
+/// Marks the log lines of one process and passes everything on.
+struct ProcessLogReporter {
+    inner: Arc<dyn RuntimeReporter>,
+    process: String,
+}
+
+#[async_trait]
+impl RuntimeReporter for ProcessLogReporter {
+    async fn event(&self, event: DeploymentEvent) -> Result<(), RuntimeExecutionError> {
+        self.inner.event(event).await
+    }
+
+    async fn log(&self, mut log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
+        log.process.get_or_insert_with(|| self.process.clone());
+        self.inner.log(log).await
+    }
+
+    async fn flush(&self) -> Result<(), RuntimeExecutionError> {
+        self.inner.flush().await
     }
 }
 
@@ -520,6 +581,19 @@ pub trait RuntimeExecutor: Send + Sync {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support route refresh",
+        ))
+    }
+
+    /// Runs one job and reports how it ended. Never holds the project: a job
+    /// runs next to a deploy, restart, or sleep of the same project, and never
+    /// starts or stops the project's web or worker containers.
+    async fn run_job(
+        &self,
+        _request: RunJobRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support job runs",
         ))
     }
 

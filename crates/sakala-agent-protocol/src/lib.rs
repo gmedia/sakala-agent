@@ -13,9 +13,11 @@ pub mod deployments;
 pub mod events;
 pub mod heartbeat;
 pub mod inspections;
+pub mod jobs;
 pub mod logs;
 pub mod node;
 pub mod placement;
+pub mod processes;
 pub mod repositories;
 pub mod status;
 
@@ -51,11 +53,20 @@ pub use inspections::{
     EnvExampleFile, InspectProjectPayload, JsFramework, JsPackageManager, JsWorkspace,
     ProjectInspection, SuggestedReleaseCommand,
 };
+pub use jobs::{
+    DEFAULT_JOB_TIMEOUT_SECONDS, JOB_FINISHED_EVENT, JOB_STARTED_EVENT, MAX_JOB_TIMEOUT_SECONDS,
+    RunJobPayload, RunJobResult, SCHEDULED_JOBS_CAPABILITY,
+};
 pub use logs::{DeploymentLog, LogStream};
 pub use node::{DesiredNodeLifecycleState, NodeInfo, NodeLifecyclePayload};
 pub use placement::{
     EDGE_ADDRESS_MAX_LENGTH, EDGE_ADDRESS_MAX_PORT, EdgeAddress, InvalidEdgeAddress, InvalidRegion,
     NodePlacement, REGION_MAX_LENGTH, REGION_PATTERN, Region,
+};
+pub use processes::{
+    JOB_PROCESS, MAX_PROCESS_NAME_LENGTH, MAX_WORKER_PROCESSES, PROCESSES_IGNORED_EVENT,
+    RELEASE_PROCESS, RESERVED_PROCESS_NAMES, RequestedProcesses, WEB_PROCESS,
+    WORKER_PROCESSES_CAPABILITY, WorkerProcess, is_valid_process_name,
 };
 pub use repositories::RepositoryAccess;
 pub use status::{CommandStatus, NodeStatus};

@@ -45,12 +45,24 @@ pub(crate) async fn emit_event_at(
 pub struct ReporterOutputSink<'a> {
     reporter: &'a dyn RuntimeReporter,
     phase: &'a str,
+    process: Option<&'a str>,
 }
 
 impl<'a> ReporterOutputSink<'a> {
     #[must_use]
     pub fn new(reporter: &'a dyn RuntimeReporter, phase: &'a str) -> Self {
-        Self { reporter, phase }
+        Self {
+            reporter,
+            phase,
+            process: None,
+        }
+    }
+
+    /// Marks every line with the process that wrote it, such as `job`.
+    #[must_use]
+    pub fn with_process(mut self, process: Option<&'a str>) -> Self {
+        self.process = process;
+        self
     }
 }
 
@@ -84,6 +96,7 @@ impl ProcessOutputSink for ReporterOutputSink<'_> {
                     stream,
                     message: format!("[{}] {frame}", self.phase),
                     recorded_at: OffsetDateTime::now_utc(),
+                    process: self.process.map(str::to_owned),
                 })
                 .await
             {

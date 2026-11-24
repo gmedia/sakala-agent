@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, fmt, path::PathBuf, str::FromStr, time::Dur
 
 use clap::Parser;
 use sakala_agent_core::{
-    AgentConfig, CoreError, EDGE_ADDRESS_ENV, REGION_ENV,
+    AgentConfig, CoreError, EDGE_ADDRESS_ENV, MAX_CONCURRENT_JOBS_ENV, REGION_ENV,
     heartbeat::{
         metrics::{
             DEFAULT_METRICS_INTERVAL, MAX_METRICS_INTERVAL, METRICS_INTERVAL_ENV,
@@ -14,10 +14,12 @@ use sakala_agent_core::{
 };
 use sakala_agent_protocol::{
     DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
-    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, Region,
+    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, Region, SCHEDULED_JOBS_CAPABILITY,
+    WORKER_PROCESSES_CAPABILITY,
 };
 use sakala_agent_runtime::{
-    DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT, DockerRuntimeConfig,
+    DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT,
+    DEFAULT_WORKER_STARTUP_WINDOW, DEFAULT_WORKER_STOP_GRACE, DockerRuntimeConfig,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
     TimeoutSafetyConfig,
     database::{DATABASE_ADMIN_DSN_ENV, PostgresAdminConfig},
@@ -38,6 +40,13 @@ pub const PUBLIC_API_URL_ENV: &str = "SAKALA_PUBLIC_API_URL";
 pub const PUBLIC_CONSOLE_URL_ENV: &str = "SAKALA_PUBLIC_CONSOLE_URL";
 
 const RELEASE_COMMAND_TIMEOUT_ENV: &str = "SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS";
+
+/// How long a worker must keep running after it started before a deployment
+/// counts it as started (ADR-022).
+const WORKER_STARTUP_ENV: &str = "SAKALA_WORKER_STARTUP_SECONDS";
+
+/// How long a worker gets between `SIGTERM` and `SIGKILL` (ADR-022).
+const WORKER_STOP_GRACE_ENV: &str = "SAKALA_WORKER_STOP_GRACE_SECONDS";
 
 /// No longer used: a project with containers keeps its live and previous
 /// images, whatever their age, and nothing else. Still read and checked, so a
@@ -296,6 +305,15 @@ struct Cli {
     #[arg(long, env = RELEASE_COMMAND_TIMEOUT_ENV)]
     release_command_timeout_seconds: Option<String>,
 
+    #[arg(long, env = WORKER_STARTUP_ENV)]
+    worker_startup_seconds: Option<String>,
+
+    #[arg(long, env = WORKER_STOP_GRACE_ENV)]
+    worker_stop_grace_seconds: Option<String>,
+
+    #[arg(long, env = MAX_CONCURRENT_JOBS_ENV)]
+    max_concurrent_jobs: Option<String>,
+
     #[arg(long, env = "SAKALA_MAX_CONCURRENT_BUILDS")]
     max_concurrent_builds: Option<String>,
 
@@ -473,6 +491,17 @@ pub fn load() -> Result<AppConfig, CoreError> {
         RELEASE_COMMAND_TIMEOUT_ENV,
         cli.release_command_timeout_seconds,
     );
+    insert(&mut values, WORKER_STARTUP_ENV, cli.worker_startup_seconds);
+    insert(
+        &mut values,
+        WORKER_STOP_GRACE_ENV,
+        cli.worker_stop_grace_seconds,
+    );
+    insert(
+        &mut values,
+        MAX_CONCURRENT_JOBS_ENV,
+        cli.max_concurrent_jobs,
+    );
     insert(
         &mut values,
         "SAKALA_MAX_CONCURRENT_BUILDS",
@@ -588,6 +617,18 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     }
 
     let release_command_timeout = release_command_timeout(values, agent.command_timeout_seconds)?;
+    let worker_startup_window = shorter_than_command(
+        values,
+        WORKER_STARTUP_ENV,
+        DEFAULT_WORKER_STARTUP_WINDOW,
+        agent.command_timeout_seconds,
+    )?;
+    let worker_stop_grace = shorter_than_command(
+        values,
+        WORKER_STOP_GRACE_ENV,
+        DEFAULT_WORKER_STOP_GRACE,
+        agent.command_timeout_seconds,
+    )?;
 
     // A deploy builds its image before it creates the container, so an image
     // younger than one command can still be about to run.
@@ -649,6 +690,8 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             max_active_containers: positive_u32(values, "SAKALA_MAX_ACTIVE_CONTAINERS", 20)?,
             max_replicas_per_project: max_replicas_per_project(values)?,
             release_command_timeout,
+            worker_startup_window,
+            worker_stop_grace,
             public_api_url: public_api_url(values, &agent.api_url)?,
             public_console_url: public_console_url(values)?,
             ..DockerRuntimeConfig::default()
@@ -715,14 +758,27 @@ fn release_command_timeout(
     values: &HashMap<String, String>,
     command_timeout_seconds: u64,
 ) -> Result<Duration, CoreError> {
-    let seconds = positive_u64(
+    shorter_than_command(
         values,
         RELEASE_COMMAND_TIMEOUT_ENV,
-        DEFAULT_RELEASE_COMMAND_TIMEOUT.as_secs(),
-    )?;
+        DEFAULT_RELEASE_COMMAND_TIMEOUT,
+        command_timeout_seconds,
+    )
+}
+
+/// A setting that runs inside a deployment command, such as the release
+/// command's deadline or a worker's startup window and stop grace, must end
+/// before that command's deadline.
+fn shorter_than_command(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: Duration,
+    command_timeout_seconds: u64,
+) -> Result<Duration, CoreError> {
+    let seconds = positive_u64(values, key, default.as_secs())?;
     if seconds >= command_timeout_seconds {
         return Err(CoreError::InvalidConfiguration(format!(
-            "{RELEASE_COMMAND_TIMEOUT_ENV} ({seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({command_timeout_seconds})"
+            "{key} ({seconds}) must be shorter than SAKALA_COMMAND_TIMEOUT_SECONDS ({command_timeout_seconds})"
         )));
     }
     Ok(Duration::from_secs(seconds))
@@ -771,6 +827,11 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             // The live and the previous image of every project stay on the
             // node, so a rollback to the previous deployment needs no build.
             IMAGE_ROLLBACK_CAPABILITY,
+            // `DeployProject.processes`: worker containers next to the web
+            // replicas, and `process` on logs, metrics, and crash details.
+            WORKER_PROCESSES_CAPABILITY,
+            // `RunJob`: one container of the live image, in its own pool.
+            SCHEDULED_JOBS_CAPABILITY,
         ]
         .into_iter()
         .map(str::to_owned)

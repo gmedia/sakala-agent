@@ -164,6 +164,7 @@ mod tests {
             ready,
             reason: (!ready).then(|| "unhealthy".to_owned()),
             desired_replicas: std::num::NonZeroU32::MIN,
+            process: None,
         }
     }
 

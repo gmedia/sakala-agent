@@ -90,6 +90,32 @@ pub enum RuntimeError {
         "the release command did not finish within {seconds} seconds and was stopped, so this deployment was not started"
     )]
     ReleaseCommandTimeout { seconds: u64 },
+    /// A worker process exited, or was restarted, before the route switched,
+    /// so the deployment did not go live and the previous one keeps running.
+    #[error("{}", describe_worker_failure(.process, *.exit_code, *.out_of_memory_limit_mb))]
+    WorkerStartFailed {
+        process: String,
+        /// `None` when Docker no longer reports one.
+        exit_code: Option<i32>,
+        /// The memory limit, when Docker reports an out-of-memory kill.
+        out_of_memory_limit_mb: Option<u64>,
+    },
+    /// The job ran and exited with a non-zero code, or could not be started
+    /// in its image at all.
+    #[error("{}", describe_job_failure(*.exit_code, *.out_of_memory_limit_mb))]
+    JobFailed {
+        exit_code: i32,
+        /// The memory limit, when Docker reports an out-of-memory kill.
+        out_of_memory_limit_mb: Option<u64>,
+    },
+    #[error("the job did not finish within {seconds} seconds and was stopped")]
+    JobTimeout { seconds: u64 },
+    /// The image of the live deployment is not on this node, or is not
+    /// provably the project's, so the job did not run.
+    #[error(
+        "the image of the live deployment is not available on this node ({reason}); deploy the project again"
+    )]
+    JobImageMissing { reason: &'static str },
     #[error("runtime routing failed: {0}")]
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
@@ -143,6 +169,10 @@ impl RuntimeError {
             Self::RootDirectoryInvalid { .. } => "runtime_root_directory_invalid",
             Self::ReleaseCommandFailed { .. } => "release_command_failed",
             Self::ReleaseCommandTimeout { .. } => "release_command_timeout",
+            Self::WorkerStartFailed { .. } => "worker_start_failed",
+            Self::JobFailed { .. } => "job_failed",
+            Self::JobTimeout { .. } => "job_timeout",
+            Self::JobImageMissing { .. } => "job_image_missing",
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
             Self::ReplicasExceeded { .. } => "runtime_replicas_exceeded",
@@ -326,6 +356,31 @@ fn describe_release_failure(exit_code: i32, out_of_memory_limit_mb: Option<u64>)
     }
 }
 
+fn describe_worker_failure(
+    process: &str,
+    exit_code: Option<i32>,
+    out_of_memory_limit_mb: Option<u64>,
+) -> String {
+    match out_of_memory_limit_mb {
+        Some(limit) => format!(
+            "worker {process} ran out of memory (limit {limit} MB) during start, so this deployment was not started; the previous version keeps running"
+        ),
+        None => format!(
+            "worker {process} exited during start with {}, so this deployment was not started; the previous version keeps running",
+            describe_exit_code(exit_code)
+        ),
+    }
+}
+
+fn describe_job_failure(exit_code: i32, out_of_memory_limit_mb: Option<u64>) -> String {
+    match out_of_memory_limit_mb {
+        Some(limit) => format!(
+            "the job ran out of memory (limit {limit} MB) and exited with exit code {exit_code}"
+        ),
+        None => format!("the job exited with exit code {exit_code}"),
+    }
+}
+
 fn describe_memory_limit(memory_limit_mb: Option<u64>) -> String {
     memory_limit_mb.map_or_else(
         || "Docker reports no memory limit for it".to_owned(),
@@ -386,6 +441,63 @@ mod tests {
             let stopped = RuntimeError::failed_operation(phase, None).to_string();
             assert!(stopped.contains("no exit code"), "{stopped}");
             assert_reads_as_words(&stopped);
+        }
+    }
+
+    #[test]
+    fn worker_and_job_failures_have_their_own_codes_and_read_as_words() {
+        for (error, code, expected) in [
+            (
+                RuntimeError::WorkerStartFailed {
+                    process: "queue".to_owned(),
+                    exit_code: Some(1),
+                    out_of_memory_limit_mb: None,
+                },
+                "worker_start_failed",
+                "worker queue exited during start with exit code 1",
+            ),
+            (
+                RuntimeError::WorkerStartFailed {
+                    process: "queue".to_owned(),
+                    exit_code: None,
+                    out_of_memory_limit_mb: Some(256),
+                },
+                "worker_start_failed",
+                "worker queue ran out of memory (limit 256 MB)",
+            ),
+            (
+                RuntimeError::JobFailed {
+                    exit_code: 3,
+                    out_of_memory_limit_mb: None,
+                },
+                "job_failed",
+                "the job exited with exit code 3",
+            ),
+            (
+                RuntimeError::JobFailed {
+                    exit_code: 137,
+                    out_of_memory_limit_mb: Some(128),
+                },
+                "job_failed",
+                "ran out of memory (limit 128 MB)",
+            ),
+            (
+                RuntimeError::JobTimeout { seconds: 300 },
+                "job_timeout",
+                "within 300 seconds",
+            ),
+            (
+                RuntimeError::JobImageMissing {
+                    reason: "image_missing",
+                },
+                "job_image_missing",
+                "deploy the project again",
+            ),
+        ] {
+            let message = error.to_string();
+            assert_eq!(error.code(), code, "{message}");
+            assert!(message.contains(expected), "{message}");
+            assert_reads_as_words(&message);
         }
     }
 

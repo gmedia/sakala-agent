@@ -19,7 +19,10 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{RuntimeError, containers::replicas::ReplicaSlot};
+use crate::{
+    RuntimeError,
+    containers::{replicas::ReplicaSlot, workers::process_from_labels},
+};
 
 /// `docker stats` format: one JSON object per container.
 pub(crate) const STATS_FORMAT: &str = "{{json .}}";
@@ -62,6 +65,8 @@ pub(crate) struct MetricsTarget {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub replica: ReplicaSlot,
+    /// The worker process, `None` for a web replica.
+    pub process: Option<String>,
 }
 
 /// One line of `docker stats`. Values Docker could not read are `None`.
@@ -95,9 +100,10 @@ struct StatsLine {
 }
 
 /// Reads one line of the metrics listing: ID, status, project, deployment,
-/// replica index, replica count, and role. A container with a role, which today
-/// is only a release container, is not a workload, and only a container Docker
-/// shows as up is sampled: a restarting one has no usage to report.
+/// replica index, replica count, role, workload kind, and process. A container
+/// with a role, a release or job container, is not a workload, and only a
+/// container Docker shows as up is sampled: a restarting one has no usage to
+/// report.
 pub(crate) fn parse_metrics_target(line: &str) -> Option<MetricsTarget> {
     let fields = line.split('\t').collect::<Vec<_>>();
     let container_id = fields
@@ -116,6 +122,7 @@ pub(crate) fn parse_metrics_target(line: &str) -> Option<MetricsTarget> {
         project_id: Uuid::parse_str(fields.get(2)?.trim()).ok()?,
         deployment_id: Uuid::parse_str(fields.get(3)?.trim()).ok()?,
         replica: ReplicaSlot::from_labels(fields.get(4).copied(), fields.get(5).copied()),
+        process: process_from_labels(fields.get(7).copied(), fields.get(8).copied()),
     })
 }
 
@@ -243,6 +250,7 @@ pub(crate) fn join_sample(
                 memory_bytes: usage.memory_bytes,
                 memory_limit_bytes: state.memory_limit_bytes,
                 restart_count: state.restart_count,
+                process: target.process.clone(),
             })
         })
         .collect::<Vec<_>>();
@@ -252,7 +260,20 @@ pub(crate) fn join_sample(
             targets.len()
         )));
     }
-    metrics.sort_by_key(|item| (item.project_id, item.deployment_id, item.replica));
+    metrics.sort_by(|left, right| {
+        (
+            left.project_id,
+            left.deployment_id,
+            &left.process,
+            left.replica,
+        )
+            .cmp(&(
+                right.project_id,
+                right.deployment_id,
+                &right.process,
+                right.replica,
+            ))
+    });
     Ok(metrics)
 }
 
@@ -286,6 +307,7 @@ mod tests {
                 index,
                 count: NonZeroU32::new(count).expect("count"),
             },
+            process: None,
         }
     }
 
@@ -428,6 +450,7 @@ mod tests {
                 memory_bytes: 37_539_021,
                 memory_limit_bytes: Some(268_435_456),
                 restart_count: 2,
+                process: None,
             }]
         );
     }

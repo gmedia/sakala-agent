@@ -21,7 +21,8 @@ pub mod workspace;
 
 pub use config::{
     DEFAULT_CRASH_STABLE_WINDOW, DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT,
-    DockerRuntimeConfig, TimeoutSafetyConfig,
+    DEFAULT_WORKER_STARTUP_WINDOW, DEFAULT_WORKER_STOP_GRACE, DockerRuntimeConfig,
+    TimeoutSafetyConfig,
 };
 pub use containers::{MAX_REPLICAS_PER_PROJECT_CEILING, ResourceSafetyConfig};
 pub use domains::{DEFAULT_PROJECT_DOMAIN_SUFFIXES, ProjectDomainSuffixes};

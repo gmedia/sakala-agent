@@ -30,7 +30,25 @@ pub struct ReadinessRequest {
     pub host: Option<String>,
 }
 
+/// What must hold for a worker to count as started: it keeps running,
+/// without a restart, for `window` after `started_at`. A worker serves no
+/// port, so nothing else can be checked.
+#[derive(Clone, Debug)]
+pub struct StabilityRequest {
+    pub container: String,
+    /// The worker process, for the failure message.
+    pub process: String,
+    /// When the container was started.
+    pub started_at: Instant,
+    pub window: Duration,
+}
+
 #[async_trait]
 pub trait HealthChecker: Send + Sync {
     async fn wait_until_ready(&self, request: &ReadinessRequest) -> Result<(), RuntimeError>;
+
+    /// Waits out the request's window and fails with
+    /// [`RuntimeError::WorkerStartFailed`] as soon as the container exits or
+    /// Docker restarts it, whatever its exit code.
+    async fn wait_until_stable(&self, request: &StabilityRequest) -> Result<(), RuntimeError>;
 }
