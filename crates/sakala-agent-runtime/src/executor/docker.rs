@@ -11,11 +11,12 @@ use async_trait::async_trait;
 use sakala_agent_core::logs::redactor::ValueRedactor;
 use sakala_agent_core::ports::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,
-    NodeTelemetry, ReconcileWorkloadRequest, RunJobRequest, RuntimeCapacity,
-    RuntimeCompatibilityIssue, RuntimeExecutionError, RuntimeExecutor, RuntimeHealthSnapshot,
-    RuntimeImageCleanup, RuntimeNetworkReconciliation, RuntimePreflightCheck,
-    RuntimePreflightReport, RuntimeReconciliationReport, RuntimeReplicaRestoration,
-    RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest, process_reporter,
+    JOB_END_BUDGET, JOB_START_BUDGET, NodeTelemetry, ReconcileWorkloadRequest, RunJobRequest,
+    RuntimeCapacity, RuntimeCompatibilityIssue, RuntimeExecutionError, RuntimeExecutor,
+    RuntimeHealthSnapshot, RuntimeImageCleanup, RuntimeNetworkReconciliation,
+    RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
+    RuntimeReplicaRestoration, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
+    process_reporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 use super::{
     image_reuse::ImagePlan,
-    one_off::{ActiveOneOffs, OneOffContainer},
+    one_off::{self, ActiveOneOffs, OneOffContainer},
     project_locks::ProjectLocks,
     replica_restore::{ReplicaRestorer, RestorePolicy, RestoreTarget},
     shell_command::{
@@ -51,9 +52,10 @@ use crate::{
     builders::{BuildOutput, BuildRequest, ImageBuildService, ImageBuilder, reusable_build},
     containers::{
         ContainerEngine, DEFAULT_WEB_STOP_GRACE, DockerContainerEngine, FailureOutput,
-        ImageCleanup, ImageRetention, ManagedWorkload, OneOffContainerRequest, OneOffExit,
-        OneOffRole, ReplicaSlot, RunContainerRequest, StopGrace, image_name, job_container_name,
-        release_container_name, replicas::resolve_replicas,
+        ImageCleanup, ImageRetention, ManagedWorkload, ONE_OFF_INSPECT_TIMEOUT,
+        OneOffContainerRequest, OneOffExit, OneOffRole, ReplicaSlot, RunContainerRequest,
+        StopGrace, image_name, job_container_name, release_container_name,
+        replicas::resolve_replicas,
     },
     health::{DockerHealthChecker, HealthChecker, ReadinessRequest, StabilityRequest},
     inspections::{ProjectInspector, RailpackProjectInspector},
@@ -74,6 +76,18 @@ use crate::{
 /// A deployment went live, but older images of its project could not be
 /// removed after it. Level `warning`; periodic image GC removes them later.
 const IMAGES_RETAINED_EVENT: &str = "deployment.images.retained";
+/// How long a job's outcome waits for the removal of its container. A
+/// removal that takes longer, such as gVisor killing a container that ran
+/// into its timeout, goes on in the background.
+const JOB_REMOVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The operation a `runtime_timeout` names when a job's container did not
+/// start within [`JOB_START_BUDGET`].
+const JOB_START_OPERATION: &str = "job container start";
+// After the container ended: reading whether it ran out of memory, then
+// waiting for its removal, within what the command deadline leaves for it.
+const _: () = assert!(
+    ONE_OFF_INSPECT_TIMEOUT.as_secs() + JOB_REMOVAL_WAIT.as_secs() < JOB_END_BUDGET.as_secs()
+);
 
 pub struct DockerRuntimeExecutor {
     workspace: Arc<dyn WorkspaceManager>,
@@ -1187,11 +1201,17 @@ impl DockerRuntimeExecutor {
     /// and removes the container on every path. Holds no project lock, so a
     /// deploy, restart, or sleep of the project runs next to it, and touches
     /// none of the project's web or worker containers.
+    ///
+    /// Bounded so the command deadline never replaces the job's own outcome:
+    /// [`JOB_START_BUDGET`] until the container runs, then the job's timeout,
+    /// then at most [`JOB_END_BUDGET`], of which the removal of the container
+    /// waits [`JOB_REMOVAL_WAIT`] before it goes on in the background.
     async fn run_job_container(
         &self,
         request: RunJobRequest,
         reporter: Arc<dyn RuntimeReporter>,
     ) -> Result<CommandOutput, RuntimeError> {
+        let start_by = Instant::now() + JOB_START_BUDGET;
         let RunJobRequest {
             command_id,
             project_id,
@@ -1217,10 +1237,11 @@ impl DockerRuntimeExecutor {
             &self.one_offs,
             job_container_name(project_id, command_id),
         );
-        // Every job first removes the one-off containers whose command
-        // ended, such as one Docker created after its command was cancelled.
-        // Its own container is registered as active already, so it stays.
-        self.sweep_one_offs().await;
+        // Every job also removes the one-off containers whose command ended,
+        // such as one Docker created after its command was cancelled, beside
+        // its own start rather than before it. Its own container is
+        // registered as active already, so it stays.
+        self.spawn_one_off_sweep();
         let container_request = OneOffContainerRequest {
             role: OneOffRole::Job,
             command_id,
@@ -1236,14 +1257,14 @@ impl DockerRuntimeExecutor {
         };
         let outcome = tokio::select! {
             biased;
-            outcome = self.execute_job(&container_request, job.timeout, &container, &reporter) => outcome,
+            outcome = self.execute_job(&container_request, start_by, job.timeout, &container, &reporter) => outcome,
             () = cancellation.cancelled() => Err(RuntimeError::Cancelled),
         };
-        if let Err(error) = container.remove().await {
+        let name = container.name.clone();
+        if let Err(error) = container.remove_within(JOB_REMOVAL_WAIT).await {
             let _ = reporter
                 .log(system_log(format!(
-                    "job container cleanup warning for {}: {error}",
-                    container.name
+                    "job container cleanup warning for {name}: {error}"
                 )))
                 .await;
         }
@@ -1312,14 +1333,26 @@ impl DockerRuntimeExecutor {
     async fn execute_job(
         &self,
         request: &OneOffContainerRequest,
+        start_by: Instant,
         timeout: std::time::Duration,
         container: &OneOffContainer,
         reporter: &Arc<dyn RuntimeReporter>,
     ) -> Result<(OneOffExit, u64), RuntimeError> {
-        let admission = self.container_admission.lock().await;
-        self.containers.ensure_job_capacity().await?;
-        container.start(request, Arc::clone(reporter)).await?;
-        drop(admission);
+        let start = async {
+            let admission = self.container_admission.lock().await;
+            self.containers.ensure_job_capacity().await?;
+            container.start(request, Arc::clone(reporter)).await?;
+            drop(admission);
+            Ok::<(), RuntimeError>(())
+        };
+        // A container Docker is still creating then is removed like one of a
+        // cancelled job.
+        tokio::time::timeout_at(start_by, start)
+            .await
+            .map_err(|_| RuntimeError::Timeout {
+                operation: JOB_START_OPERATION.to_owned(),
+                seconds: JOB_START_BUDGET.as_secs(),
+            })??;
         let reporter = reporter.as_ref();
         let started = Instant::now();
         emit_event(
@@ -1475,24 +1508,17 @@ impl DockerRuntimeExecutor {
         }
     }
 
-    /// Removes this Agent's release and job containers whose command no
-    /// longer runs, such as one Docker finished creating after its command
-    /// was cancelled. Best effort: the next sweep tries again, and the
-    /// operator log says why.
+    /// See [`one_off::sweep`].
     async fn sweep_one_offs(&self) {
-        let is_active = |name: &str| self.one_offs.contains(name);
-        match self.containers.remove_stale_one_offs(&is_active).await {
-            Ok(0) => {}
-            Ok(removed) => {
-                tracing::info!(
-                    removed,
-                    "release and job containers of ended commands removed"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(%error, "release and job containers of ended commands could not be removed");
-            }
-        }
+        one_off::sweep(self.containers.as_ref(), &self.one_offs).await;
+    }
+
+    /// [`one_off::sweep`] in the background, so it never delays what the
+    /// caller does next.
+    fn spawn_one_off_sweep(&self) {
+        let containers = Arc::clone(&self.containers);
+        let active = Arc::clone(&self.one_offs);
+        tokio::spawn(async move { one_off::sweep(containers.as_ref(), &active).await });
     }
 
     /// Best effort: a network left behind holds no state, and startup

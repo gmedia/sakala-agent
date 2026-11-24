@@ -4,6 +4,12 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+### Fixed
+
+- Job yang melewati `timeout_seconds`-nya kembali dilaporkan sebagai `job_timeout`, bukan `runtime_timeout`. Di staging 2026-11-24 (Agent 0.18.1, `runsc`, 2 vCPU sibuk) job dengan timeout 8 detik butuh 20 detik sampai container-nya berjalan, timeout 8 detiknya tepat, lalu `docker rm --force` container yang masih berjalan memakan sekitar 11 detik sampai batas command (`timeout_seconds` + 30 detik, dihitung sejak claim) memotongnya dan melaporkan `runtime_timeout`. Kini hasil job tidak menunggu penghapusan lebih dari 5 detik: penghapusan yang lebih lama berlanjut di background dan sweep menangani kegagalannya. Start container dibatasi 45 detik sejak job mulai diproses (gagal dengan `runtime_timeout` yang menyebut `job container start`), dan batas command `RunJob` menjadi `timeout_seconds` + 60 detik (45 detik start, 15 detik penutupan), masih 30 detik di bawah lease API `timeout_seconds` + 90 detik.
+- Penghapusan container job atau release yang sudah dijalankan Docker tidak lagi gagal. Di staging, `docker rm` pertama terputus oleh batas command saat Docker masih menunggu container gVisor keluar; tiga percobaan berikutnya, berjeda 1 detik, gagal dengan exit code 1, kemungkinan besar karena Docker menjawab penghapusan container itu sudah berjalan. Kini jawaban itu ditunggu sampai container hilang (paling lama 30 detik), kegagalan lain dicoba sampai 5 kali berjeda 3 detik, dan stderr Docker masuk log operator.
+- Sweep container sekali jalan yang tertinggal tidak lagi menunda start job: sweep berjalan di samping start, bukan sebelumnya. Di laptop pengembang (runc, satu pengukuran per versi), container job berjalan 1160 ms setelah diminta di 0.18.0, 1741 ms di 0.18.1, dan 1061 ms dengan perubahan ini. Start 13 sampai 20 detik di staging sebagian besar berasal dari `docker run` di bawah `runsc`, bukan dari Agent.
+
 ## [0.18.1] - 2026-11-24
 
 ### Fixed

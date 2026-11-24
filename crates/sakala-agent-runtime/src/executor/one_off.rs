@@ -18,6 +18,26 @@ use crate::{
     containers::{ContainerEngine, OneOffContainerRequest},
 };
 
+/// Removes the release and job containers of this Agent whose command no
+/// longer runs, such as one Docker finished creating after its command was
+/// cancelled. Best effort: the next sweep tries again, and the operator log
+/// says why.
+pub(super) async fn sweep(containers: &dyn ContainerEngine, active: &ActiveOneOffs) {
+    let is_active = |name: &str| active.contains(name);
+    match containers.remove_stale_one_offs(&is_active).await {
+        Ok(0) => {}
+        Ok(removed) => {
+            tracing::info!(
+                removed,
+                "release and job containers of ended commands removed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(%error, "release and job containers of ended commands could not be removed");
+        }
+    }
+}
+
 /// How long the removal of a one-off container waits for its `docker run` to
 /// end. `docker run --detach` returns once Docker created and started the
 /// container, which takes a few seconds under gVisor. Past this the
@@ -25,10 +45,12 @@ use crate::{
 /// creates.
 const START_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the removal of a one-off container is tried before it is left
-/// to the next sweep.
-const REMOVE_ATTEMPTS: u32 = 3;
+/// to the next sweep. Under gVisor on a loaded node one `docker rm --force`
+/// can spend about ten seconds waiting for the container to exit and still
+/// fail, so a few patient attempts are worth it.
+const REMOVE_ATTEMPTS: u32 = 5;
 /// The wait between two removal attempts.
-const REMOVE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const REMOVE_RETRY_DELAY: Duration = Duration::from_secs(3);
 
 /// The names of the one-off containers whose command still runs, which the
 /// sweep of one-off containers leaves alone.
@@ -126,6 +148,35 @@ impl OneOffContainer {
         remove_after_start(self.containers.as_ref(), &self.name, start).await?;
         self.started.store(false, Ordering::Release);
         Ok(())
+    }
+
+    /// Removes the container in a task of its own and waits for it at most
+    /// `wait`. A removal still running then goes on in the background, where
+    /// a failure is only logged and the sweep tries again: a slow runtime
+    /// killing the container must not hold back the command's outcome.
+    pub(super) async fn remove_within(self, wait: Duration) -> Result<(), RuntimeError> {
+        let name = self.name.clone();
+        let mut removal = tokio::spawn(async move {
+            let removed = self.remove().await;
+            // Once removed, dropping it only marks it inactive; otherwise the
+            // drop tries the removal once more in the background.
+            drop(self);
+            removed
+        });
+        match tokio::time::timeout(wait, &mut removal).await {
+            Ok(Ok(removed)) => removed,
+            Ok(Err(error)) => Err(RuntimeError::Execution(format!(
+                "one-off container removal did not finish: {error}"
+            ))),
+            Err(_) => {
+                tracing::info!(
+                    container = %name,
+                    wait = ?wait,
+                    "one-off container removal goes on in the background"
+                );
+                Ok(())
+            }
+        }
     }
 
     fn start_task(&self) -> MutexGuard<'_, Option<JoinHandle<()>>> {
