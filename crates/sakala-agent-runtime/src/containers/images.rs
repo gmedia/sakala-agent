@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::{
     RuntimeError,
     builders::image_labels::{DEPLOYMENT_ID_LABEL, PROJECT_ID_LABEL},
+    containers::OneOffRole,
 };
 
 /// Tag, in the project's repository, of the image the last successful
@@ -371,12 +372,15 @@ pub(crate) struct ProjectContainer {
     pub image: String,
     pub running: bool,
     pub created: OffsetDateTime,
+    /// A release or job container, which inherits the image's labels but
+    /// is no workload of the project.
+    pub one_off: bool,
 }
 
 /// `docker container inspect` of every container of a project, for
-/// [`parse_project_containers`].
-pub(crate) const PROJECT_CONTAINER_FORMAT: &str =
-    "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}";
+/// [`parse_project_containers`]. The one-off role comes last, empty for a
+/// workload.
+pub(crate) const PROJECT_CONTAINER_FORMAT: &str = "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}\t{{index .Config.Labels \"dev.sakala.role\"}}";
 
 pub(crate) fn parse_project_containers(
     stdout: &str,
@@ -386,10 +390,16 @@ pub(crate) fn parse_project_containers(
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-            let [name, image, running, created] = fields[..] else {
-                return Err(RuntimeError::Container(
-                    "docker container inspect returned an unknown format".to_owned(),
-                ));
+            let (name, image, running, created, role) = match fields[..] {
+                [name, image, running, created] => (name, image, running, created, None),
+                [name, image, running, created, role] => {
+                    (name, image, running, created, Some(role))
+                }
+                _ => {
+                    return Err(RuntimeError::Container(
+                        "docker container inspect returned an unknown format".to_owned(),
+                    ));
+                }
             };
             let created = OffsetDateTime::parse(created, &Rfc3339).map_err(|error| {
                 RuntimeError::Container(format!(
@@ -401,6 +411,7 @@ pub(crate) fn parse_project_containers(
                 image: image.to_owned(),
                 running: running == "true",
                 created,
+                one_off: OneOffRole::is_labelled(role),
             })
         })
         .collect()
@@ -917,6 +928,7 @@ mod tests {
             image: image.to_owned(),
             running,
             created: at(created),
+            one_off: false,
         }
     }
 
@@ -949,6 +961,17 @@ mod tests {
             ]
         );
         assert!(parse_project_containers("/a\tsha256:a\ttrue\n").is_err());
+    }
+
+    #[test]
+    fn tells_a_one_off_container_from_a_workload() {
+        let containers = parse_project_containers(
+            "/sakala-app-11111111-a\tsha256:a\ttrue\t2026-11-23T01:02:03Z\t\n\
+             /sakala-job-11111111-b\tsha256:a\ttrue\t2026-11-23T01:02:04Z\tjob\n",
+        )
+        .expect("containers");
+        assert!(!containers[0].one_off);
+        assert!(containers[1].one_off);
     }
 
     #[test]

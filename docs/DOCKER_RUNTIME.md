@@ -576,9 +576,11 @@ Container release dijalankan dengan:
 - tanpa `--restart`, tanpa port yang dipublikasikan, dan tanpa route;
 - nama `sakala-release-<project8>-<deployment-id>` dan label `dev.sakala.role=release`,
   `dev.sakala.project-id`, `dev.sakala.deployment-id`, `dev.sakala.command-id`, serta
-  `dev.sakala.agent-id`. Label `dev.sakala.managed=true` sengaja tidak dipasang, jadi
-  listing workload, health check, laporan crash, pemulihan replika, dan deteksi orphan
-  tidak pernah melihat container ini.
+  `dev.sakala.agent-id`. Agent tidak memasang `dev.sakala.managed=true`, tetapi Docker
+  menyalin label image ke container dan setiap image Sakala membawa label itu. Karena
+  itu setiap listing workload juga membaca `dev.sakala.role` dan melewati container
+  yang punya label itu, jadi lifecycle command, health check, laporan crash, metrik,
+  pemulihan replika, dan deteksi orphan tidak pernah melihat container ini.
 
 Agent mengikuti output-nya dengan `docker logs --follow` ke log deployment berawalan
 `[release]`, lalu membaca exit code dengan `docker wait`. Exit code 0 melanjutkan deploy.
@@ -592,10 +594,21 @@ tidak terdaftar, tetap `runtime_container_failed`. Melewati
 Container release dihapus dengan `docker rm --force --volumes` di setiap jalur: setelah
 exit, setelah timeout, setelah `docker run` gagal (container bisa tertinggal dalam status
 `Created`), dan saat deploy dibatalkan atau Agent shutdown. Bila task command di-abort
-setelah `SAKALA_SHUTDOWN_GRACE_SECONDS`, penghapusan berjalan di background. Container
-release yang masih tertinggal milik Agent ini, misalnya setelah Agent mati mendadak,
-dihapus saat Agent start berikutnya. Setelah kegagalan, image candidate dan network
-project yang tidak dipakai lagi dibersihkan seperti kegagalan deploy lainnya.
+setelah `SAKALA_SHUTDOWN_GRACE_SECONDS`, penghapusan berjalan di background.
+
+`docker run` container sekali jalan berjalan di task sendiri, jadi pembatalan tidak
+membunuhnya di tengah jalan. Penghapusan menunggu `docker run` itu selesai, paling lama
+30 detik, baru menjalankan `docker rm --force --volumes`; setelah 30 detik `docker run`
+dimatikan. Tanpa itu, deploy atau job yang dibatalkan saat Docker masih membuat atau
+menyalakan container bisa meninggalkan container `Created` yang muncul setelah
+penghapusan. `docker rm` yang gagal dicoba sampai 3 kali dengan jeda 1 detik.
+
+Container release dan job milik Agent ini yang command-nya sudah tidak berjalan, misalnya
+setelah Agent mati mendadak atau penghapusan yang tetap gagal, dihapus saat Agent start,
+sebelum setiap job, dan di setiap putaran rekonsiliasi network berkala (setiap 60 detik).
+Container milik command yang masih berjalan tidak pernah disentuh. Setelah kegagalan,
+image candidate dan network project yang tidak dipakai lagi dibersihkan seperti
+kegagalan deploy lainnya.
 
 Kapasitas: container release diterima lewat pengecekan yang sama dengan replika, di
 bawah lock admission yang sama, dan meminta jumlah replika deployment itu ditambah
@@ -644,14 +657,16 @@ route. Sebelum menurunkan Agent, deploy ulang project yang punya worker tanpa
 ## Job
 
 `RunJob` memakai jalur container sekali jalan yang sama dengan release command, dengan
-role `job`: label `dev.sakala.role=job` (tanpa `dev.sakala.managed`), nama
+role `job`: label `dev.sakala.role=job` (Agent tidak memasang `dev.sakala.managed`,
+tetapi container mewarisinya dari image; lihat release command di atas), nama
 `sakala-job-<project8>-<command-id>`, image deployment live yang dicari dari nama yang
 dihitung Agent dan diperiksa labelnya, env file, network project, runtime, opsi
 keamanan, dan batas resource yang sama, tanpa `--restart`, dan dengan `--pull never`
 supaya image yang hilang tidak pernah dicari di registry. Output-nya diikuti
 `docker logs --follow` dengan awalan `[job]`, exit code dibaca `docker wait`, dan
-container selalu dihapus dengan `docker rm --force --volumes`, juga setelah timeout,
-pembatalan, dan saat Agent start berikutnya.
+container selalu dihapus dengan `docker rm --force --volumes`, juga setelah timeout dan
+pembatalan, termasuk pembatalan saat Docker masih membuat container-nya. Sisa container
+job dihapus dengan cara yang sama dengan sisa container release.
 
 Job tidak memegang lock project dan berjalan di pool `SAKALA_MAX_CONCURRENT_JOBS`, jadi
 job bisa berjalan bersamaan dengan deploy, restart, atau sleep project yang sama, dan
@@ -659,7 +674,11 @@ tidak pernah menyalakan atau menghentikan container web atau worker. Penerimaann
 memakai lock admission yang sama dengan deploy dan wake, dan menghitung semua container
 yang berjalan ditambah satu. Image GC tetap aman: image yang dipakai container mana pun,
 termasuk container job, tidak dihapus. `StopProject` membatalkan job project itu yang
-sedang berjalan; `SleepProject` tidak. Kontraknya ada di
+sedang berjalan dan menghapus semua container release dan job project itu dalam status
+apa pun, dari Agent mana pun, sebelum network project dilepas; gagal menghapusnya hanya
+menjadi peringatan di log command, tidak menggagalkan stop. `SleepProject` tidak
+menyentuh job. Deploy project yang sama juga tidak menghentikan job yang sedang
+berjalan. Kontraknya ada di
 [Sakala Agent API](AGENT_API.md#job-runjob).
 
 ## Memakai ulang image

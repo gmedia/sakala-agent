@@ -2361,7 +2361,7 @@ async fn wake_replaces_the_sleeping_page_with_the_serving_route() {
             && !args.iter().any(|a| a == "--all")
             && args
                 .iter()
-                .any(|a| a == "{{.Label \"dev.sakala.project-id\"}}")
+                .any(|a| a.starts_with("{{.Label \"dev.sakala.project-id\"}}"))
     })
     .expect("capacity probe");
     let started = command_position(&runner, |args| args.first().is_some_and(|a| a == "start"))
@@ -6399,11 +6399,15 @@ async fn periodic_reconcile_reattaches_a_recreated_router_without_removing_while
             "{name}"
         );
     }
+    // Only the sweep of ended one-off containers lists containers, and it
+    // found none to remove.
     let calls = docker_calls(&runner);
     assert!(
         !calls
             .iter()
-            .any(|args| args.first().is_some_and(|arg| arg == "ps")
+            .any(|args| (args.first().is_some_and(|arg| arg == "ps")
+                && !args.iter().any(|arg| is_one_off_filter(arg)))
+                || args.first().is_some_and(|arg| arg == "rm")
                 || is_network(args, "rm")
                 || is_network(args, "disconnect")),
         "nothing is removed while a command runs: {calls:?}"
@@ -6429,8 +6433,8 @@ async fn periodic_reconcile_is_cheap_when_nothing_changed() {
     let calls = docker_calls(&runner);
     assert_eq!(
         calls.len(),
-        3,
-        "network ls, docker ps, router inspect: {calls:?}"
+        5,
+        "one one-off listing per role, network ls, docker ps, router inspect: {calls:?}"
     );
 }
 
@@ -10116,7 +10120,7 @@ async fn lifecycle_commands_never_run_a_release_command() {
 }
 
 /// What the agent asks `docker container inspect` for after a cutover.
-const PROJECT_CONTAINER_FORMAT: &str = "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}";
+const PROJECT_CONTAINER_FORMAT: &str = "{{.Name}}\t{{.Image}}\t{{.State.Running}}\t{{.Created}}\t{{index .Config.Labels \"dev.sakala.role\"}}";
 
 fn previous_reference() -> String {
     format!("sakala/project-{PROJECT}:previous")
@@ -11521,4 +11525,455 @@ async fn startup_removes_job_containers_an_interrupted_agent_left() {
             .iter()
             .any(|args| args == &["rm", "--force", "--volumes", "9a8b7c6d5e4f"])
     );
+}
+
+/// A one-off container as a listing of managed containers prints it: it
+/// inherits `dev.sakala.managed=true` from its image, so `docker ps` finds it
+/// next to the deployment's workloads, without a domain or port, with its role.
+fn one_off_lookup_row(id: &str, status: &str, name: &str, role: &str) -> String {
+    format!("{id}\t{status}\t\t\t{JOB_COMMAND_ID}\t\t\t\t{name}\t\t\t\t\t{role}\n")
+}
+
+#[tokio::test]
+async fn stopping_a_project_removes_its_leftover_job_container_instead_of_failing() {
+    // Staging, 2026-11-24: a job cancelled while Docker created its container
+    // left it in `created`, and deleting the project then failed on it.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_workload_lookup(format!(
+                "{}{}",
+                web_and_worker_lookup("Up 2 minutes"),
+                one_off_lookup_row("jobcontainer", "Created", JOB_CONTAINER, "job"),
+            ))
+            .with_release_ps(format!("{JOB_CONTAINER}\n")),
+    );
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::stop_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("a leftover job container never blocks the stop");
+
+    let removed = docker_commands(&runner, "rm");
+    for container in ["webcontainer", "workercontainer"] {
+        assert!(
+            removed.iter().any(|args| args == &["rm", container]),
+            "{removed:?}"
+        );
+    }
+    assert!(
+        removed
+            .iter()
+            .any(|args| args == &["rm", "--force", "--volumes", JOB_CONTAINER]),
+        "{removed:?}"
+    );
+    for verb in ["stop", "rm"] {
+        assert!(
+            !docker_commands(&runner, verb)
+                .iter()
+                .any(|args| args.iter().any(|argument| argument == "jobcontainer")),
+            "the job container is never handled as a workload: {verb}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sleeping_a_project_leaves_its_running_job_alone() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_workload_lookup(format!(
+        "{}{}",
+        web_and_worker_lookup("Up 2 minutes"),
+        one_off_lookup_row("jobcontainer", "Up 5 seconds", JOB_CONTAINER, "job"),
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::sleep_project(
+        &executor,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("a running job never blocks a sleep");
+
+    let stops = docker_commands(&runner, "stop");
+    assert!(
+        stops
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "webcontainer")),
+        "{stops:?}"
+    );
+    assert!(
+        !stops
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "jobcontainer")),
+        "{stops:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_off_containers_are_never_listed_as_replicas_or_workloads() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    // The replica listing: ID, status, project, deployment, replica, replicas,
+    // kind, process, role.
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "webcontainer\tUp 2 minutes\t{PROJECT}\t{DEPLOYMENT}\t0\t1\tweb\t\t\n\
+         jobcontainer\tUp 3 seconds\t{PROJECT}\t{DEPLOYMENT}\t\t\t\t\tjob\n"
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+    let snapshots = RuntimeExecutor::health_snapshot(&executor)
+        .await
+        .expect("health snapshot");
+    assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+    assert_eq!(snapshots[0].workload.container_id, "webcontainer");
+
+    // The orphan listing: ID, status, project, deployment, role.
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(format!(
+        "webcontainer\tUp 2 minutes\t{PROJECT}\t{DEPLOYMENT}\t\n\
+         jobcontainer\tUp 3 seconds\t{PROJECT}\t{DEPLOYMENT}\tjob\n\
+         createdjob\tCreated\t{PROJECT}\t{DEPLOYMENT}\tjob\n"
+    )));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner);
+    let report = RuntimeExecutor::reconcile(&executor)
+        .await
+        .expect("reconciliation");
+    assert_eq!(report.workloads.len(), 1, "{:?}", report.workloads);
+    assert_eq!(report.workloads[0].container_id, "webcontainer");
+    assert!(report.orphans.is_empty(), "{:?}", report.orphans);
+    // A running job still takes a slot on the node, once.
+    let capacity = RuntimeExecutor::capacity(&executor)
+        .await
+        .expect("capacity");
+    assert_eq!(capacity.active_workloads, Some(2));
+}
+
+#[tokio::test]
+async fn a_redeploy_leaves_a_running_job_of_the_project_alone() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_previous_containers(&[
+        ("previous-web", true, "sakala-app-previous"),
+        ("running-job", true, JOB_CONTAINER),
+    ]));
+    let mut previous = runner.previous_containers.clone();
+    previous.insert(
+        "running-job".to_owned(),
+        format!("true\t/{JOB_CONTAINER}\t\tjob\n"),
+    );
+    let runner = Arc::new(FakeRunner {
+        previous_containers: previous,
+        ..Arc::into_inner(runner).expect("only reference")
+    });
+
+    deploy_outcome(
+        runner.clone(),
+        &temp,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("redeploy");
+
+    let stops = docker_commands(&runner, "stop");
+    assert!(
+        stops
+            .iter()
+            .any(|args| args.iter().any(|argument| argument == "previous-web")),
+        "{stops:?}"
+    );
+    for verb in ["stop", "rm"] {
+        assert!(
+            !docker_commands(&runner, verb)
+                .iter()
+                .any(|args| args.iter().any(|argument| argument == "running-job")),
+            "a deploy never stops a job: {verb}"
+        );
+    }
+}
+
+/// Holds the `docker run` of one one-off container for `delay`, the way a
+/// daemon still creating a gVisor container does, and records for each
+/// removal of that container whether its `docker run` had ended by then.
+struct SlowOneOffRunner {
+    inner: FakeRunner,
+    is_run: fn(&CommandSpec) -> bool,
+    container: &'static str,
+    delay: Duration,
+    run_started: AtomicBool,
+    run_ended: AtomicBool,
+    removals: Mutex<Vec<bool>>,
+}
+
+impl SlowOneOffRunner {
+    fn new(inner: FakeRunner, is_run: fn(&CommandSpec) -> bool, container: &'static str) -> Self {
+        Self {
+            inner,
+            is_run,
+            container,
+            delay: Duration::from_millis(500),
+            run_started: AtomicBool::new(false),
+            run_ended: AtomicBool::new(false),
+            removals: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn wait_for_run(&self) {
+        tokio::time::timeout(FOLLOWER_START_TIMEOUT, async {
+            while !self.run_started.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the one-off container is being created");
+    }
+
+    fn removals(&self) -> Vec<bool> {
+        self.removals.lock().expect("removal lock").clone()
+    }
+}
+
+#[async_trait]
+impl ProcessRunner for SlowOneOffRunner {
+    async fn run(
+        &self,
+        spec: &CommandSpec,
+        sink: &dyn ProcessOutputSink,
+    ) -> Result<ProcessOutput, RuntimeError> {
+        if (self.is_run)(spec) {
+            self.run_started.store(true, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            let output = self.inner.run(spec, sink).await;
+            self.run_ended.store(true, Ordering::SeqCst);
+            return output;
+        }
+        if spec.program == "docker"
+            && string_arguments(spec) == ["rm", "--force", "--volumes", self.container]
+        {
+            self.removals
+                .lock()
+                .expect("removal lock")
+                .push(self.run_ended.load(Ordering::SeqCst));
+        }
+        self.inner.run(spec, sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_job_cancelled_while_docker_creates_its_container_still_removes_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowOneOffRunner::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30)),
+        is_job_run,
+        JOB_CONTAINER,
+    ));
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let cancellation = CancellationToken::new();
+    let job = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &job_command(json!({})),
+                    Arc::new(RecordingReporter::default()),
+                    cancellation,
+                )
+                .await
+        }
+    });
+    runner.wait_for_run().await;
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(10), job)
+        .await
+        .expect("the cancellation ends the job")
+        .expect("task")
+        .expect_err("cancelled");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    let removals = runner.removals();
+    assert_eq!(
+        removals.last(),
+        Some(&true),
+        "the removal waits for `docker run`, or the container appears after it: {removals:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_job_dropped_while_docker_creates_its_container_still_removes_it() {
+    // What happens when shutdown aborts a command after its grace period.
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowOneOffRunner::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30)),
+        is_job_run,
+        JOB_CONTAINER,
+    ));
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let job = tokio::spawn(async move {
+        CommandDispatcher::new(executor)
+            .dispatch(
+                &job_command(json!({})),
+                Arc::new(RecordingReporter::default()),
+                CancellationToken::new(),
+            )
+            .await
+    });
+    runner.wait_for_run().await;
+
+    job.abort();
+    let _ = job.await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while !runner.removals().contains(&true) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    let removals = runner.removals();
+    assert_eq!(removals.last(), Some(&true), "{removals:?}");
+}
+
+#[tokio::test]
+async fn a_deployment_cancelled_while_docker_creates_its_release_container_still_removes_it() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(SlowOneOffRunner::new(
+        FakeRunner::new(true).with_follow_delay(Duration::from_secs(30)),
+        is_release_run,
+        RELEASE_CONTAINER,
+    ));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let cancellation = CancellationToken::new();
+    let deploy = deploy_with_release("php artisan migrate --force");
+    let dispatcher = CommandDispatcher::new(Arc::new(executor));
+    let deployment = dispatcher.dispatch(
+        &deploy,
+        Arc::new(RecordingReporter::default()),
+        cancellation.clone(),
+    );
+    tokio::pin!(deployment);
+    tokio::select! {
+        result = &mut deployment => panic!("finished before its release command: {result:?}"),
+        () = runner.wait_for_run() => {}
+    }
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(10), deployment)
+        .await
+        .expect("cancellation ends the deployment")
+        .expect_err("cancelled");
+
+    assert_eq!(error.code(), "runtime_cancelled");
+    let removals = runner.removals();
+    assert_eq!(removals.last(), Some(&true), "{removals:?}");
+    assert_eq!(runner.inner.count_commands(is_workload_run), 0);
+}
+
+#[tokio::test]
+async fn the_periodic_reconcile_removes_one_off_containers_whose_command_ended() {
+    let leftover = "sakala-job-ff66ed4a-0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001";
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_job_ps(format!("{leftover}\n")));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    RuntimeExecutor::reconcile_networks(&executor, false)
+        .await
+        .expect("reconciliation");
+
+    let listing = string_arguments(&find_command(&runner, |spec| {
+        string_arguments(spec)
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.role=job")
+    }));
+    assert!(
+        listing
+            .iter()
+            .any(|argument| argument == "label=dev.sakala.agent-id=local-agent-01"),
+        "{listing:?}"
+    );
+    assert!(
+        docker_commands(&runner, "rm")
+            .iter()
+            .any(|args| args == &["rm", "--force", "--volumes", leftover])
+    );
+}
+
+#[tokio::test]
+async fn a_job_start_first_removes_one_off_containers_whose_command_ended() {
+    let leftover = "sakala-job-ff66ed4a-0b5b3f43-8a43-4b8e-9a67-8d1ab0e1d001";
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_job_ps(format!("{leftover}\n")),
+    );
+
+    run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({})),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("job");
+
+    let removal = runner
+        .command_position(|spec| string_arguments(spec) == ["rm", "--force", "--volumes", leftover])
+        .expect("the leftover is removed");
+    let run = runner.command_position(is_job_run).expect("the job runs");
+    assert!(removal < run, "removed before the job starts");
+}
+
+#[tokio::test]
+async fn the_periodic_reconcile_never_removes_the_container_of_a_running_job() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_follow_delay(Duration::from_secs(30))
+            .with_job_ps(format!("{JOB_CONTAINER}\n")),
+    );
+    let executor: Arc<dyn RuntimeExecutor> = Arc::new(DockerRuntimeExecutor::with_runner(
+        runtime_config(&temp),
+        runner.clone(),
+    ));
+    let cancellation = CancellationToken::new();
+    let job = tokio::spawn({
+        let cancellation = cancellation.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            CommandDispatcher::new(executor)
+                .dispatch(
+                    &job_command(json!({})),
+                    Arc::new(RecordingReporter::default()),
+                    cancellation,
+                )
+                .await
+        }
+    });
+    runner.wait_for_followers(1).await;
+
+    executor
+        .reconcile_networks(false)
+        .await
+        .expect("reconciliation");
+    assert_eq!(
+        runner.count_commands(is_job_removal),
+        0,
+        "the job still runs"
+    );
+
+    cancellation.cancel();
+    let _ = job.await.expect("task");
+    assert_eq!(runner.count_commands(is_job_removal), 1);
 }

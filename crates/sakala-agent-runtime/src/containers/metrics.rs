@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     RuntimeError,
-    containers::{replicas::ReplicaSlot, workers::process_from_labels},
+    containers::{OneOffRole, replicas::ReplicaSlot, workers::process_from_labels},
 };
 
 /// `docker stats` format: one JSON object per container.
@@ -113,8 +113,7 @@ pub(crate) fn parse_metrics_target(line: &str) -> Option<MetricsTarget> {
     let running = fields
         .get(1)
         .is_some_and(|status| status.trim().to_ascii_lowercase().starts_with("up"));
-    let has_role = fields.get(6).is_some_and(|role| !role.trim().is_empty());
-    if !running || has_role {
+    if !running || OneOffRole::is_labelled(fields.get(6).copied()) {
         return None;
     }
     Some(MetricsTarget {
