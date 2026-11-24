@@ -1217,9 +1217,9 @@ impl DockerRuntimeExecutor {
             &self.one_offs,
             job_container_name(project_id, command_id),
         );
-        // A job is when one-off containers come and go, so it removes the
-        // ones whose command ended, such as one Docker created after its
-        // command was cancelled. Its own container is active by now.
+        // Every job first removes the one-off containers whose command
+        // ended, such as one Docker created after its command was cancelled.
+        // Its own container is registered as active already, so it stays.
         self.sweep_one_offs().await;
         let container_request = OneOffContainerRequest {
             role: OneOffRole::Job,
