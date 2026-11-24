@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-24
+
 ### Added
 
 - Proses worker per deployment (ADR-022). Payload `DeployProject` boleh membawa `processes`, daftar paling banyak 5 worker `{ name, command, replicas, resources }`, dan node mengiklankan capability baru `worker-processes`. Setiap worker berjalan dari image dan variabel yang sama dengan proses web, lewat builder `docker run` yang sama (network project, runtime `runsc`, opsi keamanan, filter egress, `--restart unless-stopped`), dengan perintah `sh -c` sendiri, jumlah container sendiri (0 menyimpan definisi tanpa menjalankan apa pun), dan batas resource sendiri yang jatuh ke `resources` deployment per field. Container worker berlabel `dev.sakala.workload-kind=worker` dan `dev.sakala.process=<name>`, tidak punya route, tidak diprobe HTTP, tidak masuk traffic, dan tidak dipulihkan oleh pemulihan replika. Worker dianggap siap bila masih berjalan tanpa restart `SAKALA_WORKER_STARTUP_SECONDS` (default 10) setelah start, ditunggu bersamaan dengan readiness HTTP web; worker yang keluar lebih dulu, termasuk dengan code 0, menggagalkan deploy dengan kode baru `worker_start_failed` sebelum route berpindah, dan versi lama tetap melayani bersama worker-nya. Container lama dihentikan bersamaan: web dengan grace 10 detik, worker dengan `SAKALA_WORKER_STOP_GRACE_SECONDS` (default 30). `RestartProject`, `SleepProject`, `WakeProject`, dan `StopProject` menangani web dan worker bersama; `HealthCheck`, `RefreshRoute`, dan pemulihan route hanya melihat replika web. Setiap worker dihitung ke `SAKALA_MAX_ACTIVE_CONTAINERS` seperti replika. Worker yang keluar dengan code 0 setelah deploy tidak dilaporkan sebagai crash; crash lain muncul di `crashed_details` dengan key baru `process`, dikelompokkan per proses sehingga tidak menandai proses web crash. `workloads.metrics` dan `unhealthy_details` juga membawa `process` untuk worker, dan `workloads.replicas` hanya menghitung replika web. Baris log worker membawa field baru `process` dan dikirim lewat reporter sendiri dengan budget `max_total_bytes` dan status berhenti sendiri. Nilai `processes` yang tidak terbaca tidak menggagalkan deploy: proses web tetap dideploy dan event `deployment.processes.ignored` menjelaskannya. Payload tanpa `processes` berperilaku persis seperti sebelumnya. Lihat [Proses worker](docs/AGENT_API.md#proses-worker).
@@ -368,7 +370,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/gmedia/sakala-agent/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/gmedia/sakala-agent/compare/v0.16.2...v0.17.0
 [0.16.2]: https://github.com/gmedia/sakala-agent/compare/v0.16.1...v0.16.2
 [0.16.1]: https://github.com/gmedia/sakala-agent/compare/v0.16.0...v0.16.1
