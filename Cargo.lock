@@ -1676,7 +1676,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sakala-agent"
-version = "0.18.2"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-core"
-version = "0.18.2"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1717,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-protocol"
-version = "0.18.2"
+version = "0.19.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1727,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-agent-runtime"
-version = "0.18.2"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "sakala-edge"
-version = "0.18.2"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "async-trait",
