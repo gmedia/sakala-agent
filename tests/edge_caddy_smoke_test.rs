@@ -451,11 +451,37 @@ async fn real_caddy_serves_custom_domain_sites_from_the_generated_file() {
         );
     }
 
-    // Each custom domain is its own TLS site, chosen by SNI.
+    // Each custom domain is its own TLS site, chosen by SNI. The client
+    // trusts the internal CA of this Caddy, which `tls internal` creates when
+    // it loads the sites, and verifies every certificate against it.
+    let started = Instant::now();
+    let root_pem = loop {
+        let (found, pem) = {
+            let output = Command::new("docker")
+                .args([
+                    "exec",
+                    &edge,
+                    "cat",
+                    "/data/caddy/pki/authorities/local/root.crt",
+                ])
+                .output()
+                .expect("docker CLI");
+            (output.status.success(), output.stdout)
+        };
+        if found {
+            break pem;
+        }
+        assert!(
+            started.elapsed() < READY_TIMEOUT,
+            "Caddy never created its internal CA"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let root = reqwest::Certificate::from_pem(&root_pem).expect("Caddy root certificate");
     let client = |host: &'static str| {
         reqwest::Client::builder()
             .no_proxy()
-            .danger_accept_invalid_certs(true)
+            .add_root_certificate(root.clone())
             .resolve(host, https)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
