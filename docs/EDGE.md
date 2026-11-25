@@ -264,7 +264,7 @@ lengkap ada di [`examples/edge/route-table-custom-domains.json`](../examples/edg
 | `custom_routes` | array, opsional | Tidak ada, `null`, atau `[]` berarti tidak ada custom domain. Berbeda dengan `routes`, array kosong diterima, asal `expected_minimum_custom_routes` 0. |
 | `custom_routes[].host` | string, wajib | Custom domain dalam bentuk akhirnya: huruf kecil, minimal dua label, paling panjang 253 karakter, label `xn--` harus punycode valid, bukan alamat IP, bukan di bawah `SAKALA_EDGE_DOMAIN_SUFFIXES` atau `SAKALA_EDGE_CUSTOM_DOMAIN_FORBIDDEN_ZONES`. Aturannya sama dengan Agent. |
 | `custom_routes[].project_id` | UUID, wajib | Ditulis sebagai komentar. |
-| `custom_routes[].upstreams` | array string, wajib | Sama dengan `routes[].upstreams`, tetapi boleh kosong: project tanpa workload. Site-nya menjawab 404 dengan teks "Belum ada aplikasi di alamat ini", jadi sertifikat tetap terbit dan diperpanjang dan pengunjung tidak melihat error TLS. |
+| `custom_routes[].upstreams` | array string, wajib | Sama dengan `routes[].upstreams`, tetapi boleh kosong: project tanpa workload. Site-nya hanya mengimport snippet `sakala_not_found`, halaman 404 bermerek "Belum ada aplikasi di alamat ini" yang sama dengan site wildcard, jadi sertifikat tetap terbit dan diperpanjang dan pengunjung tidak melihat error TLS. |
 
 Bagian custom diperiksa terpisah dari `routes`. Satu pelanggaran menolak seluruh bagian
 custom, tetapi route project dari tabel yang sama tetap diterapkan, dan custom domain
@@ -299,11 +299,7 @@ menerbitkan revision baru.
 # Project 0a6f7f3e-4f3b-4d0e-9b8e-1f1f1f1f1f1b
 contoh.net {
 	import sakala_custom_domain_tls
-	header {
-		Cache-Control "no-store"
-		X-Robots-Tag "noindex"
-	}
-	respond "Belum ada aplikasi di alamat ini. Kalau ini domain proyekmu, cek status deployment-nya di Console Sakala." 404
+	import sakala_not_found
 }
 
 # Project 0a6f7f3e-4f3b-4d0e-9b8e-1f1f1f1f1f1a
@@ -316,7 +312,10 @@ www.contoh.com {
 Setiap custom domain menjadi satu site tingkat atas, diurutkan menurut host, sehingga
 Caddy mengelola sertifikatnya sendiri: diterbitkan begitu site muncul dan berhenti
 diperpanjang begitu site hilang. Tidak ada on-demand TLS dan tidak ada endpoint `ask`.
-Opsi load balancing untuk lebih dari satu node sama dengan route project. Site tidak
+Opsi load balancing untuk lebih dari satu node sama dengan route project. Site tanpa
+upstream tidak punya `reverse_proxy` dan tidak punya `handle` lain, hanya
+`import sakala_not_found`; status 404 dan semua header-nya berasal dari snippet itu,
+Edge tidak menambah apa pun. Site tidak
 mempercayai proxy apa pun, jadi Caddy menimpa `X-Forwarded-For`, `-Proto`, dan
 `-Host`, dan `Host` asli diteruskan ke router node, yang mengenal custom domain itu
 dari route project (lihat [Caddy Integration](CADDY_INTEGRATION.md#custom-domain)).
@@ -325,11 +324,17 @@ pernah menunjuk file yang hilang.
 
 ### Caddyfile host
 
-Edge tidak menulis apa pun tentang penerbit sertifikat. Caddyfile host wajib
-mendefinisikan snippet `sakala_custom_domain_tls` sebelum mengimport file ini, di
-tingkat atas, bukan di dalam site wildcard. Di `sakala-deployment` snippet itu ada di
-`caddy/sakala.custom-domains.<env>.Caddyfile`: Let's Encrypt saja, lewat HTTP-01 atau
-TLS-ALPN-01, dengan email operator dari `ACME_EMAIL`. Contoh ada di
+Edge tidak menulis apa pun tentang penerbit sertifikat maupun isi halaman 404.
+Caddyfile host wajib mendefinisikan dua snippet sebelum mengimport file ini, di
+tingkat atas, bukan di dalam site wildcard. Di `sakala-deployment` keduanya ada di
+`caddy/sakala.custom-domains.<env>.Caddyfile`:
+
+- `sakala_custom_domain_tls`: Let's Encrypt saja, lewat HTTP-01 atau TLS-ALPN-01,
+  dengan email operator dari `ACME_EMAIL`.
+- `sakala_not_found`: satu blok `handle` yang memasang header halaman (HTML, `no-store`,
+  `noindex`, CSP) dan menjawab halaman "Belum ada aplikasi di alamat ini" dengan 404,
+  halaman yang sama dengan site wildcard untuk project yang tidak dikenal.
+ Contoh ada di
 [`examples/edge/custom-domains.Caddyfile.example`](../examples/edge/custom-domains.Caddyfile.example):
 
 ```caddyfile
@@ -339,6 +344,20 @@ TLS-ALPN-01, dengan email operator dari `ACME_EMAIL`. Contoh ada di
 			dir https://acme-v02.api.letsencrypt.org/directory
 			email {$ACME_EMAIL}
 		}
+	}
+}
+
+(sakala_not_found) {
+	handle {
+		header {
+			Content-Type "text/html; charset=utf-8"
+			Cache-Control "no-store"
+			X-Robots-Tag "noindex"
+		}
+		respond <<NOT_FOUND
+			<!doctype html>
+			...
+			NOT_FOUND 404
 	}
 }
 
@@ -373,4 +392,4 @@ cargo test -p sakala-edge
 cargo test -p sakala-edge --test edge_caddy_smoke_test -- --ignored --nocapture
 ```
 
-Test kedua opt-in karena butuh Docker dan `caddy:2.11.3-alpine`. Test pertamanya menjalankan Caddy sungguhan dengan Caddyfile statis yang mengimport file hasil Edge (satu site HTTP dan satu site `tls internal`), memvalidasi dan me-reload lewat `docker exec`, lalu memastikan request terbagi ke dua upstream, host tanpa route mendapat 404, dan mematikan satu upstream tidak menggagalkan request berikutnya. Test keduanya mendefinisikan snippet `sakala_custom_domain_tls` dengan `tls internal`, menerapkan tabel dengan dua custom domain, lalu memastikan lewat HTTPS dengan SNI masing-masing bahwa domain dengan upstream sampai ke aplikasi dengan `Host` asli, `X-Forwarded-Proto: https`, dan `X-Forwarded-For` buatan pengunjung ditimpa, domain tanpa upstream menjawab 404, HTTP diarahkan ke HTTPS, dan route project tetap jalan.
+Test kedua opt-in karena butuh Docker dan `caddy:2.11.3-alpine`. Test pertamanya menjalankan Caddy sungguhan dengan Caddyfile statis yang mengimport file hasil Edge (satu site HTTP dan satu site `tls internal`), memvalidasi dan me-reload lewat `docker exec`, lalu memastikan request terbagi ke dua upstream, host tanpa route mendapat 404, dan mematikan satu upstream tidak menggagalkan request berikutnya. Test keduanya mendefinisikan snippet `sakala_custom_domain_tls` dengan `tls internal`, menerapkan tabel dengan dua custom domain, lalu memastikan lewat HTTPS dengan SNI masing-masing bahwa domain dengan upstream sampai ke aplikasi dengan `Host` asli, `X-Forwarded-Proto: https`, dan `X-Forwarded-For` buatan pengunjung ditimpa, domain tanpa upstream menjawab 404 dari snippet `sakala_not_found` beserta header-nya, HTTP diarahkan ke HTTPS, dan route project tetap jalan.

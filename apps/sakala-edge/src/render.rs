@@ -52,11 +52,12 @@ const FAIL_DURATION: Duration = Duration::from_secs(10);
 /// issuer for names outside Sakala's zones (Let's Encrypt over HTTP-01 or
 /// TLS-ALPN-01 in `sakala-deployment`). Renaming it breaks every Edge host.
 pub const CUSTOM_DOMAIN_TLS_SNIPPET: &str = "sakala_custom_domain_tls";
-/// What a custom domain without a workload answers, with status 404: the
-/// site keeps its certificate and tells the visitor the truth instead of a TLS
-/// error. Plain text, so nothing in it can read as a Caddy placeholder.
-const CUSTOM_DOMAIN_NOT_FOUND_BODY: &str = "Belum ada aplikasi di alamat ini. Kalau ini domain proyekmu, cek status deployment-nya di Console Sakala.";
-const NOT_FOUND_STATUS: u16 = 404;
+/// Snippet a custom domain without a workload imports in place of a proxy:
+/// the branded not-found page the host Caddyfile also serves for an unknown
+/// project, with its status 404 and headers. The site keeps its certificate,
+/// so the visitor gets an honest page instead of a TLS error. Defined by the
+/// host Caddyfile next to [`CUSTOM_DOMAIN_TLS_SNIPPET`].
+pub const NOT_FOUND_SNIPPET: &str = "sakala_not_found";
 
 /// The full file for `table`. The same routes always render the same bytes,
 /// which is how Edge tells whether Caddy needs a reload at all. The revision
@@ -105,7 +106,8 @@ fn render_proxy(content: &mut String, route: &Route) {
 /// The custom domains file (ADR-024): one top-level site per domain, sorted
 /// by host, each importing [`CUSTOM_DOMAIN_TLS_SNIPPET`] and proxying to the
 /// project's nodes like its project route. Caddy obtains and renews each
-/// site's certificate itself. A site with no node answers 404. The site trusts
+/// site's certificate itself. A site with no node imports
+/// [`NOT_FOUND_SNIPPET`] and nothing else. The site trusts
 /// no proxy, so Caddy overwrites the forwarded headers as on the wildcard.
 /// Hosts passed [`sakala_agent_runtime::CustomDomainPolicy`], so they are
 /// `a-z0-9-.` only.
@@ -120,10 +122,7 @@ pub fn render_custom(custom_routes: &CustomRoutes) -> String {
             route.project_id, route.host
         );
         if route.upstreams.is_empty() {
-            let _ = write!(
-                content,
-                "\theader {{\n\t\tCache-Control \"no-store\"\n\t\tX-Robots-Tag \"noindex\"\n\t}}\n\trespond \"{CUSTOM_DOMAIN_NOT_FOUND_BODY}\" {NOT_FOUND_STATUS}\n"
-            );
+            let _ = writeln!(content, "\timport {NOT_FOUND_SNIPPET}");
         } else {
             render_proxy(&mut content, route);
         }
@@ -276,11 +275,7 @@ mod tests {
                  # Project {PROJECT_A}\n\
                  kosong.example.org {{\n\
                  \timport sakala_custom_domain_tls\n\
-                 \theader {{\n\
-                 \t\tCache-Control \"no-store\"\n\
-                 \t\tX-Robots-Tag \"noindex\"\n\
-                 \t}}\n\
-                 \trespond \"{CUSTOM_DOMAIN_NOT_FOUND_BODY}\" 404\n\
+                 \timport sakala_not_found\n\
                  }}\n\
                  \n\
                  # Project {PROJECT_B}\n\
@@ -306,9 +301,6 @@ mod tests {
             render_custom(table.custom_routes()),
             format!("{GENERATED_HEADER}\n# Custom domains: 0\n")
         );
-        // The not-found text holds nothing Caddy would read as a placeholder
-        // or the end of the quoted token.
-        assert!(!CUSTOM_DOMAIN_NOT_FOUND_BODY.contains(['{', '}', '"', '\\', '\n']));
     }
 
     #[test]
