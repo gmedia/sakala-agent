@@ -18,6 +18,7 @@ use super::{
     databases::DatabaseHeartbeat,
     metrics::{WorkloadMetricsSampler, insert_metrics},
     object_storage::ObjectStorageHeartbeat,
+    valkey::ValkeyHeartbeat,
 };
 use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
@@ -57,6 +58,9 @@ pub struct HeartbeatRuntimeContext {
     /// `metadata.object_storage` and `metadata.buckets` on an object storage
     /// host, `None` on a node without `SAKALA_OBJECT_STORAGE_DRIVER`.
     pub object_storage: Option<ObjectStorageHeartbeat>,
+    /// `metadata.valkey` and `metadata.valkeys` on a Valkey host, `None` on a
+    /// node without `SAKALA_VALKEY_DRIVER`.
+    pub valkey: Option<ValkeyHeartbeat>,
 }
 
 pub async fn run(
@@ -232,12 +236,17 @@ async fn payload(config: &AgentConfig, context: &HeartbeatRuntimeContext) -> Hea
         Some(object_storage) => object_storage.insert(&mut metadata).await,
         None => true,
     };
+    let valkey_available = match &context.valkey {
+        Some(valkey) => valkey.insert(&mut metadata).await,
+        None => true,
+    };
     HeartbeatPayload {
         status: match context.node_lifecycle.state() {
             NodeLifecycleState::Active
                 if !telemetry_available
                     || !database_available
                     || !object_storage_available
+                    || !valkey_available
                     || resources.runtime_operational == Some(false)
                     || !workloads.capacity_available
                     || !workloads.health_available
@@ -646,6 +655,7 @@ mod tests {
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
             object_storage: None,
+            valkey: None,
         }
     }
 
@@ -673,6 +683,7 @@ mod tests {
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
             object_storage: None,
+            valkey: None,
         };
         let heartbeat = payload(&config, &context).await;
 
@@ -1751,6 +1762,97 @@ mod tests {
         assert!(heartbeat.metadata.get("buckets").is_none());
     }
 
+    struct ValkeyStores {
+        result: Result<Vec<sakala_agent_protocol::ManagedValkeyUsage>, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ports::ValkeyAdmin for ValkeyStores {
+        async fn valkey_usage(
+            &self,
+        ) -> Result<Vec<sakala_agent_protocol::ManagedValkeyUsage>, RuntimeExecutionError> {
+            self.result
+                .clone()
+                .map_err(|()| RuntimeExecutionError::new("valkey_unavailable", "refused"))
+        }
+    }
+
+    fn valkey_context(
+        result: Result<Vec<sakala_agent_protocol::ManagedValkeyUsage>, ()>,
+    ) -> HeartbeatRuntimeContext {
+        let mut context = heartbeat_context(
+            Arc::new(EmptyRuntime),
+            RuntimeReconciliationReport::default(),
+        );
+        context.valkey = Some(super::ValkeyHeartbeat::new(
+            Arc::new(ValkeyStores { result }),
+            384,
+        ));
+        context
+    }
+
+    #[tokio::test]
+    async fn a_valkey_host_reports_its_budget_and_stores() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let store = sakala_agent_protocol::ManagedValkeyUsage {
+            valkey_id: Uuid::from_u128(7),
+            mode: sakala_agent_protocol::ValkeyMode::Persistent,
+            maxmemory_mb: sakala_agent_protocol::ValkeyMemoryMb::new(64).expect("memory"),
+            locked: false,
+            status: "running".to_owned(),
+            restart_count: 0,
+            used_memory: Some(1_048_576),
+            maxmemory: Some(67_108_864),
+            evicted_keys: Some(0),
+            errorstat_oom: Some(0),
+            connected_clients: Some(2),
+            aof_last_write_status: Some("ok".to_owned()),
+        };
+
+        let heartbeat = payload(&config, &valkey_context(Ok(vec![store.clone()]))).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Ready);
+        assert_eq!(
+            heartbeat.metadata["valkey"],
+            json!({ "capacity_mb": 384, "available": true })
+        );
+        assert_eq!(
+            heartbeat.metadata["valkeys"],
+            json!([serde_json::to_value(store).expect("store")])
+        );
+        assert_eq!(heartbeat.metadata["detail_counts"]["valkeys"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_valkey_host_that_cannot_read_its_stores_is_degraded() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+
+        let heartbeat = payload(&config, &valkey_context(Err(()))).await;
+
+        assert_eq!(heartbeat.status, NodeStatus::Degraded);
+        assert_eq!(heartbeat.metadata["valkey"]["available"], false);
+        assert!(heartbeat.metadata.get("valkeys").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_node_sends_no_valkey_keys() {
+        let config = AgentConfig::from_values(&HashMap::new())
+            .expect("default agent config should be valid");
+        let heartbeat = payload(
+            &config,
+            &heartbeat_context(
+                Arc::new(EmptyRuntime),
+                RuntimeReconciliationReport::default(),
+            ),
+        )
+        .await;
+
+        assert!(heartbeat.metadata.get("valkey").is_none());
+        assert!(heartbeat.metadata.get("valkeys").is_none());
+    }
+
     #[tokio::test]
     async fn a_runtime_without_the_capability_never_samples_metrics() {
         let config = AgentConfig::from_values(&HashMap::new())
@@ -1832,6 +1934,7 @@ mod tests {
             metrics: Some(WorkloadMetricsSampler::new(Duration::from_secs(60), 20)),
             database: None,
             object_storage: None,
+            valkey: None,
         };
 
         assert_eq!(

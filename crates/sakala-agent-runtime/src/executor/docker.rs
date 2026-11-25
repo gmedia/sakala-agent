@@ -24,7 +24,7 @@ use sakala_agent_protocol::{
     InspectProjectPayload, JOB_FINISHED_EVENT, JOB_STARTED_EVENT, LogBounds, LogStream,
     MAX_JOB_TIMEOUT_SECONDS, PROCESSES_IGNORED_EVENT, ReconcileWorkloadAction, RequestedImageReuse,
     RequestedProcesses, RunJobPayload, RunJobResult, RuntimeCleanupTarget, SleepingPage,
-    WorkloadMetrics, WorkloadTraffic,
+    ValkeyAttachment, WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -415,6 +415,11 @@ impl DockerRuntimeExecutor {
         let containers_needed = containers_needed(replicas, workers.len());
         let applied_timeouts = self.timeout_safety.resolve(payload.timeouts)?;
         let applied_resources = self.containers.resolve_resources(payload.resources)?;
+        // Before the build: a deployment whose containers could not join their
+        // store must not spend minutes building first.
+        if let Some(attachment) = &payload.valkey {
+            self.containers.check_store_network(attachment).await?;
+        }
         let source = deployment_source(&payload, request.repository_credential)?;
         let plan = ImagePlan::resolve(
             self.containers.as_ref(),
@@ -747,6 +752,7 @@ impl DockerRuntimeExecutor {
                     resources: applied_resources,
                     port: payload.container_port,
                     command: build.in_package(command),
+                    valkey_network: valkey_network(payload.valkey.as_ref()),
                 },
                 containers_needed,
                 progress.release,
@@ -800,6 +806,7 @@ impl DockerRuntimeExecutor {
                             start_command: command_field(payload.start_command.as_deref())
                                 .filter(|_| build.builder == DeploymentBuilder::Dockerfile),
                             process: None,
+                            valkey_network: valkey_network(payload.valkey.as_ref()),
                         },
                         reporter_ref,
                     )
@@ -825,6 +832,7 @@ impl DockerRuntimeExecutor {
                             log_bounds: payload.log_bounds,
                             start_command: Some(build.in_package(worker.command.clone())),
                             process: Some(worker.process.clone()),
+                            valkey_network: valkey_network(payload.valkey.as_ref()),
                         },
                         reporter_ref,
                     )
@@ -1221,6 +1229,9 @@ impl DockerRuntimeExecutor {
         } = request;
         let job = validate_job(&payload, deployment_id)?;
         let resources = self.containers.resolve_resources(payload.resources)?;
+        if let Some(attachment) = &payload.valkey {
+            self.containers.check_store_network(attachment).await?;
+        }
         let (image, command) = self
             .job_image(project_id, &job, &payload.commit_sha)
             .await?;
@@ -1254,6 +1265,7 @@ impl DockerRuntimeExecutor {
             resources,
             port: payload.container_port,
             command,
+            valkey_network: valkey_network(payload.valkey.as_ref()),
         };
         let outcome = tokio::select! {
             biased;
@@ -3019,6 +3031,11 @@ fn build_environment(
             )
         })
         .collect()
+}
+
+/// The store network every container of a deployment or job joins.
+fn valkey_network(attachment: Option<&ValkeyAttachment>) -> Option<String> {
+    attachment.map(|attachment| attachment.network.clone())
 }
 
 /// The release command's rule, `release_command` being optional.

@@ -14,8 +14,8 @@ use sakala_agent_core::{
 };
 use sakala_agent_protocol::{
     DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
-    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, Region, SCHEDULED_JOBS_CAPABILITY,
-    WORKER_PROCESSES_CAPABILITY,
+    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, MANAGED_VALKEY_CAPABILITY, Region,
+    SCHEDULED_JOBS_CAPABILITY, WORKER_PROCESSES_CAPABILITY,
 };
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT,
@@ -29,6 +29,10 @@ use sakala_agent_runtime::{
         check_container_name, check_public_endpoint,
     },
     routing::{check_public_api_url, check_public_console_url},
+    valkey::{
+        DEFAULT_VALKEY_DATA_DIR, DEFAULT_VALKEY_IMAGE, ValkeyAdminConfig, ValkeyNetworkPool,
+        check_data_dir, check_image_reference,
+    },
 };
 
 /// The control plane as visitors' browsers reach it, for browser-facing URLs
@@ -145,6 +149,40 @@ pub struct ObjectStorageHostConfig {
     pub identity: ObjectStorageIdentity,
 }
 
+/// Turns on the Valkey host role: `none` (default) or `docker`.
+const VALKEY_DRIVER_ENV: &str = "SAKALA_VALKEY_DRIVER";
+/// The store image, pinned by digest.
+const VALKEY_IMAGE_ENV: &str = "SAKALA_VALKEY_IMAGE";
+/// The IPv4 range every store network's /27 is cut from.
+const VALKEY_NETWORK_POOL_ENV: &str = "SAKALA_VALKEY_NETWORK_POOL";
+/// The most Σ(`maxmemory_mb` + 64) of the node's stores may reach, in MiB.
+const VALKEY_TOTAL_MEMORY_MB_ENV: &str = "SAKALA_VALKEY_TOTAL_MEMORY_MB";
+/// The stores' records and configuration.
+const VALKEY_DATA_DIR_ENV: &str = "SAKALA_VALKEY_DATA_DIR";
+
+/// Whether the agent runs managed Valkey stores (ADR-023). Stores share bridge
+/// networks with workloads, so the role needs the Docker runtime driver.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ValkeyDriver {
+    #[default]
+    None,
+    Docker,
+}
+
+impl FromStr for ValkeyDriver {
+    type Err = CoreError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "docker" => Ok(Self::Docker),
+            _ => Err(CoreError::InvalidConfiguration(format!(
+                "{VALKEY_DRIVER_ENV} must be none or docker, received {value}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RuntimeDriver {
     #[default]
@@ -189,6 +227,8 @@ pub struct AppConfig {
     pub database: Option<DatabaseHostConfig>,
     /// `None` unless the node is an object storage host.
     pub object_storage: Option<ObjectStorageHostConfig>,
+    /// `None` unless the node runs managed Valkey stores.
+    pub valkey: Option<ValkeyAdminConfig>,
     pub log_level: String,
     /// Settings that are set but no longer have any effect, for one startup
     /// warning each.
@@ -372,6 +412,21 @@ struct Cli {
 
     #[arg(long, env = OBJECT_STORAGE_DATA_DIR_ENV)]
     object_storage_data_dir: Option<String>,
+
+    #[arg(long, env = VALKEY_DRIVER_ENV)]
+    valkey_driver: Option<String>,
+
+    #[arg(long, env = VALKEY_IMAGE_ENV)]
+    valkey_image: Option<String>,
+
+    #[arg(long, env = VALKEY_NETWORK_POOL_ENV)]
+    valkey_network_pool: Option<String>,
+
+    #[arg(long, env = VALKEY_TOTAL_MEMORY_MB_ENV)]
+    valkey_total_memory_mb: Option<String>,
+
+    #[arg(long, env = VALKEY_DATA_DIR_ENV)]
+    valkey_data_dir: Option<String>,
 
     #[arg(long, env = "SAKALA_LOG_LEVEL")]
     log_level: Option<String>,
@@ -575,6 +630,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
             cli.object_storage_min_free_mb,
         ),
         (OBJECT_STORAGE_DATA_DIR_ENV, cli.object_storage_data_dir),
+        (VALKEY_DRIVER_ENV, cli.valkey_driver),
+        (VALKEY_IMAGE_ENV, cli.valkey_image),
+        (VALKEY_NETWORK_POOL_ENV, cli.valkey_network_pool),
+        (VALKEY_TOTAL_MEMORY_MB_ENV, cli.valkey_total_memory_mb),
+        (VALKEY_DATA_DIR_ENV, cli.valkey_data_dir),
     ] {
         insert(&mut values, key, value);
     }
@@ -596,6 +656,13 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
     let object_storage = object_storage_host(values, agent.command_timeout())?;
     if object_storage.is_some() {
         agent.capabilities.push(MANAGED_S3_CAPABILITY.to_owned());
+    }
+    let container_runtime = container_runtime(values)?;
+    let valkey = valkey_host(values, runtime_driver, &agent, container_runtime.as_ref())?;
+    if valkey.is_some() {
+        agent
+            .capabilities
+            .push(MANAGED_VALKEY_CAPABILITY.to_owned());
     }
     let resource_safety = resource_safety(values)?;
     let min_workspace_free_bytes = positive_u64(values, "SAKALA_MIN_WORKSPACE_FREE_MB", 1_024)?
@@ -677,7 +744,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             ),
             railpack_image: get(values, "SAKALA_RAILPACK_IMAGE", ""),
             railpack_network: get(values, "SAKALA_RAILPACK_NETWORK", "sakala-railpack"),
-            container_runtime: container_runtime(values)?,
+            container_runtime,
             container_dns: container_dns(values)?,
             project_domain_suffixes: project_domain_suffixes(values)?,
             resource_safety,
@@ -709,6 +776,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
         metrics_interval: metrics_interval(values)?,
         database,
         object_storage,
+        valkey,
         agent,
         runtime_driver,
         log_level: get(values, "SAKALA_LOG_LEVEL", "info"),
@@ -964,6 +1032,63 @@ fn object_storage_host(
             region,
             capacity_mb: total_quota_mb,
         },
+    }))
+}
+
+/// Reads the Valkey host role. With `docker`, the network pool and the memory
+/// budget are required and every value is checked now, so a typo stops the
+/// agent instead of failing every Valkey command later.
+fn valkey_host(
+    values: &HashMap<String, String>,
+    runtime_driver: RuntimeDriver,
+    agent: &AgentConfig,
+    container_runtime: Option<&String>,
+) -> Result<Option<ValkeyAdminConfig>, CoreError> {
+    let driver: ValkeyDriver = get(values, VALKEY_DRIVER_ENV, "none").trim().parse()?;
+    if driver == ValkeyDriver::None {
+        return Ok(None);
+    }
+    if runtime_driver != RuntimeDriver::Docker {
+        return Err(CoreError::InvalidConfiguration(format!(
+            "{VALKEY_DRIVER_ENV}=docker needs SAKALA_RUNTIME_DRIVER=docker, because stores share bridge networks with workloads"
+        )));
+    }
+    let value = |key: &str| {
+        values
+            .get(key)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    let invalid =
+        |key: &str, reason: &str| CoreError::InvalidConfiguration(format!("{key} {reason}"));
+    let required = |key: &str| {
+        value(key).ok_or_else(|| {
+            CoreError::InvalidConfiguration(format!(
+                "{key} is required when {VALKEY_DRIVER_ENV}=docker"
+            ))
+        })
+    };
+
+    let image = value(VALKEY_IMAGE_ENV).unwrap_or(DEFAULT_VALKEY_IMAGE);
+    check_image_reference(image).map_err(|reason| invalid(VALKEY_IMAGE_ENV, reason))?;
+    let network_pool: ValkeyNetworkPool = required(VALKEY_NETWORK_POOL_ENV)?
+        .parse()
+        .map_err(|reason| invalid(VALKEY_NETWORK_POOL_ENV, reason))?;
+    let total_memory_mb = required(VALKEY_TOTAL_MEMORY_MB_ENV)?
+        .parse::<u64>()
+        .ok()
+        .filter(|total| *total > 0)
+        .ok_or_else(|| invalid(VALKEY_TOTAL_MEMORY_MB_ENV, "must be a whole number above 0"))?;
+    let data_dir = PathBuf::from(value(VALKEY_DATA_DIR_ENV).unwrap_or(DEFAULT_VALKEY_DATA_DIR));
+    check_data_dir(&data_dir).map_err(|reason| invalid(VALKEY_DATA_DIR_ENV, reason))?;
+    Ok(Some(ValkeyAdminConfig {
+        agent_id: agent.agent_id.clone(),
+        image: image.to_owned(),
+        data_dir,
+        network_pool,
+        total_memory_mb,
+        container_runtime: container_runtime.cloned(),
+        command_timeout: agent.command_timeout(),
     }))
 }
 
@@ -2052,6 +2177,110 @@ mod tests {
                 .to_string();
             assert!(error.contains(key), "{key}={value:?}: {error}");
             assert!(!error.contains("secret"), "{error}");
+        }
+    }
+
+    fn valkey_values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut values = HashMap::from([
+            ("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned()),
+            (VALKEY_DRIVER_ENV.to_owned(), "docker".to_owned()),
+            (
+                VALKEY_NETWORK_POOL_ENV.to_owned(),
+                "10.213.0.0/16".to_owned(),
+            ),
+            (VALKEY_TOTAL_MEMORY_MB_ENV.to_owned(), "384".to_owned()),
+        ]);
+        for (key, value) in pairs {
+            values.insert((*key).to_owned(), (*value).to_owned());
+        }
+        values
+    }
+
+    #[test]
+    fn the_valkey_role_is_off_by_default_and_none_means_off() {
+        for values in [
+            HashMap::new(),
+            HashMap::from([(VALKEY_DRIVER_ENV.to_owned(), "none".to_owned())]),
+            HashMap::from([(VALKEY_DRIVER_ENV.to_owned(), String::new())]),
+        ] {
+            let config = from_values(&values).expect("config");
+            assert!(config.valkey.is_none());
+            assert!(
+                !config
+                    .agent
+                    .capabilities
+                    .contains(&MANAGED_VALKEY_CAPABILITY.to_owned())
+            );
+        }
+        assert!(
+            from_values(&HashMap::from([(
+                VALKEY_DRIVER_ENV.to_owned(),
+                "redis".to_owned()
+            )]))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_valkey_host_advertises_managed_valkey_and_uses_the_workload_runtime() {
+        let config =
+            from_values(&valkey_values(&[("SAKALA_CONTAINER_RUNTIME", "runsc")])).expect("config");
+        assert_eq!(
+            config.agent.capabilities.last().map(String::as_str),
+            Some(MANAGED_VALKEY_CAPABILITY)
+        );
+        let valkey = config.valkey.expect("valkey role");
+        assert_eq!(valkey.image, DEFAULT_VALKEY_IMAGE);
+        assert_eq!(valkey.data_dir, PathBuf::from("/var/lib/sakala/valkey"));
+        assert_eq!(valkey.network_pool.to_string(), "10.213.0.0/16");
+        assert_eq!(valkey.total_memory_mb, 384);
+        assert_eq!(valkey.container_runtime.as_deref(), Some("runsc"));
+        assert_eq!(
+            config.docker_runtime.container_runtime.as_deref(),
+            Some("runsc")
+        );
+        assert_eq!(valkey.agent_id, config.agent.agent_id);
+        assert_eq!(valkey.command_timeout, config.agent.command_timeout());
+
+        let custom = from_values(&valkey_values(&[
+            (
+                VALKEY_IMAGE_ENV,
+                "registry.example.ac.id/valkey@sha256:c8e2d17498838af5d91e12eb7c11220b3434a7b7131a333e3af52ad5e0b80882",
+            ),
+            (VALKEY_DATA_DIR_ENV, "/srv/valkey"),
+            (VALKEY_NETWORK_POOL_ENV, "10.250.0.0/24"),
+        ]))
+        .expect("config")
+        .valkey
+        .expect("valkey role");
+        assert!(custom.image.starts_with("registry.example.ac.id/"));
+        assert_eq!(custom.data_dir, PathBuf::from("/srv/valkey"));
+        assert_eq!(custom.network_pool.capacity(), 8);
+    }
+
+    #[test]
+    fn a_valkey_host_refuses_to_start_on_missing_or_invalid_values() {
+        let error = |pairs: &[(&str, &str)]| {
+            from_values(&valkey_values(pairs))
+                .expect_err("invalid")
+                .to_string()
+        };
+        assert!(
+            error(&[("SAKALA_RUNTIME_DRIVER", "noop")]).contains("SAKALA_RUNTIME_DRIVER=docker")
+        );
+        assert!(error(&[(VALKEY_NETWORK_POOL_ENV, "")]).contains("is required"));
+        assert!(error(&[(VALKEY_TOTAL_MEMORY_MB_ENV, "")]).contains("is required"));
+        for (key, value) in [
+            (VALKEY_NETWORK_POOL_ENV, "10.213.0.1/16"),
+            (VALKEY_NETWORK_POOL_ENV, "10.213.0.0/28"),
+            (VALKEY_NETWORK_POOL_ENV, "127.0.0.0/16"),
+            (VALKEY_TOTAL_MEMORY_MB_ENV, "0"),
+            (VALKEY_TOTAL_MEMORY_MB_ENV, "384MB"),
+            (VALKEY_IMAGE_ENV, "valkey/valkey:9-alpine"),
+            (VALKEY_DATA_DIR_ENV, "valkey"),
+            (VALKEY_DATA_DIR_ENV, "/srv/a,b"),
+        ] {
+            assert!(error(&[(key, value)]).contains(key), "{key}={value}");
         }
     }
 }

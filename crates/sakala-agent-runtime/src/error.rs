@@ -116,6 +116,10 @@ pub enum RuntimeError {
         "the image of the live deployment is not available on this node ({reason}); deploy the project again"
     )]
     JobImageMissing { reason: &'static str },
+    /// The deployment's or job's `valkey` field names a store network this
+    /// node cannot put its containers on (ADR-023), so none was created.
+    #[error("{0}")]
+    ValkeyNetworkUnavailable(String),
     #[error("runtime routing failed: {0}")]
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
@@ -173,6 +177,9 @@ impl RuntimeError {
             Self::JobFailed { .. } => "job_failed",
             Self::JobTimeout { .. } => "job_timeout",
             Self::JobImageMissing { .. } => "job_image_missing",
+            Self::ValkeyNetworkUnavailable(_) => {
+                sakala_agent_protocol::valkey::error_codes::VALKEY_NETWORK_UNAVAILABLE
+            }
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",
             Self::ReplicasExceeded { .. } => "runtime_replicas_exceeded",

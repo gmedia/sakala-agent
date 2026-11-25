@@ -3,7 +3,10 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, time::sleep};
 use tracing::{debug, info, warn};
 
-use crate::{ports::RuntimeExecutor, scheduler::metrics::SchedulerMetrics};
+use crate::{
+    ports::{RuntimeExecutor, ValkeyAdmin},
+    scheduler::metrics::SchedulerMetrics,
+};
 
 /// One run is a few bounded Docker calls, so this only stops one that hangs.
 const RUN_DEADLINE: Duration = Duration::from_secs(60);
@@ -16,8 +19,12 @@ const RUN_DEADLINE: Duration = Duration::from_secs(60);
 /// restarts. Reattaching is harmless at any time. Removing unused networks waits
 /// until no command is active, like image GC, and the runtime additionally keeps
 /// it from overlapping a workload start.
+///
+/// On a Valkey host the store networks are reconciled right after, under the
+/// same rule: only while no command is active (see [`ValkeyAdmin::reconcile`]).
 pub async fn run(
     runtime: Arc<dyn RuntimeExecutor>,
+    valkey: Option<Arc<dyn ValkeyAdmin>>,
     interval: Duration,
     scheduler_metrics: Arc<SchedulerMetrics>,
     mut shutdown: watch::Receiver<bool>,
@@ -51,6 +58,23 @@ pub async fn run(
                 }
             }
         }
+        let Some(valkey) = valkey.as_ref().filter(|_| remove_unused) else {
+            continue;
+        };
+        tokio::select! {
+            outcome = tokio::time::timeout(RUN_DEADLINE, valkey.reconcile()) => {
+                match outcome {
+                    Ok(Ok(())) => debug!("Valkey store network reconciliation finished"),
+                    Ok(Err(error)) => warn!(%error, "Valkey store network reconciliation failed"),
+                    Err(_) => warn!(deadline = ?RUN_DEADLINE, "Valkey store network reconciliation timed out"),
+                }
+            }
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
     }
     info!("project network worker stopped");
 }
@@ -67,6 +91,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingRuntime {
         runs: Mutex<Vec<bool>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingValkey {
+        runs: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ValkeyAdmin for RecordingValkey {
+        async fn reconcile(&self) -> Result<(), RuntimeExecutionError> {
+            *self.runs.lock().expect("runs") += 1;
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -88,10 +125,23 @@ mod tests {
         watch::Sender<bool>,
         tokio::task::JoinHandle<()>,
     ) {
+        start_with(interval, metrics, None)
+    }
+
+    fn start_with(
+        interval: Duration,
+        metrics: Arc<SchedulerMetrics>,
+        valkey: Option<Arc<dyn ValkeyAdmin>>,
+    ) -> (
+        Arc<RecordingRuntime>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let runtime = Arc::new(RecordingRuntime::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let worker = tokio::spawn(run(
             Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>,
+            valkey,
             interval,
             metrics,
             shutdown_rx,
@@ -143,5 +193,32 @@ mod tests {
         shutdown.send(true).expect("shutdown");
         worker.await.expect("worker");
         assert!(runs.iter().all(|remove_unused| !remove_unused), "{runs:?}");
+    }
+
+    #[tokio::test]
+    async fn store_networks_are_reconciled_only_while_no_command_is_active() {
+        let idle = Arc::new(RecordingValkey::default());
+        let (runtime, shutdown, worker) = start_with(
+            Duration::from_millis(10),
+            Arc::default(),
+            Some(Arc::clone(&idle) as Arc<dyn ValkeyAdmin>),
+        );
+        wait_for_runs(&runtime, 3).await;
+        shutdown.send(true).expect("shutdown");
+        worker.await.expect("worker");
+        assert!(*idle.runs.lock().expect("runs") >= 2);
+
+        let metrics = Arc::new(SchedulerMetrics::default());
+        metrics.command_started();
+        let busy = Arc::new(RecordingValkey::default());
+        let (runtime, shutdown, worker) = start_with(
+            Duration::from_millis(10),
+            metrics,
+            Some(Arc::clone(&busy) as Arc<dyn ValkeyAdmin>),
+        );
+        wait_for_runs(&runtime, 3).await;
+        shutdown.send(true).expect("shutdown");
+        worker.await.expect("worker");
+        assert_eq!(*busy.runs.lock().expect("runs"), 0);
     }
 }

@@ -13,7 +13,7 @@ use sakala_agent_core::ports::{
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
-    WorkloadMetrics,
+    ValkeyAttachment, WorkloadMetrics,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
@@ -609,13 +609,15 @@ impl DockerContainerEngine {
     }
 
     /// `docker run --detach` with what every container of a deployment gets:
-    /// its name, the project's network, the node's runtime and name servers,
+    /// its name, the project's network and its Valkey store network, the node's
+    /// runtime and name servers,
     /// the security options, and the resource limits. `restart` is the restart
     /// policy; `None` keeps Docker's default, which never restarts.
     async fn isolated_run(
         &self,
         name: &str,
         network: &str,
+        store_network: Option<&str>,
         resources: AppliedRuntimeResources,
         restart: Option<&str>,
     ) -> Result<CommandSpec, RuntimeError> {
@@ -626,6 +628,11 @@ impl DockerContainerEngine {
             .arg(name)
             .arg("--network")
             .arg(network);
+        // The project network comes first and keeps the only route out: a
+        // store network is internal.
+        if let Some(store_network) = store_network {
+            command = command.arg("--network").arg(store_network);
+        }
         // Docker refuses an unknown runtime, and the failure stays a failure: a
         // workload must not end up on a weaker runtime than the node promises.
         if let Some(container_runtime) = &self.container_runtime {
@@ -1092,6 +1099,10 @@ impl ContainerEngine for DockerContainerEngine {
         .await
     }
 
+    async fn check_store_network(&self, attachment: &ValkeyAttachment) -> Result<(), RuntimeError> {
+        crate::valkey::check_store_network(self.runner.as_ref(), &self.agent_id, attachment).await
+    }
+
     async fn start(
         &self,
         request: &RunContainerRequest,
@@ -1105,6 +1116,7 @@ impl ContainerEngine for DockerContainerEngine {
             .isolated_run(
                 &request.name,
                 &network,
+                request.valkey_network.as_deref(),
                 request.resources,
                 Some(WORKLOAD_RESTART_POLICY),
             )
@@ -1175,7 +1187,13 @@ impl ContainerEngine for DockerContainerEngine {
         let environment = Self::effective_environment(&request.environment, request.port);
         let env_file = Self::write_env_file(&request.workspace, &environment).await?;
         let mut command = self
-            .isolated_run(&request.name, &network, request.resources, None)
+            .isolated_run(
+                &request.name,
+                &network,
+                request.valkey_network.as_deref(),
+                request.resources,
+                None,
+            )
             .await?;
         for label in [
             format!("{ROLE_LABEL_KEY}={}", request.role.as_str()),
