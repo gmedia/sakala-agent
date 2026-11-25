@@ -61,6 +61,11 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_OBJECT_STORAGE_TOTAL_QUOTA_MB` | tidak ada | Wajib dengan `rustfs`, bilangan bulat di atas 0. Jumlah semua kuota bucket di instance tidak boleh melewatinya. Dikirim sebagai `object_storage.capacity_mb`. Isi dengan nilai yang sama dengan `DISK_GUARD_OBJECT_STORAGE_QUOTA_MB` di repo deployment. |
 | `SAKALA_OBJECT_STORAGE_MIN_FREE_MB` | `1024` | Bilangan bulat ≥ 0. Ruang disk bebas minimum di `SAKALA_OBJECT_STORAGE_DATA_DIR` saat semua bucket penuh; bucket baru dan kenaikan kuota yang melanggarnya ditolak. |
 | `SAKALA_OBJECT_STORAGE_DATA_DIR` | `/var/lib/sakala/object-storage` | Path absolut direktori data RustFS di host, dibaca dengan `df`. |
+| `SAKALA_VALKEY_DRIVER` | `none` | `none` atau `docker`. `docker` menjalankan store Valkey terkelola (ADR-023), satu container per store, dan mengiklankan capability `managed-valkey`. Butuh `SAKALA_RUNTIME_DRIVER=docker`. Lihat [Valkey Host](VALKEY_HOST.md). |
+| `SAKALA_VALKEY_IMAGE` | `valkey/valkey:9.2.0-alpine@sha256:c8e2d174…0882` | Image store, wajib dipin dengan digest: `<name>[:tag]@sha256:<64 hex huruf kecil>`. Nilai lengkap default ada di [Valkey Host](VALKEY_HOST.md#konfigurasi). |
+| `SAKALA_VALKEY_NETWORK_POOL` | tidak ada | Wajib dengan `docker`. Rentang IPv4 CIDR (prefix /27 atau lebih pendek, ditulis di alamat network-nya), misalnya `10.213.0.0/16`, tempat setiap network store mengambil satu /27. Pilih rentang di luar LAN, rute host, dan `default-address-pools` Docker. |
+| `SAKALA_VALKEY_TOTAL_MEMORY_MB` | tidak ada | Wajib dengan `docker`, bilangan bulat di atas 0. Σ(`maxmemory_mb` + 64) semua store node tidak boleh melewatinya. Dikirim sebagai `valkey.capacity_mb`. |
+| `SAKALA_VALKEY_DATA_DIR` | `/var/lib/sakala/valkey` | Path absolut catatan, password admin, dan konfigurasi setiap store. Tanpa koma, tanda sama dengan, tanda kutip, atau baris baru. Data store sendiri ada di volume Docker `sakala-valkey-<id>`. |
 | `SAKALA_LOG_LEVEL` | `info` | Filter `tracing-subscriber`, misalnya `debug` atau `sakala_agent=debug`. |
 
 `SAKALA_AGENT_MODE` dan `SAKALA_RUNTIME_DRIVER` tidak mewakili hal yang sama. Mode menentukan koneksi control plane, sedangkan driver menentukan efek command pada runtime node. Lihat [Operating Modes](OPERATING_MODES.md) untuk matriks lengkap.

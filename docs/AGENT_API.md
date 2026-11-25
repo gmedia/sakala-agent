@@ -637,6 +637,7 @@ Semua field selain `command`, `timeout_seconds`, dan `commit_sha` disalin API da
 | `environment` | object string ke string | tidak | Variabel deployment live, aturan dan redaksi sama dengan `DeployProject`. `PORT` yang berbeda dari `container_port` gagal dengan `runtime_port_conflict`. |
 | `resources` | object `{ memory_mb, cpu_millis, pids_limit }` | tidak | Batas container job; kosong memakai default node, di atas batas node ditolak. |
 | `log_bounds` | object | tidak | Batas log command ini, seperti pada `DeployProject`. |
+| `valkey` | object `{ network, host }` atau `null` | tidak | Disalin dari `DeployProject` deployment live: container job ikut network store Valkey itu saat dibuat. Aturannya sama dengan [field `valkey` di `DeployProject`](#field-valkey-di-deployproject-dan-runjob). |
 
 Agent mencari image di bawah nama yang dihitung sendiri dari project job,
 `sakala/project-<project_id>:<commit12>-<deployment8>` dengan deployment pembangun image,
@@ -1927,6 +1928,181 @@ ada di `examples/heartbeat/object-storage-host.json`:
 
 Region penempatan host ini memakai `metadata.runtime.region` yang sudah ada
 (`SAKALA_AGENT_REGION`).
+
+## Valkey host
+
+Node dengan `SAKALA_VALKEY_DRIVER=docker` menjalankan store Valkey terkelola
+(ADR-023), satu container per store di network internal miliknya, dan mengiklankan
+capability `managed-valkey`. API hanya boleh mengirim command di bagian ini, dan field
+`valkey` di `DeployProject` dan `RunJob`, ke node dengan capability itu: Agent yang
+lebih lama gagal membaca respons polling yang berisi tipe command yang tidak dikenal,
+dan mengabaikan field `valkey` sehingga aplikasi gagal terhubung. Node tanpa peran
+Valkey yang menerima command ini gagal dengan `unsupported_runtime_command`.
+Project yang memasang store harus ditempatkan di node milik store itu. Konfigurasi,
+rumus memori, dan hasil uji ada di [Valkey Host](VALKEY_HOST.md).
+
+### Command Valkey
+
+Command Valkey tidak membawa identitas workload: `project_id` dan `deployment_id`
+bernilai `null`. Contoh lengkapnya ada di `examples/commands/valkey-commands.json`.
+
+| `type` | Payload | Result saat `complete` |
+| --- | --- | --- |
+| `CreateValkey` | `{ valkey_id, mode, maxmemory_mb, password }` | `{ valkey_id, mode, maxmemory_mb, memory_limit_mb, network, endpoint: { host, port }, created, locked }` |
+| `DeleteValkey` | `{ valkey_id }` | `{ valkey_id, deleted }` |
+| `RotateValkeyPassword` | `{ valkey_id, password }` | `{ valkey_id, disconnected_clients }` |
+| `LockValkey` | `{ valkey_id }` | `{ valkey_id, locked: true, disconnected_clients }` |
+| `UnlockValkey` | `{ valkey_id }` | `{ valkey_id, locked: false, disconnected_clients: 0 }` |
+| `ResizeValkey` | `{ valkey_id, maxmemory_mb }` | `{ valkey_id, maxmemory_mb, memory_limit_mb, restarted }` |
+
+Aturan field payload, semuanya wajib ada untuk command yang memakainya:
+
+| Field | Tipe | Aturan |
+| --- | --- | --- |
+| `valkey_id` | UUID string | ID store di API. Nama network, container, dan volume store adalah `sakala-valkey-<valkey_id>` (UUID huruf kecil berstrip). Bukan UUID: `invalid_runtime_command`. |
+| `mode` | string | `cache` atau `persistent`, persis huruf kecil. Lainnya `valkey_mode_invalid`. Tidak bisa diubah setelah dibuat. |
+| `maxmemory_mb` | integer | 16 sampai 512 (MiB); Console menawarkan 32, 64, 128. Negatif, pecahan, atau string: `invalid_runtime_command`; di luar rentang: `valkey_memory_invalid`. |
+| `password` | string | Password user `default`, cocok persis dengan `^[A-Za-z0-9]{32,128}$`, jadi aman di `REDIS_URL` tanpa escape. Lainnya `valkey_password_invalid`; pesan tidak pernah memuat nilainya. |
+
+Field lain di payload diabaikan. Result tidak pernah memuat password, dan `password`
+di payload diredaksi dari pesan `fail`. Agent menyimpan password tenant hanya sebagai
+hash SHA-256 di file ACL store.
+
+Arti field result:
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `memory_limit_mb` | integer | Batas memori container, `2 × maxmemory_mb + 64`. Informasi; anggaran node memakai `maxmemory_mb + 64`. |
+| `network` | string | `sakala-valkey-<valkey_id>`, nilai `valkey.network` di `DeployProject` dan `RunJob`. |
+| `endpoint.host` | string IPv4 | Alamat store di network-nya, selalu alamat kedua sebuah /27 dari `SAKALA_VALKEY_NETWORK_POOL`, misalnya `10.213.0.2`. Nilai `valkey.host` dan `REDIS_HOST`. Tetap sama selama store ada, juga bila container-nya dibuat ulang. |
+| `endpoint.port` | integer | Selalu `6379`. |
+| `created` | boolean | `false` bila store sudah ada. |
+| `locked` | boolean | Status lock store setelah command. |
+| `disconnected_clients` | integer ≥ 0 | Koneksi user `default` yang ditutup Agent, karena koneksi yang sudah login tetap login setelah password diganti atau user dimatikan. |
+| `restarted` | boolean | `true` bila runtime menolak mengubah batas memori di tempat dan container dibuat ulang: store cache kosong, store persisten memuat AOF-nya. |
+
+Semua command idempotent dan menyatukan kembali keadaan bila dikirim ulang:
+
+- `CreateValkey` membuat yang belum ada dan menyamakan yang sudah ada. Untuk store yang sudah ada, `mode` atau `maxmemory_mb` yang berbeda gagal dengan `valkey_conflict` tanpa perubahan (pakai `ResizeValkey` untuk ukuran); password dari payload dipasang lagi, dan bila berbeda dari yang berlaku, koneksi tenant ditutup. Lock tidak pernah dibuka oleh create. Container yang image atau batas memorinya tidak sama dengan setelan node dibuat ulang, data store persisten tetap. Pemeriksaan anggaran dan pool hanya berlaku untuk store baru. Bila create gagal di tengah, catatan store dan alamatnya tetap tersimpan di node dan dihitung ke anggaran; kirim ulang create yang sama, atau `DeleteValkey`.
+- `DeleteValkey` gagal dengan `valkey_in_use` selama container lain yang berjalan ada di network store; container lain yang berhenti diputus dari network dulu. Setelah itu container, network, volume (data), dan file store dihapus. `deleted: false` bila tidak ada apa pun dari store itu di node. Tidak bisa dibatalkan; backup ada di luar Agent.
+- `RotateValkeyPassword` mengganti password `default` lalu menutup koneksinya. Aplikasi gagal sampai deployment berikutnya membawa password baru.
+- `LockValkey` mematikan user `default` dan menutup koneksinya; data tetap, backup tetap jalan. `UnlockValkey` menyalakannya lagi.
+- `ResizeValkey` mengganti `maxmemory` dan batas container. Store persisten menolak ukuran di bawah `used_memory` saat ini dengan `valkey_size_below_usage`; store cache menerima dan mengusir key.
+
+Command pada store yang container-nya tidak berjalan menulis perubahan ke file store
+lalu gagal dengan `valkey_unavailable`; perubahan berlaku saat store menyala lagi.
+`valkey_id` yang tidak ada di node memberi `valkey_not_found` (kecuali
+`CreateValkey` dan `DeleteValkey`).
+
+Anggaran node untuk store baru dan kenaikan ukuran: Σ(`maxmemory_mb` + 64) semua store
+setelah perubahan tidak boleh melewati `SAKALA_VALKEY_TOTAL_MEMORY_MB`
+(`metadata.valkey.capacity_mb`); ukuran store itu sendiri diganti, tidak ditambahkan.
+Store baru juga butuh /27 bebas di `SAKALA_VALKEY_NETWORK_POOL`. Keduanya gagal dengan
+`valkey_capacity_exceeded` sebelum ada yang dibuat. Store tidak dihitung ke
+`SAKALA_MAX_ACTIVE_CONTAINERS`.
+
+### Field `valkey` di `DeployProject` dan `RunJob`
+
+Contoh lengkap ada di `examples/commands/deploy-project-valkey.json` dan
+`examples/commands/run-job-valkey.json`.
+
+```json
+{
+  "valkey": {
+    "network": "sakala-valkey-0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b",
+    "host": "10.213.0.2"
+  }
+}
+```
+
+| Field | Tipe | Aturan |
+| --- | --- | --- |
+| `valkey` | object atau `null`, opsional | Tidak ada atau `null`: project tanpa store, persis seperti sebelumnya. |
+| `valkey.network` | string | `result.network` dari `CreateValkey`: persis `sakala-valkey-` ditambah UUID huruf kecil berstrip. Nilai lain, termasuk `host`, `bridge`, atau network project lain, membuat payload tidak valid (`invalid_runtime_command`). |
+| `valkey.host` | string IPv4 | `result.endpoint.host` dari `CreateValkey`. |
+
+Sebelum container apa pun dibuat, dan untuk deploy sebelum checkout dan build, Agent
+memeriksa bahwa network itu ada di node, adalah network store milik Agent ini, dan
+store-nya ada di `host`. Bila tidak, deploy atau job gagal dengan
+`valkey_network_unavailable`, versi lama tetap berjalan, dan tidak ada container yang
+dibuat. Setiap container deployment (replika web, worker, release command) dan setiap
+container job dibuat dengan network project dan network store sekaligus; container
+yang sudah berjalan tidak pernah disambungkan belakangan. Jadi memasang, melepas, atau
+mengganti store berlaku di deployment berikutnya. Sleep, wake, restart, dan pemulihan
+replika memakai container yang sama, jadi network-nya ikut.
+
+Agent tidak membuat variabel `REDIS_*`; API menambahkannya ke `environment` seperti
+variabel lain, dan variabel project dengan nama sama menang (ADR-023).
+
+### Kode kegagalan Valkey
+
+Contoh body `fail` untuk setiap kode ada di `examples/failures/valkey-failures.json`,
+yang dicocokkan dengan kode oleh test. Kode dibandingkan sebagai string persis.
+
+| `error_code` | Arti | Tindakan API |
+| --- | --- | --- |
+| `invalid_runtime_command` | Payload bukan object, field wajib tidak ada atau tipenya salah, `valkey_id` bukan UUID, atau `valkey.network` di `DeployProject`/`RunJob` bukan nama network store. | Bug di API. |
+| `unsupported_runtime_command` | Node tidak punya peran Valkey. | Bug penempatan di API. |
+| `valkey_mode_invalid` | `mode` bukan `cache` atau `persistent`. | Bug di API. |
+| `valkey_memory_invalid` | `maxmemory_mb` di luar 16 sampai 512. | Bug di API. |
+| `valkey_password_invalid` | `password` tidak cocok dengan `^[A-Za-z0-9]{32,128}$`. | Bug di API. |
+| `valkey_capacity_exceeded` | Anggaran memori node atau pool network habis. Tidak ada yang diubah. | Operator: naikkan anggaran, perluas pool, atau pindahkan. Jangan di-retry otomatis. |
+| `valkey_not_found` | Tidak ada store dengan `valkey_id` itu di node (`RotateValkeyPassword`, `LockValkey`, `UnlockValkey`, `ResizeValkey`). | Rekonsiliasi: kirim `CreateValkey`. |
+| `valkey_conflict` | Store ada dengan mode atau ukuran lain, atau network bernama sama bukan network store Agent ini atau subnet-nya lain. Tidak ada yang diubah. | Periksa manual. |
+| `valkey_size_below_usage` | `ResizeValkey` store persisten ke ukuran di bawah datanya. Tidak ada yang diubah. | Tampilkan ke pengguna; kosongkan data dulu atau pilih ukuran lebih besar. |
+| `valkey_in_use` | `DeleteValkey` selama container yang berjalan masih di network store. Tidak ada yang dihapus. | Redeploy atau hentikan project yang memakainya, lalu kirim ulang. |
+| `valkey_unavailable` | Docker tidak menjawab, container store tidak berjalan atau tidak menjawab, store sedang memuat data, atau jatah waktu command habis. Perubahan file mungkin sudah tertulis. | Retry nanti dengan command yang sama; node juga `degraded` bila pembacaan heartbeat ikut gagal. |
+| `valkey_operation_failed` | Docker atau Valkey menolak karena alasan lain. Pesan berisi baris pertama jawabannya. | Periksa manual. |
+| `valkey_network_unavailable` | `DeployProject` atau `RunJob`: network di `valkey` tidak ada di node, bukan network store Agent ini, atau store-nya tidak di `host`. Tidak ada container yang dibuat. | Rekonsiliasi store dan penempatan, lalu deploy ulang. |
+
+### Heartbeat Valkey host
+
+Node dengan peran Valkey menambahkan dua key di `metadata`. Contoh lengkapnya ada di
+`examples/heartbeat/valkey-host.json`:
+
+```json
+{
+  "valkey": { "capacity_mb": 384, "available": true },
+  "valkeys": [
+    {
+      "valkey_id": "0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b",
+      "mode": "persistent",
+      "maxmemory_mb": 64,
+      "locked": false,
+      "status": "running",
+      "restart_count": 0,
+      "used_memory": 1048576,
+      "maxmemory": 67108864,
+      "evicted_keys": 0,
+      "errorstat_oom": 0,
+      "connected_clients": 3,
+      "aof_last_write_status": "ok"
+    }
+  ],
+  "detail_counts": { "valkeys": 1 }
+}
+```
+
+| Field | Tipe | Arti |
+| --- | --- | --- |
+| `valkey` | object | Dikirim di setiap heartbeat node Valkey, tidak pernah oleh node lain. |
+| `valkey.capacity_mb` | integer ≥ 1 | `SAKALA_VALKEY_TOTAL_MEMORY_MB`: batas Σ(`maxmemory_mb` + 64) store node ini. |
+| `valkey.available` | boolean | Apakah pembacaan store terakhir berhasil (Docker menjawab dan file store terbaca). Saat `false`, `status` node menjadi `degraded`. Pembacaan yang dilewati karena command Valkey sedang berjalan tidak mengubahnya. Satu store yang tidak menjawab tidak membuatnya `false`. |
+| `valkeys` | array, opsional | Setiap store di node, urut `valkey_id`, paling banyak 1000 item. Hanya di heartbeat pertama setelah pembacaan baru yang berhasil, paling sering sekali per 60 detik. Heartbeat tanpa key ini tidak membawa bacaan baru dan tidak berarti store hilang. List kosong berarti node tidak punya store. |
+| `valkeys[].valkey_id` | UUID string | ID store. |
+| `valkeys[].mode`, `maxmemory_mb`, `locked` | string, integer, boolean | Dari catatan store di node. |
+| `valkeys[].status` | string | `State.Status` Docker (`running`, `restarting`, `exited`, `created`, `paused`, `dead`), atau `missing` bila container store tidak ada. |
+| `valkeys[].restart_count` | integer ≥ 0 | `RestartCount` Docker; 0 bila container tidak ada. Naik terus berarti store crash berulang. |
+| `valkeys[].used_memory` | integer byte atau `null` | `used_memory` dari `INFO`. Dasar email 80 %: `used_memory / maxmemory`. |
+| `valkeys[].maxmemory` | integer byte atau `null` | `maxmemory` dari `INFO`, yaitu `maxmemory_mb × 1048576`. |
+| `valkeys[].evicted_keys` | integer atau `null` | Key yang diusir sejak store start (mode cache). |
+| `valkeys[].errorstat_oom` | integer atau `null` | Hitungan `errorstat_OOM` sejak store start: tulisan yang ditolak store persisten yang penuh. 0 bila Valkey belum pernah mencatatnya. |
+| `valkeys[].connected_clients` | integer atau `null` | `connected_clients` dari `INFO`, termasuk koneksi admin Agent sendiri saat membaca. |
+| `valkeys[].aof_last_write_status` | `"ok"`, `"err"`, atau `null` | Hanya store persisten; selalu `null` untuk store cache. `err` berarti tulisan AOF gagal, misalnya disk penuh. |
+| `detail_counts.valkeys` | integer ≥ 0 | Jumlah store sebelum dibatasi; dikirim bersama `valkeys`. |
+
+Field `INFO` bernilai `null` bila store tidak berjalan atau tidak menjawab dalam
+5 detik; field selalu ada.
 
 ## Event and Log Payloads
 

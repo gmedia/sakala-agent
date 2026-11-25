@@ -102,6 +102,13 @@ Karena itu `sakala-runtime` dan check `runtime-network` tetap dibutuhkan. Pada
 lewat DNS bawaan Docker, sama seperti di `sakala-runtime`; jalur ini belum diuji
 ulang dengan `runsc` sejak network per project.
 
+**Network store Valkey.** Pada node dengan peran Valkey (ADR-023), container project
+yang memasang store juga bergabung ke `sakala-valkey-<id>`, network `--internal`
+milik store itu, saat `docker run`, sesudah network project. Network project tetap
+memegang satu-satunya rute keluar. Network store diberi label
+`dev.sakala.network-kind=valkey` dan dikelola command Valkey; rekonsiliasi network
+project tidak menyentuhnya. Lihat [Valkey Host](VALKEY_HOST.md).
+
 ### Address pool Docker
 
 Tanpa pengaturan, Docker hanya punya sekitar 31 subnet untuk bridge network
