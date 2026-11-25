@@ -110,6 +110,11 @@ yang ia tulis. Project tanpa custom domain mendapat file yang sama byte per byte
 seperti sebelum fitur ini. Uji Docker nyata ada di
 `crates/sakala-agent-runtime/tests/custom_domains_smoke_test.rs`.
 
+Router node hanya menerima custom domain project yang punya route. Custom domain project
+tanpa workload tidak sampai ke node: site-nya di Sakala Edge hanya mengimport snippet
+`sakala_not_found`, halaman 404 bermerek yang sama dengan site wildcard (lihat
+[Sakala Edge](EDGE.md#custom-domain)).
+
 ## Route untuk beberapa replika
 
 Deployment dengan lebih dari satu replika tetap mendapat satu file dan satu blok site,

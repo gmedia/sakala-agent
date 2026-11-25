@@ -1,8 +1,9 @@
 # Custom domains of projects (ADR-024) on an Edge host, imported at the top
 # level of the host Caddyfile, beside the wildcard sites. sakala-edge writes one
 # site per verified domain into custom-domains.caddy, each starting with
-# `import sakala_custom_domain_tls`, so this snippet must be defined first and
-# keep that name. Create an empty custom-domains.caddy at install so Caddy
+# `import sakala_custom_domain_tls`; a domain without a workload has only
+# `import sakala_not_found` after it. Both snippets must be defined first and
+# keep their names. Create an empty custom-domains.caddy at install so Caddy
 # starts before the first sync. See docs/EDGE.md.
 #
 # Certificates for these names come from Let's Encrypt through HTTP-01 or
@@ -16,6 +17,20 @@
 			dir https://acme-v02.api.letsencrypt.org/directory
 			email {$ACME_EMAIL}
 		}
+	}
+}
+
+# The page a custom domain without a workload answers, with its status and
+# every header; sakala-edge adds none. sakala-deployment uses the branded
+# not-found page of the wildcard site here.
+(sakala_not_found) {
+	handle {
+		header {
+			Content-Type "text/html; charset=utf-8"
+			Cache-Control "no-store"
+			X-Robots-Tag "noindex"
+		}
+		respond "Belum ada aplikasi di alamat ini" 404
 	}
 }
 

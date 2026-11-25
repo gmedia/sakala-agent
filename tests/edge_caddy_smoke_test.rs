@@ -292,9 +292,11 @@ async fn real_caddy_serves_balances_and_fails_over_with_the_generated_routes() {
 }
 
 /// Host configuration for custom domains as `sakala-deployment` installs it,
-/// except that the snippet asks Caddy's internal CA instead of Let's Encrypt,
-/// so the test needs no public name. The generated file is imported at the top
-/// level, beside the wildcard sites.
+/// except that the TLS snippet asks Caddy's internal CA instead of Let's
+/// Encrypt, so the test needs no public name, and the not-found snippet answers
+/// a short marker instead of the branded page, with the same shape: one
+/// `handle` that sets its headers and responds 404. The generated file is
+/// imported at the top level, beside the wildcard sites.
 const CUSTOM_DOMAINS_CADDYFILE: &str = "{
 \tadmin localhost:2019
 \tskip_install_trust
@@ -302,6 +304,16 @@ const CUSTOM_DOMAINS_CADDYFILE: &str = "{
 
 (sakala_custom_domain_tls) {
 \ttls internal
+}
+
+(sakala_not_found) {
+\thandle {
+\t\theader {
+\t\t\tCache-Control \"no-store\"
+\t\t\tX-Robots-Tag \"noindex\"
+\t\t}
+\t\trespond \"sakala not-found snippet\" 404
+\t}
 }
 
 import /var/lib/sakala-edge/custom-domains.caddy
@@ -531,12 +543,9 @@ async fn real_caddy_serves_custom_domain_sites_from_the_generated_file() {
             .map(|v| v.as_bytes()),
         Some(&b"no-store"[..])
     );
-    assert!(
-        response
-            .text()
-            .await
-            .expect("body")
-            .starts_with("Belum ada aplikasi di alamat ini.")
+    assert_eq!(
+        response.text().await.expect("body"),
+        "sakala not-found snippet"
     );
 
     // Plain HTTP on a custom domain is sent to HTTPS, which is also where
