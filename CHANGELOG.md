@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-25
+
 ### Added
 
 - Peran Valkey terkelola (ADR-023), mati secara default. `SAKALA_VALKEY_DRIVER=docker` (butuh `SAKALA_RUNTIME_DRIVER=docker`) membuat Agent menjalankan satu container Valkey per store, dengan runtime workload (`runsc` di node hosted), root read-only, tanpa capability, `--user 999:1000`, `no-new-privileges`, 0,25 CPU, PID 64, dan batas memori `2 × maxmemory + 64` MiB, di network `--internal` miliknya dengan /27 dari `SAKALA_VALKEY_NETWORK_POOL` dan alamat tetap `.2`. Node mengiklankan capability baru `managed-valkey`. Mode `cache` (`allkeys-lru`, tanpa persistensi) atau `persistent` (AOF `everysec`, `noeviction`) dipilih saat membuat. Tenant memakai user `default` dengan `+@all -@admin`; user `sakala-admin` milik Agent, dengan password per store yang dibuat Agent dan tidak pernah di-mount. Data ada di volume Docker per store, konfigurasi dan file ACL (hanya hash) di `SAKALA_VALKEY_DATA_DIR`. Konfigurasi baru: `SAKALA_VALKEY_DRIVER`, `SAKALA_VALKEY_IMAGE` (default `valkey/valkey:9.2.0-alpine` dipin digest), `SAKALA_VALKEY_NETWORK_POOL`, `SAKALA_VALKEY_TOTAL_MEMORY_MB`, `SAKALA_VALKEY_DATA_DIR`. Lihat [Valkey Host](docs/VALKEY_HOST.md).
@@ -396,7 +398,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.18.2...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/gmedia/sakala-agent/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/gmedia/sakala-agent/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gmedia/sakala-agent/compare/v0.17.0...v0.18.0
