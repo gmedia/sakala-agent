@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    LogBounds, RequestedImageReuse, RuntimeResourceLimits, deployments::default_container_port,
+    LogBounds, RequestedImageReuse, RuntimeResourceLimits, ValkeyAttachment,
+    deployments::default_container_port,
 };
 
 /// Capability of a node that runs `RunJob`. An older Agent fails to read a
@@ -60,6 +61,10 @@ pub struct RunJobPayload {
     pub resources: RuntimeResourceLimits,
     #[serde(default)]
     pub log_bounds: LogBounds,
+    /// Copied from the live deployment's `DeployProject` payload: the job
+    /// container joins the same store network when it is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey: Option<ValkeyAttachment>,
 }
 
 impl RunJobPayload {

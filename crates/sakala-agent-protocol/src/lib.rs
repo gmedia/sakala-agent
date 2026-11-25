@@ -20,6 +20,7 @@ pub mod placement;
 pub mod processes;
 pub mod repositories;
 pub mod status;
+pub mod valkey;
 
 pub use buckets::{
     AccessKeyId, BUCKET_NAME_PATTERN, BucketKeyPayload, BucketName, BucketPayloadError,
@@ -70,3 +71,9 @@ pub use processes::{
 };
 pub use repositories::RepositoryAccess;
 pub use status::{CommandStatus, NodeStatus};
+pub use valkey::{
+    CreateValkeyPayload, MANAGED_VALKEY_CAPABILITY, ManagedValkeyUsage, ResizeValkeyPayload,
+    RotateValkeyPasswordPayload, VALKEY_NAME_PREFIX, VALKEY_PORT, ValkeyAttachment, ValkeyEndpoint,
+    ValkeyHostMetadata, ValkeyMemoryMb, ValkeyMode, ValkeyPassword, ValkeyPayloadError,
+    ValkeyTargetPayload, valkey_resource_name,
+};

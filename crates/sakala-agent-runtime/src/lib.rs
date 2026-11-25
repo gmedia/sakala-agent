@@ -17,6 +17,7 @@ pub mod railpack;
 mod repository_file;
 pub mod routing;
 mod telemetry;
+pub mod valkey;
 pub mod workspace;
 
 pub use config::{

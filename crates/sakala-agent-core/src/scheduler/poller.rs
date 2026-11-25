@@ -14,7 +14,7 @@ use crate::{
     AgentConfig, NodeLifecycle, NodeLifecycleState,
     api::ApiClient,
     commands::CommandProcessor,
-    ports::{DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor},
+    ports::{DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor, ValkeyAdmin},
     scheduler::metrics::SchedulerMetrics,
 };
 
@@ -25,6 +25,8 @@ pub struct ResourceAdmins {
     pub database: Option<Arc<dyn DatabaseAdmin>>,
     /// Managed object storage (`SAKALA_OBJECT_STORAGE_DRIVER`).
     pub object_storage: Option<Arc<dyn ObjectStorageAdmin>>,
+    /// Managed Valkey stores (`SAKALA_VALKEY_DRIVER`).
+    pub valkey: Option<Arc<dyn ValkeyAdmin>>,
 }
 
 pub async fn run(
@@ -48,6 +50,9 @@ pub async fn run(
         }
         if let Some(object_storage_admin) = admins.object_storage {
             processor = processor.with_object_storage_admin(object_storage_admin);
+        }
+        if let Some(valkey_admin) = admins.valkey {
+            processor = processor.with_valkey_admin(valkey_admin);
         }
         Arc::new(processor)
     });

@@ -4,9 +4,11 @@ use uuid::Uuid;
 
 use crate::{
     BucketKeyPayload, BucketPayloadError, CommandStatus, CreateBucketPayload,
-    CreateDatabasePayload, DatabasePayloadError, DatabaseTargetPayload, DeployProjectPayload,
-    DropDatabasePayload, InspectProjectPayload, InstallDatabaseExtensionPayload,
-    RotateBucketKeyPayload, RotateDatabasePasswordPayload, RunJobPayload, SetBucketQuotaPayload,
+    CreateDatabasePayload, CreateValkeyPayload, DatabasePayloadError, DatabaseTargetPayload,
+    DeployProjectPayload, DropDatabasePayload, InspectProjectPayload,
+    InstallDatabaseExtensionPayload, ResizeValkeyPayload, RotateBucketKeyPayload,
+    RotateDatabasePasswordPayload, RotateValkeyPasswordPayload, RunJobPayload,
+    SetBucketQuotaPayload, ValkeyPayloadError, ValkeyTargetPayload,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -109,6 +111,13 @@ pub enum CommandType {
     /// One run of a project command in a container of the live image, only on
     /// nodes that advertise `scheduled-jobs`.
     RunJob,
+    /// Managed Valkey, only on nodes that advertise `managed-valkey`.
+    CreateValkey,
+    DeleteValkey,
+    RotateValkeyPassword,
+    LockValkey,
+    UnlockValkey,
+    ResizeValkey,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -195,6 +204,25 @@ impl AgentCommand {
 
     pub fn set_bucket_quota_payload(&self) -> Result<SetBucketQuotaPayload, BucketPayloadError> {
         SetBucketQuotaPayload::from_value(&self.payload)
+    }
+
+    pub fn create_valkey_payload(&self) -> Result<CreateValkeyPayload, ValkeyPayloadError> {
+        CreateValkeyPayload::from_value(&self.payload)
+    }
+
+    /// The payload of `DeleteValkey`, `LockValkey`, and `UnlockValkey`.
+    pub fn valkey_target_payload(&self) -> Result<ValkeyTargetPayload, ValkeyPayloadError> {
+        ValkeyTargetPayload::from_value(&self.payload)
+    }
+
+    pub fn rotate_valkey_password_payload(
+        &self,
+    ) -> Result<RotateValkeyPasswordPayload, ValkeyPayloadError> {
+        RotateValkeyPasswordPayload::from_value(&self.payload)
+    }
+
+    pub fn resize_valkey_payload(&self) -> Result<ResizeValkeyPayload, ValkeyPayloadError> {
+        ResizeValkeyPayload::from_value(&self.payload)
     }
 
     /// A missing or `null` payload reads as an empty object. An unknown `page`

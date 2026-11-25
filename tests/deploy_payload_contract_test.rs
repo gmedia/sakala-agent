@@ -1,10 +1,12 @@
 use sakala_agent_protocol::{
     AgentCommand, BucketName, CommandPoll, CommandType, CrashedWorkloadDetail, DatabaseEndpoint,
     DatabaseExtension, DeployProjectResult, FinalizationDeferredReason, HeartbeatPayload,
-    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, ManagedBucketUsage, ManagedDatabaseSize,
-    ManagedName, NodePlacement, ObjectStorageMetadata, RequestedImageReuse, RequestedProcesses,
-    RequestedReplicas, SCHEDULED_JOBS_CAPABILITY, SleepingPage, WORKER_PROCESSES_CAPABILITY,
-    WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
+    MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, MANAGED_VALKEY_CAPABILITY,
+    ManagedBucketUsage, ManagedDatabaseSize, ManagedName, ManagedValkeyUsage, NodePlacement,
+    ObjectStorageMetadata, RequestedImageReuse, RequestedProcesses, RequestedReplicas,
+    SCHEDULED_JOBS_CAPABILITY, SleepingPage, VALKEY_NAME_PREFIX, ValkeyHostMetadata, ValkeyMode,
+    WORKER_PROCESSES_CAPABILITY, WorkloadMetrics, WorkloadReplicas, WorkloadTraffic,
+    valkey_resource_name,
 };
 
 #[test]
@@ -775,4 +777,220 @@ fn worker_heartbeat_fixture_matches_the_heartbeat_contract() {
         serde_json::to_value(&crashed).expect("serialize"),
         heartbeat.metadata["workloads"]["crashed_details"]
     );
+}
+
+#[test]
+fn api_valkey_command_fixtures_carry_valid_payloads_without_workload_identity() {
+    let poll: CommandPoll =
+        serde_json::from_str(include_str!("../examples/commands/valkey-commands.json"))
+            .expect("Valkey command fixture must deserialize");
+
+    let types: Vec<_> = poll
+        .data
+        .iter()
+        .map(|command| command.command_type)
+        .collect();
+    assert_eq!(
+        types,
+        [
+            CommandType::CreateValkey,
+            CommandType::RotateValkeyPassword,
+            CommandType::ResizeValkey,
+            CommandType::LockValkey,
+            CommandType::UnlockValkey,
+            CommandType::DeleteValkey,
+        ]
+    );
+    for command in &poll.data {
+        assert!(command.project_id.is_none());
+        assert!(command.deployment_id.is_none());
+    }
+    let create = poll.data[0]
+        .create_valkey_payload()
+        .expect("CreateValkey payload must be valid");
+    assert_eq!(
+        create.valkey_id.to_string(),
+        "0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b"
+    );
+    assert_eq!(create.mode, ValkeyMode::Persistent);
+    assert_eq!(create.maxmemory_mb.get(), 64);
+    poll.data[1]
+        .rotate_valkey_password_payload()
+        .expect("RotateValkeyPassword payload must be valid");
+    assert_eq!(
+        poll.data[2]
+            .resize_valkey_payload()
+            .expect("ResizeValkey payload must be valid")
+            .maxmemory_mb
+            .get(),
+        128
+    );
+    for command in &poll.data[3..] {
+        command
+            .valkey_target_payload()
+            .expect("LockValkey, UnlockValkey, and DeleteValkey payloads must be valid");
+    }
+}
+
+#[test]
+fn valkey_command_types_have_their_wire_names() {
+    let names: Vec<_> = [
+        CommandType::CreateValkey,
+        CommandType::DeleteValkey,
+        CommandType::RotateValkeyPassword,
+        CommandType::LockValkey,
+        CommandType::UnlockValkey,
+        CommandType::ResizeValkey,
+    ]
+    .into_iter()
+    .map(|command_type| serde_json::to_value(command_type).expect("serialize"))
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "CreateValkey",
+            "DeleteValkey",
+            "RotateValkeyPassword",
+            "LockValkey",
+            "UnlockValkey",
+            "ResizeValkey",
+        ]
+    );
+    assert_eq!(MANAGED_VALKEY_CAPABILITY, "managed-valkey");
+}
+
+#[test]
+fn deploy_payload_valkey_fixture_matches_the_contract() {
+    let command: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-valkey.json"
+    ))
+    .expect("DeployProject fixture with valkey must deserialize");
+    let payload = command.deploy_payload().expect("payload");
+
+    let valkey = payload.valkey.as_ref().expect("valkey");
+    assert_eq!(
+        valkey.network,
+        valkey_resource_name(valkey.valkey_id().expect("store ID"))
+    );
+    assert!(valkey.network.starts_with(VALKEY_NAME_PREFIX));
+    assert_eq!(valkey.host.to_string(), "10.213.0.2");
+    // The variables come from the control plane; the agent only joins the
+    // network. REDIS_URL carries no database number.
+    assert_eq!(payload.environment["REDIS_HOST"], valkey.host.to_string());
+    assert!(payload.environment["REDIS_URL"].ends_with("@10.213.0.2:6379"));
+    assert_eq!(
+        serde_json::to_value(&payload).expect("serialize")["valkey"],
+        command.payload["valkey"]
+    );
+}
+
+#[test]
+fn run_job_valkey_fixture_matches_the_contract() {
+    let poll: CommandPoll =
+        serde_json::from_str(include_str!("../examples/commands/run-job-valkey.json"))
+            .expect("poll response with RunJob must deserialize");
+    let payload = poll.data[0].run_job_payload().expect("RunJob payload");
+
+    assert_eq!(
+        payload
+            .valkey
+            .as_ref()
+            .map(|valkey| valkey.host.to_string()),
+        Some("10.213.0.2".to_owned())
+    );
+    assert_eq!(
+        serde_json::to_value(&payload).expect("serialize"),
+        poll.data[0].payload
+    );
+}
+
+#[test]
+fn payloads_without_valkey_stay_unchanged_on_the_wire() {
+    let deploy: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("fixture");
+    let payload = deploy.deploy_payload().expect("payload");
+    assert!(payload.valkey.is_none());
+    assert!(
+        serde_json::to_value(&payload)
+            .expect("serialize")
+            .get("valkey")
+            .is_none()
+    );
+    let job: CommandPoll =
+        serde_json::from_str(include_str!("../examples/commands/run-job.json")).expect("fixture");
+    let payload = job.data[0].run_job_payload().expect("payload");
+    assert!(payload.valkey.is_none());
+}
+
+#[test]
+fn valkey_host_heartbeat_fixture_matches_the_protocol_types() {
+    let heartbeat: HeartbeatPayload =
+        serde_json::from_str(include_str!("../examples/heartbeat/valkey-host.json"))
+            .expect("Valkey host heartbeat fixture must deserialize");
+
+    assert!(
+        heartbeat
+            .node
+            .capabilities
+            .contains(&MANAGED_VALKEY_CAPABILITY.to_owned())
+    );
+    let host: ValkeyHostMetadata =
+        serde_json::from_value(heartbeat.metadata["valkey"].clone()).expect("valkey");
+    assert_eq!(host.capacity_mb, 384);
+    assert!(host.available);
+    let stores: Vec<ManagedValkeyUsage> =
+        serde_json::from_value(heartbeat.metadata["valkeys"].clone()).expect("valkeys");
+    assert_eq!(stores.len(), 2);
+    assert_eq!(heartbeat.metadata["detail_counts"]["valkeys"], 2);
+    assert_eq!(stores[0].mode, ValkeyMode::Persistent);
+    assert_eq!(stores[0].aof_last_write_status.as_deref(), Some("ok"));
+    assert_eq!(stores[1].status, "exited");
+    assert_eq!(
+        stores[1].used_memory, None,
+        "readings of a stopped store are null"
+    );
+    // Every field is present, `null` included.
+    for store in heartbeat.metadata["valkeys"].as_array().expect("list") {
+        assert_eq!(store.as_object().expect("object").len(), 12);
+    }
+}
+
+#[test]
+fn valkey_failure_fixture_covers_every_valkey_failure_code() {
+    use sakala_agent_protocol::valkey::error_codes;
+
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../examples/failures/valkey-failures.json"))
+            .expect("Valkey failure fixture must parse");
+    let codes: std::collections::BTreeSet<_> = fixture
+        .as_array()
+        .expect("list")
+        .iter()
+        .map(|entry| {
+            serde_json::from_value::<CommandType>(entry["type"].clone()).expect("a command type");
+            assert!(entry["body"]["error_message"].as_str().is_some());
+            entry["body"]["error_code"]
+                .as_str()
+                .expect("code")
+                .to_owned()
+        })
+        .collect();
+    for code in [
+        error_codes::VALKEY_MODE_INVALID,
+        error_codes::VALKEY_MEMORY_INVALID,
+        error_codes::VALKEY_PASSWORD_INVALID,
+        error_codes::VALKEY_CAPACITY_EXCEEDED,
+        error_codes::VALKEY_NOT_FOUND,
+        error_codes::VALKEY_CONFLICT,
+        error_codes::VALKEY_SIZE_BELOW_USAGE,
+        error_codes::VALKEY_IN_USE,
+        error_codes::VALKEY_UNAVAILABLE,
+        error_codes::VALKEY_OPERATION_FAILED,
+        error_codes::VALKEY_NETWORK_UNAVAILABLE,
+        "unsupported_runtime_command",
+        "invalid_runtime_command",
+    ] {
+        assert!(codes.contains(code), "{code} is missing from the fixture");
+    }
 }

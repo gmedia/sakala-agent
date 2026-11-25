@@ -7,14 +7,14 @@ use sakala_agent_core::{
     heartbeat,
     ports::{
         DatabaseAdmin, ObjectStorageAdmin, RuntimeExecutor, RuntimePreflightReport,
-        RuntimeReconciliationReport,
+        RuntimeReconciliationReport, ValkeyAdmin,
     },
     reporting::ApiRuntimeReporterFactory,
     scheduler,
 };
 use sakala_agent_runtime::{
     DockerRuntimeExecutor, NoopRuntimeExecutor, database::PostgresDatabaseAdmin,
-    object_storage::RcObjectStorageAdmin,
+    object_storage::RcObjectStorageAdmin, valkey::DockerValkeyAdmin,
 };
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -108,6 +108,22 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
             ),
         }
     }
+    let valkey = config.valkey.map(|valkey| {
+        let capacity_mb = valkey.total_memory_mb;
+        let admin: Arc<dyn ValkeyAdmin> = Arc::new(DockerValkeyAdmin::new(valkey));
+        (admin, capacity_mb)
+    });
+    if let Some((admin, _)) = &valkey {
+        // Not fatal: Docker may still be starting. The node reports
+        // `degraded` while the stores cannot be read.
+        if let Err(error) = admin.check().await {
+            warn!(
+                error_code = error.code(),
+                %error,
+                "managed Valkey role is not ready; Valkey commands fail until it is"
+            );
+        }
+    }
     let reporter_factory = client.clone().map(|client| {
         Arc::new(ApiRuntimeReporterFactory::new(client))
             as Arc<dyn sakala_agent_core::ports::RuntimeReporterFactory>
@@ -188,6 +204,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     ));
     let network_task = tokio::spawn(sakala_agent_core::networks::worker::run(
         Arc::clone(&runtime),
+        valkey.as_ref().map(|(admin, _)| Arc::clone(admin)),
         PROJECT_NETWORK_INTERVAL,
         Arc::clone(&scheduler_metrics),
         shutdown_rx.clone(),
@@ -219,6 +236,9 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                     identity.clone(),
                 )
             }),
+            valkey: valkey.as_ref().map(|(admin, capacity_mb)| {
+                heartbeat::valkey::ValkeyHeartbeat::new(Arc::clone(admin), *capacity_mb)
+            }),
         },
         shutdown_rx.clone(),
     ));
@@ -231,6 +251,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         scheduler::poller::ResourceAdmins {
             database: database.map(|(admin, _)| admin),
             object_storage: object_storage.map(|(admin, _)| admin),
+            valkey: valkey.map(|(admin, _)| admin),
         },
         shutdown_rx,
     ));

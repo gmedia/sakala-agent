@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{RepositoryAccess, RequestedProcesses};
+use crate::{RepositoryAccess, RequestedProcesses, ValkeyAttachment};
 
 /// Capability of a node that reads `DeployProject.reuse_image_from_deployment_id`.
 /// The control plane sends the field only to a node that advertises it.
@@ -141,6 +141,12 @@ pub struct DeployProjectPayload {
     /// and variables, without a route. Absent means the web process only.
     #[serde(default, skip_serializing_if = "RequestedProcesses::is_absent")]
     pub processes: RequestedProcesses,
+    /// The managed Valkey store the project is attached to (ADR-023). Every
+    /// container of the deployment, the release command's included, joins the
+    /// store's network when it is created. Sent only to a node that
+    /// advertises `managed-valkey`; an invalid value fails the deployment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valkey: Option<ValkeyAttachment>,
 }
 
 /// The `reuse_image_from_deployment_id` field of a `DeployProject` payload: the

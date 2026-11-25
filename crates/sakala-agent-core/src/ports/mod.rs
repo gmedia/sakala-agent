@@ -2,6 +2,7 @@ mod database;
 mod object_storage;
 mod repository;
 mod runtime;
+mod valkey;
 
 pub use database::DatabaseAdmin;
 pub use object_storage::{BUCKET_USAGE_BUSY, ObjectStorageAdmin};
@@ -9,6 +10,8 @@ pub use repository::{
     RepositoryCredential, RepositoryCredentialProvider, SecretString,
     UnavailableRepositoryCredentialProvider,
 };
+
+pub use valkey::{VALKEY_USAGE_BUSY, ValkeyAdmin};
 
 pub use runtime::{
     CleanupRuntimeRequest, CommandOutput, DeployProjectRequest, InspectProjectRequest,

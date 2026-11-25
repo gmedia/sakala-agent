@@ -7421,6 +7421,9 @@ struct FakeRunner {
     /// What `docker image inspect` prints for the labels of an image to reuse.
     /// `None` answers as Docker does for a reference without an image.
     reuse_image_labels: Option<String>,
+    /// What `docker network inspect` prints for a Valkey store network: kind,
+    /// agent, subnet. `None` answers as Docker does for a missing network.
+    store_network: Option<String>,
 }
 
 /// Fails a test that would otherwise hang: how long a test waits for spawned
@@ -7694,7 +7697,13 @@ impl FakeRunner {
             release_oom_killed: false,
             release_run_failure: None,
             reuse_image_labels: None,
+            store_network: None,
         }
+    }
+
+    fn with_store_network(mut self, kind: &str, agent: &str, subnet: &str) -> Self {
+        self.store_network = Some(format!("{kind}\t{agent}\t{subnet} \n"));
+        self
     }
 
     fn with_reuse_image_labels(mut self, labels: serde_json::Value) -> Self {
@@ -8479,6 +8488,25 @@ impl FakeRunner {
         }
         if args.iter().any(|arg| arg.contains(".DefaultAddressPools")) {
             return Some(ok(&self.address_pools_stdout));
+        }
+        if args.first().is_some_and(|arg| arg == "network")
+            && args.get(1).is_some_and(|arg| arg == "inspect")
+            && args
+                .last()
+                .is_some_and(|name| name.starts_with("sakala-valkey-"))
+        {
+            return Some(match &self.store_network {
+                Some(stdout) => ok(stdout),
+                None => ProcessOutput {
+                    success: false,
+                    code: Some(1),
+                    stdout: String::new(),
+                    stderr: format!(
+                        "Error response from daemon: network {} not found",
+                        args.last().expect("name")
+                    ),
+                },
+            });
         }
         if args.first().is_some_and(|arg| arg == "network") {
             match args.get(1).map(String::as_str) {
@@ -12158,4 +12186,184 @@ async fn a_job_whose_container_does_not_start_in_time_fails_before_the_command_d
 
     assert_eq!(error.code(), "runtime_timeout", "{error}");
     assert!(error.to_string().contains("job container start"), "{error}");
+}
+
+// Managed Valkey (ADR-023): every container of a deployment or job joins the
+// store's network when it is created.
+
+const STORE_NETWORK: &str = "sakala-valkey-0b5c3f9e-1d2a-4e8b-9c7d-6a5f4e3d2c1b";
+const STORE_SUBNET: &str = "10.213.0.32/27";
+const STORE_HOST: &str = "10.213.0.34";
+const LOCAL_AGENT: &str = "local-agent-01";
+
+fn store_attachment() -> serde_json::Value {
+    json!({ "network": STORE_NETWORK, "host": STORE_HOST })
+}
+
+/// The `--network` values of a `docker run`, in order.
+fn networks_of(spec: &CommandSpec) -> Vec<String> {
+    string_arguments(spec)
+        .windows(2)
+        .filter(|pair| pair[0] == "--network")
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+fn is_store_network_inspect(spec: &CommandSpec) -> bool {
+    spec.program == "docker"
+        && string_arguments(spec).starts_with(&["network".to_owned(), "inspect".to_owned()])
+        && spec.args.last().is_some_and(|name| name == STORE_NETWORK)
+}
+
+#[tokio::test]
+async fn every_container_of_a_deployment_joins_its_store_network_at_creation() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner =
+        Arc::new(FakeRunner::new(true).with_store_network("valkey", LOCAL_AGENT, STORE_SUBNET));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut deploy = deploy_with_workers(queue_worker());
+    deploy.payload["release_command"] = json!("php artisan migrate --force");
+    deploy.payload["replicas"] = json!(2);
+    deploy.payload["valkey"] = store_attachment();
+
+    dispatch(executor, &deploy, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("the deployment completes");
+
+    let check = runner
+        .command_position(is_store_network_inspect)
+        .expect("the store network is checked");
+    let build = runner.command_position(is_buildx_build).expect("build");
+    assert!(check < build, "checked before the build");
+    let expected = vec![PROJECT_NETWORK.to_owned(), STORE_NETWORK.to_owned()];
+    let runs = runner
+        .commands
+        .lock()
+        .expect("commands")
+        .iter()
+        .filter(|spec| is_workload_run(spec) || is_release_run(spec))
+        .map(networks_of)
+        .collect::<Vec<_>>();
+    // Two web replicas, one queue worker, and the release command.
+    assert_eq!(runs.len(), 4, "{runs:?}");
+    for networks in runs {
+        assert_eq!(networks, expected, "the project network first");
+    }
+    assert_eq!(
+        runner.count_commands(|spec| {
+            string_arguments(spec).starts_with(&["network".to_owned(), "connect".to_owned()])
+                && spec.args.iter().any(|arg| arg == STORE_NETWORK)
+        }),
+        0,
+        "never connected after the start"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_without_a_store_keeps_one_network() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("the deployment completes");
+
+    assert_eq!(
+        networks_of(&find_command(&runner, is_workload_run)),
+        [PROJECT_NETWORK]
+    );
+    assert!(runner.command_position(is_store_network_inspect).is_none());
+}
+
+#[tokio::test]
+async fn a_store_network_that_cannot_be_joined_fails_the_deployment_before_the_build() {
+    for (runner, reason) in [
+        (FakeRunner::new(true), "does not exist on this node"),
+        (
+            FakeRunner::new(true).with_store_network("valkey", "another-agent", STORE_SUBNET),
+            "is not a Valkey store network of this agent",
+        ),
+        (
+            FakeRunner::new(true).with_store_network("project", LOCAL_AGENT, STORE_SUBNET),
+            "is not a Valkey store network of this agent",
+        ),
+        (
+            FakeRunner::new(true).with_store_network("valkey", LOCAL_AGENT, "10.213.0.64/27"),
+            "is at 10.213.0.66, not at valkey.host 10.213.0.34",
+        ),
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(runner);
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+        let mut deploy = deploy_command("auto");
+        deploy.payload["valkey"] = store_attachment();
+
+        let error = dispatch(executor, &deploy, Arc::new(RecordingReporter::default()))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(error.code(), "valkey_network_unavailable");
+        assert!(error.to_string().contains(reason), "{error}");
+        assert!(runner.command_position(is_buildx_build).is_none());
+        assert_eq!(runner.count_commands(is_workload_run), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_valkey_field_is_an_invalid_deployment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+    let mut deploy = deploy_command("auto");
+    deploy.payload["valkey"] = json!({ "network": "host", "host": STORE_HOST });
+
+    let error = dispatch(executor, &deploy, Arc::new(RecordingReporter::default()))
+        .await
+        .expect_err("refused");
+
+    assert_eq!(error.code(), "invalid_runtime_command");
+    assert!(error.to_string().contains("valkey.network"), "{error}");
+    assert!(runner.commands.lock().expect("commands").is_empty());
+}
+
+#[tokio::test]
+async fn a_job_joins_the_store_network_of_the_live_deployment() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(
+        FakeRunner::new(true)
+            .with_reuse_image_labels(live_image_labels())
+            .with_store_network("valkey", LOCAL_AGENT, STORE_SUBNET),
+    );
+
+    run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({ "valkey": store_attachment() })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("job");
+
+    assert_eq!(
+        networks_of(&find_command(&runner, is_job_run)),
+        [PROJECT_NETWORK, STORE_NETWORK]
+    );
+
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true).with_reuse_image_labels(live_image_labels()));
+    let error = run_job(
+        runner.clone(),
+        runtime_config(&temp),
+        &job_command(json!({ "valkey": store_attachment() })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("no store network");
+    assert_eq!(error.code(), "valkey_network_unavailable");
+    assert_eq!(runner.count_commands(is_job_run), 0);
 }

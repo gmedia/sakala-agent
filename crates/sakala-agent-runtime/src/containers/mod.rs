@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, LogBounds, RuntimeResourceLimits,
-    WorkloadMetrics,
+    ValkeyAttachment, WorkloadMetrics,
 };
 use uuid::Uuid;
 
@@ -56,6 +56,10 @@ pub struct RunContainerRequest {
     pub start_command: Option<String>,
     /// The worker process this container runs, `None` for a web replica.
     pub process: Option<String>,
+    /// The Valkey store network the container joins next to its project's
+    /// network (ADR-023), checked with
+    /// [`ContainerEngine::check_store_network`].
+    pub valkey_network: Option<String>,
 }
 
 /// What a one-off container runs.
@@ -125,6 +129,8 @@ pub struct OneOffContainerRequest {
     pub port: u16,
     /// Runs in the container's own `sh -c`, like a start command.
     pub command: String,
+    /// The Valkey store network the container joins, as for the replicas.
+    pub valkey_network: Option<String>,
 }
 
 /// How a one-off container ended.
@@ -284,9 +290,18 @@ pub trait ContainerEngine: Send + Sync {
 
     async fn remove(&self, workload: &ManagedWorkload) -> Result<(), RuntimeError>;
 
+    /// Fails with [`RuntimeError::ValkeyNetworkUnavailable`] unless
+    /// `attachment` names a Valkey store network of this node whose store is at
+    /// its `host`. Called before any container of a deployment or job is
+    /// created.
+    async fn check_store_network(&self, attachment: &ValkeyAttachment) -> Result<(), RuntimeError>;
+
     /// Starts a workload on its project's own network, which it creates first
     /// and connects the router to. The workload never joins the shared runtime
-    /// network, so it cannot reach other projects.
+    /// network, so it cannot reach other projects. With a Valkey store network
+    /// it joins that one too, when it is created: a container under gVisor
+    /// gets every network at `docker run`, never by `docker network connect`
+    /// once it runs.
     async fn start(
         &self,
         request: &RunContainerRequest,

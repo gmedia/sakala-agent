@@ -92,6 +92,15 @@ di satu instance RustFS lewat `rc` di dalam container-nya dan mengiklankan
 capability `managed-s3`. VM storage khusus memakai driver runtime `noop`. Lihat
 [Object Storage Host](OBJECT_STORAGE_HOST.md).
 
+### Peran Valkey
+
+`SAKALA_VALKEY_DRIVER=docker` menambahkan store Valkey terkelola di runtime node:
+satu container per store di network internal miliknya, dan container project yang
+memasangnya ikut network itu. Karena store berbagi bridge dengan workload, peran ini
+hanya bisa dipakai dengan driver runtime `docker`, dan mengiklankan capability
+`managed-valkey`. Mati secara default, jadi node dan self-host yang tidak
+menyalakannya tidak berubah. Lihat [Valkey Host](VALKEY_HOST.md).
+
 ## Topologi Caddy MVP
 
 Implementasi runtime saat ini memakai topologi referensi `sakala-infra`:

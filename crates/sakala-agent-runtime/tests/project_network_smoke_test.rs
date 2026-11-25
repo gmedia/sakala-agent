@@ -273,6 +273,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
                     log_bounds: LogBounds::default(),
                     start_command: Some(format!("caddy respond --listen :{PORT} {}", project.body)),
                     process: None,
+                    valkey_network: None,
                 },
                 &NullReporter,
             )
@@ -390,6 +391,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
     let (stop_worker, worker_shutdown) = tokio::sync::watch::channel(false);
     let worker = tokio::spawn(sakala_agent_core::networks::worker::run(
         Arc::clone(&executor) as Arc<dyn RuntimeExecutor>,
+        None,
         Duration::from_secs(1),
         Arc::new(SchedulerMetrics::default()),
         worker_shutdown,

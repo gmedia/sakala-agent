@@ -17,7 +17,7 @@ use crate::{
     logs::redactor::ValueRedactor,
     ports::{
         CommandOutput, DatabaseAdmin, JOB_END_BUDGET, JOB_START_BUDGET, ObjectStorageAdmin,
-        RuntimeExecutor, RuntimeReporter,
+        RuntimeExecutor, RuntimeReporter, ValkeyAdmin,
     },
     reporting::{
         ApiRuntimeReporter, ApiRuntimeReporterFactory, EventDelivery, EventDeliveryPolicy,
@@ -50,6 +50,9 @@ const DATABASE_PASSWORD_FIELD: &str = "password";
 
 /// Payload field of `CreateBucket` and `RotateBucketKey`.
 const BUCKET_SECRET_FIELD: &str = "secret_access_key";
+
+/// Payload field of `CreateValkey` and `RotateValkeyPassword`.
+const VALKEY_PASSWORD_FIELD: &str = "password";
 
 pub struct CommandProcessor {
     client: ApiClient,
@@ -140,6 +143,13 @@ impl CommandProcessor {
         self.dispatcher = self
             .dispatcher
             .with_object_storage_admin(object_storage_admin);
+        self
+    }
+
+    /// Lets the processor run managed Valkey commands on a Valkey host.
+    #[must_use]
+    pub fn with_valkey_admin(mut self, valkey_admin: Arc<dyn ValkeyAdmin>) -> Self {
+        self.dispatcher = self.dispatcher.with_valkey_admin(valkey_admin);
         self
     }
 
@@ -403,14 +413,15 @@ fn job_policy(
     ))
 }
 
-/// The tenant credential a database or bucket command carries, hidden from its
-/// failure message like a deployment's environment values.
+/// The tenant credential a database, bucket, or Valkey command carries, hidden
+/// from its failure message like a deployment's environment values.
 fn command_secret(command: &AgentCommand) -> Option<String> {
     let field = match command.command_type {
         CommandType::CreateDatabase | CommandType::RotateDatabasePassword => {
             DATABASE_PASSWORD_FIELD
         }
         CommandType::CreateBucket | CommandType::RotateBucketKey => BUCKET_SECRET_FIELD,
+        CommandType::CreateValkey | CommandType::RotateValkeyPassword => VALKEY_PASSWORD_FIELD,
         _ => return None,
     };
     command.payload.get(field)?.as_str().map(str::to_owned)
@@ -544,6 +555,27 @@ mod tests {
                 json!({ "secret_access_key": SECRET }),
             ),
             command(CommandType::RotateBucketKey, Value::Null),
+        ] {
+            assert_eq!(command_secret(&command), None);
+        }
+    }
+
+    #[test]
+    fn a_valkey_password_is_redacted_from_the_failure_message() {
+        const PASSWORD: &str = "c2VjcmV0dmFsa2V5cGFzc3dvcmQxMjM0";
+        for command_type in [CommandType::CreateValkey, CommandType::RotateValkeyPassword] {
+            let password = command_secret(&command(
+                command_type,
+                json!({ "valkey_id": "4f1f21ef-730d-42d5-a46d-d965353cb993", "password": PASSWORD }),
+            ));
+            let redacted =
+                ValueRedactor::new(password).redact(&format!("valkey refused {PASSWORD}"));
+            assert!(!redacted.contains(PASSWORD), "{command_type:?}: {redacted}");
+        }
+        for command in [
+            command(CommandType::LockValkey, json!({ "password": PASSWORD })),
+            command(CommandType::ResizeValkey, json!({ "password": PASSWORD })),
+            command(CommandType::RotateValkeyPassword, Value::Null),
         ] {
             assert_eq!(command_secret(&command), None);
         }

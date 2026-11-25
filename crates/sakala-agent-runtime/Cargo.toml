@@ -29,6 +29,7 @@ tracing.workspace = true
 url = "2.5.8"
 uuid.workspace = true
 yaml-rust2 = { version = "0.13.0", default-features = false }
+ipnet = { version = "2.12.2", features = ["serde"] }
 
 [lints]
 workspace = true

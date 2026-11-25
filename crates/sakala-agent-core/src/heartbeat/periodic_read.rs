@@ -1,7 +1,7 @@
 //! A reading a heartbeat part takes at most once per interval and sends once,
 //! in the heartbeat that follows a successful read, like `workloads.metrics`.
 //! Shared by the managed resource roles (`metadata.databases`,
-//! `metadata.buckets`), whose reads may be slow and whose failure makes the
+//! `metadata.buckets`, `metadata.valkeys`), whose reads may be slow and whose failure makes the
 //! node `degraded`.
 
 use std::{

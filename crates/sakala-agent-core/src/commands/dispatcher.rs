@@ -9,12 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     NodeLifecycle, NodeLifecycleState,
-    commands::handlers::{bucket, database, deploy_project, inspect_project, run_job},
+    commands::handlers::{bucket, database, deploy_project, inspect_project, run_job, valkey},
     ports::{
         CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ObjectStorageAdmin,
         ReconcileWorkloadRequest, RepositoryCredentialProvider, RuntimeExecutionError,
         RuntimeExecutor, RuntimeReporter, RuntimeReporterFactory,
-        UnavailableRepositoryCredentialProvider, WorkloadLifecycleRequest,
+        UnavailableRepositoryCredentialProvider, ValkeyAdmin, WorkloadLifecycleRequest,
     },
 };
 
@@ -25,6 +25,7 @@ pub struct CommandDispatcher {
     reporter_factory: Option<Arc<dyn RuntimeReporterFactory>>,
     database_admin: Option<Arc<dyn DatabaseAdmin>>,
     object_storage_admin: Option<Arc<dyn ObjectStorageAdmin>>,
+    valkey_admin: Option<Arc<dyn ValkeyAdmin>>,
 }
 
 impl CommandDispatcher {
@@ -37,6 +38,7 @@ impl CommandDispatcher {
             reporter_factory: None,
             database_admin: None,
             object_storage_admin: None,
+            valkey_admin: None,
         }
     }
 
@@ -52,6 +54,7 @@ impl CommandDispatcher {
             reporter_factory: None,
             database_admin: None,
             object_storage_admin: None,
+            valkey_admin: None,
         }
     }
 
@@ -68,6 +71,7 @@ impl CommandDispatcher {
             reporter_factory: None,
             database_admin: None,
             object_storage_admin: None,
+            valkey_admin: None,
         }
     }
 
@@ -99,6 +103,14 @@ impl CommandDispatcher {
         object_storage_admin: Arc<dyn ObjectStorageAdmin>,
     ) -> Self {
         self.object_storage_admin = Some(object_storage_admin);
+        self
+    }
+
+    /// Handles the managed Valkey commands on a Valkey host. Without it every
+    /// Valkey command fails with `unsupported_runtime_command`.
+    #[must_use]
+    pub fn with_valkey_admin(mut self, valkey_admin: Arc<dyn ValkeyAdmin>) -> Self {
+        self.valkey_admin = Some(valkey_admin);
         self
     }
 
@@ -278,6 +290,14 @@ impl CommandDispatcher {
             }
             CommandType::RunJob => {
                 run_job::handle(command, self.runtime.as_ref(), reporter, cancellation).await
+            }
+            CommandType::CreateValkey
+            | CommandType::DeleteValkey
+            | CommandType::RotateValkeyPassword
+            | CommandType::LockValkey
+            | CommandType::UnlockValkey
+            | CommandType::ResizeValkey => {
+                valkey::handle(command, self.valkey_admin.as_deref()).await
             }
         }
     }
