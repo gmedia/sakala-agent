@@ -24,6 +24,8 @@ async fn main() -> anyhow::Result<()> {
     info!(
         url = %source.url(),
         state_dir = %config.state_dir.display(),
+        custom_domains_file = %config.custom_domains_file.display(),
+        custom_domain_forbidden_zones = %config.policy.forbidden_zones,
         domain_suffixes = %config.policy.domain_suffixes,
         upstream_networks = %config.policy.upstreams,
         poll_interval_seconds = config.timing.poll_interval.as_secs(),
@@ -38,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         source,
         config.policy,
         caddy,
-        EdgeFiles::new(config.state_dir),
+        EdgeFiles::new(config.state_dir).with_custom_domains_path(config.custom_domains_file),
         config.timing,
     );
 

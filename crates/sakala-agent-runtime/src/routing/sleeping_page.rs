@@ -44,6 +44,10 @@ pub struct SleepingRouteSpec {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub domain: String,
+    /// Further hosts that show the same page, as on the serving route. The
+    /// page wakes the project by its slug, taken from `domain`, so a visit
+    /// through a custom domain wakes it too.
+    pub custom_domains: Vec<String>,
     pub page: SleepingRoutePage,
     /// Where the project's owner manages it (`SAKALA_PUBLIC_CONSOLE_URL`). The
     /// page names the Console without a link when this is unknown.
@@ -464,10 +468,12 @@ fn unavailable_page(console_url: Option<&Url>) -> Page {
 /// `Content-Security-Policy`, and the page. Only the waking page sends
 /// `Retry-After`.
 pub(crate) fn site_block(route: &SleepingRouteSpec) -> Result<String, RuntimeError> {
-    if !domain_safe(&route.domain) {
+    if !std::iter::once(&route.domain)
+        .chain(&route.custom_domains)
+        .all(|domain| domain_safe(domain))
+    {
         return Err(RuntimeError::InvalidCommand(
-            "the domain of a sleeping route holds characters that are not safe in a route"
-                .to_owned(),
+            "a domain of a sleeping route holds characters that are not safe in a route".to_owned(),
         ));
     }
     let console_url = route.console_url.as_ref();
@@ -493,7 +499,7 @@ pub(crate) fn site_block(route: &SleepingRouteSpec) -> Result<String, RuntimeErr
         SleepingRoutePage::Unavailable => (unavailable_page(console_url), String::new()),
     };
     let mut block = format!(
-        "{domain}:80 {{\n\
+        "{addresses} {{\n\
          \theader {{\n\
          \t\tContent-Type \"text/html; charset=utf-8\"\n\
          \t\tCache-Control \"no-store\"\n\
@@ -502,7 +508,7 @@ pub(crate) fn site_block(route: &SleepingRouteSpec) -> Result<String, RuntimeErr
          \t\tContent-Security-Policy \"{policy}\"\n\
          \t}}\n\
          \trespond <<{HEREDOC_MARKER}\n",
-        domain = route.domain,
+        addresses = super::site_addresses(&route.domain, &route.custom_domains),
         policy = page.policy,
     );
     for line in page.html.lines() {
@@ -542,6 +548,7 @@ mod tests {
 
     fn route(domain: &str, page: SleepingRoutePage) -> SleepingRouteSpec {
         SleepingRouteSpec {
+            custom_domains: Vec::new(),
             project_id: Uuid::nil(),
             deployment_id: Uuid::nil(),
             domain: domain.to_owned(),
@@ -1015,5 +1022,29 @@ mod tests {
             let error = site_block(&unsafe_console).expect_err("a quote cannot reach the link");
             assert!(error.to_string().contains("Console URL"), "{error}");
         }
+    }
+
+    #[test]
+    fn custom_domains_show_the_same_page_and_wake_by_the_project_slug() {
+        let wake = SleepingRoutePage::Waking {
+            wake_url: wake_url("https://api.sakala.dev", "portfolio").expect("wake URL"),
+        };
+        let route = SleepingRouteSpec {
+            custom_domains: vec!["www.contoh.com".to_owned()],
+            ..route("portfolio.sakala.app", wake)
+        };
+        let block = site_block(&route).expect("site block");
+
+        assert!(
+            block.starts_with("portfolio.sakala.app:80, www.contoh.com:80 {\n"),
+            "{block}"
+        );
+        assert!(block.contains("/api/v1/public/projects/portfolio/wake"));
+
+        let unsafe_custom = SleepingRouteSpec {
+            custom_domains: vec!["www.contoh.com {".to_owned()],
+            ..route
+        };
+        assert!(site_block(&unsafe_custom).is_err());
     }
 }

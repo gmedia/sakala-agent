@@ -3,8 +3,9 @@ use std::{num::NonZeroU32, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use sakala_agent_protocol::{
     CrashedWorkloadDetail, DeployProjectPayload, DeploymentEvent, DeploymentLog,
-    DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction, RunJobPayload,
-    RuntimeCleanupTarget, SleepingPage, WorkloadMetrics, WorkloadTraffic,
+    DesiredWorkloadState, InspectProjectPayload, LogBounds, ReconcileWorkloadAction,
+    RequestedCustomDomains, RunJobPayload, RuntimeCleanupTarget, SleepingPage, WorkloadMetrics,
+    WorkloadTraffic,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -68,6 +69,21 @@ pub struct WorkloadLifecycleRequest {
     /// Only `SleepProject` reads it: the page the project's domain shows while
     /// it sleeps.
     pub sleeping_page: SleepingPage,
+    /// `WakeProject`, `RestartProject`, and `SleepProject` read it: the custom
+    /// domains the route they write serves. Absent keeps the route's own.
+    pub custom_domains: RequestedCustomDomains,
+    pub cancellation: CancellationToken,
+}
+
+/// `UpdateProjectDomains`: the project's complete list of custom domains.
+/// Applies to the project's route whatever deployment it serves, because the
+/// domains belong to the project, so the command record's `deployment_id` is
+/// optional and not matched.
+#[derive(Clone, Debug)]
+pub struct UpdateProjectDomainsRequest {
+    pub command_id: Uuid,
+    pub project_id: Uuid,
+    pub custom_domains: Vec<String>,
     pub cancellation: CancellationToken,
 }
 
@@ -594,6 +610,18 @@ pub trait RuntimeExecutor: Send + Sync {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         Err(RuntimeExecutionError::unsupported_command(
             "runtime does not support route refresh",
+        ))
+    }
+
+    /// Replaces the custom domains of the project's route, serving or
+    /// sleeping, without touching its containers.
+    async fn update_project_domains(
+        &self,
+        _request: UpdateProjectDomainsRequest,
+        _reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        Err(RuntimeExecutionError::unsupported_command(
+            "runtime does not support custom domains",
         ))
     }
 

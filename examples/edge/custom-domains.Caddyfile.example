@@ -1,0 +1,22 @@
+# Custom domains of projects (ADR-024) on an Edge host, imported at the top
+# level of the host Caddyfile, beside the wildcard sites. sakala-edge writes one
+# site per verified domain into custom-domains.caddy, each starting with
+# `import sakala_custom_domain_tls`, so this snippet must be defined first and
+# keep that name. Create an empty custom-domains.caddy at install so Caddy
+# starts before the first sync. See docs/EDGE.md.
+#
+# Certificates for these names come from Let's Encrypt through HTTP-01 or
+# TLS-ALPN-01 on this host: port 80 and 443 must be reachable, and the host
+# Caddyfile must not set the global acme_dns option, which Caddy would copy
+# into this issuer. ACME_EMAIL comes from Caddy's environment; sakala-edge
+# validates with a placeholder value.
+(sakala_custom_domain_tls) {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			email {$ACME_EMAIL}
+		}
+	}
+}
+
+import /var/lib/sakala-edge/custom-domains.caddy

@@ -15,16 +15,17 @@ use sakala_agent_core::ports::{
     RuntimeCapacity, RuntimeCompatibilityIssue, RuntimeExecutionError, RuntimeExecutor,
     RuntimeHealthSnapshot, RuntimeImageCleanup, RuntimeNetworkReconciliation,
     RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
-    RuntimeReplicaRestoration, RuntimeReporter, RuntimeReporterFactory, WorkloadLifecycleRequest,
-    process_reporter,
+    RuntimeReplicaRestoration, RuntimeReporter, RuntimeReporterFactory,
+    UpdateProjectDomainsRequest, WorkloadLifecycleRequest, process_reporter,
 };
 use sakala_agent_protocol::{
     AppliedRuntimeResources, CrashedWorkloadDetail, DeployProjectPayload, DeployProjectResult,
     DeploymentBuilder, DeploymentEventLevel, DeploymentLog, ImageReuseFallbackReason,
     InspectProjectPayload, JOB_FINISHED_EVENT, JOB_STARTED_EVENT, LogBounds, LogStream,
-    MAX_JOB_TIMEOUT_SECONDS, PROCESSES_IGNORED_EVENT, ReconcileWorkloadAction, RequestedImageReuse,
+    MAX_CUSTOM_DOMAINS_PER_PROJECT, MAX_JOB_TIMEOUT_SECONDS, PROCESSES_IGNORED_EVENT,
+    ProjectDomainsUpdate, ReconcileWorkloadAction, RequestedCustomDomains, RequestedImageReuse,
     RequestedProcesses, RunJobPayload, RunJobResult, RuntimeCleanupTarget, SleepingPage,
-    ValkeyAttachment, WorkloadMetrics, WorkloadTraffic,
+    UpdateProjectDomainsResult, ValkeyAttachment, WorkloadMetrics, WorkloadTraffic,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -76,6 +77,10 @@ use crate::{
 /// A deployment went live, but older images of its project could not be
 /// removed after it. Level `warning`; periodic image GC removes them later.
 const IMAGES_RETAINED_EVENT: &str = "deployment.images.retained";
+/// `UpdateProjectDomains` changed the hosts the project's route serves.
+const CUSTOM_DOMAINS_UPDATED_EVENT: &str = "workload.domains.updated";
+/// Longest part of a refused custom domain quoted back in the error.
+const MAX_QUOTED_DOMAIN_CHARS: usize = 80;
 /// How long a job's outcome waits for the removal of its container. A
 /// removal that takes longer, such as gVisor killing a container that ran
 /// into its timeout, goes on in the background.
@@ -109,6 +114,7 @@ pub struct DockerRuntimeExecutor {
     image_retention: ImageRetention,
     min_workspace_free_bytes: u64,
     project_domains: crate::ProjectDomainSuffixes,
+    custom_domains: crate::CustomDomainPolicy,
     preflight: DockerPreflight,
     telemetry: NodeTelemetryCollector,
     public_api_url: String,
@@ -192,6 +198,10 @@ impl DockerRuntimeExecutor {
         let router_container = config.caddy_container.clone();
         let public_api_url = config.public_api_url.clone();
         let public_console_url = config.public_console_url.clone();
+        let custom_domains = crate::CustomDomainPolicy {
+            project_domains: config.project_domain_suffixes.clone(),
+            forbidden_zones: config.custom_domain_forbidden_zones.clone(),
+        };
         let reloader = Arc::new(DockerExecCaddyReloader::new(
             Arc::clone(&runner),
             config.caddy_container,
@@ -252,6 +262,7 @@ impl DockerRuntimeExecutor {
             public_api_url,
             public_console_url,
             restore_policy,
+            custom_domains,
         )
     }
 
@@ -277,6 +288,7 @@ impl DockerRuntimeExecutor {
         public_api_url: String,
         public_console_url: Option<String>,
         restore_policy: RestorePolicy,
+        custom_domains: crate::CustomDomainPolicy,
     ) -> Self {
         let public_console_url = public_console_url.and_then(|value| {
             check_public_console_url(&value)
@@ -319,6 +331,7 @@ impl DockerRuntimeExecutor {
             image_retention,
             min_workspace_free_bytes,
             project_domains: preflight.project_domains.clone(),
+            custom_domains,
             preflight,
             telemetry,
             public_api_url,
@@ -407,6 +420,13 @@ impl DockerRuntimeExecutor {
         let deployment_id = request.deployment_id;
         let payload = request.payload;
         validate_payload(&payload, &self.project_domains)?;
+        if let RequestedCustomDomains::List(domains) = &payload.custom_domains {
+            let domains = self.checked_custom_domains(domains)?;
+            // Early, so a taken domain fails before the build. The route
+            // manager checks again, atomically, when the route is written.
+            self.ensure_custom_domains_free(project_id, &domains)
+                .await?;
+        }
         let replicas = resolve_replicas(payload.replicas, self.max_replicas_per_project)?;
         let workers = resolve_workers(&payload, self.max_replicas_per_project, |limits| {
             self.containers.resolve_resources(limits)
@@ -897,12 +917,16 @@ impl DockerRuntimeExecutor {
         )
         .await?;
         progress.cutover_started.store(true, Ordering::Release);
+        let custom_domains = self
+            .custom_domains_for(project_id, &payload.custom_domains)
+            .await?;
         self.routes
             .activate(
                 &RouteSpec {
                     project_id,
                     deployment_id,
                     domain: payload.domain.clone(),
+                    custom_domains,
                     upstreams: containers.clone(),
                     port: payload.container_port,
                 },
@@ -1547,6 +1571,7 @@ impl DockerRuntimeExecutor {
     async fn activate_workload(
         &self,
         workloads: &[ManagedWorkload],
+        custom_domains: Vec<String>,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         let first = &workloads[0];
@@ -1560,6 +1585,7 @@ impl DockerRuntimeExecutor {
                     project_id: first.project_id,
                     deployment_id: first.deployment_id,
                     domain: first.domain.clone(),
+                    custom_domains,
                     upstreams: workloads
                         .iter()
                         .map(|workload| workload.name.clone())
@@ -1569,6 +1595,100 @@ impl DockerRuntimeExecutor {
                 reporter,
             )
             .await
+    }
+
+    /// A requested list of custom domains, checked against the node's rules,
+    /// sorted, and each once.
+    fn checked_custom_domains(&self, domains: &[String]) -> Result<Vec<String>, RuntimeError> {
+        if domains.len() > MAX_CUSTOM_DOMAINS_PER_PROJECT {
+            return Err(RuntimeError::CustomDomainInvalid {
+                domain: format!("list of {} names", domains.len()),
+                reason: format!(
+                    "is longer than the {MAX_CUSTOM_DOMAINS_PER_PROJECT} custom domains one project may have on a node"
+                ),
+            });
+        }
+        self.custom_domains
+            .check_all(domains)
+            .map_err(|(domain, rejection)| RuntimeError::CustomDomainInvalid {
+                domain: quoted(&domain),
+                reason: rejection.reason().to_owned(),
+            })
+    }
+
+    /// Refuses a custom domain another project's route serves now.
+    async fn ensure_custom_domains_free(
+        &self,
+        project_id: Uuid,
+        domains: &[String],
+    ) -> Result<(), RuntimeError> {
+        if domains.is_empty() {
+            return Ok(());
+        }
+        let taken = self.routes.custom_domains_by_project().await?;
+        let holder = taken
+            .iter()
+            .filter(|(holder, _)| **holder != project_id)
+            .find_map(|(_, served)| domains.iter().find(|domain| served.contains(domain)));
+        match holder {
+            Some(domain) => Err(RuntimeError::CustomDomainTaken {
+                domain: domain.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The custom domains a route written now serves: the requested list, or
+    /// with none requested the ones the project's route has, so a command that
+    /// does not carry the list never drops them.
+    async fn custom_domains_for(
+        &self,
+        project_id: Uuid,
+        requested: &RequestedCustomDomains,
+    ) -> Result<Vec<String>, RuntimeError> {
+        match requested {
+            RequestedCustomDomains::List(domains) => self.checked_custom_domains(domains),
+            RequestedCustomDomains::Absent => Ok(self
+                .routes
+                .custom_domains(project_id)
+                .await?
+                .unwrap_or_default()),
+        }
+    }
+
+    async fn run_update_domains(
+        &self,
+        request: UpdateProjectDomainsRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeError> {
+        if request.cancellation.is_cancelled() {
+            return Err(RuntimeError::Cancelled);
+        }
+        let custom_domains = self.checked_custom_domains(&request.custom_domains)?;
+        let status = self
+            .routes
+            .update_custom_domains(request.project_id, &custom_domains, reporter.as_ref())
+            .await?;
+        if status == ProjectDomainsUpdate::Updated {
+            emit_event(
+                reporter.as_ref(),
+                CUSTOM_DOMAINS_UPDATED_EVENT,
+                "The project's route now serves the requested custom domains.",
+                json!({ "project_id": request.project_id, "custom_domains": custom_domains }),
+            )
+            .await?;
+        }
+        let result = UpdateProjectDomainsResult {
+            status,
+            custom_domains: if status == ProjectDomainsUpdate::NoRoute {
+                Vec::new()
+            } else {
+                custom_domains
+            },
+        };
+        Ok(CommandOutput::with_result(
+            serde_json::to_value(result).expect("the update result always serializes"),
+        ))
     }
 
     /// Succeeds as soon as one replica is ready. When none is, the failure of
@@ -1656,6 +1776,9 @@ impl DockerRuntimeExecutor {
         if web.is_empty() {
             return Err(RuntimeError::WorkloadNotFound);
         }
+        let custom_domains = self
+            .custom_domains_for(request.project_id, &request.custom_domains)
+            .await?;
         // A running deployment gets every replica and worker back, including
         // one that stopped on its own. A crashed one, where no web replica runs
         // because they exited or Docker is between two restarts of a crash
@@ -1690,7 +1813,7 @@ impl DockerRuntimeExecutor {
                 ..workload.clone()
             })
             .collect::<Vec<_>>();
-        self.activate_workload(&restarted, reporter.as_ref())
+        self.activate_workload(&restarted, custom_domains, reporter.as_ref())
             .await?;
         let workload = &web[0];
         emit_event(
@@ -1765,6 +1888,14 @@ impl DockerRuntimeExecutor {
             .iter()
             .find(|workload| workload.is_web())
             .unwrap_or(workload);
+        // Read before anything stops, so a list the node refuses leaves the
+        // project running instead of half asleep.
+        let custom_domains = if remove {
+            Vec::new()
+        } else {
+            self.custom_domains_for(request.project_id, &request.custom_domains)
+                .await?
+        };
         self.containers.stop(&workloads).await?;
         if remove {
             self.deactivate_route(workload, reporter.as_ref()).await?;
@@ -1773,8 +1904,13 @@ impl DockerRuntimeExecutor {
             }
             self.release_network(workload.project_id).await;
         } else {
-            self.sleep_route(workload, request.sleeping_page, reporter.as_ref())
-                .await?;
+            self.sleep_route(
+                workload,
+                request.sleeping_page,
+                custom_domains,
+                reporter.as_ref(),
+            )
+            .await?;
         }
         let remove_images = remove && request.remove_images;
         let event_type = if remove {
@@ -1857,6 +1993,7 @@ impl DockerRuntimeExecutor {
         &self,
         workload: &ManagedWorkload,
         page: SleepingPage,
+        custom_domains: Vec<String>,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
         let page = match page {
@@ -1877,6 +2014,7 @@ impl DockerRuntimeExecutor {
             project_id: workload.project_id,
             deployment_id: workload.deployment_id,
             domain: workload.domain.clone(),
+            custom_domains,
             page,
             console_url: self.public_console_url.clone(),
         });
@@ -1937,6 +2075,9 @@ impl DockerRuntimeExecutor {
         let Some(workload) = web.first() else {
             return Err(RuntimeError::WorkloadNotFound);
         };
+        let custom_domains = self
+            .custom_domains_for(request.project_id, &request.custom_domains)
+            .await?;
         // Same admission as a deployment: a full node refuses the wake, and the
         // sleeping page stays until there is room for every replica and worker.
         let admission = self.container_admission.lock().await;
@@ -1965,7 +2106,10 @@ impl DockerRuntimeExecutor {
             .collect::<Vec<_>>();
         // Writes the serving route over the sleeping one in one rename, and puts
         // the sleeping page back when the router refuses the new route.
-        if let Err(error) = self.activate_workload(&woken, reporter.as_ref()).await {
+        if let Err(error) = self
+            .activate_workload(&woken, custom_domains, reporter.as_ref())
+            .await
+        {
             self.stop_failed_wake(&started).await;
             return Err(error);
         }
@@ -2025,7 +2169,10 @@ impl DockerRuntimeExecutor {
         if !workloads.iter().any(ManagedWorkload::is_running) {
             return Err(RuntimeError::WorkloadNotRunning);
         }
-        self.activate_workload(&workloads, reporter.as_ref())
+        let custom_domains = self
+            .custom_domains_for(request.project_id, &request.custom_domains)
+            .await?;
+        self.activate_workload(&workloads, custom_domains, reporter.as_ref())
             .await?;
         Ok(CommandOutput::with_result(json!({ "status": "ready" })))
     }
@@ -2564,15 +2711,31 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                 return None;
             }
         };
-        // Every replica of a deployment is listed; the host is the deployment's.
+        // A project visited only through a custom domain is not idle. Without
+        // the route files its traffic is unknown, which must not read as none.
+        let custom_domains = match self.routes.custom_domains_by_project().await {
+            Ok(custom_domains) => custom_domains,
+            Err(error) => {
+                tracing::debug!(%error, "custom domains could not be read for traffic");
+                return None;
+            }
+        };
+        // Every replica of a deployment is listed; the hosts are the deployment's.
         let mut seen = HashSet::new();
         Some(
             workloads
                 .into_iter()
                 .filter(|workload| seen.insert((workload.project_id, workload.deployment_id)))
                 .filter_map(|workload| {
+                    let custom = custom_domains
+                        .get(&workload.project_id)
+                        .map_or(&[][..], Vec::as_slice);
+                    let last_request_at = std::iter::once(&workload.domain)
+                        .chain(custom)
+                        .filter_map(|host| last_requests.get(host))
+                        .max()?;
                     Some(WorkloadTraffic {
-                        last_request_at: *last_requests.get(&workload.domain)?,
+                        last_request_at: *last_request_at,
                         project_id: workload.project_id,
                         deployment_id: workload.deployment_id,
                     })
@@ -2695,7 +2858,11 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
                     if !web.iter().any(ManagedWorkload::is_running) {
                         return Err(RuntimeError::WorkloadNotRunning.into());
                     }
-                    self.activate_workload(&web, reporter.as_ref()).await?;
+                    let custom_domains = self
+                        .custom_domains_for(request.project_id, &RequestedCustomDomains::Absent)
+                        .await?;
+                    self.activate_workload(&web, custom_domains, reporter.as_ref())
+                        .await?;
                     actions_applied.push(json!({ "action": "restore_route" }));
                 }
             }
@@ -2863,6 +3030,17 @@ impl RuntimeExecutor for DockerRuntimeExecutor {
     ) -> Result<CommandOutput, RuntimeExecutionError> {
         let _project = self.project_locks.lock(request.project_id).await;
         self.run_refresh_route(request, reporter)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn update_project_domains(
+        &self,
+        request: UpdateProjectDomainsRequest,
+        reporter: Arc<dyn RuntimeReporter>,
+    ) -> Result<CommandOutput, RuntimeExecutionError> {
+        let _project = self.project_locks.lock(request.project_id).await;
+        self.run_update_domains(request, reporter)
             .await
             .map_err(Into::into)
     }
@@ -3036,6 +3214,17 @@ fn build_environment(
 /// The store network every container of a deployment or job joins.
 fn valkey_network(attachment: Option<&ValkeyAttachment>) -> Option<String> {
     attachment.map(|attachment| attachment.network.clone())
+}
+
+/// A name from a command, quoted on one line and cut short, safe to repeat in
+/// an error the control plane shows.
+fn quoted(value: &str) -> String {
+    let cut = value
+        .chars()
+        .take(MAX_QUOTED_DOMAIN_CHARS)
+        .collect::<String>();
+    let ellipsis = if cut.len() < value.len() { "…" } else { "" };
+    format!("{cut:?}{ellipsis}")
 }
 
 /// The release command's rule, `release_command` being optional.

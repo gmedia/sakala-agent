@@ -1,6 +1,9 @@
 //! The files Edge owns in its state directory.
 //!
 //! - `routes.caddy`: the Caddyfile fragment the host Caddyfile imports.
+//! - `custom-domains.caddy`: one site per custom domain (ADR-024), imported at
+//!   the top level of the host Caddyfile. Its path can be set apart from the
+//!   state directory.
 //! - `routes.json`: the last table Caddy accepted, in the API's format, used to
 //!   serve again after a restart while the API is unreachable.
 //! - `status.json`: the sync state for monitoring.
@@ -17,27 +20,46 @@ use std::{
 use tokio::fs;
 
 pub const ROUTES_FILE: &str = "routes.caddy";
+pub const CUSTOM_DOMAINS_FILE: &str = "custom-domains.caddy";
 pub const SNAPSHOT_FILE: &str = "routes.json";
 pub const STATUS_FILE: &str = "status.json";
 /// Suffix of the temporary file each write goes through.
 const TEMPORARY_SUFFIX: &str = ".tmp";
 
-/// What the routes file held before a replacement, to put it back when Caddy
-/// refuses the new routes.
+/// What a Caddyfile fragment held before a replacement, to put it back when
+/// Caddy refuses the new one.
 #[derive(Debug)]
 pub struct RoutesBackup {
+    path: PathBuf,
     previous: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct EdgeFiles {
     dir: PathBuf,
+    custom_domains_path: PathBuf,
 }
 
 impl EdgeFiles {
+    /// Every file in `dir`, the custom domains file included.
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            custom_domains_path: dir.join(CUSTOM_DOMAINS_FILE),
+            dir,
+        }
+    }
+
+    /// Writes the custom domains file to `path` instead.
+    #[must_use]
+    pub fn with_custom_domains_path(mut self, path: PathBuf) -> Self {
+        self.custom_domains_path = path;
+        self
+    }
+
+    #[must_use]
+    pub fn custom_domains_path(&self) -> &Path {
+        &self.custom_domains_path
     }
 
     #[must_use]
@@ -67,22 +89,21 @@ impl EdgeFiles {
     /// Replaces the routes file with `content`. `None` when it already holds
     /// exactly that, so nothing was written and Caddy needs no reload.
     pub async fn replace_routes(&self, content: &str) -> io::Result<Option<RoutesBackup>> {
-        let path = self.routes_path();
-        let previous = read_optional(&path).await?;
-        if previous.as_deref() == Some(content.as_bytes()) {
-            return Ok(None);
-        }
-        write_atomic(&path, content.as_bytes()).await?;
-        Ok(Some(RoutesBackup { previous }))
+        replace(self.routes_path(), content).await
     }
 
-    /// Puts back what the routes file held before [`Self::replace_routes`]. A
-    /// file that did not exist is removed again.
+    /// [`Self::replace_routes`] for the custom domains file.
+    pub async fn replace_custom_domains(&self, content: &str) -> io::Result<Option<RoutesBackup>> {
+        replace(self.custom_domains_path.clone(), content).await
+    }
+
+    /// Puts back what a file held before [`Self::replace_routes`] or
+    /// [`Self::replace_custom_domains`]. A file that did not exist is removed
+    /// again.
     pub async fn restore_routes(&self, backup: RoutesBackup) -> io::Result<()> {
-        let path = self.routes_path();
         match backup.previous {
-            Some(content) => write_atomic(&path, &content).await,
-            None => match fs::remove_file(&path).await {
+            Some(content) => write_atomic(&backup.path, &content).await,
+            None => match fs::remove_file(&backup.path).await {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
             },
@@ -100,6 +121,15 @@ impl EdgeFiles {
     pub async fn write_status(&self, content: &[u8]) -> io::Result<()> {
         write_atomic(&self.status_path(), content).await
     }
+}
+
+async fn replace(path: PathBuf, content: &str) -> io::Result<Option<RoutesBackup>> {
+    let previous = read_optional(&path).await?;
+    if previous.as_deref() == Some(content.as_bytes()) {
+        return Ok(None);
+    }
+    write_atomic(&path, content.as_bytes()).await?;
+    Ok(Some(RoutesBackup { path, previous }))
 }
 
 async fn read_optional(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -161,5 +191,31 @@ mod tests {
 
         files.restore_routes(first).await.expect("restore");
         assert!(!files.routes_path().exists());
+    }
+
+    #[tokio::test]
+    async fn the_custom_domains_file_has_its_own_path_and_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let path = elsewhere.path().join("custom.caddy");
+        let files = EdgeFiles::new(dir.path().to_path_buf()).with_custom_domains_path(path.clone());
+        assert_eq!(
+            EdgeFiles::new(dir.path().to_path_buf()).custom_domains_path(),
+            dir.path().join("custom-domains.caddy")
+        );
+
+        files.replace_routes("routes").await.expect("write");
+        let backup = files
+            .replace_custom_domains("custom")
+            .await
+            .expect("write")
+            .expect("changed");
+        assert_eq!(fs::read_to_string(&path).await.expect("read"), "custom");
+        files.restore_routes(backup).await.expect("restore");
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_to_string(files.routes_path()).await.expect("read"),
+            "routes"
+        );
     }
 }

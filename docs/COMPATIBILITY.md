@@ -485,6 +485,43 @@ deployment of an attached project loses its store network without an error. Befo
 downgrading, delete the stores or stop the projects that use them, and check that
 `docker ps -a --filter label=dev.sakala.valkey-id` is empty.
 
+## Revision 4 additions for custom domains
+
+Still revision 4 (ADR-024), but this release adds one command type. An older Agent
+fails to deserialize a poll response that holds `UpdateProjectDomains`, and ignores
+`custom_domains`, so its router answers a custom domain with 404. The API must only send
+both to a node that advertises `custom-domains`, and must not raise
+`SAKALA_AGENT_SUPPORTED_PROTOCOL_VERSIONS` for it. A new Agent against an older API
+receives neither and writes every route byte for byte as before. Deploy the Agent
+(and `sakala-edge`) first.
+
+| Capability | Agent decision | Notes |
+| --- | --- | --- |
+| Node capability `custom-domains` | Advertised by the `docker` runtime, after `scheduled-jobs`. | Not advertised by `noop`. |
+| Payload field `custom_domains` on `DeployProject`, `WakeProject`, `RestartProject`, `SleepProject` | Honoured. | Absent or `null` keeps the custom domains of the project's route on the node; an array of strings replaces them, `[]` removes them. Other types: `invalid_runtime_command`, `SleepProject` included. Names are checked, never normalized: lowercase LDH DNS name of at least two labels, at most 253 characters, not an IP, not under a project domain suffix or `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES`, at most 32 per project. Rules in [Sakala Agent API](AGENT_API.md#custom-domain); examples in `examples/commands/deploy-project-custom-domains.json` and `examples/commands/wake-project-custom-domains.json`. |
+| Command type `UpdateProjectDomains` | Handled by the `docker` runtime, appended to `CommandType` after `ResizeValkey`. | `project_id` required, `deployment_id` optional and not matched, payload `{ custom_domains: [...] }` required. Rewrites only the site address line of the project's route, serving or sleeping, then validates and reloads the router. Result `{ status: updated \| unchanged \| no_route, custom_domains }`; event `workload.domains.updated` on `updated`. Example in `examples/commands/update-project-domains.json`. |
+| `error_code` values `runtime_custom_domain_invalid`, `runtime_custom_domain_taken` | Sent on `fail` of the commands above. | Additive. Nothing changed in either case. Example bodies in `examples/failures/custom-domain-failures.json`. |
+| `metadata.workloads.traffic[].last_request_at` | Also moves for requests to a project's custom domains. | Same shape. The custom hosts come from the route files; when they cannot be read, the whole list is left out (unknown), as when the router's counters cannot be read. |
+
+Project routes with custom domains list them as extra site addresses
+(`portfolio.sakala.app:80, www.contoh.com:80 {`). The route file is the only record of
+them on the node, because they change without a redeploy; container labels are
+unchanged.
+
+New configuration: `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES`, see
+[Configuration](CONFIGURATION.md#custom-domain).
+
+`sakala-edge` in the same release reads an optional `custom_routes` array and
+`expected_minimum_custom_routes` from the route table and writes one site per domain
+to `custom-domains.caddy`; an older Edge ignores both. See [Sakala Edge](EDGE.md#custom-domain).
+
+Rolling the Agent back: an older Agent rewrites a project route without its custom
+domains on the next deploy, wake, restart, sleep, or route refresh. Before downgrading,
+remove every custom domain of the node's projects (send `UpdateProjectDomains` with
+`[]`) and check that no file in `SAKALA_CADDY_SITES_DIR` has a second address on its
+site line. Rolling `sakala-edge` back: write an empty `custom-domains.caddy` and reload
+Caddy first, since an older Edge never touches that file.
+
 ## Upgrade procedure
 
 1. Check the release notes for protocol and configuration changes.

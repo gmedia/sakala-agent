@@ -7216,6 +7216,7 @@ fn inspect_command() -> AgentCommand {
 
 fn lifecycle_request() -> WorkloadLifecycleRequest {
     WorkloadLifecycleRequest {
+        custom_domains: Default::default(),
         command_id: Uuid::new_v4(),
         project_id: Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project UUID"),
         deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
@@ -9552,6 +9553,7 @@ async fn replica_restore_gives_way_to_a_command_of_the_same_project() {
             executor
                 .sleep_project(
                     WorkloadLifecycleRequest {
+                        custom_domains: Default::default(),
                         command_id: Uuid::new_v4(),
                         project_id: Uuid::parse_str(RESTORE_PROJECT).expect("project UUID"),
                         deployment_id: Uuid::parse_str(RESTORE_DEPLOYMENT)
@@ -12366,4 +12368,331 @@ async fn a_job_joins_the_store_network_of_the_live_deployment() {
     .expect_err("no store network");
     assert_eq!(error.code(), "valkey_network_unavailable");
     assert_eq!(runner.count_commands(is_job_run), 0);
+}
+
+/// The project's route with `custom` after its own domain, as an earlier
+/// command with custom domains wrote it.
+fn serving_route_with(custom: &str) -> String {
+    format!(
+        "# Managed by sakala-agent for project {PROJECT} deployment {DEPLOYMENT}.\nportfolio.run.sakala.localhost:80{custom} {{\n\treverse_proxy app:3000\n}}\n"
+    )
+}
+
+fn site_line(route: &std::path::Path) -> String {
+    fs::read_to_string(route)
+        .expect("route")
+        .lines()
+        .nth(1)
+        .expect("site address line")
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_deployment_serves_its_custom_domains_on_the_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let runner = Arc::new(FakeRunner::new(true));
+    let config = runtime_config(&temp);
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner);
+    let mut command = deploy_command("auto");
+    command.payload["custom_domains"] = json!(["www.contoh.com", "contoh.com", "www.contoh.com"]);
+
+    dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect("deployment with custom domains");
+
+    assert_eq!(
+        site_line(&route_path(&config, PROJECT)),
+        "portfolio.run.sakala.localhost:80, contoh.com:80, www.contoh.com:80 {"
+    );
+}
+
+#[tokio::test]
+async fn a_deployment_without_the_list_keeps_the_custom_domains_of_the_route() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &serving_route_with(", www.contoh.com:80"));
+    let executor = DockerRuntimeExecutor::with_runner(config, Arc::new(FakeRunner::new(true)));
+
+    dispatch(
+        executor,
+        &deploy_command("auto"),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("redeployment");
+
+    assert_eq!(
+        site_line(&route),
+        "portfolio.run.sakala.localhost:80, www.contoh.com:80 {"
+    );
+}
+
+#[tokio::test]
+async fn an_invalid_custom_domain_fails_the_deployment_before_any_process_runs() {
+    for domain in [
+        "api.sakala.dev",
+        "other.sakala.app",
+        "10.0.0.1",
+        "*.contoh.com",
+        "www.contoh.com {",
+    ] {
+        let temp = TempDir::new().expect("temp directory should be available");
+        let runner = Arc::new(FakeRunner::new(true));
+        let executor = DockerRuntimeExecutor::with_runner(runtime_config(&temp), runner.clone());
+        let mut command = deploy_command("auto");
+        command.payload["custom_domains"] = json!([domain]);
+
+        let error = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+            .await
+            .expect_err("refused");
+
+        assert_eq!(error.code(), "runtime_custom_domain_invalid", "{domain}");
+        assert!(!error.to_string().contains('\n'), "{error}");
+        assert!(runner.commands.lock().expect("command lock").is_empty());
+    }
+    let temp = TempDir::new().expect("temp directory should be available");
+    let executor =
+        DockerRuntimeExecutor::with_runner(runtime_config(&temp), Arc::new(FakeRunner::new(true)));
+    let mut command = deploy_command("auto");
+    command.payload["custom_domains"] = json!(
+        (0..33)
+            .map(|index| format!("d{index}.contoh.com"))
+            .collect::<Vec<_>>()
+    );
+    let error = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect_err("too many");
+    assert_eq!(error.code(), "runtime_custom_domain_invalid");
+}
+
+#[tokio::test]
+async fn sleep_and_wake_keep_the_custom_domains_unless_the_command_names_them() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &serving_route_with(", www.contoh.com:80"));
+
+    let sleeper = DockerRuntimeExecutor::with_runner(
+        config.clone(),
+        Arc::new(FakeRunner::new(true).with_docker_ps(RUNNING_WORKLOAD)),
+    );
+    RuntimeExecutor::sleep_project(
+        &sleeper,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("sleep");
+    let content = fs::read_to_string(&route).expect("route");
+    assert!(content.contains("(sleeping)"), "{content}");
+    assert_eq!(
+        site_line(&route),
+        "portfolio.run.sakala.localhost:80, www.contoh.com:80 {"
+    );
+
+    let waker = DockerRuntimeExecutor::with_runner(
+        config.clone(),
+        Arc::new(FakeRunner::new(true).with_docker_ps(EXITED_WORKLOAD)),
+    );
+    RuntimeExecutor::wake_project(
+        &waker,
+        lifecycle_request(),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake");
+    assert!(
+        !fs::read_to_string(&route)
+            .expect("route")
+            .contains("(sleeping)")
+    );
+    assert_eq!(
+        site_line(&route),
+        "portfolio.run.sakala.localhost:80, www.contoh.com:80 {"
+    );
+
+    // A wake that carries the list replaces them.
+    write_route(&config, PROJECT, &sleeping_route(PROJECT, DEPLOYMENT));
+    let waker = DockerRuntimeExecutor::with_runner(
+        config,
+        Arc::new(FakeRunner::new(true).with_docker_ps(EXITED_WORKLOAD)),
+    );
+    RuntimeExecutor::wake_project(
+        &waker,
+        WorkloadLifecycleRequest {
+            custom_domains: sakala_agent_protocol::RequestedCustomDomains::List(vec![
+                "contoh.net".to_owned(),
+            ]),
+            ..lifecycle_request()
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("wake");
+    assert_eq!(
+        site_line(&route),
+        "portfolio.run.sakala.localhost:80, contoh.net:80 {"
+    );
+}
+
+#[tokio::test]
+async fn a_sleep_with_a_custom_domain_the_node_refuses_leaves_the_project_running() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let route = write_route(&config, PROJECT, &serving_route_with(""));
+    let before = fs::read_to_string(&route).expect("route");
+    let runner = Arc::new(FakeRunner::new(true).with_docker_ps(RUNNING_WORKLOAD));
+    let executor = DockerRuntimeExecutor::with_runner(config, runner.clone());
+
+    let error = RuntimeExecutor::sleep_project(
+        &executor,
+        WorkloadLifecycleRequest {
+            custom_domains: sakala_agent_protocol::RequestedCustomDomains::List(vec![
+                "portfolio.sakala.app".to_owned(),
+            ]),
+            ..lifecycle_request()
+        },
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("refused");
+
+    assert_eq!(error.code(), "runtime_custom_domain_invalid");
+    assert_eq!(fs::read_to_string(&route).expect("route"), before);
+    assert!(
+        command_position(&runner, |args| args.first().is_some_and(|a| a == "stop")).is_none(),
+        "nothing was stopped"
+    );
+}
+
+fn update_domains_command(payload: serde_json::Value) -> AgentCommand {
+    AgentCommand {
+        id: Uuid::new_v4(),
+        command_type: CommandType::UpdateProjectDomains,
+        status: CommandStatus::Pending,
+        project_id: Some(Uuid::parse_str(PROJECT).expect("project UUID")),
+        deployment_id: None,
+        payload,
+    }
+}
+
+#[tokio::test]
+async fn update_project_domains_rewrites_the_route_without_touching_containers() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let runner = Arc::new(FakeRunner::new(true));
+
+    // Without a route there is nothing to change.
+    let output = dispatch(
+        DockerRuntimeExecutor::with_runner(config.clone(), runner.clone()),
+        &update_domains_command(json!({ "custom_domains": ["www.contoh.com"] })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("no route");
+    assert_eq!(
+        output.result,
+        json!({ "status": "no_route", "custom_domains": [] })
+    );
+
+    let route = write_route(&config, PROJECT, &serving_route_with(""));
+    let reporter = Arc::new(RecordingReporter::default());
+    let output = dispatch(
+        DockerRuntimeExecutor::with_runner(config.clone(), runner.clone()),
+        &update_domains_command(json!({ "custom_domains": ["www.contoh.com", "contoh.com"] })),
+        Arc::clone(&reporter),
+    )
+    .await
+    .expect("update");
+    assert_eq!(
+        output.result,
+        json!({ "status": "updated", "custom_domains": ["contoh.com", "www.contoh.com"] })
+    );
+    assert_eq!(
+        site_line(&route),
+        "portfolio.run.sakala.localhost:80, contoh.com:80, www.contoh.com:80 {"
+    );
+    let event_types = reporter
+        .events
+        .lock()
+        .expect("events")
+        .iter()
+        .map(|event| event.event_type.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(event_types, ["workload.domains.updated"]);
+    assert!(
+        runner
+            .commands
+            .lock()
+            .expect("command lock")
+            .iter()
+            .all(|command| command.args.iter().any(|arg| arg == "caddy")),
+        "only the router was validated and reloaded"
+    );
+
+    let output = dispatch(
+        DockerRuntimeExecutor::with_runner(config.clone(), runner.clone()),
+        &update_domains_command(json!({ "custom_domains": ["contoh.com", "www.contoh.com"] })),
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect("same list");
+    assert_eq!(output.result["status"], "unchanged");
+
+    for (payload, code) in [
+        (json!({}), "invalid_runtime_command"),
+        (
+            json!({ "custom_domains": "contoh.com" }),
+            "invalid_runtime_command",
+        ),
+        (
+            json!({ "custom_domains": ["sakala.dev"] }),
+            "runtime_custom_domain_invalid",
+        ),
+    ] {
+        let error = dispatch(
+            DockerRuntimeExecutor::with_runner(config.clone(), runner.clone()),
+            &update_domains_command(payload.clone()),
+            Arc::new(RecordingReporter::default()),
+        )
+        .await
+        .expect_err("refused");
+        assert_eq!(error.code(), code, "{payload}");
+    }
+    let mut without_project = update_domains_command(json!({ "custom_domains": [] }));
+    without_project.project_id = None;
+    let error = dispatch(
+        DockerRuntimeExecutor::with_runner(config, runner),
+        &without_project,
+        Arc::new(RecordingReporter::default()),
+    )
+    .await
+    .expect_err("refused");
+    assert_eq!(error.code(), "invalid_runtime_command");
+}
+
+#[tokio::test]
+async fn a_custom_domain_another_project_serves_fails_the_deployment_before_the_build() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let config = runtime_config(&temp);
+    let other = Uuid::new_v4().to_string();
+    write_route(
+        &config,
+        &other,
+        &format!(
+            "# Managed by sakala-agent for project {other} deployment {DEPLOYMENT}.\nother.run.sakala.localhost:80, www.contoh.com:80 {{\n\treverse_proxy app:3000\n}}\n"
+        ),
+    );
+    let runner = Arc::new(FakeRunner::new(true));
+    let executor = DockerRuntimeExecutor::with_runner(config.clone(), runner.clone());
+    let mut command = deploy_command("auto");
+    command.payload["custom_domains"] = json!(["www.contoh.com"]);
+
+    let error = dispatch(executor, &command, Arc::new(RecordingReporter::default()))
+        .await
+        .expect_err("taken");
+
+    assert_eq!(error.code(), "runtime_custom_domain_taken");
+    assert!(!error.to_string().contains(&other), "{error}");
+    assert!(runner.commands.lock().expect("command lock").is_empty());
+    assert!(!route_path(&config, PROJECT).exists());
 }

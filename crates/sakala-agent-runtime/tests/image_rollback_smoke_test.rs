@@ -547,6 +547,7 @@ fn lifecycle(
     sleeping_page: SleepingPage,
 ) -> WorkloadLifecycleRequest {
     WorkloadLifecycleRequest {
+        custom_domains: Default::default(),
         command_id: Uuid::new_v4(),
         project_id,
         deployment_id,

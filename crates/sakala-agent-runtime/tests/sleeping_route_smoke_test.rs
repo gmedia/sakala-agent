@@ -220,6 +220,7 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
     assert_eq!(traffic_of_project().await, None);
 
     let route = SleepingRouteSpec {
+        custom_domains: Vec::new(),
         project_id,
         deployment_id,
         domain: DOMAIN.to_owned(),
@@ -313,6 +314,7 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
     routes
         .activate(
             &RouteSpec {
+                custom_domains: Vec::new(),
                 project_id,
                 deployment_id,
                 domain: DOMAIN.to_owned(),
@@ -396,6 +398,7 @@ async fn real_caddy_serves_the_sleeping_page_and_counts_the_visit() {
     routes
         .activate(
             &RouteSpec {
+                custom_domains: Vec::new(),
                 project_id,
                 deployment_id,
                 domain: DOMAIN.to_owned(),

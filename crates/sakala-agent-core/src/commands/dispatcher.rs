@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use sakala_agent_protocol::{
-    AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel, SleepingPage,
+    AgentCommand, CommandType, DeploymentEvent, DeploymentEventLevel, RequestedCustomDomains,
+    SleepingPage,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -14,7 +15,8 @@ use crate::{
         CleanupRuntimeRequest, CommandOutput, DatabaseAdmin, ObjectStorageAdmin,
         ReconcileWorkloadRequest, RepositoryCredentialProvider, RuntimeExecutionError,
         RuntimeExecutor, RuntimeReporter, RuntimeReporterFactory,
-        UnavailableRepositoryCredentialProvider, ValkeyAdmin, WorkloadLifecycleRequest,
+        UnavailableRepositoryCredentialProvider, UpdateProjectDomainsRequest, ValkeyAdmin,
+        WorkloadLifecycleRequest,
     },
 };
 
@@ -142,9 +144,9 @@ impl CommandDispatcher {
                 .await
             }
             CommandType::RestartProject => {
-                self.runtime
-                    .restart_project(lifecycle_request(command, cancellation)?, reporter)
-                    .await
+                let mut request = lifecycle_request(command, cancellation)?;
+                request.custom_domains = custom_domains(command)?;
+                self.runtime.restart_project(request, reporter).await
             }
             CommandType::StopProject => {
                 let payload = command.stop_project_payload().map_err(|error| {
@@ -159,11 +161,35 @@ impl CommandDispatcher {
             CommandType::SleepProject => {
                 let mut request = lifecycle_request(command, cancellation)?;
                 request.sleeping_page = sleeping_page(command);
+                request.custom_domains = custom_domains(command)?;
                 self.runtime.sleep_project(request, reporter).await
             }
             CommandType::WakeProject => {
+                let mut request = lifecycle_request(command, cancellation)?;
+                request.custom_domains = custom_domains(command)?;
+                self.runtime.wake_project(request, reporter).await
+            }
+            CommandType::UpdateProjectDomains => {
+                let project_id = command.project_id.ok_or_else(|| {
+                    RuntimeExecutionError::invalid_command(
+                        "UpdateProjectDomains requires project_id",
+                    )
+                })?;
+                let payload = command.update_project_domains_payload().map_err(|error| {
+                    RuntimeExecutionError::invalid_command(format!(
+                        "UpdateProjectDomains payload is invalid: {error}"
+                    ))
+                })?;
                 self.runtime
-                    .wake_project(lifecycle_request(command, cancellation)?, reporter)
+                    .update_project_domains(
+                        UpdateProjectDomainsRequest {
+                            command_id: command.id,
+                            project_id,
+                            custom_domains: payload.custom_domains,
+                            cancellation,
+                        },
+                        reporter,
+                    )
                     .await
             }
             CommandType::HealthCheck => {
@@ -319,8 +345,24 @@ fn lifecycle_request(
         deployment_id,
         remove_images: false,
         sleeping_page: SleepingPage::default(),
+        custom_domains: RequestedCustomDomains::Absent,
         cancellation,
     })
+}
+
+/// The `custom_domains` of a command that writes a route. Unlike the sleeping
+/// page, a list this build cannot read refuses the command: guessing would
+/// serve a domain the control plane did not ask for, or drop one it did.
+fn custom_domains(command: &AgentCommand) -> Result<RequestedCustomDomains, RuntimeExecutionError> {
+    command
+        .custom_domains_payload()
+        .map(|payload| payload.custom_domains)
+        .map_err(|error| {
+            RuntimeExecutionError::invalid_command(format!(
+                "{:?} payload has an invalid custom_domains: {error}",
+                command.command_type
+            ))
+        })
 }
 
 /// A payload this build does not understand still puts the project to sleep,
@@ -356,10 +398,23 @@ mod tests {
         stops: Mutex<Vec<bool>>,
         sleeps: Mutex<Vec<(bool, SleepingPage)>>,
         jobs: Mutex<Vec<crate::ports::RunJobRequest>>,
+        wakes: Mutex<Vec<RequestedCustomDomains>>,
     }
 
     #[async_trait]
     impl RuntimeExecutor for RecordingRuntime {
+        async fn wake_project(
+            &self,
+            request: WorkloadLifecycleRequest,
+            _reporter: Arc<dyn RuntimeReporter>,
+        ) -> Result<CommandOutput, RuntimeExecutionError> {
+            self.wakes
+                .lock()
+                .expect("lock")
+                .push(request.custom_domains);
+            Ok(CommandOutput::empty())
+        }
+
         async fn run_job(
             &self,
             request: crate::ports::RunJobRequest,
@@ -567,5 +622,65 @@ mod tests {
                 SleepingPage::Waking,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_carries_the_custom_domains_or_keeps_the_routes_own() {
+        let runtime = Arc::new(RecordingRuntime::default());
+        let dispatcher = CommandDispatcher::new(Arc::clone(&runtime) as Arc<dyn RuntimeExecutor>);
+
+        for payload in [
+            Value::Null,
+            json!({}),
+            json!({ "custom_domains": null }),
+            json!({ "custom_domains": ["www.contoh.com"] }),
+            json!({ "custom_domains": [] }),
+        ] {
+            dispatch(&dispatcher, CommandType::WakeProject, payload)
+                .await
+                .expect("wake");
+        }
+        for payload in [
+            json!({ "custom_domains": "www.contoh.com" }),
+            json!({ "custom_domains": [1] }),
+        ] {
+            let error = dispatch(&dispatcher, CommandType::WakeProject, payload.clone())
+                .await
+                .expect_err("refused");
+            assert_eq!(error.code(), "invalid_runtime_command", "{payload}");
+            let error = dispatch(&dispatcher, CommandType::SleepProject, payload.clone())
+                .await
+                .expect_err("refused");
+            assert_eq!(error.code(), "invalid_runtime_command", "{payload}");
+        }
+
+        assert_eq!(
+            *runtime.wakes.lock().expect("lock"),
+            [
+                RequestedCustomDomains::Absent,
+                RequestedCustomDomains::Absent,
+                RequestedCustomDomains::Absent,
+                RequestedCustomDomains::List(vec!["www.contoh.com".to_owned()]),
+                RequestedCustomDomains::List(Vec::new()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_custom_domains_refuses_the_update_explicitly() {
+        struct NoDomains;
+        impl RuntimeExecutor for NoDomains {}
+        let error = CommandDispatcher::new(Arc::new(NoDomains))
+            .dispatch(
+                &command(
+                    CommandType::UpdateProjectDomains,
+                    json!({ "custom_domains": ["www.contoh.com"] }),
+                ),
+                Arc::new(SilentReporter),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("unsupported");
+        assert_eq!(error.code(), "unsupported_runtime_command");
     }
 }

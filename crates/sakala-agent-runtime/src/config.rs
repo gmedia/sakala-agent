@@ -1,6 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
-use crate::{containers::ResourceSafetyConfig, domains::ProjectDomainSuffixes};
+use crate::{
+    containers::ResourceSafetyConfig,
+    domains::{ForbiddenZones, ProjectDomainSuffixes},
+};
 
 /// How long a crash-looping workload must stay up before it stops being reported
 /// as crashed. Long enough that an app crashing every few minutes reads as crashed
@@ -124,6 +127,9 @@ pub struct DockerRuntimeConfig {
     /// Suffixes a deployment domain must sit under, one label deep. The default
     /// is the hosted Sakala zones; a self-hosted node names its own.
     pub project_domain_suffixes: ProjectDomainSuffixes,
+    /// Zones no custom domain may be or sit under, besides the project domain
+    /// suffixes (ADR-024).
+    pub custom_domain_forbidden_zones: ForbiddenZones,
     pub resource_safety: ResourceSafetyConfig,
     pub timeout_safety: TimeoutSafetyConfig,
     pub max_concurrent_builds: usize,
@@ -173,6 +179,7 @@ impl Default for DockerRuntimeConfig {
             container_runtime: None,
             container_dns: Vec::new(),
             project_domain_suffixes: ProjectDomainSuffixes::default(),
+            custom_domain_forbidden_zones: ForbiddenZones::default(),
             resource_safety: ResourceSafetyConfig::default(),
             timeout_safety: TimeoutSafetyConfig::default(),
             max_concurrent_builds: 1,

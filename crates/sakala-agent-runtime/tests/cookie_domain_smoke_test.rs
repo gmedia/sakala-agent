@@ -300,6 +300,7 @@ async fn real_caddy_makes_every_upstream_cookie_host_only() {
         routes
             .activate(
                 &RouteSpec {
+                    custom_domains: Vec::new(),
                     project_id,
                     deployment_id: Uuid::new_v4(),
                     domain: DOMAIN.to_owned(),

@@ -270,6 +270,7 @@ impl Node {
 
     fn lifecycle(&self, deployment_id: Uuid) -> WorkloadLifecycleRequest {
         WorkloadLifecycleRequest {
+            custom_domains: Default::default(),
             command_id: Uuid::new_v4(),
             project_id: self.project_id,
             deployment_id,

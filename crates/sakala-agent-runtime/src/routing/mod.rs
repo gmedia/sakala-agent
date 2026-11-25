@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use sakala_agent_core::ports::RuntimeStaleRoute;
+use sakala_agent_protocol::ProjectDomainsUpdate;
 use uuid::Uuid;
 
 use crate::{RuntimeError, RuntimeReporter};
@@ -23,12 +24,30 @@ pub struct RouteIdentity {
     pub deployment_id: Option<Uuid>,
 }
 
+/// The port every route listens on in the router. TLS ends at the host Caddy
+/// or Sakala Edge in front of it.
+pub(crate) const ROUTER_PORT: u16 = 80;
+
+/// The site address line of a project route: its own domain first, then its
+/// custom domains (ADR-024), all on the router's port. The first address is
+/// the project's domain, which is how a route file read back tells it apart.
+pub(crate) fn site_addresses(domain: &str, custom_domains: &[String]) -> String {
+    std::iter::once(domain)
+        .chain(custom_domains.iter().map(String::as_str))
+        .map(|host| format!("{host}:{ROUTER_PORT}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A serving route: the project's domain, proxied to its deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteSpec {
     pub project_id: Uuid,
     pub deployment_id: Uuid,
     pub domain: String,
+    /// Further hosts the route serves, checked, sorted, and each once. No other
+    /// project's route may hold one of them.
+    pub custom_domains: Vec<String>,
     /// The container name of every replica, in replica order. One name gives
     /// the plain proxy every earlier Agent wrote; several are balanced.
     pub upstreams: Vec<String>,
@@ -61,6 +80,31 @@ pub trait RouteManager: Send + Sync {
     /// for the wake. Read-only.
     async fn sleeping_routes(&self) -> Result<HashSet<RouteIdentity>, RuntimeError> {
         Ok(HashSet::new())
+    }
+
+    /// The custom domains the project's route serves now, serving or
+    /// sleeping. `None` when the project has no route Sakala owns. Read-only.
+    async fn custom_domains(&self, _project_id: Uuid) -> Result<Option<Vec<String>>, RuntimeError> {
+        Ok(None)
+    }
+
+    /// The custom domains of every project route that has any. Read-only.
+    async fn custom_domains_by_project(&self) -> Result<HashMap<Uuid, Vec<String>>, RuntimeError> {
+        Ok(HashMap::new())
+    }
+
+    /// Makes the project's route, whichever kind it is, serve exactly
+    /// `custom_domains` besides the project's domain. Validated and reloaded
+    /// like [`RouteManager::activate`], and restored when the router refuses it.
+    async fn update_custom_domains(
+        &self,
+        _project_id: Uuid,
+        _custom_domains: &[String],
+        _reporter: &dyn RuntimeReporter,
+    ) -> Result<ProjectDomainsUpdate, RuntimeError> {
+        Err(RuntimeError::Routing(
+            "this route manager cannot change custom domains".to_owned(),
+        ))
     }
 
     async fn activate(

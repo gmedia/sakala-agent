@@ -26,7 +26,10 @@ pub use config::{
     TimeoutSafetyConfig,
 };
 pub use containers::{MAX_REPLICAS_PER_PROJECT_CEILING, ResourceSafetyConfig};
-pub use domains::{DEFAULT_PROJECT_DOMAIN_SUFFIXES, ProjectDomainSuffixes};
+pub use domains::{
+    CustomDomainPolicy, CustomDomainRejection, DEFAULT_CUSTOM_DOMAIN_FORBIDDEN_ZONES,
+    DEFAULT_PROJECT_DOMAIN_SUFFIXES, ForbiddenZones, ProjectDomainSuffixes,
+};
 pub use error::RuntimeError;
 pub use executor::{DockerRuntimeExecutor, NoopRuntimeExecutor};
 pub use process::{

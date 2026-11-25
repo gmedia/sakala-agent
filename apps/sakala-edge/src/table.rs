@@ -5,6 +5,11 @@
 //! is escaped later: a table is either fully valid, with hosts limited to
 //! `a-z`, `0-9`, `-`, and `.`, and upstreams that are IP socket addresses, or it
 //! is refused as a whole and the previous table keeps serving (ADR-019).
+//!
+//! Custom domains (ADR-024) come in a separate `custom_routes` array, which an
+//! older Edge ignores, and are checked separately: a bad custom route refuses
+//! only the custom part, the project routes of the same table still apply, and
+//! the custom routes Edge served before stay.
 
 use std::{
     collections::HashSet,
@@ -14,8 +19,9 @@ use std::{
 };
 
 use ipnet::IpNet;
-use sakala_agent_runtime::ProjectDomainSuffixes;
+use sakala_agent_runtime::{CustomDomainPolicy, ForbiddenZones, ProjectDomainSuffixes};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -48,6 +54,11 @@ pub const DEFAULT_UPSTREAM_CIDRS: [&str; 4] =
 /// The table exactly as the API sends it, and as Edge keeps it on disk.
 /// Unknown fields are ignored, so the API can add fields without breaking an
 /// older Edge.
+///
+/// The custom part is kept as raw JSON here and read on its own by
+/// [`RoutePolicy`], so a custom route of the wrong shape refuses only the
+/// custom part instead of the whole table. Both fields are optional: an API
+/// that does not publish custom domains serves none.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WireRouteTable {
     #[serde(with = "time::serde::rfc3339")]
@@ -55,6 +66,10 @@ pub struct WireRouteTable {
     pub revision: String,
     pub expected_minimum_routes: u64,
     pub routes: Vec<WireRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_minimum_custom_routes: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_routes: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -72,6 +87,41 @@ pub struct RouteTable {
     generated_at: OffsetDateTime,
     expected_minimum_routes: u64,
     routes: Vec<Route>,
+    custom_routes: CustomRoutes,
+    /// Why the custom part of this table was refused. Its custom routes are
+    /// then empty until [`RouteTable::with_custom_routes`] puts back the ones
+    /// served before.
+    custom_rejection: Option<CustomRouteRejection>,
+}
+
+/// The custom domains of a table, sorted by host. A custom route may have no
+/// upstream: its project has no workload, and its site answers not found
+/// while Caddy keeps its certificate.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CustomRoutes {
+    expected_minimum: u64,
+    routes: Vec<Route>,
+}
+
+impl CustomRoutes {
+    #[must_use]
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    fn to_wire(&self) -> (Value, Value) {
+        (
+            Value::from(self.expected_minimum),
+            Value::Array(
+                self.routes
+                    .iter()
+                    .map(|route| {
+                        serde_json::to_value(route.to_wire()).expect("a route always serializes")
+                    })
+                    .collect(),
+            ),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,6 +129,16 @@ pub struct Route {
     pub host: String,
     pub project_id: Uuid,
     pub upstreams: Vec<SocketAddr>,
+}
+
+impl Route {
+    fn to_wire(&self) -> WireRoute {
+        WireRoute {
+            host: self.host.clone(),
+            project_id: self.project_id,
+            upstreams: self.upstreams.iter().map(ToString::to_string).collect(),
+        }
+    }
 }
 
 impl RouteTable {
@@ -97,26 +157,94 @@ impl RouteTable {
         &self.routes
     }
 
+    #[must_use]
+    pub fn custom_routes(&self) -> &CustomRoutes {
+        &self.custom_routes
+    }
+
+    /// Why the custom part of the table was refused, if it was.
+    #[must_use]
+    pub fn custom_rejection(&self) -> Option<&CustomRouteRejection> {
+        self.custom_rejection.as_ref()
+    }
+
+    /// The same table with other custom routes, such as the ones Edge served
+    /// before when this table's custom part was refused.
+    #[must_use]
+    pub fn with_custom_routes(mut self, custom_routes: CustomRoutes) -> Self {
+        self.custom_routes = custom_routes;
+        self
+    }
+
     /// The table in the API's own format, which is what the snapshot keeps, so
-    /// a snapshot goes through exactly the checks a fresh response does.
+    /// a snapshot goes through exactly the checks a fresh response does. The
+    /// custom part is the one served, not a refused one.
     #[must_use]
     pub fn to_wire(&self) -> WireRouteTable {
+        let (expected_minimum_custom_routes, custom_routes) = self.custom_routes.to_wire();
         WireRouteTable {
             generated_at: self.generated_at,
             revision: self.revision.clone(),
             expected_minimum_routes: self.expected_minimum_routes,
-            routes: self
-                .routes
-                .iter()
-                .map(|route| WireRoute {
-                    host: route.host.clone(),
-                    project_id: route.project_id,
-                    upstreams: route.upstreams.iter().map(ToString::to_string).collect(),
-                })
-                .collect(),
+            routes: self.routes.iter().map(Route::to_wire).collect(),
+            expected_minimum_custom_routes: Some(expected_minimum_custom_routes),
+            custom_routes: Some(custom_routes),
         }
     }
 }
+
+/// Why the custom part of a table was refused. The project routes of the same
+/// table still apply, and the custom routes served before stay.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum CustomRouteRejection {
+    #[error("the custom routes are not in the expected shape: {0}")]
+    Malformed(String),
+    #[error(
+        "the table lists {routes} custom routes, fewer than the {expected} the API expects to serve"
+    )]
+    BelowExpectedMinimum { routes: usize, expected: u64 },
+    #[error("the table lists {routes} custom routes, more than the {MAX_ROUTES} Edge accepts")]
+    TooManyRoutes { routes: usize },
+    #[error("custom domain {host} {reason}")]
+    InvalidHost { host: String, reason: &'static str },
+    #[error("custom domain {host} is listed more than once")]
+    DuplicateHost { host: String },
+    #[error(
+        "custom domain {host} lists {upstreams} upstreams, more than the {MAX_UPSTREAMS_PER_ROUTE} Edge accepts"
+    )]
+    TooManyUpstreams { host: String, upstreams: usize },
+    #[error(
+        "custom domain {host} has upstream {upstream}, which is not an IP address and non-zero port"
+    )]
+    InvalidUpstream { host: String, upstream: String },
+    #[error("custom domain {host} has upstream {upstream}, outside the allowed upstream networks")]
+    UpstreamNotAllowed { host: String, upstream: SocketAddr },
+    #[error("custom domain {host} lists upstream {upstream} more than once")]
+    DuplicateUpstream { host: String, upstream: SocketAddr },
+}
+
+impl CustomRouteRejection {
+    /// A stable code for the status file and logs, telling reasons apart under
+    /// the one status code [`CUSTOM_ROUTES_REJECTED`].
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed(_) => "malformed",
+            Self::BelowExpectedMinimum { .. } => "below_expected_minimum",
+            Self::TooManyRoutes { .. } => "too_many_routes",
+            Self::InvalidHost { .. } => "invalid_host",
+            Self::DuplicateHost { .. } => "duplicate_host",
+            Self::TooManyUpstreams { .. } => "too_many_upstreams",
+            Self::InvalidUpstream { .. } => "invalid_upstream",
+            Self::UpstreamNotAllowed { .. } => "upstream_not_allowed",
+            Self::DuplicateUpstream { .. } => "duplicate_upstream",
+        }
+    }
+}
+
+/// Status code of an Edge whose last table had its custom part refused, by a
+/// check here or by Caddy, while its project routes applied.
+pub const CUSTOM_ROUTES_REJECTED: &str = "custom_routes_rejected";
 
 /// Why a table was refused. Each reason keeps the previous table serving.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -242,6 +370,8 @@ impl fmt::Display for UpstreamAllowlist {
 pub struct RoutePolicy {
     pub domain_suffixes: ProjectDomainSuffixes,
     pub upstreams: UpstreamAllowlist,
+    /// Zones no custom domain may be or sit under, besides `domain_suffixes`.
+    pub forbidden_zones: ForbiddenZones,
 }
 
 impl RoutePolicy {
@@ -295,11 +425,86 @@ impl RoutePolicy {
         }
         routes.sort_by(|left, right| left.host.cmp(&right.host));
 
+        let (custom_routes, custom_rejection) =
+            match self.custom_routes(table.expected_minimum_custom_routes, table.custom_routes) {
+                Ok(custom_routes) => (custom_routes, None),
+                Err(rejection) => (CustomRoutes::default(), Some(rejection)),
+            };
         Ok(RouteTable {
             revision: table.revision,
             generated_at: table.generated_at,
             expected_minimum_routes: table.expected_minimum_routes,
             routes,
+            custom_routes,
+            custom_rejection,
+        })
+    }
+
+    /// Checks the custom part on its own. Its hosts never sit under a project
+    /// suffix, so they cannot collide with a project route.
+    fn custom_routes(
+        &self,
+        expected_minimum: Option<Value>,
+        routes: Option<Value>,
+    ) -> Result<CustomRoutes, CustomRouteRejection> {
+        let malformed = |error: serde_json::Error| {
+            CustomRouteRejection::Malformed(truncate(
+                &error.to_string(),
+                MAX_MALFORMED_DETAIL_CHARS,
+            ))
+        };
+        let expected_minimum = match expected_minimum {
+            None | Some(Value::Null) => 0,
+            Some(value) => serde_json::from_value::<u64>(value).map_err(malformed)?,
+        };
+        let routes = match routes {
+            None | Some(Value::Null) => Vec::new(),
+            Some(value) => serde_json::from_value::<Vec<WireRoute>>(value).map_err(malformed)?,
+        };
+        if routes.len() > MAX_ROUTES {
+            return Err(CustomRouteRejection::TooManyRoutes {
+                routes: routes.len(),
+            });
+        }
+        if u64::try_from(routes.len()).is_ok_and(|count| count < expected_minimum) {
+            return Err(CustomRouteRejection::BelowExpectedMinimum {
+                routes: routes.len(),
+                expected: expected_minimum,
+            });
+        }
+        let policy = CustomDomainPolicy {
+            project_domains: self.domain_suffixes.clone(),
+            forbidden_zones: self.forbidden_zones.clone(),
+        };
+        let mut hosts = HashSet::with_capacity(routes.len());
+        let mut checked = Vec::with_capacity(routes.len());
+        for route in routes {
+            policy
+                .check(&route.host)
+                .map_err(|rejection| CustomRouteRejection::InvalidHost {
+                    host: excerpt(&route.host),
+                    reason: rejection.reason(),
+                })?;
+            if !hosts.insert(route.host.clone()) {
+                return Err(CustomRouteRejection::DuplicateHost { host: route.host });
+            }
+            // No upstream is allowed: the site answers not found.
+            let upstreams = if route.upstreams.is_empty() {
+                Vec::new()
+            } else {
+                self.upstreams(&route.host, &route.upstreams)
+                    .map_err(custom_upstream_rejection)?
+            };
+            checked.push(Route {
+                host: route.host,
+                project_id: route.project_id,
+                upstreams,
+            });
+        }
+        checked.sort_by(|left, right| left.host.cmp(&right.host));
+        Ok(CustomRoutes {
+            expected_minimum,
+            routes: checked,
         })
     }
 
@@ -341,6 +546,26 @@ impl RoutePolicy {
             parsed.push(address);
         }
         Ok(parsed)
+    }
+}
+
+/// The custom-route form of an upstream rejection. [`RoutePolicy::upstreams`]
+/// only returns the upstream variants.
+fn custom_upstream_rejection(rejection: TableRejection) -> CustomRouteRejection {
+    match rejection {
+        TableRejection::TooManyUpstreams { host, upstreams } => {
+            CustomRouteRejection::TooManyUpstreams { host, upstreams }
+        }
+        TableRejection::InvalidUpstream { host, upstream } => {
+            CustomRouteRejection::InvalidUpstream { host, upstream }
+        }
+        TableRejection::UpstreamNotAllowed { host, upstream } => {
+            CustomRouteRejection::UpstreamNotAllowed { host, upstream }
+        }
+        TableRejection::DuplicateUpstream { host, upstream } => {
+            CustomRouteRejection::DuplicateUpstream { host, upstream }
+        }
+        other => CustomRouteRejection::Malformed(other.to_string()),
     }
 }
 
@@ -401,6 +626,7 @@ pub(crate) mod tests {
         RoutePolicy {
             domain_suffixes: ProjectDomainSuffixes::default(),
             upstreams: UpstreamAllowlist::default(),
+            forbidden_zones: ForbiddenZones::default(),
         }
     }
 
@@ -636,6 +862,158 @@ pub(crate) mod tests {
             TableRejection::TooManyRoutes {
                 routes: MAX_ROUTES + 1
             }
+        );
+    }
+
+    fn with_custom(custom: Value, expected_minimum: Option<Value>) -> RouteTable {
+        let mut table = serde_json::from_slice::<Value>(&body(
+            json!([{ "host": "a.sakala.app", "project_id": PROJECT_A, "upstreams": ["10.0.0.1:80"] }]),
+            1,
+        ))
+        .expect("json");
+        table["custom_routes"] = custom;
+        if let Some(expected_minimum) = expected_minimum {
+            table["expected_minimum_custom_routes"] = expected_minimum;
+        }
+        policy()
+            .parse(&serde_json::to_vec(&table).expect("json"))
+            .expect("the project routes stay valid")
+    }
+
+    fn custom_rejection(custom: Value) -> CustomRouteRejection {
+        let table = with_custom(custom, None);
+        assert!(table.custom_routes().routes().is_empty());
+        assert_eq!(table.routes().len(), 1, "project routes still apply");
+        table
+            .custom_rejection()
+            .cloned()
+            .expect("custom part refused")
+    }
+
+    #[test]
+    fn an_older_table_without_custom_routes_serves_none() {
+        let table = policy()
+            .parse(&body(
+                json!([{ "host": "a.sakala.app", "project_id": PROJECT_A, "upstreams": ["10.0.0.1:80"] }]),
+                1,
+            ))
+            .expect("valid");
+        assert_eq!(table.custom_rejection(), None);
+        assert!(table.custom_routes().routes().is_empty());
+        assert_eq!(
+            with_custom(Value::Null, Some(Value::Null)).custom_rejection(),
+            None
+        );
+    }
+
+    #[test]
+    fn custom_routes_are_checked_sorted_and_kept_in_the_snapshot() {
+        let table = with_custom(
+            json!([
+                { "host": "www.contoh.com", "project_id": PROJECT_B, "upstreams": ["10.0.47.201:8180"] },
+                { "host": "contoh.net", "project_id": PROJECT_A, "upstreams": [], "domain_id": 7 },
+            ]),
+            Some(json!(2)),
+        );
+
+        assert_eq!(table.custom_rejection(), None);
+        let hosts = table
+            .custom_routes()
+            .routes()
+            .iter()
+            .map(|route| route.host.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(hosts, ["contoh.net", "www.contoh.com"]);
+        assert!(table.custom_routes().routes()[0].upstreams.is_empty());
+        let snapshot = serde_json::to_vec(&table.to_wire()).expect("serializable");
+        assert_eq!(policy().parse(&snapshot), Ok(table));
+    }
+
+    #[test]
+    fn an_empty_custom_part_is_valid_only_when_the_api_expects_none() {
+        assert_eq!(
+            with_custom(json!([]), Some(json!(0))).custom_rejection(),
+            None
+        );
+        assert_eq!(
+            with_custom(json!([]), Some(json!(1))).custom_rejection(),
+            Some(&CustomRouteRejection::BelowExpectedMinimum {
+                routes: 0,
+                expected: 1
+            })
+        );
+    }
+
+    #[test]
+    fn a_bad_custom_route_refuses_only_the_custom_part() {
+        for (custom, reason) in [
+            (json!("www.contoh.com"), "malformed"),
+            (json!([{ "host": "www.contoh.com" }]), "malformed"),
+            (
+                json!([{ "host": "www.contoh.com", "project_id": "nope", "upstreams": [] }]),
+                "malformed",
+            ),
+            (
+                json!([{ "host": "blog.sakala.app", "project_id": PROJECT_A, "upstreams": [] }]),
+                "invalid_host",
+            ),
+            (
+                json!([{ "host": "api.sakala.dev", "project_id": PROJECT_A, "upstreams": [] }]),
+                "invalid_host",
+            ),
+            (
+                json!([{ "host": "10.0.0.1", "project_id": PROJECT_A, "upstreams": [] }]),
+                "invalid_host",
+            ),
+            (
+                json!([{ "host": "www.contoh.com {\n\trespond 200\n}", "project_id": PROJECT_A, "upstreams": [] }]),
+                "invalid_host",
+            ),
+            (
+                json!([{ "host": "*.contoh.com", "project_id": PROJECT_A, "upstreams": [] }]),
+                "invalid_host",
+            ),
+            (
+                json!([
+                    { "host": "contoh.com", "project_id": PROJECT_A, "upstreams": [] },
+                    { "host": "contoh.com", "project_id": PROJECT_B, "upstreams": [] },
+                ]),
+                "duplicate_host",
+            ),
+            (
+                json!([{ "host": "contoh.com", "project_id": PROJECT_A, "upstreams": ["node-1:8180"] }]),
+                "invalid_upstream",
+            ),
+            (
+                json!([{ "host": "contoh.com", "project_id": PROJECT_A, "upstreams": ["8.8.8.8:80"] }]),
+                "upstream_not_allowed",
+            ),
+            (
+                json!([{ "host": "contoh.com", "project_id": PROJECT_A,
+                         "upstreams": ["10.0.0.1:80", "10.0.0.1:80"] }]),
+                "duplicate_upstream",
+            ),
+        ] {
+            let rejection = custom_rejection(custom.clone());
+            assert_eq!(rejection.reason(), reason, "{custom}: {rejection}");
+            assert!(!rejection.to_string().contains('\n'), "{rejection}");
+        }
+        let many = (1..=65)
+            .map(|port| format!("10.0.0.1:{port}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            custom_rejection(
+                json!([{ "host": "contoh.com", "project_id": PROJECT_A, "upstreams": many }])
+            )
+            .reason(),
+            "too_many_upstreams"
+        );
+        let malformed_minimum = with_custom(json!([]), Some(json!(-1)));
+        assert_eq!(
+            malformed_minimum
+                .custom_rejection()
+                .map(CustomRouteRejection::reason),
+            Some("malformed")
         );
     }
 

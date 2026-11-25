@@ -13,13 +13,13 @@ use sakala_agent_core::{
     ports::SecretString,
 };
 use sakala_agent_protocol::{
-    DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
+    CUSTOM_DOMAINS_CAPABILITY, DatabaseEndpoint, IMAGE_REUSE_CAPABILITY, IMAGE_ROLLBACK_CAPABILITY,
     MANAGED_POSTGRES_CAPABILITY, MANAGED_S3_CAPABILITY, MANAGED_VALKEY_CAPABILITY, Region,
     SCHEDULED_JOBS_CAPABILITY, WORKER_PROCESSES_CAPABILITY,
 };
 use sakala_agent_runtime::{
     DEFAULT_MAX_REPLICAS_PER_PROJECT, DEFAULT_RELEASE_COMMAND_TIMEOUT,
-    DEFAULT_WORKER_STARTUP_WINDOW, DEFAULT_WORKER_STOP_GRACE, DockerRuntimeConfig,
+    DEFAULT_WORKER_STARTUP_WINDOW, DEFAULT_WORKER_STOP_GRACE, DockerRuntimeConfig, ForbiddenZones,
     MAX_REPLICAS_PER_PROJECT_CEILING, ProjectDomainSuffixes, ResourceSafetyConfig,
     TimeoutSafetyConfig,
     database::{DATABASE_ADMIN_DSN_ENV, PostgresAdminConfig},
@@ -336,6 +336,9 @@ struct Cli {
     #[arg(long, env = "SAKALA_PROJECT_DOMAIN_SUFFIXES")]
     project_domain_suffixes: Option<String>,
 
+    #[arg(long, env = CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV)]
+    custom_domain_forbidden_zones: Option<String>,
+
     #[arg(long, env = "SAKALA_BUILD_TIMEOUT_SECONDS")]
     build_timeout_seconds: Option<String>,
 
@@ -530,6 +533,11 @@ pub fn load() -> Result<AppConfig, CoreError> {
         &mut values,
         "SAKALA_PROJECT_DOMAIN_SUFFIXES",
         cli.project_domain_suffixes,
+    );
+    insert(
+        &mut values,
+        CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV,
+        cli.custom_domain_forbidden_zones,
     );
     insert(
         &mut values,
@@ -747,6 +755,7 @@ fn from_values(values: &HashMap<String, String>) -> Result<AppConfig, CoreError>
             container_runtime,
             container_dns: container_dns(values)?,
             project_domain_suffixes: project_domain_suffixes(values)?,
+            custom_domain_forbidden_zones: custom_domain_forbidden_zones(values)?,
             resource_safety,
             timeout_safety: TimeoutSafetyConfig {
                 max_build_timeout: std::time::Duration::from_secs(build_timeout_seconds),
@@ -900,6 +909,9 @@ fn capabilities(runtime_driver: RuntimeDriver) -> Vec<String> {
             WORKER_PROCESSES_CAPABILITY,
             // `RunJob`: one container of the live image, in its own pool.
             SCHEDULED_JOBS_CAPABILITY,
+            // `custom_domains` on route-writing commands, `UpdateProjectDomains`,
+            // and traffic counted for custom hosts (ADR-024).
+            CUSTOM_DOMAINS_CAPABILITY,
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1149,6 +1161,26 @@ fn project_domain_suffixes(
     }
 }
 
+/// Zones no custom domain may be or sit under (ADR-024), besides the project
+/// domain suffixes. Unset or empty keeps the hosted Sakala zones; anything else
+/// must be a valid list, so a typo stops the agent.
+const CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV: &str = "SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES";
+
+fn custom_domain_forbidden_zones(
+    values: &HashMap<String, String>,
+) -> Result<ForbiddenZones, CoreError> {
+    match values
+        .get(CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(ForbiddenZones::default()),
+        Some(value) => ForbiddenZones::parse(value).map_err(|reason| {
+            CoreError::InvalidConfiguration(format!("{CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV} {reason}"))
+        }),
+    }
+}
+
 fn get(values: &HashMap<String, String>, key: &str, default: &str) -> String {
     values
         .get(key)
@@ -1362,6 +1394,54 @@ mod tests {
                 "{invalid}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn custom_domain_forbidden_zones_default_to_hosted_zones_and_reject_bad_values() {
+        let load = |value: &str| {
+            from_values(&HashMap::from([(
+                CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV.to_owned(),
+                value.to_owned(),
+            )]))
+        };
+        let zones = |config: AppConfig| config.docker_runtime.custom_domain_forbidden_zones;
+
+        assert_eq!(
+            zones(from_values(&HashMap::new()).expect("config")),
+            ForbiddenZones::default()
+        );
+        assert_eq!(zones(load(" ").expect("config")), ForbiddenZones::default());
+        assert_eq!(
+            zones(load("kampus.ac.id, internal").expect("config")).as_slice(),
+            ["kampus.ac.id", "internal"]
+        );
+        for invalid in [",", "*.kampus.ac.id", "Kampus.ac.id"] {
+            let error = load(invalid).expect_err(invalid).to_string();
+            assert!(
+                error.contains(CUSTOM_DOMAIN_FORBIDDEN_ZONES_ENV),
+                "{invalid}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_domains_are_advertised_only_by_the_docker_runtime() {
+        let docker = HashMap::from([("SAKALA_RUNTIME_DRIVER".to_owned(), "docker".to_owned())]);
+        let docker = from_values(&docker).expect("Docker app config should load");
+        let noop = from_values(&HashMap::new()).expect("default app config should load");
+
+        assert!(
+            docker
+                .agent
+                .capabilities
+                .contains(&CUSTOM_DOMAINS_CAPABILITY.to_owned())
+        );
+        assert!(
+            !noop
+                .agent
+                .capabilities
+                .contains(&CUSTOM_DOMAINS_CAPABILITY.to_owned())
+        );
     }
 
     #[test]

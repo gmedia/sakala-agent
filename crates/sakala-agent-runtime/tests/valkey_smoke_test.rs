@@ -788,6 +788,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     // A sleeping project's container is disconnected, so it wakes without
     // the store network.
     let lifecycle = WorkloadLifecycleRequest {
+        custom_domains: Default::default(),
         command_id: Uuid::new_v4(),
         project_id,
         deployment_id: deployment,

@@ -85,6 +85,31 @@ Yang diterima aplikasi:
 diatur router; aplikasi sebaiknya tidak mempercayainya. Uji Docker nyata ada di
 `crates/sakala-agent-runtime/tests/client_ip_smoke_test.rs`.
 
+## Custom domain
+
+Project dengan custom domain (ADR-024) tetap punya satu file route. Custom domain-nya
+menjadi alamat site tambahan setelah domain project, terurut, di route biasa, route
+replika, maupun route tidur:
+
+```caddyfile
+# Managed by sakala-agent for project <project-id> deployment <deployment-id>.
+portfolio.sakala.app:80, contoh.com:80, www.contoh.com:80 {
+	reverse_proxy sakala-app-<project8>-<deployment-id>:3000 {
+		...
+	}
+}
+```
+
+Dengan begitu aplikasi menerima `Host` asli dan `metrics { per_host }` menghitung
+request per custom domain, yang Agent petakan ke project lewat file ini. Alamat
+pertama selalu domain project; halaman tidur memakainya untuk slug wake, sehingga
+halaman yang dibuka lewat custom domain membangunkan project yang benar. Agent menolak
+custom domain yang sudah ada di file route project lain, di bawah kunci yang sama
+dengan penulisan file, dan hanya membaca kembali file yang bentuknya persis seperti
+yang ia tulis. Project tanpa custom domain mendapat file yang sama byte per byte
+seperti sebelum fitur ini. Uji Docker nyata ada di
+`crates/sakala-agent-runtime/tests/custom_domains_smoke_test.rs`.
+
 ## Route untuk beberapa replika
 
 Deployment dengan lebih dari satu replika tetap mendapat satu file dan satu blok site,

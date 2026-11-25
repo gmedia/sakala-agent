@@ -8,7 +8,7 @@ use std::{
 
 use async_trait::async_trait;
 use sakala_agent_core::ports::{RuntimeExecutionError, RuntimeReporter};
-use sakala_agent_protocol::{DeploymentEvent, DeploymentLog};
+use sakala_agent_protocol::{DeploymentEvent, DeploymentLog, ProjectDomainsUpdate};
 use sakala_agent_runtime::{
     CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, ProcessStream, RuntimeError,
     routing::{
@@ -242,6 +242,7 @@ fn sleeping_with(
     page: SleepingRoutePage,
 ) -> SleepingRouteSpec {
     SleepingRouteSpec {
+        custom_domains: Vec::new(),
         project_id,
         deployment_id,
         domain: "portfolio.run.sakala.localhost".to_owned(),
@@ -362,6 +363,7 @@ async fn assert_sleeping_route_ownership(page: SleepingRoutePage) {
 
 fn route(project_id: Uuid) -> RouteSpec {
     RouteSpec {
+        custom_domains: Vec::new(),
         project_id,
         deployment_id: Uuid::new_v4(),
         domain: "portfolio.run.sakala.localhost".to_owned(),
@@ -532,4 +534,208 @@ impl RuntimeReporter for NoopReporter {
     async fn log(&self, _log: DeploymentLog) -> Result<(), RuntimeExecutionError> {
         Ok(())
     }
+}
+
+fn with_custom(route: RouteSpec, custom_domains: &[&str]) -> RouteSpec {
+    RouteSpec {
+        custom_domains: custom_domains
+            .iter()
+            .map(|domain| (*domain).to_owned())
+            .collect(),
+        ..route
+    }
+}
+
+#[tokio::test]
+async fn a_custom_domain_another_project_serves_is_refused() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+    let (holder, claimant) = (Uuid::new_v4(), Uuid::new_v4());
+    manager
+        .activate(
+            &with_custom(route(holder), &["www.contoh.com"]),
+            &NoopReporter,
+        )
+        .await
+        .expect("first project");
+
+    // Serving, sleeping, and an update are all refused, and nothing is written.
+    let claimant_path = temp.path().join(format!("{claimant}.Caddyfile"));
+    let error = manager
+        .activate(
+            &with_custom(route(claimant), &["contoh.com", "www.contoh.com"]),
+            &NoopReporter,
+        )
+        .await
+        .expect_err("taken");
+    assert_eq!(error.code(), "runtime_custom_domain_taken");
+    assert!(error.to_string().contains("www.contoh.com"));
+    assert!(!error.to_string().contains(&holder.to_string()));
+    assert!(!claimant_path.exists());
+    let mut sleeping_route = sleeping(claimant, Uuid::new_v4());
+    sleeping_route.custom_domains = vec!["www.contoh.com".to_owned()];
+    let error = manager
+        .activate_sleeping(&sleeping_route, &NoopReporter)
+        .await
+        .expect_err("taken");
+    assert_eq!(error.code(), "runtime_custom_domain_taken");
+
+    manager
+        .activate(
+            &with_custom(route(claimant), &["contoh.com"]),
+            &NoopReporter,
+        )
+        .await
+        .expect("a free domain");
+    let error = manager
+        .update_custom_domains(claimant, &["www.contoh.com".to_owned()], &NoopReporter)
+        .await
+        .expect_err("taken");
+    assert_eq!(error.code(), "runtime_custom_domain_taken");
+    assert!(
+        std::fs::read_to_string(&claimant_path)
+            .expect("route")
+            .contains("portfolio.run.sakala.localhost:80, contoh.com:80 {")
+    );
+
+    // The project that serves a domain may write it again.
+    manager
+        .activate(
+            &with_custom(route(holder), &["www.contoh.com"]),
+            &NoopReporter,
+        )
+        .await
+        .expect("own domain");
+    assert_eq!(
+        manager.custom_domains(holder).await.expect("read"),
+        Some(vec!["www.contoh.com".to_owned()])
+    );
+    let by_project = manager.custom_domains_by_project().await.expect("read");
+    assert_eq!(by_project.len(), 2);
+    assert_eq!(by_project[&claimant], ["contoh.com"]);
+}
+
+#[tokio::test]
+async fn updating_custom_domains_rewrites_only_the_addresses_of_either_route_kind() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+    let project_id = Uuid::new_v4();
+    let domains = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        manager
+            .update_custom_domains(project_id, &domains(&["www.contoh.com"]), &NoopReporter)
+            .await
+            .expect("no route"),
+        ProjectDomainsUpdate::NoRoute
+    );
+    assert_eq!(
+        manager.custom_domains(project_id).await.expect("read"),
+        None
+    );
+
+    let path = temp.path().join(format!("{project_id}.Caddyfile"));
+    for sleeping_kind in [false, true] {
+        if sleeping_kind {
+            manager
+                .activate_sleeping(&sleeping(project_id, Uuid::new_v4()), &NoopReporter)
+                .await
+                .expect("sleeping route");
+        } else {
+            manager
+                .activate(&route(project_id), &NoopReporter)
+                .await
+                .expect("serving route");
+        }
+        let before = std::fs::read_to_string(&path).expect("route");
+        assert_eq!(
+            manager
+                .update_custom_domains(
+                    project_id,
+                    &domains(&["contoh.com", "www.contoh.com"]),
+                    &NoopReporter
+                )
+                .await
+                .expect("update"),
+            ProjectDomainsUpdate::Updated
+        );
+        let after = std::fs::read_to_string(&path).expect("route");
+        assert_eq!(
+            after,
+            before.replacen(
+                "portfolio.run.sakala.localhost:80 {",
+                "portfolio.run.sakala.localhost:80, contoh.com:80, www.contoh.com:80 {",
+                1
+            )
+        );
+        assert_eq!(
+            manager
+                .update_custom_domains(
+                    project_id,
+                    &domains(&["contoh.com", "www.contoh.com"]),
+                    &NoopReporter
+                )
+                .await
+                .expect("again"),
+            ProjectDomainsUpdate::Unchanged
+        );
+        assert_eq!(
+            manager
+                .update_custom_domains(project_id, &[], &NoopReporter)
+                .await
+                .expect("remove all"),
+            ProjectDomainsUpdate::Updated
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("route"), before);
+    }
+}
+
+#[tokio::test]
+async fn a_refused_custom_domain_update_puts_the_route_back() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader))
+        .activate(
+            &with_custom(route(project_id), &["contoh.com"]),
+            &NoopReporter,
+        )
+        .await
+        .expect("route");
+    let path = temp.path().join(format!("{project_id}.Caddyfile"));
+    let before = std::fs::read_to_string(&path).expect("route");
+    let reloader = Arc::new(FailingReloader::default());
+
+    CaddyFileRouteManager::new(temp.path().to_owned(), reloader.clone())
+        .update_custom_domains(project_id, &["www.contoh.com".to_owned()], &NoopReporter)
+        .await
+        .expect_err("router refuses");
+
+    assert_eq!(std::fs::read_to_string(&path).expect("route"), before);
+    assert_eq!(reloader.rollback_reloads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_route_file_the_agent_does_not_own_is_never_updated() {
+    let temp = TempDir::new().expect("temp directory should be available");
+    let project_id = Uuid::new_v4();
+    let path = temp.path().join(format!("{project_id}.Caddyfile"));
+    std::fs::write(&path, "portfolio.example:80 {\n}\n").expect("operator file");
+
+    let manager = CaddyFileRouteManager::new(temp.path().to_owned(), Arc::new(SuccessfulReloader));
+    assert_eq!(
+        manager
+            .update_custom_domains(project_id, &["www.contoh.com".to_owned()], &NoopReporter)
+            .await
+            .expect("not ours"),
+        ProjectDomainsUpdate::NoRoute
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("file"),
+        "portfolio.example:80 {\n}\n"
+    );
 }
