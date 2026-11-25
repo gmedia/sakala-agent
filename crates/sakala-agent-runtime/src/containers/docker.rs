@@ -609,10 +609,10 @@ impl DockerContainerEngine {
     }
 
     /// `docker run --detach` with what every container of a deployment gets:
-    /// its name, the project's network and its Valkey store network, the node's
-    /// runtime and name servers,
-    /// the security options, and the resource limits. `restart` is the restart
-    /// policy; `None` keeps Docker's default, which never restarts.
+    /// its name, the project's network and its Valkey store network, the
+    /// node's runtime and name servers, the security options, and the resource
+    /// limits. `restart` is the restart policy; `None` keeps Docker's default,
+    /// which never restarts.
     async fn isolated_run(
         &self,
         name: &str,

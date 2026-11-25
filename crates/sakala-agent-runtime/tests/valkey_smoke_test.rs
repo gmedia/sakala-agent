@@ -72,9 +72,6 @@ const WEB_COMMAND: &str = "mkdir -p /www; echo web > /www/index.html; trap 'exit
 const AGENT_ID: &str = "local-agent-01";
 /// A /24 far from Docker's own pools; the role skips any /27 in use.
 const POOL: &str = "10.247.0.0/24";
-const PASSWORD_A: &str = "SmokeCacheStorePassword000000001";
-const PASSWORD_A_ROTATED: &str = "SmokeCacheStorePassword000000002";
-const PASSWORD_B: &str = "SmokePersistentStorePassword0001";
 /// Writes about 30 MB in one script: more than 16 MiB, less than 64.
 const FILL_SCRIPT: &str =
     "for i=1,200000 do redis.call('SET','fill:'..i,string.rep('x',100)) end return 1";
@@ -165,6 +162,12 @@ fn speak(container: &str, host: &str, password: Option<&str>, commands: &[&str])
         .output()
         .expect("docker should be installed");
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// A fresh store password for one run: 32 hex characters, which the
+/// password rule accepts.
+fn random_password() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 /// The store's own log, which holds no password, for a failed create.
@@ -335,6 +338,9 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     let image = image_name(project_id, image_deployment, COMMIT);
     let a_id = Uuid::new_v4();
     let b_id = Uuid::new_v4();
+    let password_a = random_password();
+    let password_a_rotated = random_password();
+    let password_b = random_password();
     let _cleanup = Cleanup {
         project_id,
         image: image.clone(),
@@ -429,14 +435,14 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     let created_a = dispatch(
         &dispatcher,
         CommandType::CreateValkey,
-        json!({ "valkey_id": a_id, "mode": "cache", "maxmemory_mb": 32, "password": PASSWORD_A }),
+        json!({ "valkey_id": a_id, "mode": "cache", "maxmemory_mb": 32, "password": password_a }),
     )
     .await
     .unwrap_or_else(|error| panic!("create the cache store: {error}\n{}", store_log(a_id)));
     let created_b = dispatch(
         &dispatcher,
         CommandType::CreateValkey,
-        json!({ "valkey_id": b_id, "mode": "persistent", "maxmemory_mb": 64, "password": PASSWORD_B }),
+        json!({ "valkey_id": b_id, "mode": "persistent", "maxmemory_mb": 64, "password": password_b }),
     )
     .await
     .unwrap_or_else(|error| panic!("create the persistent store: {error}\n{}", store_log(b_id)));
@@ -499,7 +505,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     let again = dispatch(
         &dispatcher,
         CommandType::CreateValkey,
-        json!({ "valkey_id": a_id, "mode": "cache", "maxmemory_mb": 32, "password": PASSWORD_A }),
+        json!({ "valkey_id": a_id, "mode": "cache", "maxmemory_mb": 32, "password": password_a }),
     )
     .await
     .expect("create again");
@@ -509,7 +515,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     // Deploy: the web replica is created on the project network and the
     // store network, and reaches the store with the password.
     let deployment = Uuid::new_v4();
-    let mut environment = redis_environment(&a.host, PASSWORD_A);
+    let mut environment = redis_environment(&a.host, &password_a);
     environment["APP_ENV"] = json!("production");
     executor
         .deploy_project(
@@ -543,7 +549,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     let reply = speak(
         &web,
         &a.host,
-        Some(PASSWORD_A),
+        Some(password_a.as_str()),
         &["SET greeting hello", "GET greeting", "EVAL \"return 7\" 0"],
     );
     assert!(
@@ -551,26 +557,23 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
         "{reply:?}"
     );
     assert!(
-        speak(
-            &web,
-            &a.host,
-            Some("wrong-password-wrong-password-00"),
-            &["PING"]
-        )
-        .contains("WRONGPASS")
+        speak(&web, &a.host, Some(random_password().as_str()), &["PING"]).contains("WRONGPASS")
     );
     assert!(speak(&web, &a.host, None, &["PING"]).contains("NOAUTH"));
     assert!(
         speak(
             &web,
             &a.host,
-            Some(PASSWORD_A),
+            Some(password_a.as_str()),
             &["CONFIG SET maxmemory 1gb"]
         )
         .contains("NOPERM")
     );
     // The other store is on another network.
-    assert_eq!(speak(&web, &b.host, Some(PASSWORD_B), &["PING"]), "");
+    assert_eq!(
+        speak(&web, &b.host, Some(password_b.as_str()), &["PING"]),
+        ""
+    );
 
     // A job copies the field and reaches the store the same way.
     let job = executor
@@ -584,7 +587,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
                     "commit_sha": COMMIT,
                     "reuse_image_from_deployment_id": image_deployment,
                     "container_port": PORT,
-                    "environment": redis_environment(&a.host, PASSWORD_A),
+                    "environment": redis_environment(&a.host, &password_a),
                     "valkey": { "network": a.name(), "host": a.host },
                     "timeout_seconds": 60,
                 }))
@@ -599,7 +602,10 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
 
     // Nothing else reaches a store: a container on another network, and one
     // on Docker's default bridge where builds run.
-    assert_eq!(speak(&stranger, &a.host, Some(PASSWORD_A), &["PING"]), "");
+    assert_eq!(
+        speak(&stranger, &a.host, Some(password_a.as_str()), &["PING"]),
+        ""
+    );
     let (_, bridge) = docker(&[
         "run",
         "--rm",
@@ -620,7 +626,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
             "exec",
             "-d",
             "-e",
-            &format!("SMOKE_PASSWORD={PASSWORD_A}"),
+            &format!("SMOKE_PASSWORD={password_a}"),
             &web,
             "sh",
             "-c",
@@ -641,7 +647,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     let rotated = dispatch(
         &dispatcher,
         CommandType::RotateValkeyPassword,
-        json!({ "valkey_id": a_id, "password": PASSWORD_A_ROTATED }),
+        json!({ "valkey_id": a_id, "password": password_a_rotated }),
     )
     .await
     .expect("rotate");
@@ -650,12 +656,12 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
         "{rotated}"
     );
     assert!(!a.admin(&["CLIENT", "LIST"]).contains("user=default"));
-    assert!(speak(&web, &a.host, Some(PASSWORD_A), &["PING"]).contains("WRONGPASS"));
-    assert!(speak(&web, &a.host, Some(PASSWORD_A_ROTATED), &["PING"]).contains("+PONG"));
+    assert!(speak(&web, &a.host, Some(password_a.as_str()), &["PING"]).contains("WRONGPASS"));
+    assert!(speak(&web, &a.host, Some(password_a_rotated.as_str()), &["PING"]).contains("+PONG"));
 
     // Lock: the tenant is refused, the data stays, and a repeated create
     // keeps the lock.
-    assert_eq!(b.tenant(PASSWORD_B, &["SET", "job:1", "queued"]), "OK");
+    assert_eq!(b.tenant(&password_b, &["SET", "job:1", "queued"]), "OK");
     let locked = dispatch(
         &dispatcher,
         CommandType::LockValkey,
@@ -665,19 +671,19 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     .expect("lock");
     assert_eq!(locked["locked"], true);
     assert!(
-        b.tenant(PASSWORD_B, &["GET", "job:1"])
+        b.tenant(&password_b, &["GET", "job:1"])
             .contains("WRONGPASS")
     );
     assert_eq!(b.admin(&["GET", "job:1"]), "queued");
     let recreated = dispatch(
         &dispatcher,
         CommandType::CreateValkey,
-        json!({ "valkey_id": b_id, "mode": "persistent", "maxmemory_mb": 64, "password": PASSWORD_B }),
+        json!({ "valkey_id": b_id, "mode": "persistent", "maxmemory_mb": 64, "password": password_b }),
     )
     .await
     .expect("create a locked store again");
     assert_eq!(recreated["locked"], true);
-    assert!(b.tenant(PASSWORD_B, &["PING"]).contains("WRONGPASS"));
+    assert!(b.tenant(&password_b, &["PING"]).contains("WRONGPASS"));
     let unlocked = dispatch(
         &dispatcher,
         CommandType::UnlockValkey,
@@ -686,17 +692,17 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
     .await
     .expect("unlock");
     assert_eq!(unlocked["locked"], false);
-    assert_eq!(b.tenant(PASSWORD_B, &["GET", "job:1"]), "queued");
+    assert_eq!(b.tenant(&password_b, &["GET", "job:1"]), "queued");
 
     // Restart: the persistent store keeps its data, the cache store does not.
     must("restart b", &["restart", &b.name()]);
     must("restart a", &["restart", &a.name()]);
     b.wait_ready();
     a.wait_ready();
-    assert_eq!(b.tenant(PASSWORD_B, &["GET", "job:1"]), "queued");
+    assert_eq!(b.tenant(&password_b, &["GET", "job:1"]), "queued");
     assert_eq!(a.admin(&["EXISTS", "greeting"]), "0");
     assert!(
-        b.tenant(PASSWORD_B, &["PING"]).contains("PONG"),
+        b.tenant(&password_b, &["PING"]).contains("PONG"),
         "the password survives a restart"
     );
 
@@ -722,7 +728,7 @@ async fn real_docker_runs_managed_valkey_stores_and_attached_workloads() {
         .trim(),
         (192_u64 * 1_024 * 1_024).to_string()
     );
-    assert_eq!(b.tenant(PASSWORD_B, &["EVAL", FILL_SCRIPT, "0"]), "1");
+    assert_eq!(b.tenant(&password_b, &["EVAL", FILL_SCRIPT, "0"]), "1");
     let error = dispatch(
         &dispatcher,
         CommandType::ResizeValkey,
