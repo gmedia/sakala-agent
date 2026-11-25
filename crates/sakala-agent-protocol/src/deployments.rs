@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{RepositoryAccess, RequestedProcesses, ValkeyAttachment};
+use crate::{RepositoryAccess, RequestedCustomDomains, RequestedProcesses, ValkeyAttachment};
 
 /// Capability of a node that reads `DeployProject.reuse_image_from_deployment_id`.
 /// The control plane sends the field only to a node that advertises it.
@@ -147,6 +147,12 @@ pub struct DeployProjectPayload {
     /// advertises `managed-valkey`; an invalid value fails the deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valkey: Option<ValkeyAttachment>,
+    /// Custom domains the route serves next to `domain` (ADR-024). Absent
+    /// keeps the ones the project's route on the node has; a list replaces
+    /// them. Sent only to a node that advertises `custom-domains`; an invalid
+    /// name fails the deployment before anything is built.
+    #[serde(default, skip_serializing_if = "RequestedCustomDomains::is_absent")]
+    pub custom_domains: RequestedCustomDomains,
 }
 
 /// The `reuse_image_from_deployment_id` field of a `DeployProject` payload: the

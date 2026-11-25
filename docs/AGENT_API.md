@@ -492,7 +492,9 @@ Untuk `RestartProject`, `StopProject`, `SleepProject`, `WakeProject`,
 
 Identity tersebut dipetakan Agent ke label workload Sakala. API tidak boleh
 mengirim nama Docker, domain, port, command shell, atau credential pada payload
-lifecycle.
+lifecycle. Satu-satunya nama host yang boleh ada di payload lifecycle adalah
+`custom_domains` milik `RestartProject`, `SleepProject`, dan `WakeProject`, untuk node
+yang mengiklankan `custom-domains` (lihat [Custom domain](#custom-domain)).
 
 `RestartProject` menyalakan ulang semua replika deployment itu dari container yang ada,
 tanpa build dan tanpa deployment baru. Bila minimal satu replika berjalan, semua replika
@@ -1476,7 +1478,10 @@ opsional, aditif pada revision 4, dan contohnya ada di
 
 Asal nilainya counter `caddy_http_requests_total` milik Caddy runtime dengan
 `metrics { per_host }`, dijumlahkan per host lalu dipetakan ke workload yang berjalan
-lewat label `dev.sakala.domain`. Agent membandingkan setiap bacaan dengan bacaan
+lewat label `dev.sakala.domain`. Di node dengan capability `custom-domains`, custom
+domain yang ada di file route project ikut dipetakan ke project itu, dan
+`last_request_at` adalah yang paling baru di antara semua host-nya. Tanpa itu project
+yang hanya dikunjungi lewat custom domain akan tidur setiap kali batas sepi lewat. Agent membandingkan setiap bacaan dengan bacaan
 sebelumnya:
 
 - **Bacaan pertama setelah Agent start** memberi setiap host waktu start Agent, bukan
@@ -2103,6 +2108,126 @@ Node dengan peran Valkey menambahkan dua key di `metadata`. Contoh lengkapnya ad
 
 Field `INFO` bernilai `null` bila store tidak berjalan atau tidak menjawab dalam
 5 detik; field selalu ada.
+
+## Custom domain
+
+Node dengan driver `docker` mengiklankan capability `custom-domains` (ADR-024). Router
+node lalu melayani project juga di custom domain-nya, sebagai alamat site tambahan di
+file route project yang sama, sehingga aplikasi menerima header `Host` asli
+(`www.contoh.com`), dan halaman tidur, wake, replika, serta hitungan trafik idle sleep
+berlaku juga lewat domain itu. API hanya boleh mengirim field dan command di bagian ini
+ke node dengan capability itu: Agent yang lebih lama gagal membaca respons polling yang
+berisi `UpdateProjectDomains` dan mengabaikan `custom_domains` sehingga domain itu
+mendapat 404 router. Revisi protokol tetap 4.
+
+Kepemilikan (TXT), arah DNS (CNAME), CAA, kuota, dan masa tenggang adalah urusan API.
+Agent hanya memeriksa namanya dan bahwa tidak ada project lain di node yang memakainya.
+
+### Field `custom_domains`
+
+`DeployProject`, `WakeProject`, `RestartProject`, dan `SleepProject` boleh membawa
+`custom_domains`. Contoh lengkapnya ada di
+`examples/commands/deploy-project-custom-domains.json` dan
+`examples/commands/wake-project-custom-domains.json`.
+
+```json
+{
+  "type": "WakeProject",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": { "custom_domains": ["www.contoh.com"] }
+}
+```
+
+| Nilai | Arti |
+| --- | --- |
+| tidak ada, atau `null` | Pertahankan custom domain yang ada di route project di node sekarang, atau tidak ada bila belum pernah ada. Agent lama, API lama, dan command yang tidak tahu daftarnya (`RefreshRoute`, `ReconcileWorkload` dengan `restore_route`) tidak pernah menghapus domain. |
+| array string | Daftar lengkap custom domain project. Mengganti yang ada; `[]` menghapus semuanya. Urutan bebas; Agent mengurutkan dan membuang duplikat. |
+| tipe lain (string, angka, object, array berisi selain string) | `invalid_runtime_command`, tidak ada yang berubah. Ini juga berlaku untuk `SleepProject`, yang selain itu tidak pernah menolak payload-nya. |
+
+API sebaiknya selalu mengirim daftar terkini di keempat command itu, termasuk saat
+redeploy, rollback, dan image reuse, supaya route tidak bergantung pada isi file di
+node. Di `SleepProject`, halaman tidur dan halaman `unavailable` dipasang di semua
+host itu, dan halaman tidur membangunkan project lewat slug dari domain project, jadi
+kunjungan lewat custom domain juga membangunkannya.
+
+Aturan setiap nama, sama dengan di Sakala Edge. Nama tidak dinormalkan: API mengirim
+bentuk akhirnya, dan nama yang tidak sesuai ditolak, bukan ditebak.
+
+- Huruf kecil `a-z`, angka, `-`, dan `.`; minimal dua label; label 1 sampai 63
+  karakter dan tidak diawali atau diakhiri `-`; nama paling panjang 253 karakter;
+  label internasional dalam bentuk `xn--` yang valid. Jadi tanpa skema, port,
+  wildcard, titik di akhir, atau spasi.
+- Bukan alamat IP.
+- Bukan suffix domain project node (`SAKALA_PROJECT_DOMAIN_SUFFIXES`) atau nama di
+  bawahnya, dan bukan zona di `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES` (default
+  `sakala.app,sakala.dev,localhost`) atau nama di bawahnya.
+- Paling banyak 32 nama per project.
+
+Public suffix (`ac.id`, `my.id`) tidak diperiksa Agent; itu tugas API dengan Public
+Suffix List.
+
+Pelanggaran aturan nama gagal dengan `runtime_custom_domain_invalid` sebelum apa pun
+berubah: deploy sebelum checkout dan build, sleep sebelum container dihentikan, wake
+dan restart sebelum container dinyalakan. Nama yang sudah dilayani file route project
+lain di node gagal dengan `runtime_custom_domain_taken`; deploy memeriksanya sebelum
+build, dan pemeriksaan terakhir dilakukan di bawah kunci yang sama dengan penulisan
+route, jadi dua project tidak bisa mengambil satu nama bersamaan. Pesannya tidak
+menyebut project lain; log operator menyebutnya.
+
+### `UpdateProjectDomains`
+
+Mengganti custom domain route project tanpa redeploy dan tanpa menyentuh container,
+misalnya saat domain baru `verified`, dihapus, atau dinonaktifkan. Contoh lengkapnya
+ada di `examples/commands/update-project-domains.json`.
+
+```json
+{
+  "type": "UpdateProjectDomains",
+  "project_id": "ff66ed4a-6303-4be6-8ef4-63c28b112680",
+  "deployment_id": "4f1f21ef-730d-42d5-a46d-d965353cb993",
+  "payload": { "custom_domains": ["contoh.com", "www.contoh.com"] }
+}
+```
+
+| Field | Tipe | Aturan |
+| --- | --- | --- |
+| `project_id` | UUID, wajib | Project yang route-nya diubah. Tanpa ini: `invalid_runtime_command`. |
+| `deployment_id` | UUID atau `null`, opsional | Tidak dicocokkan. Domain milik project, jadi yang diubah adalah route project apa pun deployment yang dilayaninya, termasuk deployment yang lebih baru dari yang diketahui API. |
+| `payload.custom_domains` | array string, wajib | Daftar lengkap dengan aturan di atas; `[]` menghapus semuanya. Tidak ada, `null`, atau tipe lain: `invalid_runtime_command`. |
+
+Agent menulis ulang hanya baris alamat site file route project, baik route biasa,
+replika, halaman tidur, maupun halaman `unavailable`, lalu memvalidasi dan me-reload
+router seperti route lain. Bila router menolak, file lama dikembalikan dan command
+gagal dengan `runtime_routing_failed`. Command ini memegang kunci project yang sama
+dengan deploy, wake, dan sleep, jadi berjalan sesudah command project yang sedang
+berlangsung, bukan di tengahnya.
+
+Result saat `complete`:
+
+```json
+{ "status": "updated", "custom_domains": ["contoh.com", "www.contoh.com"] }
+```
+
+| `status` | Arti |
+| --- | --- |
+| `updated` | Route sekarang melayani persis daftar itu. Agent juga mengirim event `workload.domains.updated` dengan metadata `{ project_id, custom_domains }`. |
+| `unchanged` | Route sudah melayani persis daftar itu; tidak ada yang ditulis. Mengirim ulang command yang sama aman. |
+| `no_route` | Project tidak punya route milik Sakala di node ini (belum pernah deploy, sudah di-stop, atau file route bukan milik Agent). Tidak ada yang ditulis, dan `custom_domains` kosong. Command berikutnya yang menulis route membawa daftarnya. |
+
+`custom_domains` di result selalu terurut dan tanpa duplikat.
+
+### Kode kegagalan custom domain
+
+Contoh body `fail` untuk setiap kode ada di
+`examples/failures/custom-domain-failures.json`, yang dicocokkan dengan kode oleh test.
+
+| `error_code` | Arti | Tindakan API |
+| --- | --- | --- |
+| `runtime_custom_domain_invalid` | Nama tidak memenuhi aturan di atas, atau lebih dari 32 nama. Tidak ada yang berubah. | Bug normalisasi di API; untuk zona terlarang, samakan daftar API dengan node. |
+| `runtime_custom_domain_taken` | File route project lain di node melayani nama itu. Tidak ada yang berubah, versi lama tetap berjalan. | Biasanya sisa route project yang dihapus atau perpindahan domain yang belum selesai: kirim `UpdateProjectDomains` tanpa nama itu ke project lama, atau `StopProject` untuk project yang sudah dihapus, lalu ulangi. |
+| `invalid_runtime_command` | `custom_domains` bertipe salah, atau `UpdateProjectDomains` tanpa `project_id` atau tanpa `custom_domains`. | Bug di API. |
+| `unsupported_runtime_command` | Node tidak mendukung custom domain (driver `noop`). | Bug penempatan di API. |
 
 ## Event and Log Payloads
 

@@ -415,6 +415,7 @@ async fn projects_reach_only_the_router_and_leave_no_network_behind() {
     stop_worker.send(true).expect("worker shutdown");
     worker.await.expect("worker");
     let lifecycle = |project: &Project| WorkloadLifecycleRequest {
+        custom_domains: Default::default(),
         command_id: Uuid::new_v4(),
         project_id: project.id,
         deployment_id: project.deployment,

@@ -267,6 +267,7 @@ async fn real_caddy_takes_the_client_address_only_from_the_edge() {
     routes
         .activate(
             &RouteSpec {
+                custom_domains: Vec::new(),
                 project_id,
                 deployment_id: Uuid::new_v4(),
                 domain: DOMAIN.to_owned(),

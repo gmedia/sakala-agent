@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -7,14 +7,15 @@ use std::{
 };
 
 use async_trait::async_trait;
+use sakala_agent_protocol::ProjectDomainsUpdate;
 use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
     RuntimeError, RuntimeReporter,
     routing::{
-        CaddyReloader, KnownRoutes, RouteIdentity, RouteManager, RouteSpec, SleepingRouteSpec,
-        sleeping_page,
+        CaddyReloader, KnownRoutes, ROUTER_PORT, RouteIdentity, RouteManager, RouteSpec,
+        SleepingRouteSpec, site_addresses, sleeping_page,
     },
 };
 use sakala_agent_core::ports::RuntimeStaleRoute;
@@ -113,6 +114,51 @@ fn owner_line(project_id: Uuid, deployment_id: Uuid, sleeping: bool) -> String {
     format!("{MANAGED_ROUTE_PREFIX}{project_id} deployment {deployment_id}{marker}.\n")
 }
 
+/// What opens the site block after the address line of every route this
+/// Agent writes.
+const SITE_BLOCK_OPENING: &str = " {";
+/// Separates two addresses on the address line.
+const ADDRESS_SEPARATOR: &str = ", ";
+
+/// The hosts of a route this Agent wrote: the address line, which follows the
+/// owner line, as `<domain>:80[, <custom>:80]... {`. The project's domain comes
+/// first. `None` for any other shape, so a file this Agent did not write is
+/// never read as a claim on a host.
+fn route_hosts(content: &str) -> Option<Vec<String>> {
+    let address_line = content.lines().nth(1)?;
+    let addresses = address_line.strip_suffix(SITE_BLOCK_OPENING)?;
+    let port = format!(":{ROUTER_PORT}");
+    addresses
+        .split(ADDRESS_SEPARATOR)
+        .map(|address| {
+            address
+                .strip_suffix(port.as_str())
+                .filter(|host| {
+                    !host.is_empty()
+                        && host.bytes().all(|byte| {
+                            byte.is_ascii_lowercase()
+                                || byte.is_ascii_digit()
+                                || matches!(byte, b'.' | b'-')
+                        })
+                })
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// `content` with its address line rewritten to serve `custom_domains` after
+/// the project's own domain. `None` when the file is not in the shape
+/// [`route_hosts`] reads.
+fn with_custom_domains(content: &str, custom_domains: &[String]) -> Option<String> {
+    let hosts = route_hosts(content)?;
+    let (owner, rest) = content.split_once('\n')?;
+    let (_, body) = rest.split_once('\n')?;
+    Some(format!(
+        "{owner}\n{}{SITE_BLOCK_OPENING}\n{body}",
+        site_addresses(&hosts[0], custom_domains)
+    ))
+}
+
 pub struct CaddyFileRouteManager {
     sites_dir: PathBuf,
     reloader: Arc<dyn CaddyReloader>,
@@ -129,13 +175,27 @@ impl CaddyFileRouteManager {
         }
     }
 
+    /// Writes the project's route, after making sure no other project's
+    /// route serves one of its custom domains. Both happen under the mutation
+    /// lock, so two projects cannot claim one host at the same time.
     async fn replace_route(
+        &self,
+        project_id: Uuid,
+        content: String,
+        custom_domains: &[String],
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<(), RuntimeError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        ensure_unclaimed(&self.sites_dir, project_id, custom_domains).await?;
+        self.write_and_reload(project_id, content, reporter).await
+    }
+
+    async fn write_and_reload(
         &self,
         project_id: Uuid,
         content: String,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        let _mutation_guard = self.mutation_lock.lock().await;
         let snapshot = write_route(&self.sites_dir, project_id, content).await?;
         if let Err(error) = self.reloader.validate_and_reload(reporter).await {
             snapshot.restore().await?;
@@ -146,6 +206,38 @@ impl CaddyFileRouteManager {
     }
 }
 
+/// Refuses a custom domain that the route of another project already serves.
+/// Only routes Sakala owns count; their hosts were checked when written.
+async fn ensure_unclaimed(
+    sites_dir: &Path,
+    project_id: Uuid,
+    custom_domains: &[String],
+) -> Result<(), RuntimeError> {
+    if custom_domains.is_empty() {
+        return Ok(());
+    }
+    for route in managed_routes(sites_dir).await? {
+        if route.project_id == project_id {
+            continue;
+        }
+        if let Some(taken) = custom_domains
+            .iter()
+            .find(|domain| route.hosts.contains(domain))
+        {
+            tracing::warn!(
+                %project_id,
+                holder = %route.project_id,
+                domain = %taken,
+                "refusing a custom domain the route of another project serves"
+            );
+            return Err(RuntimeError::CustomDomainTaken {
+                domain: taken.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 struct RouteSnapshot {
     path: PathBuf,
     previous: Option<Vec<u8>>,
@@ -154,9 +246,9 @@ struct RouteSnapshot {
 
 fn serving_route(route: &RouteSpec) -> String {
     let mut content = format!(
-        "{}{}:80 {{\n\treverse_proxy",
+        "{}{}{SITE_BLOCK_OPENING}\n\treverse_proxy",
         owner_line(route.project_id, route.deployment_id, false),
-        route.domain,
+        site_addresses(&route.domain, &route.custom_domains),
     );
     for upstream in &route.upstreams {
         let _ = write!(content, " {upstream}:{}", route.port);
@@ -202,6 +294,10 @@ fn sleeping_route(route: &SleepingRouteSpec) -> Result<String, RuntimeError> {
     ))
 }
 
+fn route_path(sites_dir: &Path, project_id: Uuid) -> PathBuf {
+    sites_dir.join(format!("{project_id}.Caddyfile"))
+}
+
 /// Replaces the project's route file through a rename, so Caddy never reads
 /// half of one, and keeps the previous content for a rollback.
 async fn write_route(
@@ -210,7 +306,7 @@ async fn write_route(
     content: String,
 ) -> Result<RouteSnapshot, RuntimeError> {
     fs::create_dir_all(sites_dir).await?;
-    let path = sites_dir.join(format!("{project_id}.Caddyfile"));
+    let path = route_path(sites_dir, project_id);
     let temporary = sites_dir.join(format!(".{project_id}.Caddyfile.tmp"));
     let previous = match fs::read(&path).await {
         Ok(content) => Some(content),
@@ -248,7 +344,7 @@ async fn remove_route(
     identity: RouteIdentity,
 ) -> Result<RouteSnapshot, RuntimeError> {
     let project_id = identity.project_id;
-    let path = sites_dir.join(format!("{project_id}.Caddyfile"));
+    let path = route_path(sites_dir, project_id);
     let previous = match fs::read(&path).await {
         Ok(content) => Some(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -281,11 +377,21 @@ async fn remove_route(
     })
 }
 
-/// A route file Sakala owns, with what its first line says about the owner.
+/// A route file Sakala owns, with what its first line says about the owner
+/// and the hosts its address line serves (empty for a shape this Agent does
+/// not write).
 struct ManagedRoute {
     path: PathBuf,
     project_id: Uuid,
     owner: RouteOwner,
+    hosts: Vec<String>,
+}
+
+impl ManagedRoute {
+    /// The hosts after the project's own domain.
+    fn custom_domains(&self) -> &[String] {
+        self.hosts.get(1..).unwrap_or_default()
+    }
 }
 
 /// Every route file in `sites_dir` that Sakala owns. Other files, symlinks, and
@@ -316,10 +422,15 @@ async fn managed_routes(sites_dir: &Path) -> Result<Vec<ManagedRoute>, RuntimeEr
         let Some(owner) = route_owner(&content, project_id) else {
             continue;
         };
+        let hosts = std::str::from_utf8(&content)
+            .ok()
+            .and_then(route_hosts)
+            .unwrap_or_default();
         routes.push(ManagedRoute {
             path,
             project_id,
             owner,
+            hosts,
         });
     }
     Ok(routes)
@@ -372,13 +483,80 @@ impl RouteManager for CaddyFileRouteManager {
             .collect())
     }
 
+    async fn custom_domains(&self, project_id: Uuid) -> Result<Option<Vec<String>>, RuntimeError> {
+        let path = route_path(&self.sites_dir, project_id);
+        let content = match fs::read(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if route_owner(&content, project_id).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            std::str::from_utf8(&content)
+                .ok()
+                .and_then(route_hosts)
+                .map(|hosts| hosts.into_iter().skip(1).collect())
+                .unwrap_or_default(),
+        ))
+    }
+
+    async fn custom_domains_by_project(&self) -> Result<HashMap<Uuid, Vec<String>>, RuntimeError> {
+        Ok(managed_routes(&self.sites_dir)
+            .await?
+            .into_iter()
+            .filter(|route| !route.custom_domains().is_empty())
+            .map(|route| (route.project_id, route.custom_domains().to_vec()))
+            .collect())
+    }
+
+    async fn update_custom_domains(
+        &self,
+        project_id: Uuid,
+        custom_domains: &[String],
+        reporter: &dyn RuntimeReporter,
+    ) -> Result<ProjectDomainsUpdate, RuntimeError> {
+        let _mutation_guard = self.mutation_lock.lock().await;
+        let path = route_path(&self.sites_dir, project_id);
+        let content = match fs::read(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ProjectDomainsUpdate::NoRoute);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if route_owner(&content, project_id).is_none() {
+            return Ok(ProjectDomainsUpdate::NoRoute);
+        }
+        let unreadable = || {
+            RuntimeError::Routing(format!(
+                "the route of project {project_id} is not in the form this Agent writes; refresh or redeploy it first"
+            ))
+        };
+        let content = String::from_utf8(content).map_err(|_| unreadable())?;
+        let hosts = route_hosts(&content).ok_or_else(unreadable)?;
+        if hosts[1..] == *custom_domains {
+            return Ok(ProjectDomainsUpdate::Unchanged);
+        }
+        ensure_unclaimed(&self.sites_dir, project_id, custom_domains).await?;
+        let updated = with_custom_domains(&content, custom_domains).ok_or_else(unreadable)?;
+        self.write_and_reload(project_id, updated, reporter).await?;
+        Ok(ProjectDomainsUpdate::Updated)
+    }
+
     async fn activate(
         &self,
         route: &RouteSpec,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        self.replace_route(route.project_id, serving_route(route), reporter)
-            .await
+        self.replace_route(
+            route.project_id,
+            serving_route(route),
+            &route.custom_domains,
+            reporter,
+        )
+        .await
     }
 
     async fn activate_sleeping(
@@ -386,8 +564,13 @@ impl RouteManager for CaddyFileRouteManager {
         route: &SleepingRouteSpec,
         reporter: &dyn RuntimeReporter,
     ) -> Result<(), RuntimeError> {
-        self.replace_route(route.project_id, sleeping_route(route)?, reporter)
-            .await
+        self.replace_route(
+            route.project_id,
+            sleeping_route(route)?,
+            &route.custom_domains,
+            reporter,
+        )
+        .await
     }
 
     async fn deactivate(
@@ -441,6 +624,7 @@ mod tests {
 
     fn route(upstreams: &[&str]) -> RouteSpec {
         RouteSpec {
+            custom_domains: Vec::new(),
             project_id: Uuid::parse_str("ff66ed4a-6303-4be6-8ef4-63c28b112680").expect("project"),
             deployment_id: Uuid::parse_str("4f1f21ef-730d-42d5-a46d-d965353cb993")
                 .expect("deployment"),
@@ -493,6 +677,67 @@ mod tests {
              \t}\n\
              }\n"
         );
+    }
+
+    #[test]
+    fn custom_domains_are_extra_site_addresses_after_the_project_domain() {
+        let route = RouteSpec {
+            custom_domains: vec!["contoh.com".to_owned(), "www.contoh.com".to_owned()],
+            ..route(&["app"])
+        };
+        let content = serving_route(&route);
+
+        assert!(content.contains(
+            "\nportfolio.sakala.app:80, contoh.com:80, www.contoh.com:80 {\n\treverse_proxy app:3000 {\n"
+        ));
+        assert_eq!(
+            route_hosts(&content),
+            Some(vec![
+                "portfolio.sakala.app".to_owned(),
+                "contoh.com".to_owned(),
+                "www.contoh.com".to_owned()
+            ])
+        );
+        // Without custom domains the file is byte for byte what it was before.
+        assert_eq!(
+            route_hosts(&serving_route(&route_spec_without_custom())),
+            Some(vec!["portfolio.sakala.app".to_owned()])
+        );
+    }
+
+    fn route_spec_without_custom() -> RouteSpec {
+        route(&["app"])
+    }
+
+    #[test]
+    fn rewriting_the_custom_domains_keeps_everything_else() {
+        let before = serving_route(&route(&["app-r0", "app-r1"]));
+        let after =
+            with_custom_domains(&before, &["www.contoh.com".to_owned()]).expect("our shape");
+
+        assert_eq!(
+            after,
+            before.replacen(
+                "portfolio.sakala.app:80 {",
+                "portfolio.sakala.app:80, www.contoh.com:80 {",
+                1
+            )
+        );
+        assert_eq!(with_custom_domains(&after, &[]).expect("our shape"), before);
+    }
+
+    #[test]
+    fn only_the_shape_this_agent_writes_is_read_as_hosts() {
+        for content in [
+            "",
+            "# Managed by sakala-agent for project x.\n",
+            "# owner\nportfolio.sakala.app {\n}\n",
+            "# owner\nportfolio.sakala.app:80,www.contoh.com:80 {\n}\n",
+            "# owner\n:80 {\n}\n",
+            "# owner\nportfolio.sakala.app:443 {\n}\n",
+        ] {
+            assert_eq!(route_hosts(content), None, "{content:?}");
+        }
     }
 
     #[test]

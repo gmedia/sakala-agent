@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use reqwest::Url;
 use sakala_agent_core::ports::SecretString;
 use sakala_agent_runtime::{
-    CommandSpec, ProcessOutput, ProcessOutputSink, ProcessRunner, ProjectDomainSuffixes,
-    RuntimeError,
+    CommandSpec, ForbiddenZones, ProcessOutput, ProcessOutputSink, ProcessRunner,
+    ProjectDomainSuffixes, RuntimeError,
 };
 use sakala_edge::{
     caddy::CaddyControl,
@@ -23,7 +23,7 @@ use sakala_edge::{
         STATUS_OK, USER_AGENT,
     },
     sync::{EdgeSync, SyncOutcome, SyncTiming},
-    table::{RoutePolicy, UpstreamAllowlist},
+    table::{CUSTOM_ROUTES_REJECTED, RoutePolicy, UpstreamAllowlist},
 };
 use serde_json::{Value, json};
 use wiremock::{
@@ -41,6 +41,9 @@ const PROJECT_B: &str = "0a6f7f3e-4f3b-4d0e-9b8e-1f1f1f1f1f1b";
 struct FakeCaddy {
     calls: Mutex<Vec<String>>,
     failing_action: Mutex<Option<&'static str>>,
+    /// Validation fails while this file holds this text, like a Caddy that
+    /// refuses one custom domain site.
+    refused_content: Mutex<Option<(std::path::PathBuf, &'static str)>>,
 }
 
 impl FakeCaddy {
@@ -62,7 +65,17 @@ impl ProcessRunner for FakeCaddy {
     ) -> Result<ProcessOutput, RuntimeError> {
         let action = spec.args[0].to_string_lossy().into_owned();
         self.calls.lock().expect("calls").push(action.clone());
-        let failing = *self.failing_action.lock().expect("failing action") == Some(action.as_str());
+        let refused = action == "validate"
+            && self
+                .refused_content
+                .lock()
+                .expect("refused content")
+                .as_ref()
+                .is_some_and(|(path, text)| {
+                    std::fs::read_to_string(path).is_ok_and(|content| content.contains(text))
+                });
+        let failing = refused
+            || *self.failing_action.lock().expect("failing action") == Some(action.as_str());
         Ok(ProcessOutput {
             success: !failing,
             code: Some(i32::from(failing)),
@@ -109,6 +122,7 @@ fn edge(api_url: &str, dir: &Path, caddy: &Arc<FakeCaddy>) -> EdgeSync {
         RoutePolicy {
             domain_suffixes: ProjectDomainSuffixes::default(),
             upstreams: UpstreamAllowlist::default(),
+            forbidden_zones: ForbiddenZones::default(),
         },
         CaddyControl::new(
             runner,
@@ -696,4 +710,230 @@ async fn shutdown_abandons_a_fetch_in_flight() {
         .expect("worker");
     assert!(caddy.calls().is_empty());
     assert!(!dir.path().join("routes.caddy").exists());
+}
+
+fn with_custom(mut table: Value, expected_minimum: u64, custom_routes: Value) -> Value {
+    table["expected_minimum_custom_routes"] = json!(expected_minimum);
+    table["custom_routes"] = custom_routes;
+    table
+}
+
+fn one_custom_domain(revision: &str) -> Value {
+    with_custom(
+        two_routes(revision),
+        1,
+        json!([{ "host": "www.contoh.com", "project_id": PROJECT_A,
+                 "upstreams": ["10.0.47.201:8180"] }]),
+    )
+}
+
+fn custom_file(dir: &Path) -> String {
+    read(dir.join("custom-domains.caddy"))
+}
+
+#[tokio::test]
+async fn custom_domains_get_their_own_file_next_to_the_project_routes() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    let mut sync = synced(&server, dir.path(), &caddy).await;
+    // A table without custom routes still writes an empty custom file, so the
+    // host Caddyfile can always import it.
+    assert!(custom_file(dir.path()).contains("# Custom domains: 0\n"));
+    let routes = read(dir.path().join("routes.caddy"));
+
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(one_custom_domain("rev-2")),
+    )
+    .await;
+    assert_eq!(sync.sync_once().await.expect("apply"), SyncOutcome::Applied);
+
+    let custom = custom_file(dir.path());
+    assert!(custom.contains("www.contoh.com {\n\timport sakala_custom_domain_tls\n\treverse_proxy 10.0.47.201:8180\n}\n"), "{custom}");
+    assert_eq!(read(dir.path().join("routes.caddy")), routes);
+    assert_eq!(status_of(dir.path(), "custom_route_count"), json!(1));
+    assert_eq!(status_of(dir.path(), "custom_routes_error"), Value::Null);
+    let snapshot: Value =
+        serde_json::from_str(&read(dir.path().join("routes.json"))).expect("snapshot");
+    assert_eq!(snapshot["custom_routes"][0]["host"], "www.contoh.com");
+    assert_eq!(snapshot["expected_minimum_custom_routes"], 1);
+
+    // A restart rebuilds the custom file from the snapshot.
+    std::fs::remove_file(dir.path().join("custom-domains.caddy")).expect("remove");
+    let caddy = Arc::new(FakeCaddy::default());
+    let mut restarted = edge(&closed_port_url(), dir.path(), &caddy);
+    assert!(restarted.restore_snapshot().await.expect("snapshot served"));
+    assert_eq!(custom_file(dir.path()), custom);
+    assert_eq!(caddy.calls(), ["validate", "reload"]);
+
+    // A table that drops the domain removes its site.
+    let mut sync = sync;
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(with_custom(two_routes("rev-3"), 0, json!([]))),
+    )
+    .await;
+    assert_eq!(sync.sync_once().await.expect("apply"), SyncOutcome::Applied);
+    assert!(!custom_file(dir.path()).contains("contoh"));
+}
+
+#[tokio::test]
+async fn a_bad_custom_route_keeps_the_served_sites_and_applies_the_project_routes() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(one_custom_domain("rev-1")),
+    )
+    .await;
+    let mut sync = edge(&server.uri(), dir.path(), &caddy);
+    sync.sync_once().await.expect("first sync");
+    let custom = custom_file(dir.path());
+
+    // The new table moves a project and lists a platform name as custom.
+    let mut bad = with_custom(
+        two_routes("rev-2"),
+        2,
+        json!([
+            { "host": "www.contoh.com", "project_id": PROJECT_A, "upstreams": ["10.0.47.201:8180"] },
+            { "host": "api.sakala.dev", "project_id": PROJECT_B, "upstreams": ["10.0.47.201:8180"] },
+        ]),
+    );
+    bad["routes"][1]["upstreams"] = json!(["10.0.48.9:8180"]);
+    serve(&server, ResponseTemplate::new(200).set_body_json(bad)).await;
+    assert_eq!(
+        sync.sync_once().await.expect("applied"),
+        SyncOutcome::Applied
+    );
+
+    assert!(read(dir.path().join("routes.caddy")).contains("10.0.48.9:8180"));
+    assert_eq!(custom_file(dir.path()), custom);
+    let error = status_of(dir.path(), "custom_routes_error");
+    assert_eq!(error["code"], CUSTOM_ROUTES_REJECTED);
+    assert_eq!(error["reason"], "invalid_host");
+    assert_eq!(status_of(dir.path(), "last_error"), Value::Null);
+    assert_eq!(status_of(dir.path(), "custom_route_count"), json!(1));
+    let snapshot: Value =
+        serde_json::from_str(&read(dir.path().join("routes.json"))).expect("snapshot");
+    assert_eq!(snapshot["revision"], "rev-2");
+    assert_eq!(snapshot["custom_routes"].as_array().map(Vec::len), Some(1));
+
+    // The API hears about it on every request while the revision stays.
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(
+        reported(&server).await,
+        report("rev-2", CUSTOM_ROUTES_REJECTED)
+    );
+
+    // A fixed table clears it.
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(one_custom_domain("rev-3")),
+    )
+    .await;
+    sync.sync_once().await.expect("apply");
+    assert_eq!(status_of(dir.path(), "custom_routes_error"), Value::Null);
+    serve(&server, ResponseTemplate::new(304)).await;
+    sync.sync_once().await.expect("unchanged");
+    assert_eq!(reported(&server).await, report("rev-3", STATUS_OK));
+}
+
+#[tokio::test]
+async fn a_custom_site_caddy_refuses_never_holds_back_the_project_routes() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(one_custom_domain("rev-1")),
+    )
+    .await;
+    let mut sync = edge(&server.uri(), dir.path(), &caddy);
+    sync.sync_once().await.expect("first sync");
+    let custom = custom_file(dir.path());
+    *caddy.refused_content.lock().expect("lock") = Some((
+        dir.path().join("custom-domains.caddy"),
+        "refused.example.org",
+    ));
+
+    // Both files change; Caddy refuses only because of the new custom site.
+    let mut next = with_custom(
+        two_routes("rev-2"),
+        1,
+        json!([{ "host": "refused.example.org", "project_id": PROJECT_B, "upstreams": [] }]),
+    );
+    next["routes"][1]["upstreams"] = json!(["10.0.48.9:8180"]);
+    serve(&server, ResponseTemplate::new(200).set_body_json(next)).await;
+    let calls_before = caddy.calls().len();
+    assert_eq!(
+        sync.sync_once().await.expect("applied"),
+        SyncOutcome::Applied
+    );
+
+    assert_eq!(
+        caddy.calls()[calls_before..],
+        ["validate", "validate", "reload"]
+    );
+    assert!(read(dir.path().join("routes.caddy")).contains("10.0.48.9:8180"));
+    assert_eq!(custom_file(dir.path()), custom);
+    let error = status_of(dir.path(), "custom_routes_error");
+    assert_eq!(error["reason"], "caddy_refused");
+    assert_eq!(
+        sync.current()
+            .map(|table| table.custom_routes().routes()[0].host.clone()),
+        Some("www.contoh.com".to_owned())
+    );
+
+    // Only the custom file changes, and Caddy refuses it: nothing is served
+    // differently, and the routes stay.
+    let mut only_custom = with_custom(
+        two_routes("rev-3"),
+        1,
+        json!([{ "host": "refused.example.org", "project_id": PROJECT_B, "upstreams": [] }]),
+    );
+    only_custom["routes"][1]["upstreams"] = json!(["10.0.48.9:8180"]);
+    serve(
+        &server,
+        ResponseTemplate::new(200).set_body_json(only_custom),
+    )
+    .await;
+    let calls_before = caddy.calls().len();
+    assert_eq!(
+        sync.sync_once().await.expect("applied"),
+        SyncOutcome::SameRoutes
+    );
+    assert_eq!(caddy.calls()[calls_before..], ["validate", "reload"]);
+    assert_eq!(custom_file(dir.path()), custom);
+    assert_eq!(status_of(dir.path(), "revision"), json!("rev-3"));
+    assert_eq!(
+        status_of(dir.path(), "custom_routes_error")["reason"],
+        "caddy_refused"
+    );
+}
+
+#[tokio::test]
+async fn the_custom_domain_route_table_example_is_accepted_as_a_whole() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let caddy = Arc::new(FakeCaddy::default());
+    let example: Value = serde_json::from_str(include_str!(
+        "../examples/edge/route-table-custom-domains.json"
+    ))
+    .expect("example");
+    serve(&server, ResponseTemplate::new(200).set_body_json(example)).await;
+    let mut sync = edge(&server.uri(), dir.path(), &caddy);
+
+    assert_eq!(sync.sync_once().await.expect("apply"), SyncOutcome::Applied);
+    assert_eq!(status_of(dir.path(), "custom_routes_error"), Value::Null);
+    assert_eq!(status_of(dir.path(), "custom_route_count"), json!(2));
+    let custom = custom_file(dir.path());
+    assert!(
+        custom.contains("contoh.net {\n\timport sakala_custom_domain_tls\n"),
+        "{custom}"
+    );
+    assert!(custom.contains("www.contoh.com {\n\timport sakala_custom_domain_tls\n\treverse_proxy 10.0.47.201:8180\n}"), "{custom}");
 }

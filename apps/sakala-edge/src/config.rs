@@ -5,11 +5,12 @@ use std::{collections::HashMap, env, path::PathBuf, time::Duration};
 use clap::Parser;
 use reqwest::Url;
 use sakala_agent_core::ports::SecretString;
-use sakala_agent_runtime::ProjectDomainSuffixes;
+use sakala_agent_runtime::{ForbiddenZones, ProjectDomainSuffixes};
 use thiserror::Error;
 
 use crate::{
     caddy::{CaddyCommand, DEFAULT_RELOAD_COMMAND, DEFAULT_VALIDATE_COMMAND},
+    files::CUSTOM_DOMAINS_FILE,
     sync::SyncTiming,
     table::{RoutePolicy, UpstreamAllowlist},
 };
@@ -21,6 +22,8 @@ pub const UPSTREAM_CIDRS: &str = "SAKALA_EDGE_UPSTREAM_CIDRS";
 pub const POLL_INTERVAL_SECONDS: &str = "SAKALA_EDGE_POLL_INTERVAL_SECONDS";
 pub const MAX_BACKOFF_SECONDS: &str = "SAKALA_EDGE_MAX_BACKOFF_SECONDS";
 pub const STATE_DIR: &str = "SAKALA_EDGE_STATE_DIR";
+pub const CUSTOM_DOMAINS_FILE_PATH: &str = "SAKALA_EDGE_CUSTOM_DOMAINS_FILE";
+pub const CUSTOM_DOMAIN_FORBIDDEN_ZONES: &str = "SAKALA_EDGE_CUSTOM_DOMAIN_FORBIDDEN_ZONES";
 pub const CADDY_VALIDATE_CMD: &str = "SAKALA_EDGE_CADDY_VALIDATE_CMD";
 pub const CADDY_RELOAD_CMD: &str = "SAKALA_EDGE_CADDY_RELOAD_CMD";
 pub const LOG_LEVEL: &str = "SAKALA_EDGE_LOG_LEVEL";
@@ -43,6 +46,9 @@ pub struct EdgeConfig {
     pub policy: RoutePolicy,
     pub timing: SyncTiming,
     pub state_dir: PathBuf,
+    /// Where the custom domain sites are written; `custom-domains.caddy` in
+    /// the state directory by default.
+    pub custom_domains_file: PathBuf,
     pub validate_command: CaddyCommand,
     pub reload_command: CaddyCommand,
     pub log_level: String,
@@ -69,6 +75,10 @@ struct Cli {
     max_backoff_seconds: Option<String>,
     #[arg(long, env = STATE_DIR)]
     state_dir: Option<String>,
+    #[arg(long, env = CUSTOM_DOMAINS_FILE_PATH)]
+    custom_domains_file: Option<String>,
+    #[arg(long, env = CUSTOM_DOMAIN_FORBIDDEN_ZONES)]
+    custom_domain_forbidden_zones: Option<String>,
     #[arg(long, env = CADDY_VALIDATE_CMD)]
     caddy_validate_cmd: Option<String>,
     #[arg(long, env = CADDY_RELOAD_CMD)]
@@ -88,6 +98,11 @@ pub fn load() -> Result<EdgeConfig, ConfigError> {
         (POLL_INTERVAL_SECONDS, cli.poll_interval_seconds),
         (MAX_BACKOFF_SECONDS, cli.max_backoff_seconds),
         (STATE_DIR, cli.state_dir),
+        (CUSTOM_DOMAINS_FILE_PATH, cli.custom_domains_file),
+        (
+            CUSTOM_DOMAIN_FORBIDDEN_ZONES,
+            cli.custom_domain_forbidden_zones,
+        ),
         (CADDY_VALIDATE_CMD, cli.caddy_validate_cmd),
         (CADDY_RELOAD_CMD, cli.caddy_reload_cmd),
         (LOG_LEVEL, cli.log_level),
@@ -110,6 +125,7 @@ pub fn from_values(values: &HashMap<String, String>) -> Result<EdgeConfig, Confi
         )));
     }
 
+    let state_dir = PathBuf::from(set(values, STATE_DIR).unwrap_or(DEFAULT_STATE_DIR));
     Ok(EdgeConfig {
         api_url: api_url(values)?,
         token: token(values)?,
@@ -124,12 +140,20 @@ pub fn from_values(values: &HashMap<String, String>) -> Result<EdgeConfig, Confi
                 Some(value) => UpstreamAllowlist::parse(value)
                     .map_err(|reason| ConfigError(format!("{UPSTREAM_CIDRS} {reason}")))?,
             },
+            forbidden_zones: match set(values, CUSTOM_DOMAIN_FORBIDDEN_ZONES) {
+                None => ForbiddenZones::default(),
+                Some(value) => ForbiddenZones::parse(value).map_err(|reason| {
+                    ConfigError(format!("{CUSTOM_DOMAIN_FORBIDDEN_ZONES} {reason}"))
+                })?,
+            },
         },
         timing: SyncTiming {
             poll_interval,
             max_backoff,
         },
-        state_dir: PathBuf::from(set(values, STATE_DIR).unwrap_or(DEFAULT_STATE_DIR)),
+        state_dir: state_dir.clone(),
+        custom_domains_file: set(values, CUSTOM_DOMAINS_FILE_PATH)
+            .map_or_else(|| state_dir.join(CUSTOM_DOMAINS_FILE), PathBuf::from),
         validate_command: command(values, CADDY_VALIDATE_CMD, DEFAULT_VALIDATE_COMMAND)?,
         reload_command: command(values, CADDY_RELOAD_CMD, DEFAULT_RELOAD_COMMAND)?,
         log_level: set(values, LOG_LEVEL)
@@ -232,6 +256,11 @@ mod tests {
             ProjectDomainSuffixes::default()
         );
         assert_eq!(config.policy.upstreams, UpstreamAllowlist::default());
+        assert_eq!(config.policy.forbidden_zones, ForbiddenZones::default());
+        assert_eq!(
+            config.custom_domains_file,
+            PathBuf::from("/var/lib/sakala-edge/custom-domains.caddy")
+        );
         assert_eq!(config.log_level, "info");
     }
 
@@ -243,6 +272,8 @@ mod tests {
             (POLL_INTERVAL_SECONDS, "2"),
             (MAX_BACKOFF_SECONDS, "30"),
             (STATE_DIR, "/srv/edge"),
+            (CUSTOM_DOMAINS_FILE_PATH, "/etc/caddy/edge/custom.caddy"),
+            (CUSTOM_DOMAIN_FORBIDDEN_ZONES, "example.ac.id"),
             (CADDY_VALIDATE_CMD, "caddy validate --config /srv/Caddyfile"),
             (CADDY_RELOAD_CMD, "caddy reload --config /srv/Caddyfile"),
             (LOG_LEVEL, "debug"),
@@ -265,6 +296,11 @@ mod tests {
         assert_eq!(config.timing.poll_interval, Duration::from_secs(2));
         assert_eq!(config.state_dir, PathBuf::from("/srv/edge"));
         assert_eq!(
+            config.custom_domains_file,
+            PathBuf::from("/etc/caddy/edge/custom.caddy")
+        );
+        assert_eq!(config.policy.forbidden_zones.as_slice(), ["example.ac.id"]);
+        assert_eq!(
             config.reload_command.to_string(),
             "caddy reload --config /srv/Caddyfile"
         );
@@ -280,6 +316,10 @@ mod tests {
             (vec![(EDGE_TOKEN, "change-me")], EDGE_TOKEN),
             (vec![(DOMAIN_SUFFIXES, "*.sakala.app")], DOMAIN_SUFFIXES),
             (vec![(UPSTREAM_CIDRS, "0.0.0.0/0")], UPSTREAM_CIDRS),
+            (
+                vec![(CUSTOM_DOMAIN_FORBIDDEN_ZONES, "*.sakala.app")],
+                CUSTOM_DOMAIN_FORBIDDEN_ZONES,
+            ),
             (vec![(POLL_INTERVAL_SECONDS, "0")], POLL_INTERVAL_SECONDS),
             (vec![(POLL_INTERVAL_SECONDS, "fast")], POLL_INTERVAL_SECONDS),
             (

@@ -4,11 +4,11 @@ use uuid::Uuid;
 
 use crate::{
     BucketKeyPayload, BucketPayloadError, CommandStatus, CreateBucketPayload,
-    CreateDatabasePayload, CreateValkeyPayload, DatabasePayloadError, DatabaseTargetPayload,
-    DeployProjectPayload, DropDatabasePayload, InspectProjectPayload,
+    CreateDatabasePayload, CreateValkeyPayload, CustomDomainsPayload, DatabasePayloadError,
+    DatabaseTargetPayload, DeployProjectPayload, DropDatabasePayload, InspectProjectPayload,
     InstallDatabaseExtensionPayload, ResizeValkeyPayload, RotateBucketKeyPayload,
     RotateDatabasePasswordPayload, RotateValkeyPasswordPayload, RunJobPayload,
-    SetBucketQuotaPayload, ValkeyPayloadError, ValkeyTargetPayload,
+    SetBucketQuotaPayload, UpdateProjectDomainsPayload, ValkeyPayloadError, ValkeyTargetPayload,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -118,6 +118,9 @@ pub enum CommandType {
     LockValkey,
     UnlockValkey,
     ResizeValkey,
+    /// Replaces the custom domains of a project's route without a redeploy,
+    /// only on nodes that advertise `custom-domains`.
+    UpdateProjectDomains,
 }
 
 /// Command record returned by the control-plane polling endpoint.
@@ -223,6 +226,25 @@ impl AgentCommand {
 
     pub fn resize_valkey_payload(&self) -> Result<ResizeValkeyPayload, ValkeyPayloadError> {
         ResizeValkeyPayload::from_value(&self.payload)
+    }
+
+    /// The `custom_domains` of a `WakeProject`, `RestartProject`, or
+    /// `SleepProject` payload. A payload that is not an object, or has no
+    /// such field, keeps the custom domains the route has: these payloads were
+    /// free-form before, and only the field itself is this feature's to refuse.
+    pub fn custom_domains_payload(&self) -> Result<CustomDomainsPayload, serde_json::Error> {
+        match self.payload.get("custom_domains") {
+            None => Ok(CustomDomainsPayload::default()),
+            Some(custom_domains) => Ok(CustomDomainsPayload {
+                custom_domains: serde_json::from_value(custom_domains.clone())?,
+            }),
+        }
+    }
+
+    pub fn update_project_domains_payload(
+        &self,
+    ) -> Result<UpdateProjectDomainsPayload, serde_json::Error> {
+        serde_json::from_value(self.payload.clone())
     }
 
     /// A missing or `null` payload reads as an empty object. An unknown `page`

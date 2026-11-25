@@ -273,6 +273,7 @@ async fn real_caddy_balances_replicas_and_survives_a_killed_one() {
     };
     let executor = agent();
     let lifecycle = || WorkloadLifecycleRequest {
+        custom_domains: Default::default(),
         command_id: Uuid::new_v4(),
         project_id,
         deployment_id,

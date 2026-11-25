@@ -37,6 +37,7 @@ Agent memuat konfigurasi dari environment variable atau CLI flag yang sepadan. C
 | `SAKALA_CONTAINER_RUNTIME` | kosong | Runtime OCI untuk workload, misalnya `runsc`, dengan nama yang terdaftar di Docker. Kosong berarti default Docker. Build dan sandbox Railpack tidak terpengaruh. Bila terisi tetapi tidak terdaftar, preflight gagal fatal, dan Agent tidak pernah pindah ke runtime lain. Lihat [gVisor](RUNTIME_HARDENING.md#gvisor). |
 | `SAKALA_CONTAINER_DNS` | kosong | Daftar IP name server untuk workload, dipisah koma, misalnya `1.1.1.1,8.8.8.8`. Agent menulisnya ke `.sakala-resolv.conf` di `SAKALA_RUNTIME_WORKSPACE` dan me-mount-nya sebagai `/etc/resolv.conf` read-only. Wajib di bawah `runsc`; tanpa ini workload tidak bisa me-resolve hostname. |
 | `SAKALA_PROJECT_DOMAIN_SUFFIXES` | `run.sakala.localhost,staging.sakala.app,sakala.app` | Suffix domain yang boleh dipakai deployment, dipisah koma, misalnya `run.example.ac.id`. Domain diterima hanya bila berupa tepat satu label DNS ditambah salah satu suffix ini, seperti `portfolio.run.example.ac.id`. Isi dengan `SAKALA_PROJECT_DEFAULT_DOMAIN` milik `sakala-api`. Setiap suffix wajib huruf kecil, minimal dua label, tanpa wildcard, dan label internasional ditulis dalam bentuk `xn--`. Nilai yang tidak valid membuat Agent berhenti saat start. Kosong atau tidak diisi berarti tiga suffix default Sakala hosted. Lihat [Domain project](#domain-project). |
+| `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES` | `sakala.app,sakala.dev,localhost` | Zona yang tidak boleh menjadi custom domain project (ADR-024), dipisah koma: zona itu sendiri dan semua nama di bawahnya ditolak dengan `runtime_custom_domain_invalid`. Suffix domain project selalu ditolak juga, tanpa perlu ditulis di sini. Setiap zona huruf kecil, boleh satu label (`localhost`), tanpa wildcard. Mengisi nilai mengganti seluruh default. Nilai yang tidak valid membuat Agent berhenti saat start. Samakan dengan `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES` di `sakala-api` dan `SAKALA_EDGE_CUSTOM_DOMAIN_FORBIDDEN_ZONES` di Sakala Edge. Lihat [Custom domain](#custom-domain). |
 | `SAKALA_BUILD_TIMEOUT_SECONDS` | `600` | Hard maximum node untuk fase build image; payload deployment boleh meminta nilai lebih pendek. |
 | `SAKALA_START_TIMEOUT_SECONDS` | `120` | Hard maximum node untuk start container dan health readiness; harus lebih pendek dari command timeout. |
 | `SAKALA_RELEASE_COMMAND_TIMEOUT_SECONDS` | `600` | Batas waktu [release command](DOCKER_RUNTIME.md#release-command) satu deployment, dalam detik. Harus bilangan bulat positif dan lebih pendek dari `SAKALA_COMMAND_TIMEOUT_SECONDS`; nilai lain membuat Agent berhenti saat start. Release command yang melewati batas ini dibunuh dan deploy gagal dengan `release_command_timeout`. Batas ini berlaku di dalam deadline command yang sama dengan build dan start, jadi build lama ditambah release command lama bisa lebih dulu mencapai command timeout dan gagal dengan `runtime_timeout`. |
@@ -112,6 +113,19 @@ Sakala hosted memakai `sakala.app` untuk production (`<slug>.sakala.app`) dan `s
 Suffix yang berlaku dicatat pada log preflight sebagai check `project-domains`. Ganti nilainya bila `SAKALA_PROJECT_DEFAULT_DOMAIN` di `sakala-api` berubah, karena domain yang dikirim API harus tetap berada di bawah salah satu suffix ini.
 
 Mengganti domain tidak memindahkan workload yang sudah berjalan. Agent menyimpan domain sebagai label `dev.sakala.domain` di container, dan `WakeProject` serta `RestartProject` membangun route dari label itu. Setelah `projects:move-domain` di `sakala-api`, setiap project harus dideploy ulang, termasuk yang sedang tidur, supaya route-nya pindah ke domain baru. Container lama dengan domain yang tidak lagi diizinkan tetap bisa di-wake atau di-restart, tetapi bila ditidurkan, Agent tidak bisa membuat halaman bangun untuknya dan menghapus route-nya.
+
+## Custom domain
+
+Project juga bisa dilayani di custom domain yang sudah dibuktikan pemiliknya di `sakala-api` (ADR-024). Command yang menulis route membawa `custom_domains`, dan Agent menambahkannya sebagai alamat site di file route project yang sama, setelah domain project. Berbeda dengan domain project, custom domain tidak disimpan di label container, karena bisa berubah tanpa redeploy lewat `UpdateProjectDomains`; file route-nya yang menjadi catatan, sehingga command tanpa daftar mempertahankannya.
+
+Agent tidak menormalkan nama dan menolak nama di bawah suffix domain project dan di bawah `SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES`. Instalasi self-hosted di `example.ac.id` yang tidak ingin pengguna memakai nama kampus sebagai custom domain bisa memakai:
+
+```bash
+SAKALA_PROJECT_DOMAIN_SUFFIXES=run.example.ac.id
+SAKALA_CUSTOM_DOMAIN_FORBIDDEN_ZONES=example.ac.id,localhost
+```
+
+TLS custom domain diterbitkan di Edge, bukan di router node, yang tetap HTTP di port 80. Aturan lengkap dan kode kegagalan ada di [Agent API](AGENT_API.md#custom-domain).
 
 ## Resource Policy Boundary
 

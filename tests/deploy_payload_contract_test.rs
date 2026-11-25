@@ -994,3 +994,112 @@ fn valkey_failure_fixture_covers_every_valkey_failure_code() {
         assert!(codes.contains(code), "{code} is missing from the fixture");
     }
 }
+
+#[test]
+fn custom_domain_examples_match_the_wire_contract() {
+    use sakala_agent_protocol::{
+        CUSTOM_DOMAINS_CAPABILITY, ProjectDomainsUpdate, RequestedCustomDomains,
+        UpdateProjectDomainsResult,
+    };
+
+    assert_eq!(CUSTOM_DOMAINS_CAPABILITY, "custom-domains");
+    let deploy: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/deploy-project-custom-domains.json"
+    ))
+    .expect("deploy example");
+    assert_eq!(
+        deploy.deploy_payload().expect("payload").custom_domains,
+        RequestedCustomDomains::List(vec!["www.contoh.com".to_owned(), "contoh.com".to_owned()])
+    );
+    // The plain deployment example keeps whatever the route has.
+    let plain: AgentCommand =
+        serde_json::from_str(include_str!("../examples/commands/deploy-project.json"))
+            .expect("deploy example");
+    assert_eq!(
+        plain.deploy_payload().expect("payload").custom_domains,
+        RequestedCustomDomains::Absent
+    );
+
+    let wake: AgentCommand = serde_json::from_str(include_str!(
+        "../examples/commands/wake-project-custom-domains.json"
+    ))
+    .expect("wake example");
+    assert_eq!(wake.command_type, CommandType::WakeProject);
+    assert_eq!(
+        wake.custom_domains_payload()
+            .expect("payload")
+            .custom_domains,
+        RequestedCustomDomains::List(vec!["www.contoh.com".to_owned()])
+    );
+
+    let update: serde_json::Value = serde_json::from_str(include_str!(
+        "../examples/commands/update-project-domains.json"
+    ))
+    .expect("update example");
+    let command: AgentCommand =
+        serde_json::from_value(update["command"].clone()).expect("update command");
+    assert_eq!(command.command_type, CommandType::UpdateProjectDomains);
+    assert_eq!(
+        command
+            .update_project_domains_payload()
+            .expect("payload")
+            .custom_domains,
+        ["www.contoh.com", "contoh.com"]
+    );
+    let result: UpdateProjectDomainsResult =
+        serde_json::from_value(update["complete"]["result"].clone()).expect("result");
+    assert_eq!(result.status, ProjectDomainsUpdate::Updated);
+    assert_eq!(result.custom_domains, ["contoh.com", "www.contoh.com"]);
+    assert_eq!(update["event"]["event_type"], "workload.domains.updated");
+}
+
+#[test]
+fn custom_domain_failure_examples_hold_every_code_with_the_agents_own_messages() {
+    use sakala_agent_protocol::custom_domains::error_codes;
+    use sakala_agent_runtime::{CustomDomainPolicy, RuntimeError};
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../examples/failures/custom-domain-failures.json"
+    ))
+    .expect("custom domain failure fixture must parse");
+    let entries = fixture.as_array().expect("list");
+    let policy = CustomDomainPolicy::default();
+    for entry in entries {
+        serde_json::from_value::<CommandType>(entry["type"].clone()).expect("a command type");
+        let code = entry["body"]["error_code"].as_str().expect("code");
+        let message = entry["body"]["error_message"].as_str().expect("message");
+        // The messages are what this build sends, not paraphrases.
+        let expected = match code {
+            error_codes::CUSTOM_DOMAIN_INVALID => {
+                let domain = message
+                    .split('"')
+                    .nth(1)
+                    .expect("a quoted domain in the message");
+                let rejection = policy.check(domain).expect_err("the example is refused");
+                RuntimeError::CustomDomainInvalid {
+                    domain: format!("{domain:?}"),
+                    reason: rejection.reason().to_owned(),
+                }
+                .to_string()
+            }
+            error_codes::CUSTOM_DOMAIN_TAKEN => RuntimeError::CustomDomainTaken {
+                domain: "www.contoh.com".to_owned(),
+            }
+            .to_string(),
+            _ => message.to_owned(),
+        };
+        assert_eq!(message, expected, "{code}");
+    }
+    let codes = entries
+        .iter()
+        .map(|entry| entry["body"]["error_code"].as_str().expect("code"))
+        .collect::<std::collections::BTreeSet<_>>();
+    for code in [
+        error_codes::CUSTOM_DOMAIN_INVALID,
+        error_codes::CUSTOM_DOMAIN_TAKEN,
+        "invalid_runtime_command",
+        "unsupported_runtime_command",
+    ] {
+        assert!(codes.contains(code), "{code} is missing from the fixture");
+    }
+}

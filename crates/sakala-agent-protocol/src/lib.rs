@@ -8,6 +8,7 @@ pub const PROTOCOL_VERSION: u32 = 4;
 
 pub mod buckets;
 pub mod commands;
+pub mod custom_domains;
 pub mod databases;
 pub mod deployments;
 pub mod events;
@@ -32,6 +33,11 @@ pub use commands::{
     AgentCommand, CleanupRuntimePayload, CommandPoll, CommandType, CompleteCommandPayload,
     DesiredWorkloadState, ReconcileWorkloadAction, ReconcileWorkloadPayload, RuntimeCleanupTarget,
     SleepProjectPayload, SleepingPage, StopProjectPayload,
+};
+pub use custom_domains::{
+    CUSTOM_DOMAINS_CAPABILITY, CustomDomainsPayload, MAX_CUSTOM_DOMAINS_PER_PROJECT,
+    ProjectDomainsUpdate, RequestedCustomDomains, UpdateProjectDomainsPayload,
+    UpdateProjectDomainsResult,
 };
 pub use databases::{
     CreateDatabasePayload, DatabaseEndpoint, DatabaseExtension, DatabasePassword,

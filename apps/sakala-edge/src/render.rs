@@ -21,7 +21,7 @@
 
 use std::{fmt::Write as _, time::Duration};
 
-use crate::table::{Route, RouteTable};
+use crate::table::{CustomRoutes, Route, RouteTable};
 
 /// First line of every generated file, so an operator who opens it knows not to
 /// edit it by hand.
@@ -47,6 +47,17 @@ const LB_TRY_INTERVAL: Duration = Duration::from_millis(250);
 /// makes the site answer 503 for this long.
 const FAIL_DURATION: Duration = Duration::from_secs(10);
 
+/// Snippet every custom domain site imports. The host Caddyfile of the Edge
+/// defines it before importing the custom domains file, with the certificate
+/// issuer for names outside Sakala's zones (Let's Encrypt over HTTP-01 or
+/// TLS-ALPN-01 in `sakala-deployment`). Renaming it breaks every Edge host.
+pub const CUSTOM_DOMAIN_TLS_SNIPPET: &str = "sakala_custom_domain_tls";
+/// What a custom domain without a workload answers, with status 404: the
+/// site keeps its certificate and tells the visitor the truth instead of a TLS
+/// error. Plain text, so nothing in it can read as a Caddy placeholder.
+const CUSTOM_DOMAIN_NOT_FOUND_BODY: &str = "Belum ada aplikasi di alamat ini. Kalau ini domain proyekmu, cek status deployment-nya di Console Sakala.";
+const NOT_FOUND_STATUS: u16 = 404;
+
 /// The full file for `table`. The same routes always render the same bytes,
 /// which is how Edge tells whether Caddy needs a reload at all. The revision
 /// and generation time stay out of the file for that reason: a new revision
@@ -65,7 +76,15 @@ fn render_route(content: &mut String, route: &Route) {
     let matcher = format!("{MATCHER_PREFIX}{}", route.host.replace('.', "_"));
     let _ = writeln!(content, "# Project {}", route.project_id);
     let _ = writeln!(content, "{matcher} host {}", route.host);
-    let _ = write!(content, "handle {matcher} {{\n\treverse_proxy");
+    let _ = writeln!(content, "handle {matcher} {{");
+    render_proxy(content, route);
+    content.push_str("}\n");
+}
+
+/// One indented `reverse_proxy` line, with balancing options when the route
+/// has more than one node.
+fn render_proxy(content: &mut String, route: &Route) {
+    content.push_str("\treverse_proxy");
     for upstream in &route.upstreams {
         let _ = write!(content, " {upstream}");
     }
@@ -80,7 +99,37 @@ fn render_route(content: &mut String, route: &Route) {
             caddy_duration(FAIL_DURATION),
         );
     }
-    content.push_str("\n}\n");
+    content.push('\n');
+}
+
+/// The custom domains file (ADR-024): one top-level site per domain, sorted
+/// by host, each importing [`CUSTOM_DOMAIN_TLS_SNIPPET`] and proxying to the
+/// project's nodes like its project route. Caddy obtains and renews each
+/// site's certificate itself. A site with no node answers 404. The site trusts
+/// no proxy, so Caddy overwrites the forwarded headers as on the wildcard.
+/// Hosts passed [`sakala_agent_runtime::CustomDomainPolicy`], so they are
+/// `a-z0-9-.` only.
+#[must_use]
+pub fn render_custom(custom_routes: &CustomRoutes) -> String {
+    let routes = custom_routes.routes();
+    let mut content = format!("{GENERATED_HEADER}\n# Custom domains: {}\n", routes.len());
+    for route in routes {
+        let _ = write!(
+            content,
+            "\n# Project {}\n{} {{\n\timport {CUSTOM_DOMAIN_TLS_SNIPPET}\n",
+            route.project_id, route.host
+        );
+        if route.upstreams.is_empty() {
+            let _ = write!(
+                content,
+                "\theader {{\n\t\tCache-Control \"no-store\"\n\t\tX-Robots-Tag \"noindex\"\n\t}}\n\trespond \"{CUSTOM_DOMAIN_NOT_FOUND_BODY}\" {NOT_FOUND_STATUS}\n"
+            );
+        } else {
+            render_proxy(&mut content, route);
+        }
+        content.push_str("}\n");
+    }
+    content
 }
 
 /// A duration in Caddyfile syntax: whole seconds as `5s`, anything finer in
@@ -187,6 +236,79 @@ mod tests {
         // Two handle blocks plus one balancing block, each opened and closed once.
         assert_eq!(rendered.matches('{').count(), 3);
         assert_eq!(rendered.matches('}').count(), 3);
+    }
+
+    fn custom_table(custom_routes: serde_json::Value) -> RouteTable {
+        let mut body: serde_json::Value = serde_json::from_slice(&body(
+            json!([{ "host": "a.sakala.app", "project_id": PROJECT_A, "upstreams": ["10.0.0.1:80"] }]),
+            0,
+        ))
+        .expect("json");
+        body["custom_routes"] = custom_routes;
+        let table = policy()
+            .parse(&serde_json::to_vec(&body).expect("json"))
+            .expect("valid");
+        assert_eq!(table.custom_rejection(), None);
+        table
+    }
+
+    #[test]
+    fn custom_domains_become_sorted_sites_that_import_the_tls_snippet() {
+        let table = custom_table(json!([
+            { "host": "www.contoh.com", "project_id": PROJECT_B,
+              "upstreams": ["10.0.47.201:8180", "10.0.47.202:8180"] },
+            { "host": "contoh.net", "project_id": PROJECT_A, "upstreams": ["10.0.47.201:8180"] },
+            { "host": "kosong.example.org", "project_id": PROJECT_A, "upstreams": [] },
+        ]));
+
+        assert_eq!(
+            render_custom(table.custom_routes()),
+            format!(
+                "{GENERATED_HEADER}\n\
+                 # Custom domains: 3\n\
+                 \n\
+                 # Project {PROJECT_A}\n\
+                 contoh.net {{\n\
+                 \timport sakala_custom_domain_tls\n\
+                 \treverse_proxy 10.0.47.201:8180\n\
+                 }}\n\
+                 \n\
+                 # Project {PROJECT_A}\n\
+                 kosong.example.org {{\n\
+                 \timport sakala_custom_domain_tls\n\
+                 \theader {{\n\
+                 \t\tCache-Control \"no-store\"\n\
+                 \t\tX-Robots-Tag \"noindex\"\n\
+                 \t}}\n\
+                 \trespond \"{CUSTOM_DOMAIN_NOT_FOUND_BODY}\" 404\n\
+                 }}\n\
+                 \n\
+                 # Project {PROJECT_B}\n\
+                 www.contoh.com {{\n\
+                 \timport sakala_custom_domain_tls\n\
+                 \treverse_proxy 10.0.47.201:8180 10.0.47.202:8180 {{\n\
+                 \t\tlb_policy least_conn\n\
+                 \t\tlb_try_duration 5s\n\
+                 \t\tlb_try_interval 250ms\n\
+                 \t\tfail_duration 10s\n\
+                 \t}}\n\
+                 }}\n"
+            )
+        );
+        // The project routes file is unchanged by custom domains.
+        assert!(!render(&table).contains("contoh"));
+    }
+
+    #[test]
+    fn no_custom_domains_render_a_file_without_sites() {
+        let table = custom_table(json!([]));
+        assert_eq!(
+            render_custom(table.custom_routes()),
+            format!("{GENERATED_HEADER}\n# Custom domains: 0\n")
+        );
+        // The not-found text holds nothing Caddy would read as a placeholder
+        // or the end of the quoted token.
+        assert!(!CUSTOM_DOMAIN_NOT_FOUND_BODY.contains(['{', '}', '"', '\\', '\n']));
     }
 
     #[test]

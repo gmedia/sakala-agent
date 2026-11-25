@@ -2782,6 +2782,7 @@ async fn deleting_a_project_removes_its_images_and_leaves_the_other_project_alon
     let output = executor
         .stop_project(
             WorkloadLifecycleRequest {
+                custom_domains: Default::default(),
                 command_id: Uuid::new_v4(),
                 project_id: deleted,
                 deployment_id: deleted_deployment,
@@ -2965,6 +2966,7 @@ impl Deployment {
 
     fn lifecycle(&self) -> WorkloadLifecycleRequest {
         WorkloadLifecycleRequest {
+            custom_domains: Default::default(),
             command_id: Uuid::new_v4(),
             project_id: self.project_id,
             deployment_id: self.deployment_id,

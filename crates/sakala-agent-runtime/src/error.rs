@@ -120,6 +120,17 @@ pub enum RuntimeError {
     /// node cannot put its containers on (ADR-023), so none was created.
     #[error("{0}")]
     ValkeyNetworkUnavailable(String),
+    /// A custom domain of the command fails the node's rules (ADR-024).
+    #[error("custom domain {domain} {reason}")]
+    CustomDomainInvalid {
+        /// The name, quoted and escaped for one line.
+        domain: String,
+        reason: String,
+    },
+    /// Another project's route on this node serves the custom domain. Which
+    /// project is logged for the operator, not sent with the command.
+    #[error("custom domain {domain} is already served by another project on this node")]
+    CustomDomainTaken { domain: String },
     #[error("runtime routing failed: {0}")]
     Routing(String),
     #[error("runtime capacity exceeded: {0}")]
@@ -179,6 +190,12 @@ impl RuntimeError {
             Self::JobImageMissing { .. } => "job_image_missing",
             Self::ValkeyNetworkUnavailable(_) => {
                 sakala_agent_protocol::valkey::error_codes::VALKEY_NETWORK_UNAVAILABLE
+            }
+            Self::CustomDomainInvalid { .. } => {
+                sakala_agent_protocol::custom_domains::error_codes::CUSTOM_DOMAIN_INVALID
+            }
+            Self::CustomDomainTaken { .. } => {
+                sakala_agent_protocol::custom_domains::error_codes::CUSTOM_DOMAIN_TAKEN
             }
             Self::Routing(_) => "runtime_routing_failed",
             Self::Capacity(_) => "runtime_capacity_exceeded",

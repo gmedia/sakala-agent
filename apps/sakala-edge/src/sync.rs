@@ -13,9 +13,12 @@ use tracing::{debug, info, warn};
 use crate::{
     caddy::{CaddyControl, CaddyError},
     files::EdgeFiles,
-    render::render,
+    render::{render, render_custom},
     source::{AppliedState, FetchError, Fetched, RouteSource, STATUS_OK},
-    table::{RoutePolicy, RouteTable, TableRejection},
+    table::{
+        CUSTOM_ROUTES_REJECTED, CustomRouteRejection, CustomRoutes, RoutePolicy, RouteTable,
+        TableRejection,
+    },
 };
 
 /// How often to poll and how far to back off after failures.
@@ -97,6 +100,24 @@ pub struct StatusError {
     pub at: OffsetDateTime,
 }
 
+/// Why the custom part of the served table is not the API's (ADR-024). The
+/// project routes of that table apply; the custom routes served before stay.
+/// It lasts while the API keeps the same revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CustomRoutesError {
+    /// Always [`CUSTOM_ROUTES_REJECTED`], the status Edge reports to the API.
+    pub code: &'static str,
+    /// What was wrong: a [`CustomRouteRejection::reason`], or `caddy_refused`
+    /// when Caddy refused the rendered sites.
+    pub reason: &'static str,
+    pub message: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// [`CustomRoutesError::reason`] when Caddy refused the custom domains file.
+const CADDY_REFUSED_CUSTOM_ROUTES: &str = "caddy_refused";
+
 /// Written to `status.json` after every attempt, for monitoring. A healthy Edge
 /// has a recent `last_success_at`; a stale table shows as an old one together
 /// with `last_error`.
@@ -104,6 +125,10 @@ pub struct StatusError {
 pub struct SyncStatus {
     pub revision: Option<String>,
     pub route_count: usize,
+    /// Custom domain sites Caddy serves.
+    pub custom_route_count: usize,
+    /// Set while the custom part of the served revision was refused.
+    pub custom_routes_error: Option<CustomRoutesError>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub generated_at: Option<OffsetDateTime>,
     pub source: Option<RoutesSource>,
@@ -113,6 +138,16 @@ pub struct SyncStatus {
     pub last_success_at: Option<OffsetDateTime>,
     pub consecutive_failures: u32,
     pub last_error: Option<StatusError>,
+}
+
+/// What one write, validate, and reload left Caddy serving.
+struct Applied {
+    /// Caddy took a new configuration.
+    reloaded: bool,
+    /// The table as served: its custom routes are the previous ones when Caddy
+    /// refused the new custom sites.
+    table: RouteTable,
+    custom_refused: Option<CaddyError>,
 }
 
 pub struct EdgeSync {
@@ -173,16 +208,19 @@ impl EdgeSync {
             return Ok(false);
         };
         let result = async {
-            let table = self.policy.parse(&snapshot)?;
-            self.apply(&table).await?;
-            Ok::<_, SyncError>(table)
+            let (table, rejection) = self.keep_served_custom(self.policy.parse(&snapshot)?);
+            let applied = self.apply(table).await?;
+            Ok::<_, SyncError>((applied, rejection))
         }
         .await;
         match result {
-            Ok(table) => {
+            Ok((applied, rejection)) => {
+                self.record_custom(rejection, applied.custom_refused.as_ref());
+                let table = applied.table;
                 info!(
                     revision = table.revision(),
                     routes = table.routes().len(),
+                    custom_routes = table.custom_routes().routes().len(),
                     "serving the route snapshot until the API answers"
                 );
                 self.serve(table, RoutesSource::Snapshot);
@@ -273,7 +311,14 @@ impl EdgeSync {
                 .status
                 .last_error
                 .as_ref()
-                .map_or(STATUS_OK, |error| error.code),
+                .map(|error| error.code)
+                .or_else(|| {
+                    self.status
+                        .custom_routes_error
+                        .as_ref()
+                        .map(|error| error.code)
+                })
+                .unwrap_or(STATUS_OK),
         }
     }
 
@@ -302,14 +347,19 @@ impl EdgeSync {
         };
         let table = self.policy.parse(&body)?;
         if revision == Some(table.revision()) {
-            // The API confirmed the table Edge serves, possibly from the snapshot.
+            // The API confirmed the table Edge serves, possibly from the
+            // snapshot. A refused custom part of that revision stays refused.
             self.status.source = Some(RoutesSource::Api);
             return Ok(SyncOutcome::Unchanged);
         }
-        let reloaded = self.apply(&table).await?;
+        let (table, rejection) = self.keep_served_custom(table);
+        let applied = self.apply(table).await?;
+        self.record_custom(rejection, applied.custom_refused.as_ref());
+        let (table, reloaded) = (applied.table, applied.reloaded);
         info!(
             revision = table.revision(),
             routes = table.routes().len(),
+            custom_routes = table.custom_routes().routes().len(),
             reloaded,
             "serving a new route table"
         );
@@ -321,39 +371,141 @@ impl EdgeSync {
         })
     }
 
-    /// Writes the routes, validates, and reloads; on any Caddy failure puts the
-    /// previous file back and reloads again, like the Agent's route manager.
-    /// Saves the snapshot only once Caddy accepted the table. `Ok(false)` when
-    /// the routes file already held this table and Caddy was not touched.
-    async fn apply(&self, table: &RouteTable) -> Result<bool, SyncError> {
-        let backup = self
+    /// The custom routes Caddy serves now; none before the first table.
+    fn served_custom(&self) -> CustomRoutes {
+        self.current
+            .as_ref()
+            .map(|table| table.custom_routes().clone())
+            .unwrap_or_default()
+    }
+
+    /// `table` with the custom routes served now in place of a custom part the
+    /// checks refused, and why it was refused.
+    fn keep_served_custom(&self, table: RouteTable) -> (RouteTable, Option<CustomRouteRejection>) {
+        match table.custom_rejection().cloned() {
+            Some(rejection) => (
+                table.with_custom_routes(self.served_custom()),
+                Some(rejection),
+            ),
+            None => (table, None),
+        }
+    }
+
+    /// Writes both files, validates, and reloads; on a Caddy failure puts the
+    /// previous files back and reloads again, like the Agent's route manager.
+    /// When the custom domains file changed too, the project routes get a
+    /// second chance with the previous custom sites, so a custom site Caddy
+    /// refuses never holds back project routes. Saves the snapshot only once
+    /// Caddy accepted the table. Not `reloaded` when both files already held
+    /// this table and Caddy was not touched.
+    async fn apply(&self, table: RouteTable) -> Result<Applied, SyncError> {
+        let previous_custom = self.served_custom();
+        let routes_backup = self
             .files
-            .replace_routes(&render(table))
+            .replace_routes(&render(&table))
             .await
             .map_err(storage("the routes file"))?;
-        let reloaded = backup.is_some();
-        if let Some(backup) = backup
+        let custom_backup = match self
+            .files
+            .replace_custom_domains(&render_custom(table.custom_routes()))
+            .await
+        {
+            Ok(backup) => backup,
+            Err(error) => {
+                if let Some(routes_backup) = routes_backup {
+                    self.files
+                        .restore_routes(routes_backup)
+                        .await
+                        .map_err(storage("the routes file"))?;
+                }
+                return Err(storage("the custom domains file")(error));
+            }
+        };
+        let mut applied = Applied {
+            reloaded: routes_backup.is_some() || custom_backup.is_some(),
+            table,
+            custom_refused: None,
+        };
+        if applied.reloaded
             && let Err(error) = self.caddy.validate_and_reload().await
         {
+            let Some(custom_backup) = custom_backup else {
+                if let Some(routes_backup) = routes_backup {
+                    self.files
+                        .restore_routes(routes_backup)
+                        .await
+                        .map_err(storage("the routes file"))?;
+                }
+                self.caddy.reload_after_rollback().await;
+                return Err(error.into());
+            };
             self.files
-                .restore_routes(backup)
+                .restore_routes(custom_backup)
                 .await
-                .map_err(storage("the routes file"))?;
-            self.caddy.reload_after_rollback().await;
-            return Err(error.into());
+                .map_err(storage("the custom domains file"))?;
+            match routes_backup {
+                None => {
+                    self.caddy.reload_after_rollback().await;
+                    applied.reloaded = false;
+                }
+                Some(routes_backup) => {
+                    if let Err(second) = self.caddy.validate_and_reload().await {
+                        self.files
+                            .restore_routes(routes_backup)
+                            .await
+                            .map_err(storage("the routes file"))?;
+                        self.caddy.reload_after_rollback().await;
+                        return Err(second.into());
+                    }
+                }
+            }
+            applied.table = applied.table.with_custom_routes(previous_custom);
+            applied.custom_refused = Some(error);
         }
-        let snapshot =
-            serde_json::to_vec_pretty(&table.to_wire()).expect("a route table always serializes");
+        let snapshot = serde_json::to_vec_pretty(&applied.table.to_wire())
+            .expect("a route table always serializes");
         self.files
             .write_snapshot(&snapshot)
             .await
             .map_err(storage("the snapshot"))?;
-        Ok(reloaded)
+        Ok(applied)
+    }
+
+    /// Records why the custom part of the table just applied is not served,
+    /// or clears the record when it is.
+    fn record_custom(
+        &mut self,
+        rejection: Option<CustomRouteRejection>,
+        refused: Option<&CaddyError>,
+    ) {
+        let error = match (rejection, refused) {
+            (Some(rejection), _) => Some((rejection.reason(), rejection.to_string())),
+            (None, Some(refused)) => Some((
+                CADDY_REFUSED_CUSTOM_ROUTES,
+                format!("{refused}; the custom domain sites were put back"),
+            )),
+            (None, None) => None,
+        };
+        self.status.custom_routes_error = error.map(|(reason, message)| {
+            warn!(
+                code = CUSTOM_ROUTES_REJECTED,
+                reason,
+                error = %message,
+                "custom routes refused; serving the previous custom domains"
+            );
+            CustomRoutesError {
+                code: CUSTOM_ROUTES_REJECTED,
+                reason,
+                message,
+                at: OffsetDateTime::now_utc(),
+            }
+        });
     }
 
     fn serve(&mut self, table: RouteTable, source: RoutesSource) {
         self.status.revision = Some(table.revision().to_owned());
         self.status.route_count = table.routes().len();
+        self.status.custom_route_count = table.custom_routes().routes().len();
         self.status.generated_at = Some(table.generated_at());
         self.status.source = Some(source);
         self.current = Some(table);

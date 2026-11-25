@@ -20,5 +20,6 @@ pub use runtime::{
     RuntimeHealthSnapshot, RuntimeImageCleanup, RuntimeNetworkReconciliation, RuntimeOrphan,
     RuntimePreflightCheck, RuntimePreflightReport, RuntimeReconciliationReport,
     RuntimeReplicaRestoration, RuntimeReporter, RuntimeReporterFactory, RuntimeStaleImage,
-    RuntimeStaleRoute, RuntimeWorkload, WorkloadLifecycleRequest, process_reporter,
+    RuntimeStaleRoute, RuntimeWorkload, UpdateProjectDomainsRequest, WorkloadLifecycleRequest,
+    process_reporter,
 };

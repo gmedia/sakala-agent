@@ -4,6 +4,11 @@
 //! any hostname would let one project claim another's domain, or a domain the node
 //! operator never meant to serve, so the node keeps an allowlist of suffixes and
 //! accepts exactly one DNS label under one of them.
+//!
+//! A project may also be reached through custom domains its owner proved to
+//! control (ADR-024). The control plane checks ownership; the node and Sakala
+//! Edge only check the name itself with [`CustomDomainPolicy`]: a plain DNS
+//! name, never one of the platform's own zones.
 
 use std::fmt;
 
@@ -96,6 +101,172 @@ impl fmt::Display for ProjectDomainSuffixes {
     }
 }
 
+/// Zones no custom domain may be or sit under, kept when the operator names
+/// none: the hosted project and product zones, and `localhost`, which never
+/// leaves the machine. The project domain suffixes are refused on top of these.
+pub const DEFAULT_CUSTOM_DOMAIN_FORBIDDEN_ZONES: [&str; 3] =
+    ["sakala.app", "sakala.dev", "localhost"];
+
+/// Zones a custom domain may not be or sit under.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForbiddenZones(Vec<String>);
+
+impl Default for ForbiddenZones {
+    fn default() -> Self {
+        Self(
+            DEFAULT_CUSTOM_DOMAIN_FORBIDDEN_ZONES
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+}
+
+impl ForbiddenZones {
+    /// Parses a comma-separated list such as `sakala.app,example.ac.id`. Each
+    /// zone is a lowercase DNS name of one or more labels, so a whole top-level
+    /// domain such as `localhost` can be listed. Repeated entries are dropped.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let mut zones = Vec::new();
+        for zone in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let valid = zone.len() <= MAX_NAME_LEN
+                && zone.split('.').all(valid_label)
+                && canonical_hostname(zone);
+            if !valid {
+                return Err(format!(
+                    "{zone:?} is not a valid zone: write a lowercase DNS name such as sakala.app, with internationalized labels in their xn-- form"
+                ));
+            }
+            if !zones.iter().any(|known| known == zone) {
+                zones.push(zone.to_owned());
+            }
+        }
+        if zones.is_empty() {
+            return Err("lists no zone".to_owned());
+        }
+        Ok(Self(zones))
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl fmt::Display for ForbiddenZones {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0.join(", "))
+    }
+}
+
+/// Why a custom domain was refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CustomDomainRejection {
+    /// Not a lowercase DNS name of at least two labels: uppercase, Unicode, a
+    /// wildcard, a port, a trailing dot, or characters no hostname holds.
+    NotADomain,
+    /// An IPv4 address. IPv6 addresses never pass the label rules.
+    IpAddress,
+    /// A project domain suffix of this node, or a name under one: those names
+    /// belong to Sakala projects.
+    ProjectZone,
+    /// A forbidden zone, or a name under one.
+    ForbiddenZone,
+}
+
+impl CustomDomainRejection {
+    /// Why, as the end of a sentence that starts with the domain.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::NotADomain => {
+                "is not a lowercase DNS name of at least two labels; write it without a scheme, port, wildcard, or trailing dot, with internationalized labels in their xn-- form"
+            }
+            Self::IpAddress => "is an IP address, not a domain",
+            Self::ProjectZone => "is under a Sakala project domain, which is not a custom domain",
+            Self::ForbiddenZone => "is under a zone Sakala does not accept as a custom domain",
+        }
+    }
+
+    /// A stable code for logs and status files.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NotADomain => "not_a_domain",
+            Self::IpAddress => "ip_address",
+            Self::ProjectZone => "project_zone",
+            Self::ForbiddenZone => "forbidden_zone",
+        }
+    }
+}
+
+impl fmt::Display for CustomDomainRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+/// What a custom domain must be: a plain DNS name outside every project
+/// domain suffix and forbidden zone. Every accepted name is lowercase
+/// letters, digits, `-`, and `.`, so it can be written into a Caddyfile as
+/// it is. Nothing is normalized: the control plane sends names in their final
+/// form, and a name that is not is refused rather than guessed at.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CustomDomainPolicy {
+    pub project_domains: ProjectDomainSuffixes,
+    pub forbidden_zones: ForbiddenZones,
+}
+
+impl CustomDomainPolicy {
+    pub fn check(&self, domain: &str) -> Result<(), CustomDomainRejection> {
+        if matches!(Host::parse(domain), Ok(Host::Ipv4(_) | Host::Ipv6(_))) {
+            return Err(CustomDomainRejection::IpAddress);
+        }
+        let labels = domain.split('.').collect::<Vec<_>>();
+        let valid = domain.len() <= MAX_NAME_LEN
+            && labels.len() >= 2
+            && labels.iter().all(|label| valid_label(label))
+            && canonical_hostname(domain);
+        if !valid {
+            return Err(CustomDomainRejection::NotADomain);
+        }
+        if within_any(domain, self.project_domains.as_slice()) {
+            return Err(CustomDomainRejection::ProjectZone);
+        }
+        if within_any(domain, self.forbidden_zones.as_slice()) {
+            return Err(CustomDomainRejection::ForbiddenZone);
+        }
+        Ok(())
+    }
+
+    /// Checks every name and returns them sorted, each once, so the same set
+    /// always renders the same route. The error names the first refused name.
+    pub fn check_all(
+        &self,
+        domains: &[String],
+    ) -> Result<Vec<String>, (String, CustomDomainRejection)> {
+        let mut accepted = Vec::with_capacity(domains.len());
+        for domain in domains {
+            self.check(domain)
+                .map_err(|rejection| (domain.clone(), rejection))?;
+            accepted.push(domain.clone());
+        }
+        accepted.sort();
+        accepted.dedup();
+        Ok(accepted)
+    }
+}
+
+/// Whether `domain` is one of `zones` or a name under one.
+fn within_any(domain: &str, zones: &[String]) -> bool {
+    zones.iter().any(|zone| {
+        domain == zone
+            || domain
+                .strip_suffix(zone.as_str())
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
+}
+
 fn validate_suffix(suffix: &str) -> Result<(), &'static str> {
     if suffix.contains('*') {
         return Err("wildcards are not allowed; write run.example.org, not *.run.example.org");
@@ -145,7 +316,144 @@ fn canonical_hostname(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_PROJECT_DOMAIN_SUFFIXES, ProjectDomainSuffixes};
+    use super::{
+        CustomDomainPolicy, CustomDomainRejection, DEFAULT_CUSTOM_DOMAIN_FORBIDDEN_ZONES,
+        DEFAULT_PROJECT_DOMAIN_SUFFIXES, ForbiddenZones, ProjectDomainSuffixes,
+    };
+
+    #[test]
+    fn custom_domains_are_plain_names_outside_the_platform() {
+        let policy = CustomDomainPolicy::default();
+
+        for domain in [
+            "contoh.com",
+            "www.contoh.com",
+            "himpunan.kampus.ac.id",
+            "a.b.c.d.example.org",
+            "xn--bcher-kva.example",
+            "2fa.example.com",
+            "my-site.example.co.id",
+            "sakala.app.example.com",
+            "evilsakala.app",
+        ] {
+            assert_eq!(policy.check(domain), Ok(()), "{domain}");
+        }
+        for (domain, rejection) in [
+            ("", CustomDomainRejection::NotADomain),
+            ("localhost", CustomDomainRejection::NotADomain),
+            ("com", CustomDomainRejection::NotADomain),
+            ("Contoh.com", CustomDomainRejection::NotADomain),
+            ("contoh.com.", CustomDomainRejection::NotADomain),
+            (".contoh.com", CustomDomainRejection::NotADomain),
+            ("www..contoh.com", CustomDomainRejection::NotADomain),
+            ("*.contoh.com", CustomDomainRejection::NotADomain),
+            ("contoh.com:443", CustomDomainRejection::NotADomain),
+            ("https://contoh.com", CustomDomainRejection::NotADomain),
+            ("my_site.contoh.com", CustomDomainRejection::NotADomain),
+            ("-www.contoh.com", CustomDomainRejection::NotADomain),
+            ("www.contoh.com {\n}", CustomDomainRejection::NotADomain),
+            ("bücher.example", CustomDomainRejection::NotADomain),
+            ("xn--a.example", CustomDomainRejection::NotADomain),
+            ("contoh.123", CustomDomainRejection::NotADomain),
+            ("10.0.0.1", CustomDomainRejection::IpAddress),
+            ("127.1", CustomDomainRejection::IpAddress),
+            ("[::1]", CustomDomainRejection::IpAddress),
+            ("::1", CustomDomainRejection::NotADomain),
+            ("portfolio.sakala.app", CustomDomainRejection::ProjectZone),
+            (
+                "api.portfolio.sakala.app",
+                CustomDomainRejection::ProjectZone,
+            ),
+            ("staging.sakala.app", CustomDomainRejection::ProjectZone),
+            ("x.run.sakala.localhost", CustomDomainRejection::ProjectZone),
+            ("sakala.app", CustomDomainRejection::ProjectZone),
+            ("sakala.dev", CustomDomainRejection::ForbiddenZone),
+            ("api.sakala.dev", CustomDomainRejection::ForbiddenZone),
+            ("x.localhost", CustomDomainRejection::ForbiddenZone),
+        ] {
+            assert_eq!(policy.check(domain), Err(rejection), "{domain:?}");
+        }
+        let longest_label = "a".repeat(63);
+        let long = format!(
+            "{longest_label}.{longest_label}.{longest_label}.{}.com",
+            "b".repeat(57)
+        );
+        assert_eq!(long.len(), 253);
+        assert_eq!(policy.check(&long), Ok(()));
+        assert_eq!(
+            policy.check(&format!("a{long}")),
+            Err(CustomDomainRejection::NotADomain)
+        );
+        assert_eq!(
+            policy.check(&format!("{longest_label}a.example.com")),
+            Err(CustomDomainRejection::NotADomain)
+        );
+    }
+
+    #[test]
+    fn a_self_hosted_node_refuses_its_own_suffix_and_configured_zones() {
+        let policy = CustomDomainPolicy {
+            project_domains: ProjectDomainSuffixes::parse("run.kampus.ac.id").expect("suffix"),
+            forbidden_zones: ForbiddenZones::parse("kampus.ac.id").expect("zone"),
+        };
+
+        assert_eq!(
+            policy.check("web.run.kampus.ac.id"),
+            Err(CustomDomainRejection::ProjectZone)
+        );
+        assert_eq!(
+            policy.check("www.kampus.ac.id"),
+            Err(CustomDomainRejection::ForbiddenZone)
+        );
+        // Only the zones it names: the hosted defaults are replaced.
+        assert_eq!(policy.check("portfolio.sakala.app"), Ok(()));
+        assert_eq!(policy.check("himpunan.example.ac.id"), Ok(()));
+    }
+
+    #[test]
+    fn a_list_is_checked_sorted_and_deduplicated() {
+        let policy = CustomDomainPolicy::default();
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            policy.check_all(&list(&["www.contoh.com", "contoh.com", "www.contoh.com"])),
+            Ok(list(&["contoh.com", "www.contoh.com"]))
+        );
+        assert_eq!(policy.check_all(&[]), Ok(Vec::new()));
+        assert_eq!(
+            policy.check_all(&list(&["contoh.com", "blog.sakala.app"])),
+            Err((
+                "blog.sakala.app".to_owned(),
+                CustomDomainRejection::ProjectZone
+            ))
+        );
+    }
+
+    #[test]
+    fn forbidden_zones_parse_one_label_zones_and_refuse_typos() {
+        assert_eq!(
+            ForbiddenZones::default().as_slice(),
+            DEFAULT_CUSTOM_DOMAIN_FORBIDDEN_ZONES
+        );
+        let zones = ForbiddenZones::parse(" sakala.app , internal,sakala.app ").expect("zones");
+        assert_eq!(zones.as_slice(), ["sakala.app", "internal"]);
+        assert_eq!(zones.to_string(), "sakala.app, internal");
+        for value in [
+            "",
+            " , ",
+            "*.sakala.app",
+            "Sakala.app",
+            "sakala.app.",
+            "sakala app",
+        ] {
+            assert!(ForbiddenZones::parse(value).is_err(), "{value:?}");
+        }
+    }
 
     fn custom() -> ProjectDomainSuffixes {
         ProjectDomainSuffixes::parse("run.example.ac.id").expect("valid suffix")
