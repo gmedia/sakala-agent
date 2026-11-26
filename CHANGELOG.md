@@ -4,7 +4,7 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
-## [0.20.0] - 2026-11-30
+## [0.20.0] - 2026-11-26
 
 ### Added
 
