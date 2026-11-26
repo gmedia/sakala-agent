@@ -4,6 +4,8 @@ Semua perubahan penting pada project ini akan dicatat di sini. Format mengikuti 
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-30
+
 ### Added
 
 - Custom domain untuk project (ADR-024), di belakang capability baru `custom-domains` yang diiklankan runtime `docker`. `DeployProject`, `WakeProject`, `RestartProject`, dan `SleepProject` boleh membawa `custom_domains`: tidak ada atau `null` mempertahankan custom domain yang sudah ada di route project, array menggantinya, `[]` menghapus semuanya. Router node melayaninya sebagai alamat site tambahan di file route project yang sama (`portfolio.sakala.app:80, www.contoh.com:80 {`), di route biasa, replika, halaman tidur, dan halaman `unavailable`, sehingga aplikasi menerima `Host` asli dan halaman tidur di custom domain membangunkan project lewat slug domain project-nya. Project tanpa custom domain mendapat file route yang sama byte per byte seperti sebelumnya, dan label container tidak berubah.
@@ -409,7 +411,8 @@ Deploy `sakala-api` lebih dulu; lihat [Compatibility](docs/COMPATIBILITY.md). Co
 - Tutup race concurrent container admission dengan authoritative pre-run check, lindungi route deployment baru dari lifecycle command lama, dan terima output decimal Docker image prune tanpa mengubah cleanup sukses menjadi gagal.
 - Checkout Git mengambil commit sebelum checkout, redeploy menghentikan container lama yang masih running, serta semantik missing workload untuk Stop/Sleep dibedakan.
 
-[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/gmedia/sakala-agent/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/gmedia/sakala-agent/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/gmedia/sakala-agent/compare/v0.18.2...v0.19.0
 [0.18.2]: https://github.com/gmedia/sakala-agent/compare/v0.18.1...v0.18.2
 [0.18.1]: https://github.com/gmedia/sakala-agent/compare/v0.18.0...v0.18.1
